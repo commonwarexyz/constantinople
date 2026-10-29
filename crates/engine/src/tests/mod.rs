@@ -54,7 +54,7 @@ use commonware_utils::{
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::PublicKeyCache;
 use properties::{
-    BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
+    BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff, PipelinedHandoffs,
     RestartPreservesProcessedHeight, RestartRecoveryComplete, StateSyncReadyAtHeight,
 };
 use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
@@ -99,6 +99,7 @@ struct TestEngineDefinition {
     pending_sync_floor: Option<EngineFinalization<TestPublicKey, MinSig>>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
+    max_message_size: u32,
 }
 
 impl TestEngineDefinition {
@@ -117,6 +118,7 @@ impl TestEngineDefinition {
             pending_sync_floor: None,
             prunable_items_per_section: NZU64!(4_096),
             retained_marshal_blocks: 16,
+            max_message_size: 1024 * 1024,
         }
     }
 
@@ -148,6 +150,11 @@ impl TestEngineDefinition {
 
     const fn with_state_sync(mut self) -> Self {
         self.enable_state_sync = true;
+        self
+    }
+
+    const fn with_max_message_size(mut self, max_message_size: u32) -> Self {
+        self.max_message_size = max_message_size;
         self
     }
 
@@ -226,6 +233,10 @@ impl EngineDefinition for TestEngineDefinition {
             (TRANSACTION_RESOLVER_CHANNEL, TEST_QUOTA),
             (PROBE_CHANNEL, TEST_QUOTA),
         ]
+    }
+
+    fn max_message_size(&self) -> u32 {
+        self.max_message_size
     }
 
     async fn init(&self, ctx: InitContext<'_, Self::PublicKey>) -> (Self::Engine, Self::State) {
@@ -394,7 +405,6 @@ impl EngineDefinition for TestEngineDefinition {
                         fetch_batch_size: NZU64!(16),
                         apply_batch_size: NZU64!(64),
                         max_outstanding_requests: NZUsize!(8),
-                        update_channel_size: NZUsize!(256),
                     },
                     prune_config: Some(PruneConfig {
                         maintenance_interval: NZUsize!(16),
@@ -443,6 +453,7 @@ impl EngineDefinition for TestEngineDefinition {
                 .send(ValidatorState {
                     marshal,
                     startup_sync_height,
+                    context: Arc::new(context.child("metrics")),
                 })
                 .is_err()
             {
@@ -493,6 +504,7 @@ fn run_finalize(engine: TestEngineDefinition) {
         .seeds(0..2)
         .exit_condition(FinalizedHeightAtLeast::new(100))
         .property(BlockAgreementAtHeight::new(100))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -535,6 +547,7 @@ fn run_crash_restart(engine: TestEngineDefinition) {
         ))
         .exit_condition(FinalizedHeightAtLeast::new(50))
         .property(BlockAgreementAtHeight::new(50))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -564,6 +577,7 @@ fn run_restart_at_processed_height(processed_height: u64) {
         .timeout(Duration::from_secs(30))
         .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
         .property(RestartPreservesProcessedHeight::new(barrier))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -576,20 +590,21 @@ fn run_delayed_start(engine: TestEngineDefinition) {
         .crash(delayed)
         .exit_condition(FinalizedHeightAtLeast::new(20))
         .property(BlockAgreementAtHeight::new(20))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
 
 fn run_state_sync(engine: TestEngineDefinition) {
     let delayed = delay_first(&engine, 80);
-    PlanBuilder::new(engine)
+    PlanBuilder::new(engine.with_max_message_size(MAX_PROBE_MESSAGE_SIZE))
         .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -597,9 +612,8 @@ fn run_state_sync(engine: TestEngineDefinition) {
 fn run_state_sync_deterministic(engine: TestEngineDefinition) {
     let delayed = delay_first(&engine, 80);
     let seeds = 0..2;
-    let first = PlanBuilder::new(engine.clone())
+    let first = PlanBuilder::new(engine.clone().with_max_message_size(MAX_PROBE_MESSAGE_SIZE))
         .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
         .crash(delayed.clone())
         .exit_condition(StateSyncReadyAtHeight::new(150))
@@ -607,9 +621,8 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
         .property(BlockAgreementAtHeight::new(150))
         .run()
         .unwrap();
-    let second = PlanBuilder::new(engine)
+    let second = PlanBuilder::new(engine.with_max_message_size(MAX_PROBE_MESSAGE_SIZE))
         .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
         .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
@@ -628,9 +641,8 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
 
 fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
     let delayed = delay_first(&engine, 80);
-    PlanBuilder::new(engine)
+    PlanBuilder::new(engine.with_max_message_size(MAX_PROBE_MESSAGE_SIZE))
         .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(delayed)
         .crash(Crash::Random {
@@ -641,20 +653,21 @@ fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
         .exit_condition(StateSyncReadyAtHeight::new(200))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::at_least(200, 3))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
 
 fn run_state_sync_lossy(engine: TestEngineDefinition) {
     let delayed = delay_first(&engine, 80);
-    PlanBuilder::new(engine)
+    PlanBuilder::new(engine.with_max_message_size(MAX_PROBE_MESSAGE_SIZE))
         .link(lossy_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::at_least(150, 3))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -665,11 +678,14 @@ fn run_lossy(engine: TestEngineDefinition) {
         .seeds(0..2)
         .exit_condition(FinalizedHeightAtLeast::new(20))
         .property(BlockAgreementAtHeight::new(20))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
 
 fn run_random_crashes(engine: TestEngineDefinition) {
+    // Random crashes start one period into the run, so the exit height must
+    // keep the network finalizing well beyond it.
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
@@ -678,8 +694,9 @@ fn run_random_crashes(engine: TestEngineDefinition) {
             downtime: Duration::from_secs(1),
             count: 1,
         })
-        .exit_condition(FinalizedHeightAtLeast::new(50))
-        .property(BlockAgreementAtHeight::new(50))
+        .exit_condition(FinalizedHeightAtLeast::new(100))
+        .property(BlockAgreementAtHeight::new(100))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -702,6 +719,7 @@ fn run_many_crashes(engine: TestEngineDefinition) {
         .crash(Crash::Schedule(schedule))
         .exit_condition(FinalizedHeightAtLeast::new(50))
         .property(BlockAgreementAtHeight::new(50))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -727,6 +745,7 @@ fn run_total_shutdown(engine: TestEngineDefinition) {
         .timeout(Duration::from_secs(90))
         .exit_condition(FinalizedHeightAtLeast::new(100))
         .property(BlockAgreementAtHeight::new(100))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -735,9 +754,8 @@ fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
     let delayed = engine.participants().first().cloned().unwrap();
     let delayed_start = delay_first(&engine, 80);
 
-    PlanBuilder::new(engine)
+    PlanBuilder::new(engine.with_max_message_size(MAX_PROBE_MESSAGE_SIZE))
         .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(delayed_start)
         .crash(Crash::Schedule(
@@ -748,6 +766,7 @@ fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
         .exit_condition(StateSyncReadyAtHeight::new(180))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::at_least(180, 3))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -780,6 +799,7 @@ fn run_rapid_crashes(engine: TestEngineDefinition) {
         .crash(Crash::Schedule(schedule))
         .exit_condition(FinalizedHeightAtLeast::new(40))
         .property(BlockAgreementAtHeight::new(40))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -821,6 +841,7 @@ fn run_network_partition(engine: TestEngineDefinition) {
         .crash(Crash::Schedule(schedule))
         .exit_condition(FinalizedHeightAtLeast::new(40))
         .property(BlockAgreementAtHeight::at_least(40, 3))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }
@@ -835,6 +856,7 @@ fn run_secondaries_sync(engine: TestEngineDefinition) {
         .seeds(0..2)
         .exit_condition(FinalizedHeightAtLeast::new(40))
         .property(BlockAgreementAtHeight::new(40))
+        .property(PipelinedHandoffs)
         .run()
         .unwrap();
 }

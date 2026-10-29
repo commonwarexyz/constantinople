@@ -17,8 +17,10 @@ where
     /// Returns the transactions to include in the next proposal.
     ///
     /// `round` is the consensus round the proposal targets. Speculative
-    /// pre-builds call this before the round is entered, so implementations
-    /// must not assume the round is live.
+    /// pre-builds call this before the round is entered and before `parent`
+    /// certifies, so implementations must not assume the round is live or
+    /// that `parent` will finalize. A caller may also abandon a build, so
+    /// returned transactions may never be proposed and are not handed back.
     ///
     /// `filled` is the sum of encoded signed transaction sizes already in the
     /// proposal. The implementation must stay within its transaction byte

@@ -52,9 +52,14 @@ separately.
 
 Account pages show the certificate as soon as it is verified and load state
 and transaction proofs concurrently. Each `tx_activity` row carries its
-transaction's QMDB location, so row proofs need no further SQL reads. Row
-proofs retain a certificate that covers the newest transaction on the selected
-page. A newer page shares one certificate refresh across its rows.
+transaction's QMDB location, so activity proofs need no further SQL reads.
+One QMDB multi-proof authenticates all distinct locations and their expected
+digests on the selected page under one retained certificate. Duplicate locations
+must agree on the digest. A newer page shares one certificate refresh across its
+rows. The ten-row page fits the service's 1024-location limit; oversized batches
+are rejected before making a request. A failed batch leaves every row waiting
+or in error according to the same retry rules as individual proofs. Each row's
+shared byte count is the full multi-proof size, not an additional per-row cost.
 Account-state retries do not restart transaction proofs already in progress.
 
 The publication target's Store sequence becomes the minimum sequence for

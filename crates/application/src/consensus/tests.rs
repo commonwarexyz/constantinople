@@ -4,18 +4,21 @@ use super::{
 };
 use commonware_codec::{DecodeExt as _, Encode, EncodeSize as _, Write as _};
 use commonware_consensus::{
+    Handoff,
+    marshal::ancestry,
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
     },
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
-    Digest, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519,
-    secp256r1::standard as secp256r1, sha256,
+    Digest, Digested, Digestible as _, Hasher as _, Signer as _,
+    bls12381::primitives::variant::MinSig, secp256r1::standard as secp256r1, sha256,
 };
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_glue::stateful::{
-    Application as StatefulApplication,
-    db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _},
+    Application as StatefulApplication, Input,
+    db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
 use commonware_parallel::Sequential;
 use commonware_runtime::{
@@ -42,9 +45,9 @@ type TestApp = Application<
     deterministic::Context,
     sha256::Sha256,
     sha256::Digest,
-    threshold::Scheme<ed25519::PublicKey, MinSig>,
-    ed25519::PublicKey,
-    StaticTransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>,
+    threshold::Scheme<ed25519::VerifyingKey, MinSig>,
+    ed25519::VerifyingKey,
+    StaticTransactionSource<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>,
     Sequential,
 >;
 type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;
@@ -108,7 +111,7 @@ where
     non_empty_range!(bounds.inactivity_floor, bounds.tip.size)
 }
 
-type TestBlock = SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+type TestBlock = SealedBlock<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
 
 /// Genesis-backed fixture shared by the propose/verify tests.
 ///
@@ -118,16 +121,16 @@ struct VerifyHarness {
     app: TestApp,
     dbs: TestDbs,
     parent: TestBlock,
-    leader: ed25519::PrivateKey,
-    sender: ed25519::PrivateKey,
-    alt_sender: ed25519::PrivateKey,
-    recipient: ed25519::PrivateKey,
+    leader: ed25519::SigningKey,
+    sender: ed25519::SigningKey,
+    alt_sender: ed25519::SigningKey,
+    recipient: ed25519::SigningKey,
     state_target: StateSyncTarget<sha256::Digest>,
     transaction_target: TransactionHistoryTarget<sha256::Digest>,
 }
 
 async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
-    let cache = CacheRef::from_pooler(context, NZU16!(16), NZUsize!(4096));
+    let cache = CacheRef::new(NZU16!(16), NZUsize!(4096));
     let dbs = TestDbs::init(
         context.child("dbs"),
         (
@@ -138,10 +141,10 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     )
     .await;
 
-    let leader = ed25519::PrivateKey::from_seed(21);
-    let sender = ed25519::PrivateKey::from_seed(22);
-    let recipient = ed25519::PrivateKey::from_seed(23);
-    let alt_sender = ed25519::PrivateKey::from_seed(24);
+    let leader = ed25519::SigningKey::from_seed(21);
+    let sender = ed25519::SigningKey::from_seed(22);
+    let recipient = ed25519::SigningKey::from_seed(23);
+    let alt_sender = ed25519::SigningKey::from_seed(24);
 
     let (mut state_batch, transaction_batch) = dbs.new_batches().await;
     for funded in [&sender, &alt_sender] {
@@ -195,11 +198,11 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     }
 }
 
-type TestSource = StaticTransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+type TestSource = StaticTransactionSource<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
 
 fn transfer(
-    sender: &ed25519::PrivateKey,
-    recipient: &ed25519::PrivateKey,
+    sender: &ed25519::SigningKey,
+    recipient: &ed25519::SigningKey,
     value: u64,
 ) -> SignedTransaction<sha256::Sha256> {
     Transaction::new(
@@ -214,8 +217,8 @@ fn transfer(
 /// Builds a child header that reuses the parent's commitments.
 fn unexecuted_child_header(
     parent: &TestBlock,
-    consensus_context: &SimplexContext<sha256::Digest, ed25519::PublicKey>,
-) -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey> {
+    consensus_context: &SimplexContext<sha256::Digest, ed25519::VerifyingKey>,
+) -> Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey> {
     Header {
         context: consensus_context.clone(),
         parent: *parent.seal(),
@@ -229,7 +232,7 @@ fn unexecuted_child_header(
 }
 
 fn sized_unverified_block(
-    header: Header<sha256::Digest, sha256::Digest, ed25519::PublicKey>,
+    header: Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>,
     encoded_size: usize,
 ) -> TestBlock {
     let lazy = |payload_size: usize| {
@@ -427,6 +430,44 @@ fn replay_rejects_invalid_body() {
     });
 }
 
+/// Replay takes the transaction-history floor from the block's header, so an
+/// uncertified ancestor can name a floor past its own commit.
+#[test]
+fn replay_rejects_transaction_floor_past_commit() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+
+        // An empty body appends only its commit, at the parent's history size.
+        let commit = parent.header.transactions_range.end();
+        let mut header = unexecuted_child_header(&parent, &consensus_context);
+        header.transactions_range = non_empty_range!(commit + 1, commit + 2);
+        let block = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
+            .seal(&mut sha256::Sha256::default());
+
+        let result = StatefulApplication::apply(
+            &mut app,
+            (context.child("replay"), consensus_context),
+            &block,
+            dbs.new_batches().await,
+        )
+        .await;
+
+        assert!(result.is_none());
+    });
+}
+
 #[test]
 fn verify_rejects_missing_parent() {
     deterministic::Runner::default().start(|context| async move {
@@ -523,6 +564,251 @@ fn propose_drops_inapplicable_and_refills() {
             )
             .await;
         assert!(accepted.is_some());
+    });
+}
+
+#[test]
+fn prepare_stages_the_block_propose_builds() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            recipient,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+
+        // Give both builds the same parent, parent state, and transactions.
+        let transaction = transfer(&sender, &recipient, 1);
+        let ancestry =
+            || ancestry::from_iter([Digested::precomputed(parent.clone(), parent.digest())]);
+        let input = || Input {
+            upstream: (),
+            provider: TestSource::new(vec![vec![transaction.clone()]]),
+        };
+
+        let Handoff::Stage(prepared) = StatefulApplication::prepare(
+            &mut app,
+            (context.child("prepare"), consensus_context.clone()),
+            ancestry(),
+            dbs.new_batches().await,
+            input(),
+        )
+        .await
+        else {
+            panic!("prepare must stage the block it builds");
+        };
+        let proposed = StatefulApplication::propose(
+            &mut app,
+            (context.child("propose"), consensus_context),
+            ancestry(),
+            dbs.new_batches().await,
+            input(),
+        )
+        .await
+        .expect("propose must build a block");
+
+        // Each build reads the clock, so only the timestamps may differ.
+        let mut prepared_header = prepared.block.header.clone();
+        prepared_header.timestamp = proposed.block.header.timestamp;
+        assert_eq!(prepared_header, proposed.block.header);
+        assert_eq!(
+            body_digests(&prepared.block),
+            vec![*transaction.message_digest()]
+        );
+        assert_eq!(body_digests(&prepared.block), body_digests(&proposed.block));
+    });
+}
+
+/// The outgoing leader equivocated at view 1 and its block P2 replaced the
+/// parent P1 before P1 certified, so view 2 is requested on each in turn.
+#[test]
+fn prepare_restages_on_a_replacement_parent() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent: genesis,
+            leader,
+            sender,
+            alt_sender,
+            recipient,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+        let fork = |parent: &<TestDbs as DatabaseSet<deterministic::Context>>::Merkleized| {
+            <TestDbs as DatabaseSet<deterministic::Context>>::fork_batches(parent)
+        };
+
+        // Both parents are children of genesis at view 1. P1 consumes the
+        // sender's nonce 0 and P2 does not.
+        let parent_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), genesis.digest()),
+        };
+        let p1 = app
+            .propose_child(
+                (context.child("propose_p1"), parent_context.clone()),
+                Arc::new(genesis.clone()),
+                dbs.new_batches().await,
+                &mut TestSource::new(vec![vec![transfer(&sender, &recipient, 1)]]),
+            )
+            .await
+            .expect("P1 must build");
+        let p2 = app
+            .propose_child(
+                (context.child("propose_p2"), parent_context),
+                Arc::new(genesis),
+                dbs.new_batches().await,
+                &mut TestSource::new(vec![vec![transfer(&alt_sender, &recipient, 1)]]),
+            )
+            .await
+            .expect("P2 must build");
+
+        // Stamping P2 ahead of the local clock lets only a child of P2 take
+        // its timestamp.
+        let Block { mut header, body } = p2.block.into_inner();
+        header.timestamp = 10_000;
+        let p2_block = Block { header, body }.seal(&mut sha256::Sha256::default());
+        let p2_state = p2.merkleized;
+
+        // Each request for view 2 offers the sender's nonce-0 transfer.
+        let transaction = transfer(&sender, &recipient, 2);
+        let child_context = |parent: &TestBlock| SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(2)),
+            leader: leader.public_key(),
+            parent: (View::new(1), parent.digest()),
+        };
+        let ancestry_of = |parent: &TestBlock| {
+            ancestry::from_iter([Digested::precomputed(parent.clone(), parent.digest())])
+        };
+        let input = || Input {
+            upstream: (),
+            provider: TestSource::new(vec![vec![transaction.clone()]]),
+        };
+
+        // Both requests stage a block, the second on the replacement parent.
+        let Handoff::Stage(on_p1) = StatefulApplication::prepare(
+            &mut app,
+            (context.child("prepare_p1"), child_context(&p1.block)),
+            ancestry_of(&p1.block),
+            fork(&p1.merkleized),
+            input(),
+        )
+        .await
+        else {
+            panic!("prepare must stage a block on P1");
+        };
+        let Handoff::Stage(on_p2) = StatefulApplication::prepare(
+            &mut app,
+            (context.child("prepare_p2"), child_context(&p2_block)),
+            ancestry_of(&p2_block),
+            fork(&p2_state),
+            input(),
+        )
+        .await
+        else {
+            panic!("prepare must stage a block on the replacement P2");
+        };
+
+        // Each body follows its parent's nonce, so only P2's child carries
+        // the transfer.
+        assert!(body_digests(&on_p1.block).is_empty());
+        assert_eq!(
+            body_digests(&on_p2.block),
+            vec![*transaction.message_digest()]
+        );
+
+        // The second block extends P2 and commits to different state.
+        let header = on_p2.block.header.clone();
+        assert_eq!(header.context, child_context(&p2_block));
+        assert_eq!(header.parent, p2_block.digest());
+        assert_eq!(header.height, p2_block.header.height + 1);
+        assert!(header.timestamp >= p2_block.header.timestamp);
+        assert!(on_p1.block.header.timestamp < p2_block.header.timestamp);
+        assert_ne!(header.state_root, on_p1.block.header.state_root);
+        assert_ne!(
+            header.transactions_root,
+            on_p1.block.header.transactions_root
+        );
+
+        // It verifies and replays to its sync targets on P2's state.
+        let accepted = app
+            .verify_child(
+                (context.child("verify_p2"), header.context.clone()),
+                Arc::new(on_p2.block.clone()),
+                std::future::ready(Some(Arc::new(p2_block))),
+                fork(&p2_state),
+            )
+            .await;
+        assert!(accepted.is_some());
+        let applied = StatefulApplication::apply(
+            &mut app,
+            (context.child("apply_p2"), header.context.clone()),
+            &on_p2.block,
+            fork(&p2_state),
+        )
+        .await
+        .expect("the block applies on P2's state");
+        assert!(
+            <TestDbs as DatabaseSet<deterministic::Context>>::matches_sync_targets(
+                &applied,
+                &<TestApp as StatefulApplication<deterministic::Context>>::sync_targets(
+                    &on_p2.block
+                ),
+            )
+        );
+
+        // P1 already consumed the nonce, so the block fails on P1's state.
+        let rejected = app
+            .verify_child(
+                (context.child("verify_p1"), header.context),
+                Arc::new(on_p2.block),
+                std::future::ready(Some(Arc::new(p1.block))),
+                fork(&p1.merkleized),
+            )
+            .await;
+        assert!(rejected.is_none());
+    });
+}
+
+/// Pins the application's own decline: the stateful actor declines an empty
+/// ancestry before it would call `prepare`.
+#[test]
+fn prepare_waits_without_a_parent() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+
+        let prepared = StatefulApplication::prepare(
+            &mut app,
+            (context.child("prepare"), consensus_context),
+            ancestry::from_iter(std::iter::empty::<Digested<TestBlock>>()),
+            dbs.new_batches().await,
+            Input {
+                upstream: (),
+                provider: TestSource::new(Vec::new()),
+            },
+        )
+        .await;
+        assert!(prepared.is_wait());
     });
 }
 
@@ -640,14 +926,22 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let VerifyHarness {
             mut app,
             dbs,
-            parent,
             leader,
+            state_target,
+            transaction_target,
             ..
         } = Box::pin(verify_harness(&context)).await;
 
-        // Advance past the genesis timestamp so the proposal's clock-derived
-        // timestamp is strictly greater than the parent's.
-        context.sleep(Duration::from_millis(10)).await;
+        // Stamp the parent ahead of the local clock, as a proposer whose clock
+        // runs fast would. A child built before the local clock catches up
+        // takes the parent's timestamp.
+        let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
+            &mut sha256::Sha256::default(),
+            leader.public_key(),
+            10_000,
+            state_target,
+            transaction_target,
+        );
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -664,6 +958,7 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             )
             .await
             .expect("empty proposal must succeed");
+        assert_eq!(proposed.block.header.timestamp, parent.header.timestamp);
 
         let replayed = StatefulApplication::apply(
             &mut app,
@@ -687,14 +982,14 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             .await;
         assert!(accepted.is_some());
 
-        // The identical block with its timestamp rewound to the parent's is
+        // The identical block with its timestamp rewound below the parent's is
         // rejected by the timestamp check alone.
         let Block { mut header, body } = proposed.block.into_inner();
         assert!(
             body.is_empty(),
             "stale block must mirror the empty proposal"
         );
-        header.timestamp = parent.header.timestamp;
+        header.timestamp = parent.header.timestamp - 1;
         let stale = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
             .seal(&mut sha256::Sha256::default());
         let rejected = app
@@ -711,8 +1006,8 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
 
 #[test]
 fn parent_inactivity_floor_skips_the_parent_commit() {
-    let leader = ed25519::PrivateKey::from_seed(7);
-    let recipient = ed25519::PrivateKey::from_seed(8);
+    let leader = ed25519::SigningKey::from_seed(7);
+    let recipient = ed25519::SigningKey::from_seed(8);
     let genesis_target = TransactionHistoryTarget {
         root: sha256::Digest::EMPTY,
         size: commonware_storage::mmr::Location::new(1),
@@ -757,7 +1052,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
 
 #[test]
 fn genesis_block_uses_the_initialized_transaction_target() {
-    let leader = ed25519::PrivateKey::from_seed(11).public_key();
+    let leader = ed25519::SigningKey::from_seed(11).public_key();
     let target = TransactionHistoryTarget {
         root: sha256::Sha256::hash(&[b"genesis"]),
         size: commonware_storage::mmr::Location::new(1),
@@ -808,12 +1103,13 @@ impl Clone for DelayedSource {
     }
 }
 
-impl constantinople_mempool::TransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>
+impl
+    constantinople_mempool::TransactionSource<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>
     for DelayedSource
 {
     async fn propose(
         &mut self,
-        parent: &Header<sha256::Digest, sha256::Digest, ed25519::PublicKey>,
+        parent: &Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>,
         round: Round,
         filled: usize,
     ) -> Vec<constantinople_primitives::VerifiedTransaction<sha256::Sha256>> {
@@ -850,8 +1146,8 @@ fn build_timeout_bounds_refill_rounds() {
             deterministic::Context,
             sha256::Sha256,
             sha256::Digest,
-            threshold::Scheme<ed25519::PublicKey, MinSig>,
-            ed25519::PublicKey,
+            threshold::Scheme<ed25519::VerifyingKey, MinSig>,
+            ed25519::VerifyingKey,
             DelayedSource,
             Sequential,
         > = Application::new(

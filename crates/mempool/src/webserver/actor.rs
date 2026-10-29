@@ -140,7 +140,7 @@ pub struct Config<St: Strategy> {
     /// extraction and block release in the actor, and hex-encoding digest
     /// lists for status responses.
     pub strategy: St,
-    /// Shared cache of decompressed transaction public keys.
+    /// Shared cache of decompressed secp256r1 transaction public keys.
     pub public_key_cache: PublicKeyCache,
 }
 
@@ -915,7 +915,8 @@ mod tests {
         status_for_finalized_block, total_bytes_for,
     };
     use ahash::{AHashMap, AHashSet};
-    use commonware_cryptography::{Signer, ed25519, sha256};
+    use commonware_cryptography::{Signer, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _};
@@ -936,7 +937,7 @@ mod tests {
     fn background_requires_capacity_beyond_foreground_reserve() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (mailbox, receiver) =
-                Mailbox::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::channel(1);
+                Mailbox::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::channel(1);
             let config = Config {
                 max_pool_bytes: 1_000,
                 max_propose_bytes: 1_000,
@@ -1019,8 +1020,8 @@ mod tests {
 
     #[test]
     fn new_transactions_filters_duplicate_digests() {
-        let signer = ed25519::PrivateKey::from_seed(1);
-        let recipient = ed25519::PrivateKey::from_seed(2).public_key();
+        let signer = ed25519::SigningKey::from_seed(1);
+        let recipient = ed25519::SigningKey::from_seed(2).public_key();
         let transaction = Transaction::new(
             TransactionPublicKey::ed25519(signer.public_key()),
             TransactionPublicKey::ed25519(recipient),
@@ -1251,8 +1252,8 @@ mod tests {
     }
 
     fn pool_entry(seed: u64, txs: usize, total_bytes: usize) -> PoolEntry<sha256::Sha256> {
-        let signer = ed25519::PrivateKey::from_seed(seed);
-        let recipient = ed25519::PrivateKey::from_seed(seed + 100).public_key();
+        let signer = ed25519::SigningKey::from_seed(seed);
+        let recipient = ed25519::SigningKey::from_seed(seed + 100).public_key();
         let transactions = (0..txs as u64)
             .map(|nonce| {
                 Transaction::new(
@@ -1352,7 +1353,7 @@ mod tests {
             let (sender, rx) = mpsc::channel(8);
             let mailbox = Mailbox::new(sender.clone());
             let public_key_cache = PublicKeyCache::new(context.child("cache"), NZUsize!(16));
-            let actor = Actor::<_, sha256::Digest, ed25519::PublicKey, sha256::Sha256, _>::new(
+            let actor = Actor::<_, sha256::Digest, ed25519::VerifyingKey, sha256::Sha256, _>::new(
                 context,
                 Config {
                     max_pool_bytes: total_bytes_for(&transactions),

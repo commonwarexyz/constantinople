@@ -48,32 +48,34 @@ constantinople-application = { path = "crates/application" }
 
 # Commonware
 # Match Exoware so public Rust types use the same crate revisions.
-commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-stream = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-allocator = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-glue = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-coding = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-stream = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301", default-features = false }
+commonware-cryptography-curve25519 = { git = "https://github.com/commonwarexyz/monorepo", rev = "7c2cf9a8cf81164b2d1da7e18030910fdcea4301" }
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "19c6fc447cd19fcb77f3bb7b937c4a476a75a425" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "19c6fc447cd19fcb77f3bb7b937c4a476a75a425" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "19c6fc447cd19fcb77f3bb7b937c4a476a75a425" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "19c6fc447cd19fcb77f3bb7b937c4a476a75a425" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "19c6fc447cd19fcb77f3bb7b937c4a476a75a425" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "19c6fc447cd19fcb77f3bb7b937c4a476a75a425" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "e082ce48e8ee127b2172d9e515ba7a8aa2a27425" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "e082ce48e8ee127b2172d9e515ba7a8aa2a27425" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "e082ce48e8ee127b2172d9e515ba7a8aa2a27425" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "e082ce48e8ee127b2172d9e515ba7a8aa2a27425" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "e082ce48e8ee127b2172d9e515ba7a8aa2a27425" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "e082ce48e8ee127b2172d9e515ba7a8aa2a27425" }
 datafusion = "55"
 
 # Other
@@ -100,7 +102,6 @@ thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
 serde_yaml = "0.9"
 tempfile = "3"
-mimalloc = "0.1.52"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.25", default-features = false }
 tracing-subscriber = "0.3"

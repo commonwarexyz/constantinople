@@ -4,14 +4,20 @@
 //! (dominated by per-transaction seal hashing), too much to run inline on a
 //! core tokio worker.
 
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use commonware_codec::{Decode as _, Encode as _, RangeCfg};
-use commonware_cryptography::{Signer as _, ed25519, sha256};
+use commonware_cryptography::{Signer as _, sha256};
+use commonware_cryptography_curve25519::signing as ed25519;
 use constantinople_primitives::{SignedTransaction, Transaction, TransactionPublicKey};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 type TestHasher = sha256::Sha256;
 
@@ -22,8 +28,8 @@ const SIGNERS: usize = 1024;
 /// Signs `n` transactions and encodes them as one length-prefixed batch, the
 /// wire format relayers post to the ingress endpoints.
 fn encoded_batch(n: usize) -> bytes::Bytes {
-    let signers: Vec<ed25519::PrivateKey> = (0..SIGNERS as u64)
-        .map(ed25519::PrivateKey::from_seed)
+    let signers: Vec<ed25519::SigningKey> = (0..SIGNERS as u64)
+        .map(ed25519::SigningKey::from_seed)
         .collect();
     (0..n)
         .map(|i| {

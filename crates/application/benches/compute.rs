@@ -1,55 +1,102 @@
-use ahash::{AHashMap, AHashSet};
-use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
-use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::Rayon;
-use commonware_runtime::{Runner as _, buffer::paged::CacheRef, tokio};
+//! Measures block settlement against a QMDB state database of one million accounts, by stage.
+//!
+//! Verification plans the body, stages its accounts, settles them, and merkleizes the slots.
+//! Proposal selects the body over refill rounds, staging each round's new accounts, then settles
+//! and merkleizes. Each stage reports its median over the timed iterations, and every iteration
+//! starts from the same seeded state, so the roots of a fixture must not change.
+//!
+//! Environment:
+//! - `CONSTANTINOPLE_BENCH_WORKERS` (8): Rayon workers and Tokio worker threads.
+//! - `CONSTANTINOPLE_BENCH_COUNTS` (`32768,65536,131072`): transfers per block.
+//! - `CONSTANTINOPLE_BENCH_FIXTURE`: run only this fixture (`ring`, `unique`, `shared`, `mixed`,
+//!   `hot`).
+//! - `CONSTANTINOPLE_BENCH_MODE`: run only `verify` or `propose`.
+//! - `CONSTANTINOPLE_BENCH_ROUNDS` (4): candidate rounds per proposal.
+//! - `CONSTANTINOPLE_BENCH_WARMUP` (2) and `CONSTANTINOPLE_BENCH_ITERS` (10).
+//! - `CONSTANTINOPLE_BENCH_CACHE_PAGES`: page-cache size, in pages.
+
+// The layout of the main future nests deeper than the compiler's default limit.
+#![recursion_limit = "256"]
+
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
+use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_glue::{
+    stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
+    transfers::{Plan, Selection},
+};
+use commonware_parallel::{Rayon, Strategy as _};
+use commonware_runtime::{
+    BLOB_PAGE_SIZE, Runner as _,
+    buffer::paged::{self, CacheRef},
+    tokio,
+};
 use commonware_storage::{
-    journal::contiguous::fixed::Config as FixedJournalConfig, merkle::full::Config as MmrConfig,
-    qmdb::any::FixedConfig, translator::EightCap,
+    journal::contiguous::fixed::Config as FixedJournalConfig,
+    merkle::full::Config as MmrConfig,
+    qmdb::any::{FixedConfig, batch::Slot},
+    translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize};
+use commonware_utils::{NZU64, NZUsize};
 use constantinople_application::{
-    consensus::{self, StateBatch, StateDatabase},
-    executor::PreparedTransfer,
+    consensus::{StateBatch, StateDatabase},
+    executor::{PreparedTransfer, TransferAccount, account_slots, starting_accounts},
 };
-use constantinople_primitives::{
-    Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
-};
-use core::num::{NonZeroU64, NonZeroUsize};
+use constantinople_primitives::{Account, AccountKey, Nonce};
+use core::num::NonZeroUsize;
 use std::{
-    hint::black_box,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 type Db = StateDatabase<tokio::Context, Sha256, EightCap, Rayon>;
 type Batch = StateBatch<tokio::Context, Sha256, EightCap, Rayon>;
-type TestTx = VerifiedTransaction<Sha256>;
 
 const ACCOUNTS: u64 = 1_000_000;
-const COUNTS: &[usize] = &[16_384, 32_768];
-const MAX_SIGNED_ACCOUNTS: u64 = 65_536;
-const NAMESPACE: &[u8] = b"compute-bench";
+const CACHE_BYTES: usize = 512 * 1024 * 1024;
+const COUNTS: &str = "32768,65536,131072";
 const SHARED_FANOUT: usize = 8;
+const HOT_ACCOUNTS: usize = 64;
 const WARMUP: u32 = 2;
 const ITERS: u32 = 10;
 
 #[derive(Clone, Copy)]
 enum Fixture {
+    /// Each account pays the next, as the spammer does: every account but the ends is touched
+    /// twice.
+    Ring,
+    /// Every account is touched once.
     Unique,
+    /// Each account sends and receives `SHARED_FANOUT` transfers.
     Shared,
+    /// Half shared, half unique.
     Mixed,
+    /// `HOT_ACCOUNTS` senders pay `HOT_ACCOUNTS` recipients.
+    Hot,
 }
 
 impl Fixture {
+    const ALL: [Self; 5] = [
+        Self::Ring,
+        Self::Unique,
+        Self::Shared,
+        Self::Mixed,
+        Self::Hot,
+    ];
+
     const fn name(self) -> &'static str {
         match self {
+            Self::Ring => "ring",
             Self::Unique => "unique",
             Self::Shared => "shared",
             Self::Mixed => "mixed",
+            Self::Hot => "hot",
         }
     }
 }
@@ -58,49 +105,143 @@ fn key(index: u64) -> AccountKey {
     AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
-fn signed_key(index: u64) -> AccountKey {
-    AccountKey::from_public_key(&TransactionPublicKey::ed25519(
-        ed25519::PrivateKey::from_seed(index).public_key(),
-    ))
-}
-
-struct TestSigner {
-    key: ed25519::PrivateKey,
-    public_key: ed25519::PublicKey,
-}
-
-impl TestSigner {
-    fn from_seed(seed: u64) -> Self {
-        let key = ed25519::PrivateKey::from_seed(seed);
-        let public_key = key.public_key();
-        Self { key, public_key }
-    }
-
-    fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTx {
-        Transaction::new(
-            TransactionPublicKey::ed25519(self.key.public_key()),
-            TransactionPublicKey::ed25519(to),
-            NonZeroU64::new(value).expect("bench value must be non-zero"),
-            nonce,
-        )
-        .seal_and_sign(&self.key, NAMESPACE, &mut Sha256::default())
+const fn transfer(sender: AccountKey, recipient: AccountKey, nonce: u64) -> PreparedTransfer {
+    PreparedTransfer {
+        sender,
+        recipient,
+        value: 1,
+        nonce,
     }
 }
 
-struct LoadPlan<'a> {
-    discrete_senders: Vec<&'a AccountKey>,
-    discrete_recipients: Vec<&'a AccountKey>,
-    general: Vec<&'a AccountKey>,
+const VERIFY_STAGES: &[&str] = &["plan", "stage", "settle", "merkleize"];
+const PROPOSE_STAGES: &[&str] = &["touch", "stage", "apply", "settle", "merkleize"];
+
+/// Verifies `body` as `consensus::compute` does, timing each stage. Returns the stage times, the
+/// number of written accounts, and the root.
+async fn verify(
+    batch: Batch,
+    body: &Arc<Vec<PreparedTransfer>>,
+    strategy: &Rayon,
+) -> (Vec<Duration>, usize, String) {
+    let start = Instant::now();
+    let transfers = Arc::clone(body);
+    let plan = strategy
+        .spawn(transfers.len(), move |s: Rayon| {
+            Plan::new(transfers.as_slice(), &s)
+        })
+        .await
+        .expect("body plans");
+    let planned = Instant::now();
+    let (reads, staged) = {
+        let keys: Vec<&AccountKey> = plan.keys().iter().collect();
+        batch.stage(&keys).await.expect("stage")
+    };
+    let read = Instant::now();
+    let slots = strategy
+        .spawn(plan.len(), move |s: Rayon| {
+            plan.settle(&starting_accounts(reads), &s)
+                .map(account_slots)
+        })
+        .await
+        .expect("body settles");
+    let settled = Instant::now();
+    let writes = slots
+        .iter()
+        .filter(|slot| !matches!(slot, Slot::Keep))
+        .count();
+    let merkleized = staged
+        .merkleize(slots, Vec::new())
+        .await
+        .expect("merkleize");
+    let done = Instant::now();
+    let times = vec![
+        planned - start,
+        read - planned,
+        settled - read,
+        done - settled,
+    ];
+    (times, writes, root_hex(merkleized.root()))
 }
 
-impl LoadPlan<'_> {
-    const fn discrete(&self) -> bool {
-        !self.discrete_senders.is_empty()
+/// Proposes from `rounds` as `execute_proposal` does, timing each stage. Returns the stage times,
+/// the number of accepted transfers, and the root.
+async fn propose(
+    batch: Batch,
+    rounds: &[Arc<Vec<PreparedTransfer>>],
+    strategy: &Rayon,
+) -> (Vec<Duration>, usize, String) {
+    let mut times = vec![Duration::ZERO; PROPOSE_STAGES.len()];
+    let mut selection: Selection<AccountKey, TransferAccount> = Selection::new();
+    let mut unstaged = Some(batch);
+    let mut staged = None;
+    let mut accepted = 0;
+    for round in rounds {
+        let start = Instant::now();
+        let (back, touched) = {
+            let round = Arc::clone(round);
+            let mut selection = selection;
+            strategy
+                .spawn(round.len(), move |_: Rayon| {
+                    let touched = selection.touch(&round);
+                    (selection, touched)
+                })
+                .await
+        };
+        selection = back;
+        let touched_at = Instant::now();
+        if !touched.is_empty() {
+            let keys: Vec<&AccountKey> = selection.keys()[touched].iter().collect();
+            let reads = if let Some(batch) = unstaged.take() {
+                let (reads, next) = batch.stage(&keys).await.expect("stage");
+                staged = Some(next);
+                reads
+            } else {
+                let (_, reads, next) = staged
+                    .take()
+                    .expect("staged after the first round")
+                    .expand(&keys)
+                    .await
+                    .expect("expand");
+                staged = Some(next);
+                reads
+            };
+            selection.register(starting_accounts(reads));
+        }
+        let read = Instant::now();
+        let (back, flags) = {
+            let round = Arc::clone(round);
+            let mut selection = selection;
+            strategy
+                .spawn(round.len(), move |_: Rayon| {
+                    let flags = selection.apply(&round);
+                    (selection, flags)
+                })
+                .await
+        };
+        selection = back;
+        accepted += flags.iter().filter(|accepted| **accepted).count();
+        let applied = Instant::now();
+        times[0] += touched_at - start;
+        times[1] += read - touched_at;
+        times[2] += applied - read;
     }
-
-    const fn general(&self) -> bool {
-        !self.general.is_empty()
-    }
+    let staged = staged.expect("a round staged");
+    let start = Instant::now();
+    let slots = strategy
+        .spawn(selection.keys().len(), move |s: Rayon| {
+            account_slots(selection.settle(&s))
+        })
+        .await;
+    let settled = Instant::now();
+    let merkleized = staged
+        .merkleize(slots, Vec::new())
+        .await
+        .expect("merkleize");
+    let done = Instant::now();
+    times[3] = settled - start;
+    times[4] = done - settled;
+    (times, accepted, root_hex(merkleized.root()))
 }
 
 fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
@@ -128,269 +269,94 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
     }
 }
 
-fn load_plan(transfers: &[PreparedTransfer]) -> LoadPlan<'_> {
-    let mut touches: AHashMap<&AccountKey, usize> =
-        AHashMap::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
-        *touches.entry(&transfer.sender).or_default() += 1;
-        if transfer.sender != transfer.recipient {
-            *touches.entry(&transfer.recipient).or_default() += 1;
-        }
-    }
-
-    let mut general_seen = AHashSet::with_capacity(transfers.len().saturating_mul(2));
-    let mut plan = LoadPlan {
-        discrete_senders: Vec::with_capacity(transfers.len()),
-        discrete_recipients: Vec::with_capacity(transfers.len()),
-        general: Vec::new(),
-    };
-    for transfer in transfers {
-        let sender_unique = touches.get(&transfer.sender).copied().unwrap_or_default() == 1;
-        let recipient_unique = transfer.sender == transfer.recipient
-            || touches
-                .get(&transfer.recipient)
-                .copied()
-                .unwrap_or_default()
-                == 1;
-        if sender_unique && recipient_unique {
-            plan.discrete_senders.push(&transfer.sender);
-            if transfer.sender != transfer.recipient {
-                plan.discrete_recipients.push(&transfer.recipient);
-            }
-            continue;
-        }
-
-        if general_seen.insert(&transfer.sender) {
-            plan.general.push(&transfer.sender);
-        }
-        if transfer.sender != transfer.recipient && general_seen.insert(&transfer.recipient) {
-            plan.general.push(&transfer.recipient);
-        }
-    }
-    plan
-}
-
+/// `n` transfers between accounts, each sender consuming its nonces in order.
 fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
-    match fixture {
-        Fixture::Unique => (0..n)
-            .map(|i| {
-                let sender = key(i as u64);
-                let recipient = key(n as u64 + i as u64);
-                PreparedTransfer {
-                    sender,
-                    recipient,
-                    sender_prefix: sender.prefix(),
-                    recipient_prefix: recipient.prefix(),
-                    value: 1,
-                    nonce: 0,
-                }
-            })
-            .collect(),
+    let pairs: Vec<(u64, u64)> = match fixture {
+        Fixture::Ring => (0..n as u64).map(|i| (i, (i + 1) % ACCOUNTS)).collect(),
+        Fixture::Unique => (0..n as u64).map(|i| (i, n as u64 + i)).collect(),
         Fixture::Shared => {
             let accounts = (n / SHARED_FANOUT).max(1);
-            let mut nonces = vec![0u64; accounts];
             (0..n)
-                .map(|i| {
-                    let sender_index = i % accounts;
-                    let recipient_index = (i * 7 + 3) % accounts;
-                    let nonce = nonces[sender_index];
-                    nonces[sender_index] += 1;
-                    let sender = key(sender_index as u64);
-                    let recipient = key(recipient_index as u64);
-                    PreparedTransfer {
-                        sender,
-                        recipient,
-                        sender_prefix: sender.prefix(),
-                        recipient_prefix: recipient.prefix(),
-                        value: 1,
-                        nonce,
-                    }
-                })
+                .map(|i| ((i % accounts) as u64, ((i * 7 + 3) % accounts) as u64))
                 .collect()
         }
         Fixture::Mixed => {
             let shared = n / 2;
             let unique = n - shared;
-            let shared_accounts = (shared / SHARED_FANOUT).max(1);
-            let mut nonces = vec![0u64; shared_accounts];
-            let shared_transfers = (0..shared).map(|i| {
-                let sender_index = i % shared_accounts;
-                let recipient_index = (i * 7 + 3) % shared_accounts;
-                let nonce = nonces[sender_index];
-                nonces[sender_index] += 1;
-                let sender = key(sender_index as u64);
-                let recipient = key(recipient_index as u64);
-                PreparedTransfer {
-                    sender,
-                    recipient,
-                    sender_prefix: sender.prefix(),
-                    recipient_prefix: recipient.prefix(),
-                    value: 1,
-                    nonce,
-                }
-            });
-            let unique_transfers = (0..unique).map(|i| {
-                let sender = key(n as u64 + i as u64);
-                let recipient = key(n as u64 + unique as u64 + i as u64);
-                PreparedTransfer {
-                    sender,
-                    recipient,
-                    sender_prefix: sender.prefix(),
-                    recipient_prefix: recipient.prefix(),
-                    value: 1,
-                    nonce: 0,
-                }
-            });
-            shared_transfers.chain(unique_transfers).collect()
-        }
-    }
-}
-
-fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
-    match fixture {
-        Fixture::Unique => (0..n)
-            .map(|i| {
-                let sender = TestSigner::from_seed(i as u64);
-                let recipient = TestSigner::from_seed(n as u64 + i as u64).public_key;
-                sender.sign(recipient, 1, 0)
-            })
-            .collect(),
-        Fixture::Shared => {
-            let accounts = (n / SHARED_FANOUT).max(1);
-            let signers = (0..accounts)
-                .map(|index| TestSigner::from_seed(index as u64))
-                .collect::<Vec<_>>();
-            let mut nonces = vec![0u64; accounts];
-            (0..n)
-                .map(|i| {
-                    let sender_index = i % accounts;
-                    let recipient_index = (i * 7 + 3) % accounts;
-                    let nonce = nonces[sender_index];
-                    nonces[sender_index] += 1;
-                    signers[sender_index].sign(
-                        signers[recipient_index].public_key.clone(),
-                        1,
-                        nonce,
-                    )
-                })
+            let accounts = (shared / SHARED_FANOUT).max(1);
+            (0..shared)
+                .map(|i| ((i % accounts) as u64, ((i * 7 + 3) % accounts) as u64))
+                .chain((0..unique).map(|i| ((n + i) as u64, (n + unique + i) as u64)))
                 .collect()
         }
-        Fixture::Mixed => {
-            let shared = n / 2;
-            let unique = n - shared;
-            let shared_accounts = (shared / SHARED_FANOUT).max(1);
-            let signers = (0..MAX_SIGNED_ACCOUNTS)
-                .map(TestSigner::from_seed)
-                .collect::<Vec<_>>();
-            let mut nonces = vec![0u64; shared_accounts];
-            let shared_txs = (0..shared).map(|i| {
-                let sender_index = i % shared_accounts;
-                let recipient_index = (i * 7 + 3) % shared_accounts;
-                let nonce = nonces[sender_index];
-                nonces[sender_index] += 1;
-                signers[sender_index].sign(signers[recipient_index].public_key.clone(), 1, nonce)
-            });
-            let unique_txs = (0..unique).map(|i| {
-                let sender_index = n + i;
-                let recipient_index = n + unique + i;
-                signers[sender_index].sign(signers[recipient_index].public_key.clone(), 1, 0)
-            });
-            shared_txs.chain(unique_txs).collect()
+        Fixture::Hot => (0..n)
+            .map(|i| {
+                let sender = (i % HOT_ACCOUNTS) as u64;
+                let recipient = ACCOUNTS - 1 - ((i * 7 + 3) % HOT_ACCOUNTS) as u64;
+                (sender, recipient)
+            })
+            .collect(),
+    };
+    let mut nonces = vec![0u64; ACCOUNTS as usize];
+    pairs
+        .into_iter()
+        .map(|(sender, recipient)| {
+            let nonce = nonces[sender as usize];
+            nonces[sender as usize] += 1;
+            transfer(key(sender), key(recipient), nonce)
+        })
+        .collect()
+}
+
+/// Medians of each stage over the timed iterations.
+struct Stages {
+    names: &'static [&'static str],
+    samples: Vec<Vec<Duration>>,
+}
+
+impl Stages {
+    fn new(names: &'static [&'static str]) -> Self {
+        Self {
+            names,
+            samples: vec![Vec::new(); names.len()],
         }
+    }
+
+    fn record(&mut self, times: &[Duration]) {
+        assert_eq!(times.len(), self.names.len());
+        for (samples, time) in self.samples.iter_mut().zip(times) {
+            samples.push(*time);
+        }
+    }
+
+    fn median(samples: &[Duration]) -> Duration {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    }
+
+    fn report(&self) -> String {
+        let mut line = String::new();
+        for (name, samples) in self.names.iter().zip(&self.samples) {
+            line += &format!(" {name} {:.3?}", Self::median(samples));
+        }
+        let totals: Vec<Duration> = (0..self.samples[0].len())
+            .map(|iter| self.samples.iter().map(|samples| samples[iter]).sum())
+            .collect();
+        let (min, max) = (
+            totals.iter().min().expect("timed iterations"),
+            totals.iter().max().expect("timed iterations"),
+        );
+        line += &format!(
+            " | total {:.3?} (min {min:.3?} max {max:.3?})",
+            Self::median(&totals)
+        );
+        line
     }
 }
 
-async fn time_compute(
-    batch: Batch,
-    transfers: Arc<Vec<PreparedTransfer>>,
-    strategy: &Rayon,
-) -> (usize, Duration, Duration, String) {
-    let start = Instant::now();
-    let (staged, updates) = consensus::compute(batch, transfers, strategy).await;
-    let updates = updates.expect("compute path");
-    let compute_elapsed = start.elapsed();
-    let count = updates.len();
-    let merkleized = staged
-        .merkleize(updates, Vec::new())
-        .await
-        .expect("merkleize");
-    let root = format!("{}", merkleized.root());
-    black_box(&merkleized);
-    let total = start.elapsed();
-    (count, compute_elapsed, total - compute_elapsed, root)
-}
-
-async fn load_discrete(batch: &Batch, plan: &LoadPlan<'_>) {
-    let values = batch
-        .get_many(plan.discrete_senders.as_slice())
-        .await
-        .expect("sender loads");
-    black_box(values);
-    if !plan.discrete_recipients.is_empty() {
-        let values = batch
-            .get_many(plan.discrete_recipients.as_slice())
-            .await
-            .expect("recipient loads");
-        black_box(values);
-    }
-}
-
-async fn load_general(batch: &Batch, plan: &LoadPlan<'_>) {
-    let values = batch
-        .get_many(plan.general.as_slice())
-        .await
-        .expect("general loads");
-    black_box(values);
-}
-
-async fn load_combined(batch: &Batch, plan: &LoadPlan<'_>) {
-    let keys = plan
-        .discrete_senders
-        .iter()
-        .chain(&plan.discrete_recipients)
-        .chain(&plan.general)
-        .copied()
-        .collect::<Vec<_>>();
-    let values = batch
-        .get_many(keys.as_slice())
-        .await
-        .expect("account loads");
-    black_box(values);
-}
-
-async fn time_loads(batch: &Batch, plan: &LoadPlan<'_>, overlap: bool) -> Duration {
-    let start = Instant::now();
-    match (plan.discrete(), plan.general(), overlap) {
-        (true, true, true) => {
-            futures::join!(load_discrete(batch, plan), load_general(batch, plan));
-        }
-        (true, true, false) => {
-            load_discrete(batch, plan).await;
-            load_general(batch, plan).await;
-        }
-        (true, _, _) => load_discrete(batch, plan).await,
-        (_, true, _) => load_general(batch, plan).await,
-        (false, false, _) => {}
-    }
-    start.elapsed()
-}
-
-async fn time_combined_load(batch: &Batch, plan: &LoadPlan<'_>) -> Duration {
-    let start = Instant::now();
-    load_combined(batch, plan).await;
-    start.elapsed()
-}
-
-async fn time_prepare_compute(batch: Batch, strategy: &Rayon, txs: &[TestTx]) -> (usize, Duration) {
-    let start = Instant::now();
-    let (transfers, digests) = consensus::prepare_signed(strategy, txs).expect("prepare");
-    let transfers = Arc::new(transfers);
-    let (staged, updates) = consensus::compute(batch, transfers.clone(), strategy).await;
-    let updates = updates.expect("compute path");
-    let elapsed = start.elapsed();
-    let count = updates.len();
-    black_box((&transfers, &digests, &staged, &updates));
-    (count, elapsed)
+fn root_hex(root: impl core::fmt::Debug) -> String {
+    format!("{root:?}")
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -411,144 +377,110 @@ fn main() {
     let workers = env_usize("CONSTANTINOPLE_BENCH_WORKERS", 8).max(1);
     tokio::Runner::new(tokio::Config::default().with_worker_threads(workers)).start(
         |context| async move {
-        let bench_prepare = std::env::var_os("CONSTANTINOPLE_BENCH_PREPARE").is_some();
-        let bench_loads = std::env::var_os("CONSTANTINOPLE_BENCH_LOADS").is_some();
-        let warmup = env_u32("CONSTANTINOPLE_BENCH_WARMUP", WARMUP);
-        let iters = env_u32("CONSTANTINOPLE_BENCH_ITERS", ITERS).max(1);
-        let cache_pages = env_usize("CONSTANTINOPLE_BENCH_CACHE_PAGES", 65_536).max(1);
-        let strategy =
-            Rayon::new(NonZeroUsize::new(workers).expect("worker count")).expect("rayon pool");
-        let cache = CacheRef::from_pooler(
-            &context,
-            NZU16!(8192),
-            NonZeroUsize::new(cache_pages).expect("cache pages"),
-        );
-        let db = <Db as DatabaseSet<tokio::Context>>::init(
-            context,
-            config(strategy.clone(), cache),
-            None,
-        )
-        .await;
-
-        let mut batch = db.new_batches().await;
-        for index in 0..ACCOUNTS {
-            batch = batch.write(
-                key(index),
-                Some(Account {
-                    balance: 1_000_000,
-                    nonce: Nonce::default(),
-                }),
+            let warmup = env_u32("CONSTANTINOPLE_BENCH_WARMUP", WARMUP);
+            let iters = env_u32("CONSTANTINOPLE_BENCH_ITERS", ITERS).max(1);
+            let rounds = env_usize("CONSTANTINOPLE_BENCH_ROUNDS", 4).max(1);
+            let cache_pages = env_usize(
+                "CONSTANTINOPLE_BENCH_CACHE_PAGES",
+                CACHE_BYTES / BLOB_PAGE_SIZE as usize,
+            )
+            .max(1);
+            let counts: Vec<usize> = std::env::var("CONSTANTINOPLE_BENCH_COUNTS")
+                .unwrap_or_else(|_| COUNTS.into())
+                .split(',')
+                .map(|count| count.trim().parse().expect("transfer count"))
+                .collect();
+            let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
+            let mode_filter = std::env::var("CONSTANTINOPLE_BENCH_MODE").ok();
+            let strategy =
+                Rayon::new(NonZeroUsize::new(workers).expect("worker count")).expect("rayon pool");
+            let cache = CacheRef::new(
+                paged::page_size(BLOB_PAGE_SIZE),
+                NonZeroUsize::new(cache_pages).expect("cache pages"),
             );
-        }
-        if bench_prepare {
-            for index in 0..MAX_SIGNED_ACCOUNTS {
+            let db = <Db as DatabaseSet<tokio::Context>>::init(
+                context,
+                config(strategy.clone(), cache),
+                None,
+            )
+            .await;
+
+            let mut batch = db.new_batches().await;
+            for index in 0..ACCOUNTS {
                 batch = batch.write(
-                    signed_key(index),
+                    key(index),
                     Some(Account {
                         balance: 1_000_000,
                         nonce: Nonce::default(),
                     }),
                 );
             }
-        }
-        let merkleized = batch.merkleize().await.expect("seed merkleize");
-        db.apply(merkleized).await;
-        assert!(db.finalize().await.durable().await);
+            let merkleized = batch.merkleize().await.expect("seed merkleize");
+            db.apply(merkleized).await;
+            assert!(db.finalize().await.durable().await);
 
-        let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
-        let count_filter = std::env::var("CONSTANTINOPLE_BENCH_COUNT")
-            .ok()
-            .and_then(|count| count.parse::<usize>().ok());
-        for &n in COUNTS {
-            if count_filter.is_some_and(|filter| filter != n) {
-                continue;
-            }
-            for fixture in [Fixture::Unique, Fixture::Shared, Fixture::Mixed] {
-                if fixture_filter
-                    .as_deref()
-                    .is_some_and(|filter| filter != fixture.name())
-                {
-                    continue;
-                }
+            for &n in &counts {
+                for fixture in Fixture::ALL {
+                    if fixture_filter
+                        .as_deref()
+                        .is_some_and(|filter| filter != fixture.name())
+                    {
+                        continue;
+                    }
+                    let body = Arc::new(transfers(fixture, n));
+                    let label = format!("{} {n} txs / {workers} workers", fixture.name());
 
-                let transfers = Arc::new(transfers(fixture, n));
-                if bench_loads {
-                    let plan = load_plan(&transfers);
-                    let mut seq_total = Duration::ZERO;
-                    let mut overlap_total = Duration::ZERO;
-                    let mut combined_total = Duration::ZERO;
-                    for iter in 0..(warmup + iters) {
-                        let seq_batch = db.new_batches().await;
-                        let seq = time_loads(&seq_batch, &plan, false).await;
-                        let overlap_batch = db.new_batches().await;
-                        let overlap = time_loads(&overlap_batch, &plan, true).await;
-                        let combined_batch = db.new_batches().await;
-                        let combined = time_combined_load(&combined_batch, &plan).await;
-                        if iter >= warmup {
-                            seq_total += seq;
-                            overlap_total += overlap;
-                            combined_total += combined;
+                    if mode_filter.as_deref().is_none_or(|mode| mode == "verify") {
+                        let mut stages = Stages::new(VERIFY_STAGES);
+                        let mut outcome = None;
+                        for iter in 0..(warmup + iters) {
+                            let batch = db.new_batches().await;
+                            let (times, writes, root) = verify(batch, &body, &strategy).await;
+                            match &outcome {
+                                None => outcome = Some((writes, root)),
+                                Some(expected) => assert_eq!(expected, &(writes, root)),
+                            }
+                            if iter >= warmup {
+                                stages.record(&times);
+                            }
                         }
+                        let (writes, root) = outcome.expect("iterations ran");
+                        println!(
+                            "verify  {label} |{} | {writes} writes root {root}",
+                            stages.report()
+                        );
                     }
 
-                    println!(
-                        "loads    {n} txs / {ACCOUNTS} accounts / {} / {} workers\n  sequential: {:?}\n  overlap:    {:?}\n  combined:   {:?}",
-                        fixture.name(),
-                        workers,
-                        seq_total / iters,
-                        overlap_total / iters,
-                        combined_total / iters,
-                    );
-                }
-
-                let mut total = Duration::ZERO;
-                let mut merk_total = Duration::ZERO;
-                let mut writes = 0usize;
-                let mut root = String::new();
-                for iter in 0..(warmup + iters) {
-                    let batch = db.new_batches().await;
-                    let (count, compute_t, merk_t, r) =
-                        time_compute(batch, Arc::clone(&transfers), &strategy).await;
-                    writes = count;
-                    root = r;
-                    if iter >= warmup {
-                        total += compute_t;
-                        merk_total += merk_t;
-                    }
-                }
-
-                let avg = total / iters;
-                let merk_avg = merk_total / iters;
-                let pipeline = avg + merk_avg;
-                let tps = n as f64 / pipeline.as_secs_f64() / 1e6;
-                println!(
-                    "pipeline {n} txs / {ACCOUNTS} accounts / {} / {workers} workers\n  compute: {avg:?}  merkleize: {merk_avg:?}  total: {pipeline:?}  ({tps:.2} Melem/s) / {writes} writes\n  root: {root}",
-                    fixture.name(),
-                );
-
-                if bench_prepare {
-                    let txs = signed_txs(fixture, n);
-                    let mut total = Duration::ZERO;
-                    let mut writes = 0usize;
-                    for iter in 0..(warmup + iters) {
-                        let batch = db.new_batches().await;
-                        let (count, elapsed) = time_prepare_compute(batch, &strategy, &txs).await;
-                        writes = count;
-                        if iter >= warmup {
-                            total += elapsed;
+                    if mode_filter.as_deref().is_none_or(|mode| mode == "propose") {
+                        let per_round = n.div_ceil(rounds);
+                        let candidates: Vec<Arc<Vec<PreparedTransfer>>> = body
+                            .chunks(per_round)
+                            .map(|round| Arc::new(round.to_vec()))
+                            .collect();
+                        let mut stages = Stages::new(PROPOSE_STAGES);
+                        let mut outcome = None;
+                        for iter in 0..(warmup + iters) {
+                            let batch = db.new_batches().await;
+                            let (times, accepted, root) =
+                                propose(batch, &candidates, &strategy).await;
+                            assert_eq!(accepted, n, "every candidate applies");
+                            match &outcome {
+                                None => outcome = Some(root),
+                                Some(expected) => assert_eq!(expected, &root),
+                            }
+                            if iter >= warmup {
+                                stages.record(&times);
+                            }
                         }
+                        println!(
+                            "propose {label} / {} rounds |{} | root {}",
+                            candidates.len(),
+                            stages.report(),
+                            outcome.expect("iterations ran")
+                        );
                     }
-
-                    let avg = total / iters;
-                    let tps = n as f64 / avg.as_secs_f64() / 1e6;
-                    println!(
-                        "prepare+compute  {n} txs / {ACCOUNTS} accounts / {} / {} workers\n  compute: {avg:?}  ({tps:.2} Melem/s) / {writes} writes",
-                        fixture.name(),
-                        workers,
-                    );
                 }
             }
-        }
-    },
+        },
     );
 }

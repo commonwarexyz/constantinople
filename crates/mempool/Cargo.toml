@@ -44,8 +44,10 @@ mocks = [ "commonware-consensus/mocks", "commonware-cryptography/mocks" ]
 
 [dev-dependencies]
 # Commonware
+commonware-allocator.workspace = true
 commonware-math.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519.workspace = true
 
 # Other
 bytes.workspace = true
@@ -53,7 +55,6 @@ rand.workspace = true
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true, features = ["executor"] }
 criterion.workspace = true
-mimalloc.workspace = true
 
 [[bench]]
 name = "decode"

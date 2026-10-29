@@ -37,7 +37,7 @@ import {
     prefetchFinalizedCertificate,
     fetchAndVerifyAccountProof,
     fetchAndVerifyTransactionProof,
-    fetchAndVerifyTransactionRowProof,
+    fetchAndVerifyTransactionRowProofs,
     fetchLatestProofTarget,
     type AccountActivityMode,
     type AccountTransactionRow,
@@ -572,57 +572,47 @@ export default function App() {
             0n,
         );
         let rowTarget = accountTarget;
-        let targetRefresh: Promise<LatestProofTarget> | undefined;
-        // A newer page can require a later certificate. Share that refresh
-        // across rows and retain it through retries without following the tip.
-        const rowProofTarget = (): Promise<LatestProofTarget> => {
+        // A newer page can require a later certificate. Retain it through
+        // retries without following the tip.
+        const rowProofTarget = async (): Promise<LatestProofTarget> => {
             const published = publishedProofTargetRef.current;
             if (
                 newestHeight <= rowTarget.height ||
                 !published ||
                 published.height <= rowTarget.height
             ) {
-                return Promise.resolve(rowTarget);
+                return rowTarget;
             }
-            if (!targetRefresh) {
-                targetRefresh = fetchLatestProofTarget({
-                    storeUrl,
-                    sqlUrl: indexerUrl,
-                    simplexVerificationMaterial,
-                    publishedTarget: published,
-                    signal: controller.signal,
-                })
-                    .then((target) => {
-                        rowTarget = target;
-                        return target;
-                    })
-                    .finally(() => { targetRefresh = undefined; });
-            }
-            return targetRefresh;
+            rowTarget = await fetchLatestProofTarget({
+                storeUrl,
+                sqlUrl: indexerUrl,
+                simplexVerificationMaterial,
+                publishedTarget: published,
+                signal: controller.signal,
+            });
+            return rowTarget;
         };
 
-        rows.forEach((row, index) => {
-            retryAccountWork(async () => {
-                const target = await rowProofTarget();
-                return fetchAndVerifyTransactionRowProof({
-                    qmdbUrl,
-                    row,
-                    target,
-                    signal: controller.signal,
-                });
-            }, controller.signal, isRetryableAccountProofError, {
-                onRetry: (error) => updateRow(index, retryingProofState(error)),
+        retryAccountWork(async () => {
+            const target = await rowProofTarget();
+            return fetchAndVerifyTransactionRowProofs({
+                qmdbUrl,
+                rows,
+                target,
+                signal: controller.signal,
+            });
+        }, controller.signal, isRetryableAccountProofError, {
+            onRetry: (error) => rows.forEach((_row, index) => updateRow(index, retryingProofState(error))),
+        })
+            .then((proofs) => {
+                if (controller.signal.aborted) return;
+                proofs.forEach((proof, index) => updateRow(index, verifiedProofState(proof)));
             })
-                .then((proof) => {
-                    if (controller.signal.aborted) return;
-                    updateRow(index, verifiedProofState(proof));
-                })
-                .catch((error) => {
-                    if (controller.signal.aborted) return;
-                    const detail = error instanceof Error ? error.message : String(error);
-                    updateRow(index, { status: 'error', detail });
-                });
-        });
+            .catch((error) => {
+                if (controller.signal.aborted) return;
+                const detail = error instanceof Error ? error.message : String(error);
+                rows.forEach((_row, index) => updateRow(index, { status: 'error', detail }));
+            });
 
         return () => controller.abort();
     }, [accountPage, accountTargetReady, lookupAccount]);
@@ -1450,6 +1440,7 @@ function AccountPage({
                             <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
                             <span>proof</span>
                             <ProofMark proof={txProof} />
+                            {txProof.status === 'verified' && <span>{txProof.proofSizeBytes}b shared</span>}
                         </div>
                     </div>
                 ))}

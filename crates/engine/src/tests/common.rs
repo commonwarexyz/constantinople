@@ -11,11 +11,11 @@ use commonware_cryptography::{
         dkg::feldman_desmedt::{Output, deal},
         primitives::{group::Share, sharing::Mode, variant::MinSig},
     },
-    ed25519,
     sha256::Sha256,
 };
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
-use commonware_runtime::Quota;
+use commonware_runtime::{Quota, deterministic};
 use commonware_utils::{
     Acknowledgement, N3f1, TryCollect, acknowledgement::Exact, channel::mpsc, sync::Mutex, test_rng,
 };
@@ -28,8 +28,8 @@ use std::{
 };
 
 pub(crate) type TestHasher = Sha256;
-pub(crate) type TestPrivateKey = ed25519::PrivateKey;
-pub(crate) type TestPublicKey = ed25519::PublicKey;
+pub(crate) type TestPrivateKey = ed25519::SigningKey;
+pub(crate) type TestPublicKey = ed25519::VerifyingKey;
 pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
 pub(crate) type TestBlock = ApplicationBlock<TestHasher, TestPublicKey>;
 pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
@@ -192,6 +192,9 @@ where
 pub(crate) struct ValidatorState {
     pub(crate) marshal: TestMarshalMailbox,
     pub(crate) startup_sync_height: Option<u64>,
+    /// Runtime context whose metrics export covers every validator in the
+    /// simulation.
+    pub(crate) context: Arc<deterministic::Context>,
 }
 
 impl PartialEq for ValidatorState {

@@ -1,8 +1,9 @@
-//! Cache of decompressed transaction public keys for signature verification.
+//! Cache of decompressed secp256r1 transaction public keys for signature
+//! verification.
 
 use crate::TransactionPublicKey;
-use commonware_codec::{Copying, FixedSize as _, ReadExt as _};
-use commonware_cryptography::{ed25519, secp256r1::standard as secp256r1};
+use commonware_codec::FixedSize as _;
+use commonware_cryptography::secp256r1::standard as secp256r1;
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     Metrics,
@@ -16,25 +17,16 @@ use core::num::NonZeroUsize;
 use p256::ecdsa::VerifyingKey;
 use std::{collections::HashMap, sync::Arc};
 
-/// A public key decompressed into the form used by signature verification.
+/// A shared, fixed-capacity cache mapping a secp256r1 [`TransactionPublicKey`]
+/// to its decompressed verifying key.
 ///
-/// Both schemes store a compressed point on the wire. Recovering the affine
-/// point (an Edwards point for Ed25519, the SEC1 `y` coordinate for secp256r1)
-/// requires curve arithmetic that is a significant part of per-signature
-/// verification cost.
-#[derive(Clone)]
-pub enum DecompressedPublicKey {
-    /// A decompressed Ed25519 verification key.
-    Ed25519(ed25519::PublicKey),
-    /// A decompressed secp256r1 verifying key.
-    Secp256r1(VerifyingKey),
-}
-
-/// A shared, fixed-capacity cache mapping a [`TransactionPublicKey`] to its
-/// [`DecompressedPublicKey`].
+/// Secp256r1 keys are stored compressed on the wire, and recovering the SEC1
+/// `y` coordinate is a significant part of per-signature verification cost.
+/// Ed25519 keys are never cached: batch verification decompresses each
+/// distinct Ed25519 key once per batch from its raw encoding.
 #[derive(Clone)]
 pub struct PublicKeyCache {
-    inner: Arc<RwLock<Cache<TransactionPublicKey, DecompressedPublicKey>>>,
+    inner: Arc<RwLock<Cache<TransactionPublicKey, VerifyingKey>>>,
     misses: Counter,
 }
 
@@ -53,12 +45,13 @@ impl PublicKeyCache {
     /// serial curve arithmetic nor per-key lock traffic — even when one cold
     /// sender signs every transaction in the batch.
     ///
-    /// Returns `None` if any key does not encode a valid curve point.
+    /// Returns `None` if any key is not a secp256r1 key encoding a valid
+    /// curve point.
     pub fn decompress(
         &self,
         keys: &[&TransactionPublicKey],
         strategy: &impl Strategy,
-    ) -> Option<Vec<DecompressedPublicKey>> {
+    ) -> Option<Vec<VerifyingKey>> {
         let span = tracing::info_span!(
             "primitives.public_key_cache.decompress",
             keys = keys.len().traced(),
@@ -73,9 +66,9 @@ impl PublicKeyCache {
         // holds (a queued writer from a miss path blocks new readers), which
         // deadlocks the entire pool. Lookups are cheap hash probes; only the
         // curve arithmetic below is worth parallelism.
-        let mut resolved: Vec<Option<DecompressedPublicKey>> = {
+        let mut resolved: Vec<Option<VerifyingKey>> = {
             let cache = self.inner.read();
-            keys.iter().map(|&key| cache.get(key).cloned()).collect()
+            keys.iter().map(|&key| cache.get(key).copied()).collect()
         };
 
         // Deduplicate the misses (one cold sender may sign every transaction
@@ -99,7 +92,7 @@ impl PublicKeyCache {
         if missed > 0 {
             let work: Vec<(usize, &TransactionPublicKey)> =
                 unique_keys.iter().copied().enumerate().collect();
-            let decompressed: Vec<(usize, DecompressedPublicKey)> = strategy
+            let decompressed: Vec<(usize, VerifyingKey)> = strategy
                 .try_map_collect_vec(work, |(slot, key)| {
                     Self::decompress_uncached(key)
                         .map(|decompressed| (slot, decompressed))
@@ -110,20 +103,16 @@ impl PublicKeyCache {
 
             // Insert the unique misses under one write lock, then fan the
             // values back out to every index that referenced them.
-            let mut by_slot: Vec<Option<DecompressedPublicKey>> = vec![None; unique_keys.len()];
+            let mut by_slot: Vec<Option<VerifyingKey>> = vec![None; unique_keys.len()];
             {
                 let mut cache = self.inner.write();
                 for (slot, value) in decompressed {
-                    cache.put(unique_keys[slot].clone(), value.clone());
+                    cache.put(unique_keys[slot].clone(), value);
                     by_slot[slot] = Some(value);
                 }
             }
             for (index, slot) in missing {
-                resolved[index] = Some(
-                    by_slot[slot]
-                        .clone()
-                        .expect("every unique miss decompressed above"),
-                );
+                resolved[index] = by_slot[slot];
             }
         }
 
@@ -136,17 +125,11 @@ impl PublicKeyCache {
     }
 
     /// Decompresses `key` without consulting or populating the cache.
-    fn decompress_uncached(key: &TransactionPublicKey) -> Option<DecompressedPublicKey> {
+    fn decompress_uncached(key: &TransactionPublicKey) -> Option<VerifyingKey> {
         match key {
-            TransactionPublicKey::Ed25519 { .. } => {
-                let bytes = &key.as_ref()[1..1 + ed25519::PublicKey::SIZE];
-                let parsed = ed25519::PublicKey::read(&mut Copying(bytes)).ok()?;
-                Some(DecompressedPublicKey::Ed25519(parsed))
-            }
-            TransactionPublicKey::Secp256r1 { .. } => {
-                let bytes = &key.as_ref()[1..1 + secp256r1::PublicKey::SIZE];
-                let parsed = VerifyingKey::from_sec1_bytes(bytes).ok()?;
-                Some(DecompressedPublicKey::Secp256r1(parsed))
+            TransactionPublicKey::Ed25519 { .. } => None,
+            TransactionPublicKey::Secp256r1 { encoded } => {
+                VerifyingKey::from_sec1_bytes(&encoded[1..1 + secp256r1::PublicKey::SIZE]).ok()
             }
         }
     }
@@ -175,27 +158,17 @@ impl PublicKeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_codec::Encode as _;
-    use commonware_cryptography::{Signer as _, ed25519, secp256r1::standard as secp256r1};
+    use commonware_codec::{Encode as _, ReadExt as _};
+    use commonware_cryptography::{Signer as _, secp256r1::standard as secp256r1};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random as _;
     use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, deterministic};
     use commonware_utils::{NZUsize, test_rng};
 
-    fn decompress_one(
-        cache: &PublicKeyCache,
-        key: &TransactionPublicKey,
-    ) -> Option<DecompressedPublicKey> {
+    fn decompress_one(cache: &PublicKeyCache, key: &TransactionPublicKey) -> Option<VerifyingKey> {
         cache
             .decompress(&[key], &commonware_parallel::Sequential)
             .map(|mut keys| keys.remove(0))
-    }
-
-    fn ed25519_key(seed: u64) -> TransactionPublicKey {
-        let mut rng = test_rng();
-        for _ in 0..seed {
-            let _ = ed25519::PrivateKey::random(&mut rng);
-        }
-        TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key())
     }
 
     fn secp256r1_key(seed: u64) -> TransactionPublicKey {
@@ -207,28 +180,21 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_decompress_matches_direct_and_caches() {
+    fn ed25519_keys_are_rejected_and_not_cached() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(4));
-            let key = ed25519_key(0);
+            let ed25519 =
+                TransactionPublicKey::ed25519(ed25519::SigningKey::random(test_rng()).public_key());
+            assert!(decompress_one(&cache, &ed25519).is_none());
+            assert!(
+                cache
+                    .decompress(
+                        &[&secp256r1_key(0), &ed25519],
+                        &commonware_parallel::Sequential
+                    )
+                    .is_none()
+            );
             assert!(cache.is_empty());
-
-            let DecompressedPublicKey::Ed25519(decompressed) =
-                decompress_one(&cache, &key).expect("valid key decompresses")
-            else {
-                panic!("ed25519 key should decompress to ed25519");
-            };
-            let expected = ed25519::PublicKey::read(&mut Copying(
-                &key.as_ref()[1..1 + ed25519::PublicKey::SIZE],
-            ))
-            .unwrap();
-            assert_eq!(decompressed, expected);
-            assert_eq!(cache.len(), 1);
-            assert!(cache.contains(&key));
-
-            // Hit path: no growth.
-            assert!(decompress_one(&cache, &key).is_some());
-            assert_eq!(cache.len(), 1);
         });
     }
 
@@ -238,11 +204,7 @@ mod tests {
             let cache = PublicKeyCache::new(context, NZUsize!(4));
             let key = secp256r1_key(0);
 
-            let DecompressedPublicKey::Secp256r1(decompressed) =
-                decompress_one(&cache, &key).expect("valid key decompresses")
-            else {
-                panic!("secp256r1 key should decompress to secp256r1");
-            };
+            let decompressed = decompress_one(&cache, &key).expect("valid key decompresses");
             let expected =
                 VerifyingKey::from_sec1_bytes(&key.as_ref()[1..1 + secp256r1::PublicKey::SIZE])
                     .unwrap();
@@ -256,32 +218,11 @@ mod tests {
     }
 
     #[test]
-    fn caches_both_schemes_together() {
-        deterministic::Runner::default().start(|context| async move {
-            let cache = PublicKeyCache::new(context, NZUsize!(8));
-            let ed = ed25519_key(0);
-            let r1 = secp256r1_key(0);
-
-            assert!(matches!(
-                decompress_one(&cache, &ed),
-                Some(DecompressedPublicKey::Ed25519(_))
-            ));
-            assert!(matches!(
-                decompress_one(&cache, &r1),
-                Some(DecompressedPublicKey::Secp256r1(_))
-            ));
-            assert_eq!(cache.len(), 2);
-            assert!(cache.contains(&ed));
-            assert!(cache.contains(&r1));
-        });
-    }
-
-    #[test]
     fn respects_capacity_via_eviction() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(1));
-            let key_a = ed25519_key(0);
-            let key_b = ed25519_key(1);
+            let key_a = secp256r1_key(0);
+            let key_b = secp256r1_key(1);
             assert_ne!(key_a, key_b);
 
             assert!(decompress_one(&cache, &key_a).is_some());
@@ -319,7 +260,7 @@ mod tests {
     fn registers_and_counts_misses() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(4));
-            let key = ed25519_key(0);
+            let key = secp256r1_key(0);
             assert!(decompress_one(&cache, &key).is_some()); // miss
             assert!(decompress_one(&cache, &key).is_some()); // hit (not counted)
             assert!(decompress_one(&cache, &key).is_some()); // hit (not counted)
@@ -356,8 +297,8 @@ mod tests {
             let mut rng = test_rng();
             let keys: Vec<TransactionPublicKey> = (0..1024)
                 .map(|_| {
-                    TransactionPublicKey::ed25519(
-                        ed25519::PrivateKey::random(&mut rng).public_key(),
+                    TransactionPublicKey::secp256r1(
+                        secp256r1::PrivateKey::random(&mut rng).public_key(),
                     )
                 })
                 .collect();

@@ -1,164 +1,140 @@
-use commonware_cryptography::{Signer, ed25519, sha256};
-use commonware_math::algebra::Random;
-use constantinople_application::executor::{self, PreparedTransfer, State};
-use constantinople_primitives::{
-    Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
-};
-use core::num::NonZeroU64;
+//! Measures the in-memory CPU cost of settling a block body: planning it and settling it against
+//! starting accounts already in memory. It does not read or merkleize a database; the `compute`
+//! bench target measures the whole pipeline against QMDB.
+
+use ahash::AHashMap;
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
+use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_glue::transfers::Plan;
+use commonware_parallel::{Rayon, Sequential, Strategy};
+use constantinople_application::executor::{PreparedTransfer, account_slots, starting_accounts};
+use constantinople_primitives::{Account, AccountKey, Nonce};
+use core::num::NonZeroUsize;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::{SeedableRng, rngs::StdRng};
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
-type TestHasher = sha256::Sha256;
-type TestTransaction = VerifiedTransaction<TestHasher>;
-type Transfers = Vec<PreparedTransfer>;
+type State = AHashMap<AccountKey, Account>;
 
-const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
 
-/// Senders per transaction in the contended fixture (each sender signs this many).
+/// Transactions each sender signs in the contended fixture.
 const SHARED_FANOUT: usize = 8;
 
-fn executor(c: &mut Criterion) {
-    let mut group = c.benchmark_group("executor");
+/// Workers in the pool behind the parallel rows.
+const WORKERS: usize = 8;
 
+fn key(index: u64) -> AccountKey {
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
+}
+
+fn executor(c: &mut Criterion) {
+    let pool = Rayon::new(NonZeroUsize::new(WORKERS).expect("workers")).expect("rayon pool");
+    let mut group = c.benchmark_group("executor");
     for &transaction_count in TRANSACTION_COUNTS {
         group.throughput(Throughput::Elements(transaction_count as u64));
 
         // Unique senders and recipients (every account touched once).
-        let (state, transfers) = build_unique_fixture(transaction_count);
-        bench_compute(&mut group, "unique", transaction_count, &state, &transfers);
+        let (state, transfers) = unique_fixture(transaction_count);
+        bench_settle(&mut group, "unique", &state, &transfers, &Sequential);
+        bench_settle(&mut group, "unique/pool", &state, &transfers, &pool);
 
         // Contended accounts: each sender signs several transactions to shared
         // recipients, so senders and recipients overlap across the batch.
-        let (state, transfers) = build_shared_fixture(transaction_count);
-        bench_compute(&mut group, "shared", transaction_count, &state, &transfers);
+        let (state, transfers) = shared_fixture(transaction_count);
+        bench_settle(&mut group, "shared", &state, &transfers, &Sequential);
+        bench_settle(&mut group, "shared/pool", &state, &transfers, &pool);
     }
-
     group.finish();
 }
 
-/// Benchmarks only the in-memory CPU cost of the current compute kernel on
-/// pre-loaded state. It does NOT measure the load, which is the part this
-/// change restructures, so it is not a benchmark of the pipeline. For the real
-/// load + compute measurement against a QMDB, run the `compute` bench target.
-fn bench_compute(
+fn settle(state: &State, transfers: &[PreparedTransfer], strategy: &impl Strategy) -> usize {
+    let plan = Plan::new(transfers, strategy).expect("bench transfers plan");
+    let reads = plan
+        .keys()
+        .iter()
+        .map(|key| state.get(key).copied())
+        .collect();
+    let slots = plan
+        .settle(&starting_accounts(reads), strategy)
+        .expect("bench transfers settle");
+    account_slots(slots).len()
+}
+
+fn bench_settle(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     fixture: &str,
-    transaction_count: usize,
     state: &State,
-    transfers: &Transfers,
+    transfers: &[PreparedTransfer],
+    strategy: &impl Strategy,
 ) {
     group.bench_with_input(
-        BenchmarkId::new(fixture, transaction_count),
-        &transaction_count,
+        BenchmarkId::new(fixture, transfers.len()),
+        &transfers.len(),
         |bencher, _| {
-            bencher.iter(|| {
-                black_box(
-                    executor::compute(black_box(state), black_box(transfers))
-                        .expect("bench transfers should execute")
-                        .len(),
-                )
-            });
+            bencher.iter(|| black_box(settle(black_box(state), black_box(transfers), strategy)));
         },
     );
 }
 
-fn build_unique_fixture(transaction_count: usize) -> (State, Transfers) {
-    let mut accounts = State::new();
-    let mut transactions = Vec::with_capacity(transaction_count);
-
-    for index in 0..transaction_count {
-        let signer = TestSigner::new(index as u64);
-        let recipient = TestSigner::new(index as u64 + transaction_count as u64).public_key;
-        let sender_public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
-        let recipient_public_key = TransactionPublicKey::ed25519(recipient.clone());
-        accounts.insert(
-            AccountKey::from_public_key(&sender_public_key),
-            Account {
-                balance: 1,
-                nonce: Nonce::default(),
-            },
-        );
-        accounts.insert(
-            AccountKey::from_public_key(&recipient_public_key),
-            Account::default(),
-        );
-        transactions.push(signer.sign(recipient, 1, 0));
-    }
-
-    finalize_fixture(accounts, transactions)
+fn unique_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
+    let mut state = State::new();
+    let transfers = (0..transaction_count as u64)
+        .map(|index| {
+            let sender = key(index);
+            let recipient = key(index + transaction_count as u64);
+            state.insert(
+                sender,
+                Account {
+                    balance: 1,
+                    nonce: Nonce::default(),
+                },
+            );
+            state.insert(recipient, Account::default());
+            PreparedTransfer {
+                sender,
+                recipient,
+                value: 1,
+                nonce: 0,
+            }
+        })
+        .collect();
+    (state, transfers)
 }
 
-fn build_shared_fixture(transaction_count: usize) -> (State, Transfers) {
+fn shared_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
     let account_count = (transaction_count / SHARED_FANOUT).max(1);
-    let signers: Vec<TestSigner> = (0..account_count)
-        .map(|index| TestSigner::new(index as u64))
-        .collect();
-
-    let mut accounts = State::new();
-    for signer in &signers {
-        let public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
-        accounts.insert(
-            AccountKey::from_public_key(&public_key),
-            Account {
+    let state = (0..account_count as u64)
+        .map(|index| {
+            let account = Account {
                 balance: transaction_count as u64,
                 nonce: Nonce::default(),
-            },
-        );
-    }
-
+            };
+            (key(index), account)
+        })
+        .collect();
     let mut nonces = vec![0u64; account_count];
-    let mut transactions = Vec::with_capacity(transaction_count);
-    for index in 0..transaction_count {
-        let sender_index = index % account_count;
-        let recipient_index = (index * 7 + 3) % account_count;
-        let nonce = nonces[sender_index];
-        nonces[sender_index] += 1;
-        transactions.push(signers[sender_index].sign(
-            signers[recipient_index].public_key.clone(),
-            1,
-            nonce,
-        ));
-    }
-
-    finalize_fixture(accounts, transactions)
-}
-
-fn finalize_fixture(accounts: State, transactions: Vec<TestTransaction>) -> (State, Transfers) {
-    let transfers = transactions
-        .iter()
-        .map(executor::prepare_transfer)
-        .collect::<Option<Vec<_>>>()
-        .expect("bench transactions should prepare");
-    executor::compute(&accounts, &transfers).expect("bench fixtures must be valid");
-    (accounts, transfers)
-}
-
-struct TestSigner {
-    key: ed25519::PrivateKey,
-    public_key: ed25519::PublicKey,
-}
-
-impl TestSigner {
-    fn new(index: u64) -> Self {
-        let key = ed25519::PrivateKey::random(StdRng::seed_from_u64(index));
-        let public_key = key.public_key();
-        Self { key, public_key }
-    }
-
-    fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
-        Transaction::new(
-            TransactionPublicKey::ed25519(self.key.public_key()),
-            TransactionPublicKey::ed25519(to),
-            NonZeroU64::new(value).expect("bench value must be non-zero"),
-            nonce,
-        )
-        .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
-    }
+    let transfers = (0..transaction_count)
+        .map(|index| {
+            let sender = index % account_count;
+            let recipient = (index * 7 + 3) % account_count;
+            let nonce = nonces[sender];
+            nonces[sender] += 1;
+            PreparedTransfer {
+                sender: key(sender as u64),
+                recipient: key(recipient as u64),
+                value: 1,
+                nonce,
+            }
+        })
+        .collect();
+    (state, transfers)
 }
 
 criterion_group! {

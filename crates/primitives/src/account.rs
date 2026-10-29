@@ -6,7 +6,8 @@ use crate::{
 };
 use bytes::BufMut;
 use commonware_codec::{Buf, Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
-use commonware_cryptography::{Hasher, ed25519, sha256};
+use commonware_cryptography::{Hasher, sha256};
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
 use core::ops::Deref;
@@ -20,14 +21,14 @@ pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
 
 // Account keys keep the legacy Ed25519 public-key width. Secp256r1 accounts
 // are hashed into this same fixed-width state key.
-const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
+const ACCOUNT_KEY_SIZE: usize = ed25519::VerifyingKey::SIZE;
 
 /// Fixed-width account identifier derived from a transaction public key.
 ///
-/// Unlike [`commonware_cryptography::PublicKey`] implementations, decoding an
-/// [`AccountKey`] does not validate or decompress the curve point. This keeps
-/// state-database replay, indexing, and lookup on cheap byte comparisons while
-/// preserving the legacy Ed25519 account format.
+/// An Ed25519 account is keyed by its 32-byte public-key encoding and a
+/// secp256r1 account by the SHA-256 digest of its tagged key encoding.
+/// Decoding copies bytes without interpreting them as a curve point, so
+/// state-database replay, indexing, and lookup stay on byte comparisons.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FixedArray)]
 #[fixed_array(infallible)]
 pub struct AccountKey {
@@ -60,14 +61,6 @@ impl AccountKey {
             SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(&[bytes]).as_ref()).ok(),
             _ => None,
         }
-    }
-
-    /// First eight account-key bytes as a little-endian routing prefix.
-    #[inline]
-    pub fn prefix(&self) -> u64 {
-        let mut prefix = [0u8; 8];
-        prefix.copy_from_slice(&self.bytes[..8]);
-        u64::from_le_bytes(prefix)
     }
 }
 
@@ -270,9 +263,8 @@ fn consume_current_nonce(base: u64, bitmap: u64) -> Option<Nonce> {
 mod tests {
     use super::*;
     use commonware_codec::{Copying, DecodeExt, FixedSize};
-    use commonware_cryptography::{
-        Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,
-    };
+    use commonware_cryptography::{Hasher, Signer, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
 
     #[test]
     fn account_key_roundtrip_does_not_validate_public_key() {
@@ -286,7 +278,7 @@ mod tests {
 
     #[test]
     fn account_key_from_ed25519_public_key_uses_legacy_key_bytes() {
-        let private_key = ed25519::PrivateKey::from_seed(1);
+        let private_key = ed25519::SigningKey::from_seed(1);
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
 
         let key = AccountKey::from_public_key(&public_key);

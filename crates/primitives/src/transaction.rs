@@ -246,8 +246,8 @@ impl<D: Digest> Sealable for Transaction<D> {
 #[cfg(any(test, feature = "arbitrary"))]
 impl<D: Digest> arbitrary::Arbitrary<'_> for Transaction<D> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let sender = commonware_cryptography::ed25519::PublicKey::arbitrary(u)?;
-        let to = commonware_cryptography::ed25519::PublicKey::arbitrary(u)?;
+        let sender = commonware_cryptography_curve25519::signing::VerifyingKey::arbitrary(u)?;
+        let to = commonware_cryptography_curve25519::signing::VerifyingKey::arbitrary(u)?;
         Ok(Self {
             sender: Lazy::new(TransactionPublicKey::ed25519(sender)),
             to: AccountKey::from_public_key(&TransactionPublicKey::ed25519(to)),
@@ -265,14 +265,15 @@ mod test {
     use crate::Sealable;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
     use commonware_codec::{Copying, DecodeExt, EncodeSize};
-    use commonware_cryptography::{Signer, ed25519, sha256};
+    use commonware_cryptography::{Signer, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
 
     fn test_sender() -> TransactionPublicKey {
         let mut rng = StdRng::from_seed([7u8; 32]);
-        TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key())
+        TransactionPublicKey::ed25519(ed25519::SigningKey::random(&mut rng).public_key())
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::{
 };
 use commonware_actor::Feedback;
 use commonware_consensus::{
-    Reporter,
+    Handoff, Reporter,
     marshal::{Update, ancestry::Ancestry},
 };
 use commonware_cryptography::{
@@ -15,7 +15,7 @@ use commonware_glue::stateful::{
     Application as StatefulApplication, Input, Proposed, db::DatabaseSet,
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use constantinople_application::consensus::{Application, FinalizedArtifacts, FinalizedHookFn};
 use constantinople_mempool::TransactionSource;
 use futures::Stream;
@@ -41,7 +41,7 @@ where
 
 pub(crate) struct EngineApplication<E, H, P, V, I, St>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -92,7 +92,7 @@ where
 
 impl<E, H, P, V, I, St> EngineApplication<E, H, P, V, I, St>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -111,7 +111,7 @@ where
 
 impl<E, H, P, V, I, St> Clone for EngineApplication<E, H, P, V, I, St>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -202,7 +202,7 @@ where
 
 impl<E, H, P, V, I, St> StatefulApplication<E> for EngineApplication<E, H, P, V, I, St>
 where
-    E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
+    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -224,6 +224,22 @@ where
 
     async fn genesis(&mut self) -> Self::Block {
         self.inner.genesis().await.into()
+    }
+
+    async fn prepare(
+        &mut self,
+        context: (E, Self::Context),
+        ancestry: impl Ancestry<Self::Block>,
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+        input: Input<Self::Input, Self::Provider>,
+    ) -> Handoff<Proposed<Self, E>> {
+        self.inner
+            .prepare(context, InnerAncestry::new(ancestry), batches, input)
+            .await
+            .map(|proposed| Proposed {
+                block: proposed.block.into(),
+                merkleized: proposed.merkleized,
+            })
     }
 
     async fn propose(

@@ -22,6 +22,7 @@ constantinople-primitives.workspace = true
 
 # Commonware
 commonware-actor.workspace = true
+commonware-allocator.workspace = true
 commonware-codec.workspace = true
 commonware-macros.workspace = true
 commonware-consensus.workspace = true
@@ -52,7 +53,6 @@ bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
 http-body.workspace = true
-mimalloc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 thiserror.workspace = true
@@ -64,8 +64,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-coding.workspace = true
+commonware-cryptography-curve25519.workspace = true
 commonware-glue.workspace = true
 commonware-math.workspace = true
+commonware-runtime = { workspace = true, features = ["test-utils"] }
 exoware-simulator.workspace = true
 rand.workspace = true
 tempfile.workspace = true

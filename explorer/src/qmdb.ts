@@ -8,7 +8,7 @@ import {
 } from '@exowarexyz/sql';
 import { Client, StoreKeyPrefix, TraversalMode, type StoreClient } from '@exowarexyz/sdk';
 import {
-    SimplexClient,
+    SimplexReader,
     SimplexRecordKind,
     finalizedByHeightKey,
     headerByDigestKey,
@@ -28,6 +28,7 @@ const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS')
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
 const SIMPLEX_STORE_PREFIX = new Uint8Array([0x02]);
 const ACCOUNT_PAGE_SIZE = 10;
+const MAX_TRANSACTION_PROOF_LOCATIONS = 1024;
 const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
@@ -475,42 +476,57 @@ export async function fetchAndVerifyAccountProof({
     };
 }
 
-export async function fetchAndVerifyTransactionRowProof({
+// Results follow the input rows; all rows share one proof and certificate.
+export async function fetchAndVerifyTransactionRowProofs({
     qmdbUrl,
-    row,
+    rows,
     target,
     signal,
 }: {
     qmdbUrl: string;
-    row: AccountTransactionRow;
+    rows: readonly AccountTransactionRow[];
     target: LatestProofTarget;
     signal?: AbortSignal;
-}): Promise<VerifiedTransactionProof> {
-    const digestBytes = fromHex(row.digest);
-    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const { location } = row;
-    if (location >= target.transactionsTip) {
-        throw uncoveredError(`transaction location ${location}`);
+}): Promise<VerifiedTransactionProof[]> {
+    signal?.throwIfAborted();
+    const values = new Map<bigint, Uint8Array>();
+    for (const { location, digest } of rows) {
+        const value = fromHex(digest);
+        assertByteLength(value, DIGEST_BYTES, 'transaction digest');
+        if (location >= target.transactionsTip) {
+            throw uncoveredError(`transaction location ${location}`);
+        }
+        const previous = values.get(location);
+        if (previous && !bytesEqual(previous, value)) {
+            throw new Error(`conflicting transaction digests at location ${location}`);
+        }
+        values.set(location, value);
+    }
+    if (values.size === 0) return [];
+    if (values.size > MAX_TRANSACTION_PROOF_LOCATIONS) {
+        throw new Error(`transaction page exceeds ${MAX_TRANSACTION_PROOF_LOCATIONS} proof locations`);
     }
 
-    const tip = transactionProofTip(target.transactionsTip);
-    const verification = await fetchFixedKeylessAppendProof(
-        `${trimTrailingSlash(qmdbUrl)}/transactions`,
-        location,
-        tip,
-        target.transactionsRoot,
-        digestBytes,
-        target.sequenceNumber,
-        signal,
-    );
+    const expected = [...values].map(([location, value]) => ({ location, value }))
+        .sort((a, b) => a.location < b.location ? -1 : a.location > b.location ? 1 : 0);
 
-    return {
+    const tip = transactionProofTip(target.transactionsTip);
+    const client = new QmdbOperationLogClient(`${trimTrailingSlash(qmdbUrl)}/transactions`);
+    const verification = await client.getFixedKeylessAppendMany(
+        { tip, minSequenceNumber: target.sequenceNumber },
+        target.transactionsRoot,
+        expected,
+        { signal },
+    );
+    signal?.throwIfAborted();
+
+    return rows.map(({ location }) => ({
         location,
         tip,
         height: target.height,
         view: target.view,
         proofSizeBytes: verification.proofSizeBytes,
-    };
+    }));
 }
 
 async function fetchTransactionProofMetadata(
@@ -763,7 +779,7 @@ async function fetchFinalizedTransactionTarget(
     minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<AuthenticatedTarget> {
-    const simplex = await verifiedSimplexClient(source.storeUrl, source.simplexVerificationMaterial);
+    const simplex = await verifiedSimplexReader(source.storeUrl, source.simplexVerificationMaterial);
     signal?.throwIfAborted();
     const target = await certifiedTarget(simplex, height, minSequenceNumber, signal);
     if (target) return target;
@@ -775,14 +791,13 @@ async function fetchFinalizedTransactionTarget(
 }
 
 async function certifiedTarget(
-    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    simplex: SimplexReader<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<AuthenticatedTarget | null> {
-    const certificate = await simplex.getFinalizationByHeight(
+    const certificate = await simplex.withMinSequenceNumber(minSequenceNumber).getFinalizationByHeight(
         height.toString(),
-        minSequenceNumber,
         { signal },
     );
     if (!certificate) return null;
@@ -795,7 +810,7 @@ async function certifiedTarget(
 
 async function descendantFinalizedTarget(
     source: FinalizationSource,
-    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    simplex: SimplexReader<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
@@ -845,7 +860,7 @@ async function descendantFinalizedTarget(
 
 async function descendantTarget(
     source: FinalizationSource,
-    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    simplex: SimplexReader<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
@@ -1019,14 +1034,14 @@ function missingFinalization(height: bigint): Error {
     return new Error(`finalization missing at height ${height}`);
 }
 
-async function verifiedSimplexClient(
+async function verifiedSimplexReader(
     storeUrl: string,
     simplexVerificationMaterial: string,
-): Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
+): Promise<SimplexReader<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
     if (simplexVerificationMaterial.trim().length === 0) {
         throw new Error('Simplex verification material is not configured');
     }
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(simplexStore(storeUrl), {
+    return new SimplexReader<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(simplexStore(storeUrl), {
         verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
     });
 }
@@ -1301,22 +1316,26 @@ async function sqlQuery(
     query: string,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<DecodedQueryResult> {
+): Promise<DecodedQueryResult & { sequenceNumber: bigint }> {
     const sql = new SqlClient(trimTrailingSlash(sqlUrl));
     const result = await sql.query(
         query.replace(/\s+/g, ' ').trim(),
         minSequenceNumber,
         { signal },
     );
-    assertEvaluatedSequence(result.sequenceNumber, minSequenceNumber, 'SQL query');
-    return result;
+    const { sequenceNumber } = result;
+    assertEvaluatedSequence(sequenceNumber, minSequenceNumber, 'SQL query');
+    return { ...result, sequenceNumber };
 }
 
 function assertEvaluatedSequence(
-    evaluated: bigint,
+    evaluated: bigint | undefined,
     minimum: bigint,
     operation: string,
-): void {
+): asserts evaluated is bigint {
+    if (evaluated === undefined) {
+        throw new Error(`${operation} is missing its evaluated Store sequence`);
+    }
     if (evaluated < minimum) {
         throw new Error(`${operation} evaluated before the requested Store sequence`);
     }

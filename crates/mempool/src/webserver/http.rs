@@ -19,11 +19,11 @@ use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
 use commonware_utils::sys_rng;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
-    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    Account, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey, TransactionSignature,
+    VerifiedTransaction, verify_transactions,
 };
 use std::{fmt::Display, sync::Arc};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info_span;
 
@@ -269,8 +269,11 @@ where
     };
 
     // Cheap decode failures must not train the scheduler to run expensive
-    // valid batches on the async worker. Force the outer handoff while
-    // retaining adaptive scheduling inside signature verification.
+    // valid batches on the async worker, so the outer job always hands off
+    // while signature verification inside it keeps adaptive scheduling. Rayon
+    // runs a spawned job inline only after a returned future has measured the
+    // hand-off round trip at its call site, so the job's future is dropped and
+    // its result returns over a channel.
     // Pool threads have an empty tracing context, so capture the caller's span explicitly.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
@@ -278,7 +281,7 @@ where
     let public_key_cache = state.public_key_cache.clone();
     let work_size = body.len();
     let strategy = state.strategy.clone();
-    let verified = state.strategy.manual().spawn(work_size, move |_| {
+    let job = move || {
         let _permit = permit;
         let batch_id = H::hash(&[body.as_ref()]).to_string();
 
@@ -292,12 +295,12 @@ where
 
         // Retained fields must not keep the entire request allocation alive.
         let cfg = (RangeCfg::new(1..=max_transactions), ());
-        let signed = Vec::<SignedTransaction<H>>::decode_cfg(Copying(body.as_ref()), &cfg)
+        let transactions = Vec::<SignedTransaction<H>>::decode_cfg(Copying(body.as_ref()), &cfg)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        decode.record("txs", signed.len().traced());
+        decode.record("txs", transactions.len().traced());
         drop(decode);
 
-        let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
+        let total_bytes: usize = transactions.iter().map(EncodeSize::encode_size).sum();
         if total_bytes > max_batch_bytes {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
@@ -305,22 +308,19 @@ where
         let verify = info_span!(
             parent: &parent,
             "mempool.ingress.verify",
-            txs = signed.len().traced(),
+            txs = transactions.len().traced(),
             bytes = total_bytes.traced(),
         )
         .entered();
-        let signed_lazy = signed
-            .into_iter()
-            .map(LazySignedTransaction::new)
-            .collect::<Vec<_>>();
-        let transactions = verify_transaction_chunks::<H, _>(
+        if !verify_transactions::<H, _>(
             namespace,
             &mut sys_rng(),
             &public_key_cache,
-            signed_lazy,
+            &transactions,
             &strategy,
-        )
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        ) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         drop(verify);
 
         let digests = transactions
@@ -333,8 +333,14 @@ where
             transactions,
             digests,
         })
-    });
-    verified.await
+    };
+    let (verified_tx, verified_rx) = oneshot::channel();
+    drop(state.strategy.spawn(work_size, move |_| {
+        let _ = verified_tx.send(job());
+    }));
+    verified_rx
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 /// Returns the latest known status for a submitted batch.
@@ -446,7 +452,8 @@ mod tests {
         http::{Method, Request, StatusCode, header},
     };
     use commonware_codec::Encode;
-    use commonware_cryptography::{Signer, ed25519, sha256};
+    use commonware_cryptography::{Signer, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_parallel::Sequential;
     use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
@@ -458,7 +465,7 @@ mod tests {
 
     const HTTP_TEST_NAMESPACE: &[u8] = b"mempool-http-test";
 
-    type TestMessage = Message<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+    type TestMessage = Message<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
 
     fn test_router_with_receiver(
         context: impl Metrics,
@@ -476,7 +483,7 @@ mod tests {
         });
 
         (
-            router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state),
+            router::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256, Sequential>(state),
             receiver,
         )
     }
@@ -486,8 +493,8 @@ mod tests {
     }
 
     fn signed_body(count: usize) -> bytes::Bytes {
-        let signer = ed25519::PrivateKey::from_seed(1);
-        let recipient = ed25519::PrivateKey::from_seed(2).public_key();
+        let signer = ed25519::SigningKey::from_seed(1);
+        let recipient = ed25519::SigningKey::from_seed(2).public_key();
         let transaction = Transaction::new(
             TransactionPublicKey::ed25519(signer.public_key()),
             TransactionPublicKey::ed25519(recipient),

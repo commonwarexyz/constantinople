@@ -18,19 +18,20 @@ constantinople-primitives.workspace = true
 constantinople-mempool.workspace = true
 
 # Commonware
+commonware-allocator.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519.workspace = true
 commonware-deployer.workspace = true
 commonware-formatting.workspace = true
 commonware-parallel.workspace = true
-commonware-runtime.workspace = true
+commonware-runtime = { workspace = true, features = ["mimalloc"] }
 commonware-utils.workspace = true
 
 # Other
 ahash.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true
-mimalloc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }

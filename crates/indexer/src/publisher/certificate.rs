@@ -568,18 +568,15 @@ mod tests {
     use super::*;
     use commonware_codec::Encode as _;
     use commonware_consensus::{
-        simplex::{
-            scheme::bls12381_threshold::standard,
-            types::{Context as SimplexContext, Finalization, Finalize, Proposal},
-        },
+        simplex::types::{Context as SimplexContext, Finalization, Finalize, Proposal},
         types::{Round, View},
     };
     use commonware_cryptography::{
         Digest as _, Signer as _,
         bls12381::primitives::variant::MinSig,
-        ed25519,
         sha256::{Digest as Sha256Digest, Sha256},
     };
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, telemetry::metrics::has_metric_value};
     use commonware_utils::{NZU16, non_empty_range};
@@ -593,10 +590,10 @@ mod tests {
 
     type TestReporter = CertificateReporter<
         Sha256,
-        ed25519::PublicKey,
-        ThresholdScheme<ed25519::PublicKey, MinSig>,
+        ed25519::VerifyingKey,
+        ThresholdScheme<ed25519::VerifyingKey, MinSig>,
     >;
-    type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
+    type TestCommitment = EngineCommitment<Sha256, ed25519::VerifyingKey>;
 
     #[test]
     fn finalized_block_completion_implies_exact_persistence() {
@@ -871,8 +868,8 @@ mod tests {
             let uploader = tokio::spawn(run_uploader::<
                 _,
                 Sha256,
-                ed25519::PublicKey,
-                ThresholdScheme<ed25519::PublicKey, MinSig>,
+                ed25519::VerifyingKey,
+                ThresholdScheme<ed25519::VerifyingKey, MinSig>,
             >(
                 context.child("uploader"),
                 client,
@@ -926,9 +923,9 @@ mod tests {
         });
     }
 
-    fn test_block(height: u64) -> EngineBlock<Sha256, ed25519::PublicKey> {
-        let leader = ed25519::PrivateKey::from_seed(1).public_key();
-        let signer = ed25519::PrivateKey::from_seed(2);
+    fn test_block(height: u64) -> EngineBlock<Sha256, ed25519::VerifyingKey> {
+        let leader = ed25519::SigningKey::from_seed(1).public_key();
+        let signer = ed25519::SigningKey::from_seed(2);
         let sender = TransactionPublicKey::ed25519(signer.public_key());
         let transaction = Transaction::<Sha256Digest>::new(
             sender.clone(),
@@ -956,10 +953,11 @@ mod tests {
     }
 
     fn test_finalization(
-        block: &EngineBlock<Sha256, ed25519::PublicKey>,
-    ) -> Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, TestCommitment> {
+        block: &EngineBlock<Sha256, ed25519::VerifyingKey>,
+    ) -> Finalization<ThresholdScheme<ed25519::VerifyingKey, MinSig>, TestCommitment> {
         let mut rng = StdRng::from_seed([7; 32]);
-        let fixture = standard::fixture::<MinSig, _>(&mut rng, b"indexer-test", 4);
+        let (schemes, verifier) =
+            crate::publisher::fixture::threshold(&mut rng, b"indexer-test", 4);
         let commitment = TestCommitment::from((
             *block.seal(),
             Sha256Digest::EMPTY,
@@ -974,14 +972,13 @@ mod tests {
             block.header.context.parent.0,
             commitment,
         );
-        let finalizes = fixture
-            .schemes
+        let finalizes = schemes
             .iter()
             .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("sign finalization"))
             .collect::<Vec<_>>();
         let finalizes = commonware_utils::iter::NonEmpty::try_new(finalizes.iter())
             .expect("test finalizations are non-empty");
-        Finalization::from_finalizes(&fixture.verifier, finalizes, &Sequential)
+        Finalization::from_finalizes(&verifier, finalizes, &Sequential)
             .expect("assemble finalization")
     }
 }

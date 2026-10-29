@@ -20,6 +20,7 @@ commonware-utils.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519.workspace = true
 commonware-runtime.workspace = true
 
 # Other
@@ -39,17 +40,25 @@ commonware-codec = { workspace = true, features = ["arbitrary"] }
 commonware-utils = { workspace = true, features = ["arbitrary"] }
 commonware-consensus = { workspace = true, features = ["arbitrary"] }
 commonware-cryptography = { workspace = true, features = ["arbitrary"] }
+commonware-allocator.workspace = true
+commonware-cryptography-curve25519 = { workspace = true, features = ["arbitrary"] }
 
 # Other
 rand = { workspace = true, features = ["std_rng"] }
 arbitrary = { workspace = true, features = ["derive"] }
+criterion.workspace = true
 
 [features]
 arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-consensus/arbitrary",
 	"commonware-cryptography/arbitrary",
+	"commonware-cryptography-curve25519/arbitrary",
 	"commonware-math/arbitrary",
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",
 ]
+
+[[bench]]
+name = "verify"
+harness = false

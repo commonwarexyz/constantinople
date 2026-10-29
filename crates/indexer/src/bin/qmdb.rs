@@ -5,6 +5,7 @@
 //! transaction-hash history under `/transactions`.
 
 use axum::Router;
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use commonware_codec::FixedSize;
 use commonware_cryptography::sha256::Sha256;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
@@ -16,9 +17,14 @@ use constantinople_indexer::{
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::service::server::{keyless_operation_log_stack, unordered_operation_log_stack};
 use exoware_sdk::StoreClient;
+use std::time::Duration;
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 const PROFILE: Profile = Profile {
     name: "qmdb-indexer",

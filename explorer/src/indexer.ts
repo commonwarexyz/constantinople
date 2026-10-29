@@ -166,7 +166,7 @@ function decodeBlockMetadata(
     result: DecodedQueryResult,
     target: PublishedProofTarget,
 ): ObservedBlock | null {
-    if (result.sequenceNumber < target.sequenceNumber) {
+    if (result.sequenceNumber === undefined || result.sequenceNumber < target.sequenceNumber) {
         throw new Error('block metadata query evaluated below the proof target sequence');
     }
 

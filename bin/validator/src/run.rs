@@ -8,12 +8,10 @@ use crate::{
 use commonware_codec::Encode;
 use commonware_consensus::{simplex::elector::RoundRobin, types::Epoch};
 use commonware_cryptography::{
-    ChaCha20Poly1305,
-    bls12381::primitives::variant::MinSig,
-    certificate::ConstantProvider,
-    ed25519::{self, PublicKey},
+    ChaCha20Poly1305, bls12381::primitives::variant::MinSig, certificate::ConstantProvider,
     sha256::Sha256,
 };
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_formatting::hex;
 use commonware_glue::stateful::{
     PruneConfig,
@@ -26,7 +24,7 @@ use commonware_p2p::{
 };
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
+    Quota, Runner as _, Strategizer as _, Supervisor as _,
     tokio::{
         telemetry::{self, Logs},
         tracing::Config as TracesConfig,
@@ -36,9 +34,7 @@ use commonware_stream::{
     cups::{self, Cups},
     sake::{self, Sake},
 };
-use commonware_utils::{
-    NZDuration, NZU32, NZU64, NZUsize, Probability, TryCollect, ordered::Set, union,
-};
+use commonware_utils::{NZDuration, NZU64, NZUsize, Probability, TryCollect, ordered::Set, union};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
     MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
@@ -69,10 +65,8 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
 };
 const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 
-const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
 const NETWORK_CHANNEL_MAILBOX_BUDGET: usize = 1_024;
-const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
+const NETWORK_MAILBOX_SIZE: NonZeroUsize = NZUsize!(1_000);
 
 pub(crate) type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -89,39 +83,10 @@ fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
         .expect("mempool drop grace block count overflowed")
 }
 
-fn buffer_pool_configs(
-    worker_threads: usize,
-    max_blocking_threads: usize,
-) -> (BufferPoolConfig, BufferPoolConfig) {
-    let storage_parallelism = worker_threads
-        .checked_add(max_blocking_threads)
-        .expect("storage buffer pool parallelism overflowed");
-    let network_parallelism =
-        NonZeroUsize::new(worker_threads).expect("network buffer pool parallelism is zero");
-    let storage_parallelism =
-        NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
-
-    let network_cfg = BufferPoolConfig::for_network()
-        .with_size_class_range(
-            NZUsize!(1024),
-            NETWORK_BUFFER_POOL_MAX_SIZE,
-            NETWORK_BUFFER_POOL_MAX_PER_CLASS,
-        )
-        .with_parallelism(network_parallelism);
-    // Storage I/O can run on Tokio's blocking pool. Include those threads so
-    // the pool's automatic TLS cache sizing does not strand scarce storage
-    // buffers outside the global freelist under load.
-    let storage_cfg = BufferPoolConfig::for_storage()
-        .with_parallelism(storage_parallelism)
-        .with_max_per_class(STORAGE_BUFFER_POOL_MAX_PER_CLASS);
-
-    (network_cfg, storage_cfg)
-}
-
 // Preserve the transport used by existing validators.
 const fn network_upgrader(
-    signer: ed25519::PrivateKey,
-) -> Cups<Sake<ed25519::PrivateKey>, ChaCha20Poly1305> {
+    signer: ed25519::SigningKey,
+) -> Cups<Sake<ed25519::SigningKey>, ChaCha20Poly1305> {
     Cups::new(
         Sake {
             signer,
@@ -196,11 +161,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
         .with_worker_threads(worker_threads);
-    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) =
-        buffer_pool_configs(worker_threads, runtime_cfg.max_blocking_threads());
-    let runtime_cfg = runtime_cfg
-        .with_network_buffer_pool_config(network_buffer_pool_cfg)
-        .with_storage_buffer_pool_config(storage_buffer_pool_cfg);
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
@@ -249,6 +209,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.bootstrappers,
                 max_peers_per_set,
                 MAXIMUM_MESSAGE_SIZE,
+                NETWORK_MAILBOX_SIZE,
             )
         } else {
             discovery::Config::local(
@@ -259,6 +220,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.bootstrappers,
                 max_peers_per_set,
                 MAXIMUM_MESSAGE_SIZE,
+                NETWORK_MAILBOX_SIZE,
             )
         };
 
@@ -272,12 +234,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let mempool_drop_grace_blocks =
             default_mempool_drop_grace_blocks(decoded.primary_participants.len());
-        let primary: Set<ed25519::PublicKey> = decoded
+        let primary: Set<ed25519::VerifyingKey> = decoded
             .primary_participants
             .into_iter()
             .try_collect()
             .unwrap();
-        let secondary: Set<ed25519::PublicKey> = decoded
+        let secondary: Set<ed25519::VerifyingKey> = decoded
             .secondary_participants
             .into_iter()
             .try_collect()
@@ -295,7 +257,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         };
         let probe_network = network.register(PROBE_CHANNEL, quota);
         let provider =
-            ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
+            ConstantProvider::new(ThresholdScheme::<ed25519::VerifyingKey, MinSig>::verifier(
                 &union(b"constantinople", b"_CONSENSUS"),
                 decoded.dkg_output.players().clone(),
                 decoded.dkg_output.public().clone(),
@@ -460,12 +422,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         info!("starting engine");
         // Primaries report to the local mempool. Secondaries upload index data
         // from the finalized hook and do not need marshal updates here.
-        let reporter: Option<Mailbox<EngineCommitment<Sha256, PublicKey>, PublicKey, Sha256>> =
-            if is_primary {
-                Some(mempool_mailbox.clone())
-            } else {
-                None
-            };
+        let reporter: Option<
+            Mailbox<EngineCommitment<Sha256, ed25519::VerifyingKey>, ed25519::VerifyingKey, Sha256>,
+        > = if is_primary {
+            Some(mempool_mailbox.clone())
+        } else {
+            None
+        };
         let engine_handle = engine.start(channels, reporter);
 
         wait_for_critical_task_exit(
@@ -506,7 +469,6 @@ const fn production_sync_config() -> SyncEngineConfig {
         fetch_batch_size: NZU64!(1024),
         apply_batch_size: STATE_SYNC_APPLY_BATCH_SIZE,
         max_outstanding_requests: NZUsize!(8),
-        update_channel_size: NZUsize!(256),
     }
 }
 
@@ -514,7 +476,8 @@ const fn production_sync_config() -> SyncEngineConfig {
 mod tests {
     use super::{channel_quota, default_mempool_drop_grace_blocks, wait_for_critical_task_exit};
     use crate::indexer::indexer_critical_task;
-    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+    use commonware_cryptography::Signer as _;
+    use commonware_cryptography_curve25519::signing::SigningKey;
     use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _};
     use std::{future::pending, time::Duration};
 
@@ -528,9 +491,9 @@ mod tests {
     #[test]
     fn p2p_channel_registration_has_bounded_capacity() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let signer = PrivateKey::from_seed(0);
+            let signer = SigningKey::from_seed(0);
             let participants: Vec<_> = (0..5)
-                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .map(|seed| SigningKey::from_seed(seed).public_key())
                 .collect();
             let max_peers = commonware_p2p::authenticated::peer_set_limit(
                 participants.iter(),
@@ -545,6 +508,7 @@ mod tests {
                 Vec::new(),
                 max_peers,
                 super::MAXIMUM_MESSAGE_SIZE,
+                super::NETWORK_MAILBOX_SIZE,
             );
             let quota = channel_quota(
                 max_peers,

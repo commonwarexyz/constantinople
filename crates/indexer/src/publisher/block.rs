@@ -214,10 +214,10 @@ mod tests {
     };
     use commonware_cryptography::{
         Digest, Signer,
-        ed25519::{self, PublicKey},
         secp256r1::standard as secp256r1,
         sha256::{self, Sha256},
     };
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
     use constantinople_engine::types::{EngineBlock, EngineCommitment};
@@ -232,12 +232,12 @@ mod tests {
     #[test]
     fn r1_sender_history_uses_account_key() {
         let mut rng = StdRng::from_seed([3; 32]);
-        let consensus_key = ed25519::PrivateKey::random(&mut rng);
-        let signer = ed25519::PrivateKey::random(&mut rng);
+        let consensus_key = ed25519::SigningKey::random(&mut rng);
+        let signer = ed25519::SigningKey::random(&mut rng);
         let sender =
             TransactionPublicKey::secp256r1(secp256r1::PrivateKey::random(&mut rng).public_key());
         let recipient =
-            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+            TransactionPublicKey::ed25519(ed25519::SigningKey::random(&mut rng).public_key());
         let sender_account = AccountKey::from_public_key(&sender);
         let transaction = Transaction::<sha256::Digest>::new(
             sender,
@@ -248,7 +248,7 @@ mod tests {
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
         let digest = *transaction.message_digest();
         let block = EngineBlock::from(
-            Block::<TestCommitment, PublicKey, Sha256>::new(
+            Block::<TestCommitment, ed25519::VerifyingKey, Sha256>::new(
                 test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
                 vec![transaction],
             )
@@ -432,11 +432,11 @@ mod tests {
     #[test]
     fn row_encoding_uses_lazy_transaction_bytes_without_materializing() {
         let mut rng = StdRng::from_seed([9; 32]);
-        let consensus_key = ed25519::PrivateKey::random(&mut rng);
-        let signer = ed25519::PrivateKey::random(&mut rng);
+        let consensus_key = ed25519::SigningKey::random(&mut rng);
+        let signer = ed25519::SigningKey::random(&mut rng);
         let sender = TransactionPublicKey::ed25519(signer.public_key());
         let recipient =
-            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+            TransactionPublicKey::ed25519(ed25519::SigningKey::random(&mut rng).public_key());
         let signed = Transaction::<sha256::Digest>::new(
             sender,
             recipient,
@@ -469,8 +469,8 @@ mod tests {
     }
 
     fn transfer(seed: u64) -> SignedTransaction<Sha256> {
-        let signer = ed25519::PrivateKey::from_seed(seed);
-        let recipient = ed25519::PrivateKey::from_seed(seed + 1).public_key();
+        let signer = ed25519::SigningKey::from_seed(seed);
+        let recipient = ed25519::SigningKey::from_seed(seed + 1).public_key();
         Transaction::<sha256::Digest>::new(
             TransactionPublicKey::ed25519(signer.public_key()),
             TransactionPublicKey::ed25519(recipient),
@@ -492,8 +492,8 @@ mod tests {
     fn unchecked_block(
         body: Vec<LazySignedTransaction<Sha256>>,
         transactions_range: NonEmptyRange<u64>,
-    ) -> EngineBlock<Sha256, PublicKey> {
-        let leader = ed25519::PrivateKey::from_seed(0).public_key();
+    ) -> EngineBlock<Sha256, ed25519::VerifyingKey> {
+        let leader = ed25519::SigningKey::from_seed(0).public_key();
         EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(leader, transactions_range),
@@ -541,9 +541,9 @@ mod tests {
     }
 
     fn test_header(
-        leader: PublicKey,
+        leader: ed25519::VerifyingKey,
         transactions_range: NonEmptyRange<u64>,
-    ) -> Header<TestCommitment, sha256::Digest, PublicKey> {
+    ) -> Header<TestCommitment, sha256::Digest, ed25519::VerifyingKey> {
         Header {
             context: Context {
                 round: Round::new(Epoch::zero(), View::zero()),
@@ -560,7 +560,7 @@ mod tests {
         }
     }
 
-    type TestCommitment = EngineCommitment<Sha256, PublicKey>;
+    type TestCommitment = EngineCommitment<Sha256, ed25519::VerifyingKey>;
 
     fn valid_commitment() -> TestCommitment {
         TestCommitment::from((

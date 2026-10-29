@@ -162,7 +162,6 @@ pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, E
 pub(crate) type StatefulApp<E, H, P, V, I, St> = Stateful<
     E,
     App<E, H, P, V, I, St>,
-    ThresholdScheme<P, V>,
     EngineVariant<H, P>,
     (
         StateResolverMailbox<E, H, St>,

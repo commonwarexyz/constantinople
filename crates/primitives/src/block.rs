@@ -394,14 +394,15 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Signer, ed25519, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography::{Signer, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use rand::{SeedableRng, rngs::StdRng};
 
-    fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
+    fn test_context() -> Context<sha256::Digest, ed25519::VerifyingKey> {
         let mut rng = StdRng::from_seed([7u8; 32]);
-        let leader = ed25519::PrivateKey::random(&mut rng).public_key();
+        let leader = ed25519::SigningKey::random(&mut rng).public_key();
         Context {
             round: Round::new(Epoch::zero(), View::zero()),
             leader,
@@ -409,7 +410,7 @@ mod tests {
         }
     }
 
-    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey> {
+    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey> {
         Header {
             context: test_context(),
             parent: sha256::Digest::EMPTY,
@@ -430,7 +431,7 @@ mod tests {
         header.write(&mut buf);
 
         let decoded =
-            Header::<sha256::Digest, sha256::Digest, ed25519::PublicKey>::decode_cfg(buf, &())
+            Header::<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>::decode_cfg(buf, &())
                 .expect("decoding should succeed");
         assert_eq!(decoded, header);
     }
@@ -447,13 +448,15 @@ mod tests {
 
     #[test]
     fn block_codec_roundtrip_empty_body() {
-        let block =
-            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(test_header(), vec![]);
+        let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
+            test_header(),
+            vec![],
+        );
 
         let mut buf = Vec::with_capacity(block.encode_size());
         block.write(&mut buf);
 
-        let decoded = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::decode_cfg(
+        let decoded = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::decode_cfg(
             buf,
             &BlockCfg::default(),
         )
@@ -489,7 +492,7 @@ mod tests {
 
     #[test]
     fn block_codec_enforces_encoded_size_limit() {
-        type TestBlock = Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+        type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
 
         for size in [MAXIMUM_BLOCK_SIZE - 1, MAXIMUM_BLOCK_SIZE] {
             let mut encoded = encoded_block_with_size(size);
@@ -507,8 +510,10 @@ mod tests {
 
     #[test]
     fn block_encode_size_matches_written() {
-        let block =
-            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(test_header(), vec![]);
+        let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
+            test_header(),
+            vec![],
+        );
         let expected = block.encode_size();
 
         let mut buf = Vec::new();
@@ -535,7 +540,7 @@ mod tests {
         )
         .expect("test WebAuthn signature should encode");
         let signed = crate::SignedTransaction::new_unchecked(sealed, signature);
-        let block = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(
+        let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
             test_header(),
             vec![signed],
         );
@@ -543,7 +548,7 @@ mod tests {
         let encoded = block.encode();
         let mut reader = encoded;
         let _decoded =
-            <Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
+            <Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
                 &mut reader,
                 &BlockCfg::default(),
             )

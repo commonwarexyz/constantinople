@@ -7,6 +7,7 @@
 //! `--hosts ... --config ...` convention for remote bundles.
 
 use axum::Router;
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use constantinople_indexer::{
     adapter::{self, BoxError, Profile},
     namespaces::sql_meta_client,
@@ -14,10 +15,14 @@ use constantinople_indexer::{
 };
 use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 const PROFILE: Profile = Profile {
     name: "metadata-indexer",

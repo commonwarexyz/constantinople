@@ -15,7 +15,7 @@ import {
     type DecodedQueryResult,
     type Table,
 } from '@exowarexyz/sql';
-import { SimplexClient, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
+import { SimplexReader, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { ensureSimplexWasm } from '@exowarexyz/simplex/wasm';
 import { StoreClient, TraversalMode, type QueryResult } from '@exowarexyz/sdk';
 import { toArrayBuffer, toHex } from '../src/codec.ts';
@@ -28,7 +28,7 @@ import {
 import {
     fetchAccountTransactionsPage,
     fetchAndVerifyAccountProof,
-    fetchAndVerifyTransactionRowProof,
+    fetchAndVerifyTransactionRowProofs,
     fetchAndVerifyTransactionProof,
     fetchLatestProofTarget,
     prefetchFinalizedCertificate,
@@ -38,6 +38,7 @@ import {
 
 const HEIGHT = 7n;
 const FLOOR = 41n;
+type TestSimplexReader = SimplexReader<VerifiedSimplexCertificate, VerifiedSimplexCertificate>;
 const LOCATION = 4n;
 const NOT_IN_BLOCK = /is not a transaction append of block/;
 
@@ -56,7 +57,7 @@ test.before(async () => {
 test('account target retries when publication precedes its Simplex certificate', async (t) => {
     const certificate = await finalizedCertificate(HEIGHT);
     let available = false;
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => {
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => {
         return available ? certificate : null;
     });
     mockNoDescendant(t);
@@ -96,10 +97,10 @@ test('reported height starts certificate and metadata reads together and retains
     let metadataStarted!: () => void;
     const metadataReady = new Promise<void>((resolve) => { metadataStarted = resolve; });
     const reads: string[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, height: string) {
         reads.push('certificate');
         assert.equal(height, HEIGHT.toString());
-        assert.equal(floor, FLOOR);
+        assert.equal(this.minSequenceNumber(), FLOOR);
         await metadataReady;
         return certificate;
     });
@@ -148,7 +149,7 @@ test(`transaction proof reads height ${HEIGHT} from tx_meta without a reported h
     const containing = await finalizedCertificate(HEIGHT);
     mockParentHeaders(t, [latest, containing]);
     const heights: string[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (height: string) => {
         heights.push(height);
         return height === HEIGHT.toString() ? containing : latest;
     });
@@ -179,7 +180,7 @@ for (const { location, accepted } of [
         const latest = await finalizedCertificate(HEIGHT + 1n);
         const containing = await finalizedCertificate(1n, 0n, 8n);
         mockParentHeaders(t, [latest]);
-        t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) =>
+        t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (height: string) =>
             height === '1' ? containing : latest,
         );
         t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
@@ -213,7 +214,7 @@ test('submission proofs retry when the transaction metadata is not published yet
     const certificate = await finalizedCertificate(HEIGHT + 1n);
     const options = transactionProofOptions(digest);
     options.publishedTarget.blockDigest = certificate.payload.slice(0, 32);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async () => emptyQueryResult());
     const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
         throw new Error('unexpected proof');
@@ -243,7 +244,7 @@ for (const finalizedHeight of [undefined, HEIGHT + 1n]) {
             floors.push(minSequenceNumber);
             return txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT });
         });
-        t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) =>
+        t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (height: string) =>
             height === HEIGHT.toString() ? containing : later,
         );
         const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
@@ -291,8 +292,8 @@ test('transaction proof discovers its height despite an ahead-of-target report r
     const options = transactionProofOptions(digest);
     options.publishedTarget.blockDigest = latest.payload.slice(0, 32);
     const heights: string[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
-        assert.equal(floor, FLOOR);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, height: string) {
+        assert.equal(this.minSequenceNumber(), FLOOR);
         heights.push(height);
         return height === HEIGHT.toString() ? containing : latest;
     });
@@ -335,10 +336,8 @@ for (const finalizedHeight of [undefined, HEIGHT - 1n]) {
             const hintStarted = deferred<void>();
             let hintSignal: AbortSignal | undefined;
             const heights: string[] = [];
-            t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-                height: string, floor: bigint, options: { signal?: AbortSignal },
-            ) => {
-                assert.equal(floor, FLOOR);
+            t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, height: string, options: { signal?: AbortSignal }) {
+                assert.equal(this.minSequenceNumber(), FLOOR);
                 heights.push(height);
                 if (height === HEIGHT.toString()) return certificate;
                 assert.equal(height, (finalizedHeight ?? HEIGHT + 1n).toString());
@@ -388,7 +387,7 @@ test('a certificate failure still rejects when SQL confirms the hinted height', 
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const failure = new Error('owning certificate is invalid');
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => {
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => {
         throw failure;
     });
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) => txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }));
@@ -411,8 +410,8 @@ test('cancellation stops the SQL-derived lookup after discarding a pending hint'
     const hintStarted = deferred<void>();
     const owningStarted = deferred<void>();
     const signals: AbortSignal[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-        height: string, _floor: bigint, options: { signal?: AbortSignal },
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (
+        height: string, options: { signal?: AbortSignal },
     ) => new Promise<VerifiedSimplexCertificate>((_resolve, reject) => {
         const signal = options.signal!;
         signals.push(signal);
@@ -452,7 +451,7 @@ test('an ahead-of-target report still waits when the SQL-derived height is uncov
     const latest = await finalizedCertificate(HEIGHT + 1n);
     const options = transactionProofOptions(digest);
     options.publishedTarget.blockDigest = latest.payload.slice(0, 32);
-    const certificate = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => latest);
+    const certificate = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => latest);
     const query = t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT + 2n }),
     );
@@ -478,7 +477,7 @@ test('a reported height cannot place a transaction outside its certified range',
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
     mockParentHeader(t, certificate);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: 8n, body, height: HEIGHT }),
     );
@@ -512,9 +511,9 @@ for (const { name, location, accepted } of [
             events.push('parent');
             return certificate.parentHeader;
         });
-        const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
+        const certificates = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, height: string) {
             assert.equal(height, HEIGHT.toString());
-            assert.equal(floor, FLOOR);
+            assert.equal(this.minSequenceNumber(), FLOOR);
             return certificate;
         });
         const metadata = t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
@@ -555,7 +554,7 @@ test('transaction inclusion height cannot be genesis', async (t) => {
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(0n);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: 0n }),
     );
@@ -585,9 +584,9 @@ test('a missing parent header retries at its height and succeeds after publicati
     const certificate = await finalizedCertificate(HEIGHT);
     let available = false;
     const parent = mockParentHeader(t, certificate, () => available ? certificate.parentHeader : undefined);
-    const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
+    const certificates = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, height: string) {
         assert.equal(height, HEIGHT.toString());
-        assert.equal(floor, FLOOR);
+        assert.equal(this.minSequenceNumber(), FLOOR);
         return certificate;
     });
     const metadata = t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
@@ -628,7 +627,7 @@ test('an out-of-range location fails terminally even when the parent header is m
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
     mockParentHeader(t, certificate, () => undefined);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: latestTarget().transactionsTip - 1n, body, height: HEIGHT }),
     );
@@ -651,7 +650,7 @@ test('a hinted parent header read overlaps the tx_meta read', { timeout: 5_000 }
         parentStarted.resolve();
         return certificate.parentHeader;
     });
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) => {
         await parentStarted.promise;
         return txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT });
@@ -680,7 +679,7 @@ for (const invalidParent of ['tampered', 'wrong height'] as const) {
         const returnedHeader = certificate.parentHeader.slice();
         if (invalidParent === 'tampered') returnedHeader[returnedHeader.length - 1] ^= 1;
         const parent = mockParentHeader(t, certificate, () => returnedHeader);
-        const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
+        const certificates = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (height: string) => {
             assert.equal(height, HEIGHT.toString());
             return certificate;
         });
@@ -719,7 +718,7 @@ test('cancellation during a parent header read stops before callbacks or proofs'
         started.resolve();
         return response.promise;
     });
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
     );
@@ -751,7 +750,7 @@ test('a reported height at the publication boundary still authenticates its dige
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT + 1n);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT + 1n }),
     );
@@ -767,7 +766,7 @@ test('a lower hint cannot bypass the publication digest when SQL resolves to the
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const containing = await finalizedCertificate(HEIGHT);
     const lower = await finalizedCertificate(HEIGHT - 1n);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) =>
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (height: string) =>
         height === HEIGHT.toString() ? containing : lower);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) => txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }));
     const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
@@ -788,7 +787,7 @@ test('a lower hint cannot bypass the publication digest when SQL resolves to the
 
 test('reported-height proofs reject tampered transaction metadata', async (t) => {
     const certificate = await finalizedCertificate(HEIGHT);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async () => queryResult({
         qmdb_location: LOCATION,
         body: new Uint8Array(82).fill(0x33),
@@ -806,7 +805,7 @@ test('reported-height proofs retain the request floor without response sequence 
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
     mockParentHeader(t, certificate);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
     );
@@ -830,7 +829,7 @@ test('proof diagnostics preserve retryable transport causes', async (t) => {
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
     mockParentHeader(t, certificate);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
     );
@@ -853,8 +852,8 @@ test('a failed metadata read cancels its concurrent certificate request', async 
     let certificateStarted!: () => void;
     const ready = new Promise<void>((resolve) => { certificateStarted = resolve; });
     let certificateSignal: AbortSignal | undefined;
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-        _height: string, _floor: bigint, options: { signal?: AbortSignal },
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (
+        _height: string, options: { signal?: AbortSignal },
     ) => new Promise((_resolve, reject) => {
         certificateSignal = options.signal;
         certificateSignal!.addEventListener('abort', () => reject(certificateSignal!.reason), { once: true });
@@ -879,10 +878,8 @@ test('prefetched certificates share verification and retain each proof publicati
     const certificate = await finalizedCertificate(HEIGHT);
     mockParentHeader(t, certificate);
     const options = transactionProofOptions(digest);
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-        _height: string, floor: bigint,
-    ) => {
-        assert.equal(floor, 0n);
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, _height: string) {
+        assert.equal(this.minSequenceNumber() ?? 0n, 0n);
         return certificate;
     });
     await prefetchFinalizedCertificate({ ...options, height: HEIGHT });
@@ -901,7 +898,7 @@ test('prefetched certificates share verification and retain each proof publicati
 });
 
 test('certificate cache is scoped by store, verification material, and height', async (t) => {
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (height: string) => {
         return finalizedCertificate(BigInt(height));
     });
     const options = { ...transactionProofOptions(''), height: HEIGHT };
@@ -917,7 +914,7 @@ for (const failure of ['missing', 'error', 'wrong height'] as const) {
     test(`certificate cache does not retain ${failure}`, async (t) => {
         const certificate = await finalizedCertificate(HEIGHT);
         let available = false;
-        const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => {
+        const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => {
             if (available) return certificate;
             if (failure === 'missing') return null;
             if (failure === 'error') throw new Error('certificate unavailable');
@@ -938,8 +935,8 @@ test('cancelling one certificate waiter does not cancel a shared request', async
     const ready = deferred<void>();
     const response = deferred<VerifiedSimplexCertificate>();
     let sharedSignal: AbortSignal | undefined;
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-        _height: string, _floor: bigint, options: { signal?: AbortSignal },
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (
+        _height: string, options: { signal?: AbortSignal },
     ) => {
         sharedSignal = options.signal;
         ready.resolve();
@@ -966,8 +963,8 @@ test('last certificate waiter cancels promptly and a replacement ignores the aba
     const abandoned = deferred<VerifiedSimplexCertificate>();
     const replacement = deferred<VerifiedSimplexCertificate>();
     const signals: AbortSignal[] = [];
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-        _height: string, _floor: bigint, options: { signal?: AbortSignal },
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (
+        _height: string, options: { signal?: AbortSignal },
     ) => {
         signals.push(options.signal!);
         ready.resolve();
@@ -991,7 +988,7 @@ test('last certificate waiter cancels promptly and a replacement ignores the aba
 
 test('an already cancelled caller cannot use or initiate a cached certificate', async (t) => {
     const certificate = await finalizedCertificate(HEIGHT);
-    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    const read = t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     const options = { ...transactionProofOptions(''), height: HEIGHT };
     const signal = AbortSignal.abort(new Error('already cancelled'));
     await assert.rejects(prefetchFinalizedCertificate({ ...options, signal }), /already cancelled/);
@@ -1003,7 +1000,7 @@ test('an already cancelled caller cannot use or initiate a cached certificate', 
 
 test('cached target byte arrays cannot be changed through a caller result', async (t) => {
     const certificate = await finalizedCertificate(HEIGHT);
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async () => certificate);
     const options = {
         ...transactionProofOptions(''),
         publishedTarget: { height: HEIGHT, blockDigest: certificate.payload.slice(0, 32), sequenceNumber: FLOOR },
@@ -1228,33 +1225,33 @@ test('transaction row proof uses the activity location without SQL and retains t
         throw new Error('unexpected SQL request');
     });
     const qmdbFloors: Array<bigint | undefined> = [];
-    t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
-        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
+    t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppendMany', async (
+        request: { tip: bigint; minSequenceNumber?: bigint }, root: Uint8Array,
+        expected: readonly { location: bigint; value: BytesLike }[],
     ) => {
         qmdbFloors.push(request.minSequenceNumber);
-        assert.equal(location, LOCATION);
-        assert.equal(toHex(value), digest);
-        return keylessProof(request, root, location, value);
+        assert.deepEqual(expected, [{ location: LOCATION, value: new Uint8Array(32).fill(0x33) }]);
+        return { root, operations: [], proofSizeBytes: 12 };
     });
 
-    const proof = await fetchAndVerifyTransactionRowProof({
-        qmdbUrl: 'http://qmdb', row: activityRow(digest), target: latestTarget(),
+    const [proof] = await fetchAndVerifyTransactionRowProofs({
+        qmdbUrl: 'http://qmdb', rows: [activityRow(digest)], target: latestTarget(),
     });
 
-    assert.equal(proof.location, LOCATION);
+    assert.equal(proof?.location, LOCATION);
     assert.equal(query.mock.callCount(), 0);
     assert.deepEqual(qmdbFloors, [FLOOR]);
 });
 
 test('transaction row proof waits for a target covering the activity location', async (t) => {
-    const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+    const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppendMany', async () => {
         throw new Error('unexpected proof request');
     });
 
     await assert.rejects(
-        fetchAndVerifyTransactionRowProof({
+        fetchAndVerifyTransactionRowProofs({
             qmdbUrl: 'http://qmdb',
-            row: { ...activityRow('33'.repeat(32)), location: latestTarget().transactionsTip },
+            rows: [{ ...activityRow('33'.repeat(32)), location: latestTarget().transactionsTip }],
             target: latestTarget(),
         }),
         /not yet covered by a provable finalization/,
@@ -1313,6 +1310,21 @@ test('speculative account SQL with an older floor is refreshed before proving', 
     assert.match(queries[0]!, /qmdb_location < 10/);
 });
 
+test('account metadata lookup rejects a missing evaluated sequence before reading its row', async (t) => {
+    t.mock.method(SqlClient.prototype, 'query', async () => ({
+        sequenceNumber: undefined,
+        table: {
+            get numRows(): number { throw new Error('row consumed'); },
+            getChild(): never { throw new Error('row consumed'); },
+        } as unknown as Table,
+    }));
+
+    await assert.rejects(
+        fetchAccountProofMetadata({ sqlUrl: 'http://sql', account: '22'.repeat(32), minSequenceNumber: FLOOR }),
+        /SQL query is missing its evaluated Store sequence/,
+    );
+});
+
 function activityRow(digest: string) {
     return {
         digest, direction: 'sent' as const, counterparty: '44'.repeat(32),
@@ -1349,13 +1361,12 @@ function testTable(rows: readonly Record<string, unknown>[]): Table {
 }
 
 function keylessProof(
-    request: OperationRangeRequest,
+    _request: OperationRangeRequest,
     root: Uint8Array,
     location: bigint,
     value: Uint8Array,
 ): VerifiedFixedKeylessAppendProof {
     return {
-        sequenceNumber: request.minSequenceNumber ?? 0n,
         location,
         value,
         root,
@@ -1365,13 +1376,12 @@ function keylessProof(
 }
 
 function unorderedProof(
-    request: OperationRangeRequest,
+    _request: OperationRangeRequest,
     root: Uint8Array,
     location: bigint,
     key: Uint8Array,
 ): VerifiedFixedUnorderedUpdateProof {
     return {
-        sequenceNumber: request.minSequenceNumber ?? 0n,
         location,
         key,
         value: accountValue(9n, 2n, 3n),
@@ -1812,8 +1822,8 @@ test('a shared finalization attempt is joined only by callers it covers', async 
     const certificate = await finalizedCertificate(HEIGHT);
     const responses: Array<ReturnType<typeof deferred<VerifiedSimplexCertificate>>> = [];
     const floors: bigint[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (_height: string, floor: bigint) => {
-        floors.push(floor);
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, _height: string) {
+        floors.push(this.minSequenceNumber() ?? 0n);
         const response = deferred<VerifiedSimplexCertificate>();
         responses.push(response);
         return response.promise;
@@ -1838,8 +1848,8 @@ test('a replaced lower-floor attempt stops with its own caller while the coverin
     const certificate = await finalizedCertificate(HEIGHT);
     const responses: Array<ReturnType<typeof deferred<VerifiedSimplexCertificate>>> = [];
     const signals: AbortSignal[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-        _height: string, _floor: bigint, options: { signal?: AbortSignal },
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async (
+        _height: string, options: { signal?: AbortSignal },
     ) => {
         signals.push(options.signal!);
         const response = deferred<VerifiedSimplexCertificate>();
@@ -1889,8 +1899,8 @@ function mockDescendantStore(t: test.TestContext, options: DescendantStoreOption
     };
     const headers = new Map([...blocks.values()].map((block) => [toHex(block.digest), block.header]));
 
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
-        recorded.certificateReads.push({ height: BigInt(height), floor });
+    t.mock.method(SimplexReader.prototype, 'getFinalizationByHeight', async function (this: TestSimplexReader, height: string) {
+        recorded.certificateReads.push({ height: BigInt(height), floor: this.minSequenceNumber() ?? 0n });
         if (options.certificate && BigInt(height) !== 7n) return options.certificate(BigInt(height));
         return certified.includes(BigInt(height)) ? chainCertificate(blocks.get(BigInt(height))!) : null;
     });
