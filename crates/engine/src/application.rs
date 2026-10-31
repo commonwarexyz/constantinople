@@ -12,7 +12,7 @@ use commonware_cryptography::{
     certificate::Scheme,
 };
 use commonware_glue::stateful::{
-    Application as StatefulApplication, Input, Proposed, db::DatabaseSet,
+    Application as StatefulApplication, Finality, Input, Proposed, db::DatabaseSet,
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
@@ -259,24 +259,16 @@ where
         })
     }
 
-    async fn verify(
+    async fn process(
         &mut self,
         context: (E, Self::Context),
         ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+        finality: Finality,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         self.inner
-            .verify(context, InnerAncestry::new(ancestry), batches)
+            .process(context, InnerAncestry::new(ancestry), batches, finality)
             .await
-    }
-
-    async fn apply(
-        &mut self,
-        context: (E, Self::Context),
-        block: &Self::Block,
-        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
-    ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
-        self.inner.apply(context, block, batches).await
     }
 
     async fn capture(

@@ -5,7 +5,7 @@ use commonware_codec::{Copying, ReadExt as _};
 use commonware_coding::Config as CodingConfig;
 use commonware_cryptography::Hasher;
 use commonware_p2p::{Blocker, Message, Receiver};
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, num::NonZeroUsize};
 
 /// Blocks peers that send marshal shards coded for a different validator set.
 ///
@@ -72,6 +72,11 @@ where
             }
         }
     }
+
+    /// The filter holds no messages of its own, so it reports the wrapped receiver's capacity.
+    fn capacity(&self) -> NonZeroUsize {
+        self.receiver.capacity()
+    }
 }
 
 #[cfg(test)]
@@ -94,7 +99,7 @@ mod tests {
     };
     use commonware_parallel::Sequential;
     use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
-    use commonware_utils::{NZU16, NZUsize, ordered::Set, probability};
+    use commonware_utils::{NZU16, NZU32, NZUsize, ordered::Set, probability};
     use std::{num::NonZeroU32, time::Duration};
 
     type TestShard = Shard<EngineBlock<Sha256, ed25519::VerifyingKey>, ReedSolomon<Sha256>, Sha256>;
@@ -105,7 +110,7 @@ mod tests {
         success_rate: probability!(1.0),
     };
 
-    const QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
+    const QUOTA: Quota = Quota::per_second(NonZeroU32::MAX).allow_burst(NZU32!(1_024));
 
     fn shard(config: CodingConfig) -> Bytes {
         let (root, shards) = ReedSolomon::<Sha256>::encode(&config, &b"block"[..], &Sequential)

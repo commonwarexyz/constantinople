@@ -17,7 +17,7 @@ use commonware_cryptography::{
 };
 use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_glue::stateful::{
-    Application as StatefulApplication, Input,
+    Application as StatefulApplication, Finality, Input,
     db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
 use commonware_parallel::Sequential;
@@ -418,11 +418,12 @@ fn replay_rejects_invalid_body() {
         )
         .seal(&mut sha256::Sha256::default());
 
-        let result = StatefulApplication::apply(
+        let result = StatefulApplication::process(
             &mut app,
             (context.child("replay"), consensus_context),
-            &block,
+            ancestry::from_iter([Digested::precomputed(block.clone(), block.digest())]),
             dbs.new_batches().await,
+            Finality::Finalized,
         )
         .await;
 
@@ -456,11 +457,12 @@ fn replay_rejects_transaction_floor_past_commit() {
         let block = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
             .seal(&mut sha256::Sha256::default());
 
-        let result = StatefulApplication::apply(
+        let result = StatefulApplication::process(
             &mut app,
             (context.child("replay"), consensus_context),
-            &block,
+            ancestry::from_iter([Digested::precomputed(block.clone(), block.digest())]),
             dbs.new_batches().await,
+            Finality::Finalized,
         )
         .await;
 
@@ -749,11 +751,15 @@ fn prepare_restages_on_a_replacement_parent() {
             )
             .await;
         assert!(accepted.is_some());
-        let applied = StatefulApplication::apply(
+        let applied = StatefulApplication::process(
             &mut app,
             (context.child("apply_p2"), header.context.clone()),
-            &on_p2.block,
+            ancestry::from_iter([Digested::precomputed(
+                on_p2.block.clone(),
+                on_p2.block.digest(),
+            )]),
             fork(&p2_state),
+            Finality::Finalized,
         )
         .await
         .expect("the block applies on P2's state");
@@ -960,11 +966,15 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             .expect("empty proposal must succeed");
         assert_eq!(proposed.block.header.timestamp, parent.header.timestamp);
 
-        let replayed = StatefulApplication::apply(
+        let replayed = StatefulApplication::process(
             &mut app,
             (context.child("replay"), consensus_context.clone()),
-            &proposed.block,
+            ancestry::from_iter([Digested::precomputed(
+                proposed.block.clone(),
+                proposed.block.digest(),
+            )]),
             dbs.new_batches().await,
+            Finality::Finalized,
         )
         .await
         .expect("valid block replays");

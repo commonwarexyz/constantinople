@@ -81,11 +81,16 @@ impl Transfer for PreparedTransfer {
     type Key = AccountKey;
     type Account = TransferAccount;
 
+    /// The sender's change consumes the nonce and debits the value, and the recipient's change
+    /// credits it. A self-transfer lists its sender twice, so both settle as one change that debits
+    /// and credits the value.
     fn changes(&self) -> impl Iterator<Item = (&AccountKey, Change<u64>)> {
         [
-            (&self.sender, Change::Effect(self.nonce)),
-            (&self.sender, Change::Debit(self.value)),
-            (&self.recipient, Change::Credit(self.value)),
+            (
+                &self.sender,
+                Change::debit(self.value).with_effect(self.nonce),
+            ),
+            (&self.recipient, Change::credit(self.value)),
         ]
         .into_iter()
     }

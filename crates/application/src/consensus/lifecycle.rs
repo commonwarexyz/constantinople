@@ -265,7 +265,8 @@ where
         Some(execution.into_merkleized())
     }
 
-    /// Replays a block into speculative batches.
+    /// Replays a finalized block into batches, taking its transaction-history
+    /// floor from its header.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(

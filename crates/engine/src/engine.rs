@@ -93,7 +93,6 @@ const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
-const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -502,7 +501,6 @@ where
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 records: shard_records,
-                background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
             },
         );
