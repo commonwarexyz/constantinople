@@ -1,5 +1,6 @@
 import {
     memo,
+    useCallback,
     useEffect,
     useMemo,
     useRef,
@@ -7,6 +8,7 @@ import {
     type CSSProperties,
 } from 'react';
 import { SqlClient } from '@exowarexyz/sql';
+import { AnalysisDialog } from './AnalysisDialog';
 import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
@@ -99,8 +101,6 @@ const HISTOGRAM_MAX_ROWS = 200;
 const HISTOGRAM_MIN_ROWS = 8;
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const LIVE_STATUS_TEXT = '>>> live';
-const LIVE_STATUS_SYMBOLS = [...LIVE_STATUS_TEXT];
 
 type Status =
     | { kind: 'connecting' }
@@ -136,7 +136,7 @@ interface WalletAccountView {
     readonly nonce: { readonly base: bigint; readonly bitmap: bigint };
 }
 
-type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>>;
+type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>> & { readonly offset: bigint };
 type AccountSnapshot = { readonly height: bigint; readonly blockDigest: Uint8Array };
 
 interface WalletRefresh {
@@ -177,7 +177,7 @@ export default function App() {
     });
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const [isWalletOpen, setIsWalletOpen] = useState(false);
-    const [isSearchOpen, setIsSearchOpen] = useState(false);
+    const [isAnalysisOpen, setIsAnalysisOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
     const [walletAddress, setWalletAddress] = useState<{ wallet: ActiveWallet; key: string } | null>(null);
     const walletAccountKey = walletAddress && walletAddress.wallet === wallet ? walletAddress.key : null;
@@ -192,7 +192,6 @@ export default function App() {
     const [history, setHistory] = useState<SubmittedTransaction[]>([]);
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
-    const [accountInput, setAccountInput] = useState(() => accountFromLocation());
     const [lookupBlock, setLookupBlock] = useState(() => blockFromLocation());
     const [blockOffsets, setBlockOffsets] = useState<bigint[]>([0n]);
     const [blockBundle, setBlockBundle] = useState<BlockBundle | null>(null);
@@ -217,7 +216,6 @@ export default function App() {
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
-    const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const [storageError, setStorageError] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
@@ -397,7 +395,6 @@ export default function App() {
         const onPopState = () => {
             const next = accountFromLocation();
             setLookupAccount(next);
-            setAccountInput(next);
             accountSnapshotRef.current = null;
             setAccountCursorStack([null]);
             setLookupBlock(blockFromLocation());
@@ -423,8 +420,10 @@ export default function App() {
         }
         const retained = accountSnapshotRef.current;
         const at = retained?.account === lookupAccount ? retained.target : undefined;
-        if (!at) setAccountTarget(null);
-        setAccountProof({ status: 'fetching', detail: 'fetching certified account' });
+        if (!at) {
+            setAccountTarget(null);
+            setAccountProof({ status: 'fetching', detail: 'fetching certified account' });
+        }
         setAccountTransactions([]);
         setAccountNextCursor(null);
         setAccountActivityError('loading transactions');
@@ -438,7 +437,7 @@ export default function App() {
             signal: controller.signal,
         }), controller.signal, isRetryableAccountProofError, {
             onRetry: (error) => {
-                setAccountProof(retryingProofState(error));
+                if (!at) setAccountProof(retryingProofState(error));
                 setAccountActivityError(accountRetryReason(error) ?? errorMessage(error));
             },
         }).then((bundle) => {
@@ -455,7 +454,7 @@ export default function App() {
             setAccountActivityError('');
         }).catch((error) => {
             if (controller.signal.aborted) return;
-            setAccountProof({ status: 'error', detail: errorMessage(error) });
+            if (!at) setAccountProof({ status: 'error', detail: errorMessage(error) });
             setAccountActivityError(errorMessage(error));
         });
         return () => controller.abort();
@@ -463,7 +462,7 @@ export default function App() {
 
     useEffect(() => {
         const controller = new AbortController();
-        setBlockBundle(null);
+        setBlockBundle((current) => current?.block.height === lookupBlock ? current : null);
         setBlockMessage('');
         if (lookupBlock === null) {
             setBlockLoading(false);
@@ -477,7 +476,7 @@ export default function App() {
             onRetry: (error) => setBlockMessage(accountRetryReason(error) ?? errorMessage(error)),
         }).then((bundle) => {
             if (controller.signal.aborted) return;
-            setBlockBundle(bundle);
+            setBlockBundle({ ...bundle, offset: currentBlockOffset });
             setBlockMessage('');
             setBlockLoading(false);
         }).catch((error) => {
@@ -816,15 +815,14 @@ export default function App() {
         }
     };
 
-    const openAccountPage = (value: string): boolean => {
+    const openAccountPage = useCallback((value: string): boolean => {
         const normalized = normalizeAccountInput(value);
         if (!normalized) return false;
 
-        setSearchMessage('');
+        setIsAnalysisOpen(false);
         if (normalized !== lookupAccount) accountSnapshotRef.current = null;
         setLookupAccount(normalized);
         setLookupBlock(null);
-        setAccountInput(normalized);
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
         url.pathname = '/';
@@ -835,22 +833,22 @@ export default function App() {
             window.history.pushState(null, '', nextLocation);
         }
         setIsWalletOpen(false);
-        setIsSearchOpen(false);
         return true;
+    }, [lookupAccount]);
+
+    const openAnalysis = () => {
+        setIsAnalysisOpen(true);
+        setIsWalletOpen(false);
     };
 
-    const submitAccountLookup = () => {
-        if (openAccountPage(accountInput)) return;
-        setSearchMessage('expected a 32-byte address');
-    };
+    const closeAnalysis = useCallback(() => setIsAnalysisOpen(false), []);
 
     const clearAccountLookup = () => {
+        setIsAnalysisOpen(false);
         setLookupAccount('');
         setLookupBlock(null);
-        setAccountInput('');
         accountSnapshotRef.current = null;
         setAccountCursorStack([null]);
-        setSearchMessage('');
         const url = new URL(window.location.href);
         url.pathname = '/';
         url.searchParams.delete('block');
@@ -861,9 +859,9 @@ export default function App() {
         }
     };
 
-    const openBlockPage = (height: bigint) => {
+    const openBlockPage = useCallback((height: bigint) => {
+        setIsAnalysisOpen(false);
         setLookupAccount('');
-        setAccountInput('');
         accountSnapshotRef.current = null;
         setLookupBlock(height);
         setBlockOffsets([0n]);
@@ -872,7 +870,7 @@ export default function App() {
         url.searchParams.delete('account');
         url.searchParams.set('block', height.toString());
         window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
-    };
+    }, []);
 
     const refreshAccountPage = () => {
         accountSnapshotRef.current = null;
@@ -1102,17 +1100,24 @@ export default function App() {
                         </button>
                     </h1>
                     <div className="app__header-actions">
-                        <StatusBadge status={status} spinner={spinner} />
-                        <span className="app__header-separator" aria-hidden="true">
-                            ⬝
-                        </span>
-                        <button className="wallet-trigger" onClick={() => setIsSearchOpen(true)}>
+                        {(status.kind !== 'live' || lookupAccount !== '' || lookupBlock !== null) && (
+                            <>
+                                <StatusBadge status={status} spinner={spinner} height={blocks[0]?.height ?? null} />
+                                <span className="app__header-separator" aria-hidden="true">
+                                    ⬝
+                                </span>
+                            </>
+                        )}
+                        <button className="wallet-trigger" aria-expanded={isAnalysisOpen} onClick={openAnalysis}>
                             search
                         </button>
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
-                        <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
+                        <button className="wallet-trigger" onClick={() => {
+                            setIsAnalysisOpen(false);
+                            setIsWalletOpen(true);
+                        }}>
                             wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
                         </button>
                     </div>
@@ -1123,7 +1128,7 @@ export default function App() {
                     </div>
                 )}
                 <main className="app__main app__main--minimal">
-                    <section className="explorer-stage" aria-label="live transaction throughput">
+                    <section className="explorer-stage" aria-label="block explorer">
                         {lookupAccount ? (
                             <AccountPage
                                 account={lookupAccount}
@@ -1145,7 +1150,8 @@ export default function App() {
                         ) : lookupBlock !== null ? (
                             <BlockPage
                                 height={lookupBlock}
-                                bundle={blockBundle}
+                                offset={currentBlockOffset}
+                                bundle={blockBundle?.block.height === lookupBlock ? blockBundle : null}
                                 message={blockMessage}
                                 loading={blockLoading}
                                 pageNumber={blockOffsets.length}
@@ -1174,6 +1180,15 @@ export default function App() {
                         )}
                     </section>
                 </main>
+                <AnalysisDialog
+                    open={isAnalysisOpen}
+                    endpoint={indexerUrl}
+                    suggestedAccount={lookupAccount || walletAccountKey || ''}
+                    latestHeight={blocks[0]?.height ?? null}
+                    onClose={closeAnalysis}
+                    onOpenAccount={openAccountPage}
+                    onOpenBlock={openBlockPage}
+                />
                 {isWalletOpen && (
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
                         <WalletPanel
@@ -1206,19 +1221,6 @@ export default function App() {
                             onOpenAddress={openAccountPage}
                         />
                     </WalletModal>
-                )}
-                {isSearchOpen && (
-                    <SearchModal onClose={() => setIsSearchOpen(false)}>
-                        <AccountSearchPanel
-                            accountInput={accountInput}
-                            message={searchMessage}
-                            onAccountInputChange={(value) => {
-                                setAccountInput(value);
-                                setSearchMessage('');
-                            }}
-                            onSubmit={submitAccountLookup}
-                        />
-                    </SearchModal>
                 )}
                 {copyToast && <TerminalToast message={copyToast} />}
             </div>
@@ -1259,6 +1261,8 @@ function AccountPage({
     onNext: () => void;
     onRefresh: () => void;
 }) {
+    const transactionProof = transactions[0]?.proof;
+    const proofItems = new Set(transactions.map(({ row }) => row.location)).size;
     return (
         <section className="account-page" aria-label="account proof">
             <div className="account-page__title">
@@ -1269,8 +1273,14 @@ function AccountPage({
                 <span className="account-page__prompt">address</span>
                 <CopyableValue value={account} onCopy={onCopy} />
             </div>
-            <div className="account-proof-grid">
+            <div className="account-proof-grid account-proof-grid--account">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
+                <ProofDatum
+                    label="proof"
+                    value={transactionProof?.status === 'verified'
+                        ? `op${transactionProof.tip} / ${proofItems}L`
+                        : '-'}
+                />
                 <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
                 <ProofDatum
                     label="state"
@@ -1284,7 +1294,10 @@ function AccountPage({
                     label="state proof"
                     value={
                         proof.status === 'verified'
-                            ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b`
+                            ? <span className="proof-badge" title={`${proof.detail}; loc ${proof.location}; ${proof.proofSizeBytes.toLocaleString()} bytes`}>
+                                <span className="tx-proof-check" aria-label="QMDB proof verified">✓</span>
+                                <span>{proof.proofSizeBytes.toLocaleString()} bytes</span>
+                            </span>
                             : proof.status === 'missing'
                                 ? 'not available'
                                 : proof.status
@@ -1343,9 +1356,6 @@ function AccountPage({
                             <span>value {row.value.toString()}</span>
                             <span>nonce {row.nonce.toString()}</span>
                             <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
-                            <span>proof</span>
-                            <ProofMark proof={txProof} />
-                            {txProof.status === 'verified' && <span>{txProof.proofSizeBytes}b shared</span>}
                         </div>
                     </div>
                 ))}
@@ -1355,10 +1365,11 @@ function AccountPage({
 }
 
 function BlockPage({
-    height, bundle, message, loading, pageNumber, hasPrevious,
+    height, offset, bundle, message, loading, pageNumber, hasPrevious,
     onPrevious, onNext, onCopy, onOpenAddress,
 }: {
     height: bigint;
+    offset: bigint;
     bundle: BlockBundle | null;
     message: string;
     loading: boolean;
@@ -1369,27 +1380,34 @@ function BlockPage({
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
 }) {
+    const page = bundle?.offset === offset ? bundle : null;
+    const transactionProof = page?.transactions[0]?.proof;
     return (
         <section className="account-page" aria-label="certified block">
             <div className="account-page__title">block {height.toString()}</div>
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : loading ? 'loading certificate' : '-'} />
+                <ProofDatum
+                    label="proof"
+                    value={page && transactionProof
+                        ? `op${transactionProof.tip} / ${page.transactions.length}L`
+                        : '-'}
+                />
                 <ProofDatum label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '-'} />
                 <ProofDatum label="transactions" value={bundle?.block.transactionCount.toString() ?? '-'} />
-                <ProofDatum label="proof" value={bundle ? 'verified' : loading ? 'loading' : 'unavailable'} />
             </div>
             <div className="account-page__subhead">
                 <span>transactions / page {pageNumber}</span>
                 <div className="account-page__pager">
                     <button disabled={!hasPrevious || loading} onClick={onPrevious}>prev</button>
-                    <button disabled={loading || !bundle || bundle.nextOffset === null} onClick={onNext}>next</button>
+                    <button disabled={loading || !page || page.nextOffset === null} onClick={onNext}>next</button>
                 </div>
             </div>
             {message && <div className="account-tx-row" role="status">{message}</div>}
             {loading && !message && <div className="account-tx-row" role="status">loading certified transactions</div>}
-            {bundle && bundle.transactions.length === 0 && <div className="account-tx-row">no transactions in this block</div>}
+            {page && page.transactions.length === 0 && <div className="account-tx-row">no transactions in this block</div>}
             <div className="account-tx-list">
-                {bundle?.transactions.map((transaction) => (
+                {page?.transactions.map((transaction) => (
                     <div className="account-tx-row" key={transaction.location.toString()}>
                         <div className="account-tx-row__main">
                             <CopyableValue value={transaction.digest} onCopy={onCopy} />
@@ -1402,9 +1420,6 @@ function BlockPage({
                             <span>value {transaction.value.toString()}</span>
                             <span>nonce {transaction.nonce.toString()}</span>
                             <span>loc {transaction.location.toString()}</span>
-                            <span>proof</span>
-                            <ProofMark proof={verifiedProofState(transaction.proof)} />
-                            <span>{transaction.proof.proofSizeBytes}b shared</span>
                         </div>
                     </div>
                 ))}
@@ -1413,96 +1428,12 @@ function BlockPage({
     );
 }
 
-function ProofDatum({ label, value }: { label: string; value: string }) {
+function ProofDatum({ label, value }: { label: string; value: React.ReactNode }) {
     return (
         <div className="account-proof-grid__cell">
             <span>{label}</span>
             <strong>{value}</strong>
         </div>
-    );
-}
-
-function ProofMark({ proof }: { proof: TransactionProofState }) {
-    if (proof.status === 'verified') {
-        return <span className="tx-proof-check" title={proof.detail}>✓</span>;
-    }
-    if (proof.status === 'error') {
-        return <span className="tx-proof-error" title={proof.detail}>!</span>;
-    }
-    return <span className="tx-proof-spinner" title={proof.detail} />;
-}
-
-function SearchModal({
-    children,
-    onClose,
-}: {
-    children: React.ReactNode;
-    onClose: () => void;
-}) {
-    useEffect(() => {
-        const closeOnEscape = (event: KeyboardEvent) => {
-            if (event.key !== 'Escape') return;
-            onClose();
-        };
-        window.addEventListener('keydown', closeOnEscape);
-        return () => window.removeEventListener('keydown', closeOnEscape);
-    }, [onClose]);
-
-    return (
-        <div
-            className="modal"
-            role="presentation"
-            onMouseDown={(event) => {
-                if (event.target === event.currentTarget) onClose();
-            }}
-        >
-            <section className="modal__panel modal__panel--search" role="dialog" aria-modal="true" aria-label="account search">
-                <header className="modal__header">
-                    <h2>search</h2>
-                    <button className="modal__close" onClick={onClose}>
-                        close
-                    </button>
-                </header>
-                {children}
-            </section>
-        </div>
-    );
-}
-
-function AccountSearchPanel({
-    accountInput,
-    message,
-    onAccountInputChange,
-    onSubmit,
-}: {
-    accountInput: string;
-    message: string;
-    onAccountInputChange: (value: string) => void;
-    onSubmit: () => void;
-}) {
-    return (
-        <section className="account-search">
-            <form
-                className="account-lookup"
-                onSubmit={(event) => {
-                    event.preventDefault();
-                    onSubmit();
-                }}
-            >
-                <label>
-                    <span>account&gt;</span>
-                    <input
-                        autoFocus
-                        value={accountInput}
-                        onChange={(event) => onAccountInputChange(event.target.value)}
-                        placeholder="address"
-                        spellCheck={false}
-                    />
-                </label>
-                <button type="submit">open</button>
-            </form>
-            {message && <div className="account-search__message">{message}</div>}
-        </section>
     );
 }
 
@@ -2140,7 +2071,7 @@ function useBrailleSpinner(active: boolean): string {
     return BRAILLE_SPINNER[index];
 }
 
-function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
+function StatusBadge({ status, spinner, height }: { status: Status; spinner: string; height: bigint | null }) {
     if (status.kind === 'connecting') {
         return (
             <span className="app__status">
@@ -2160,15 +2091,8 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
         );
     }
     return (
-        <span className="app__status live">
-            <span className="app__live-text" aria-hidden="true">
-                {LIVE_STATUS_SYMBOLS.map((symbol, index) => (
-                    <span className="app__live-symbol" key={index}>
-                        {symbol}
-                    </span>
-                ))}
-            </span>
-            <span className="visually-hidden">live</span>
+        <span className="app__status">
+            height <span className="accent">{height?.toString() ?? '—'}</span>
         </span>
     );
 }
@@ -2338,7 +2262,10 @@ const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
     blocks: ObservedBlock[];
     onOpenBlock: (height: bigint) => void;
 }) {
-    const recent = blocks.slice(0, BLOCK_LOG_MAX);
+    // Hover and focus hold the displayed rows in place for selection.
+    const [pausedBlocks, setPausedBlocks] = useState<ObservedBlock[] | null>(null);
+    const pointerInside = useRef(false);
+    const recent = (pausedBlocks ?? blocks).slice(0, BLOCK_LOG_MAX);
     const formatter = useMemo(
         () =>
             new Intl.DateTimeFormat(undefined, {
@@ -2360,7 +2287,27 @@ const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
                 <span># txs</span>
                 <span>timestamp</span>
             </div>
-            <div className="block-log__list">
+            <div
+                className="block-log__list"
+                onPointerEnter={(event) => {
+                    if (event.pointerType === 'touch') return;
+                    pointerInside.current = true;
+                    setPausedBlocks((current) => current ?? blocks);
+                }}
+                onPointerLeave={(event) => {
+                    if (event.pointerType === 'touch') return;
+                    pointerInside.current = false;
+                    if (!event.currentTarget.contains(document.activeElement)) {
+                        setPausedBlocks(null);
+                    }
+                }}
+                onFocus={() => setPausedBlocks((current) => current ?? blocks)}
+                onBlur={(event) => {
+                    if (!pointerInside.current && !event.currentTarget.contains(event.relatedTarget)) {
+                        setPausedBlocks(null);
+                    }
+                }}
+            >
                 {recent.map((block) => (
                     <BlockLogRow key={block.height.toString()} block={block} formatter={formatter} onOpenBlock={onOpenBlock} />
                 ))}
@@ -2380,7 +2327,20 @@ const BlockLogRow = memo(function BlockLogRow({
 }) {
     const hash = useMemo(() => bytesToHex(block.digest), [block.digest]);
     return (
-        <button type="button" className="block-row" onClick={() => onOpenBlock(block.height)} aria-label={`view block ${block.height}`}>
+        <button
+            type="button"
+            className="block-row"
+            onPointerDown={(event) => {
+                if (event.pointerType === 'touch') {
+                    event.currentTarget.focus({ preventScroll: true });
+                }
+            }}
+            onPointerCancel={(event) => {
+                if (event.pointerType === 'touch') event.currentTarget.blur();
+            }}
+            onClick={() => onOpenBlock(block.height)}
+            aria-label={`view block ${block.height}`}
+        >
             <span className="block-row__height">{block.height.toString()}</span>
             <span className="block-row__hash" title={hash}>
                 {shortHex(hash)}

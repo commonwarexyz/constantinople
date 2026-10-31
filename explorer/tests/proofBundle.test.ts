@@ -208,6 +208,66 @@ test('real publisher certificates and proofs authenticate direct, descendant, em
     assert.equal(transaction.location, last.transactions.at(-1)!.location);
 });
 
+test('repeated certificates reuse only the last authenticated target and still hash transaction bodies', async (t) => {
+    const fixture = await publisherFixture();
+    const opts = fixtureOptions(fixture);
+    await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
+    const header = fixture.descendantBlock.headers.at(-1)!;
+    assert.ok(fixture.directBlock.certificate.endsWith(header));
+    const digest = t.mock.method(crypto.subtle, 'digest');
+    const headerHashes = () => digest.mock.calls.filter(({ arguments: [, bytes] }) =>
+        toHex(new Uint8Array(bytes as ArrayBuffer)) === header).length;
+    const bodyHashes = () => digest.mock.calls.filter(({ arguments: [, bytes] }) => bytes.byteLength === 82).length;
+
+    const first = await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock);
+    assert.equal(headerHashes(), 1);
+    assert.equal(bodyHashes(), 3);
+    const repeated = await verifyBlockBundle({ ...opts, height: 1n }, { ...fixture.directBlock, sequenceNumber: '10' });
+    assert.equal(repeated.target.sequenceNumber, 10n);
+    assert.equal(first.target.sequenceNumber, 9n);
+    assert.equal(bodyHashes(), 6);
+    assert.equal(headerHashes(), 1);
+
+    await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
+    await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock);
+    assert.equal(headerHashes(), 2);
+    assert.equal(bodyHashes(), 9);
+});
+
+test('certificate reuse requires every signed and unsigned byte to match', async () => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), height: 1n };
+    const expected = await verifyBlockBundle(opts, fixture.directBlock);
+    const changedSignature = fromHex(fixture.directBlock.certificate);
+    changedSignature[0] ^= 1;
+    const changedHeader = fromHex(fixture.directBlock.certificate);
+    changedHeader[changedHeader.length - 1] ^= 1;
+    for (const [certificate, error] of [
+        [toHex(changedSignature), /finalization certificate verification failed/],
+        [toHex(changedHeader), /header digest/],
+        [`${fixture.directBlock.certificate}00`, /trailing bytes/],
+    ] as const) {
+        await assert.rejects(verifyBlockBundle(opts, { ...fixture.directBlock, certificate }), error);
+        assert.deepEqual(await verifyBlockBundle(opts, fixture.directBlock), expected);
+    }
+});
+
+test('returned target buffers cannot mutate a reused certificate target', async () => {
+    const fixture = await publisherFixture();
+    const opts = fixtureOptions(fixture);
+    await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
+    const first = await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock);
+    const expected = structuredClone(first);
+    for (const result of [first, await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock)]) {
+        assert.deepEqual(result, expected);
+        for (const value of Object.values(result.target)) {
+            if (value instanceof Uint8Array) value.fill(0);
+        }
+        result.block.blockDigest.fill(0);
+    }
+    assert.deepEqual(await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock), expected);
+});
+
 test('single-transaction finalization reports its owning block before membership verification', async () => {
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), digest: fixture.transactionDigest };

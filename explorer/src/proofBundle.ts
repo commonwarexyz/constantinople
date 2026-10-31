@@ -19,7 +19,11 @@ const TRANSACTION_BODY_BYTES = 82;
 const MAX_TRANSACTION_BYTES = 919;
 const verifier = new QmdbProofVerifier({ merkleFamily: 'mmr', hashFamily: 'sha256' });
 type CertificateVerifier = SimplexCertificateVerifier<VerifiedSimplexCertificate, VerifiedSimplexCertificate>;
-const certificateInitializations = new Map<string, Promise<CertificateVerifier>>();
+interface CertificateContext {
+    readonly verifier: CertificateVerifier;
+    lastVerified?: { readonly certificate: Uint8Array; readonly target: Omit<CertifiedTarget, 'sequenceNumber'> };
+}
+const certificateInitializations = new Map<string, Promise<CertificateContext>>();
 
 interface CommonOptions {
     readonly qmdbUrl: string;
@@ -91,7 +95,7 @@ export interface VerifiedBlockBundle {
 }
 
 export async function prewarmProofVerification(material: string): Promise<void> {
-    await Promise.all([certificateVerifier(material), initQmdbWasm()]);
+    await Promise.all([certificateContext(material), initQmdbWasm()]);
 }
 
 export async function loadAccountBundle(options: AccountBundleOptions): Promise<VerifiedAccountBundle> {
@@ -266,17 +270,28 @@ async function loadEnvelope(options: CommonOptions, path: string): Promise<unkno
 
 async function certifiedTarget(options: CommonOptions, envelope: Envelope): Promise<CertifiedTarget> {
     options.signal?.throwIfAborted();
-    const certificates = await certificateVerifier(options.simplexVerificationMaterial);
+    const context = await certificateContext(options.simplexVerificationMaterial);
     options.signal?.throwIfAborted();
-    const certificate = await certificates.verifyFinalization(envelope.certificate, {
-        kind: 'finalization', index: 'latest', height: 0n,
-        key: new Uint8Array(), value: envelope.certificate, source: 'get',
-    });
-    if (!certificate) throw new Error('aggregate finalization certificate is invalid');
-    const target = await finalizedTargetFromCertificate(certificate);
-    if (target.height === 0n || certificate.header.length > 100 + 512) throw new Error('invalid certified execution header');
+    let verified = context.lastVerified;
+    // The envelope owns these bytes, including the unsigned header bound to the signed commitment.
+    if (!verified || !bytesEqual(verified.certificate, envelope.certificate)) {
+        const certificate = await context.verifier.verifyFinalization(envelope.certificate, {
+            kind: 'finalization', index: 'latest', height: 0n,
+            key: new Uint8Array(), value: envelope.certificate, source: 'get',
+        });
+        if (!certificate) throw new Error('aggregate finalization certificate is invalid');
+        const target = await finalizedTargetFromCertificate(certificate);
+        if (target.height === 0n || certificate.header.length > 100 + 512) throw new Error('invalid certified execution header');
+        verified = { certificate: envelope.certificate, target };
+    }
     options.signal?.throwIfAborted();
-    return { ...target, sequenceNumber: envelope.sequenceNumber };
+    context.lastVerified = verified;
+    const target = verified.target;
+    return {
+        ...target, blockDigest: target.blockDigest.slice(), parentDigest: target.parentDigest.slice(),
+        stateRoot: target.stateRoot.slice(), transactionsRoot: target.transactionsRoot.slice(),
+        sequenceNumber: envelope.sequenceNumber,
+    };
 }
 
 async function owningBlock(target: CertifiedTarget, envelope: Envelope, height: bigint, signal?: AbortSignal) {
@@ -383,12 +398,12 @@ function parseEnvelope(raw: unknown, pageSize: number): Envelope {
     };
 }
 
-function certificateVerifier(material: string): Promise<CertificateVerifier> {
+function certificateContext(material: string): Promise<CertificateContext> {
     const key = material.trim().toLowerCase();
     if (!/^(?:[0-9a-f]{2})+$/.test(key) || key.length > 2 * 1024 * 1024) throw new Error('invalid Simplex verification material');
     let pending = certificateInitializations.get(key);
     if (!pending) {
-        pending = simplexFinalizationVerifier(key);
+        pending = simplexFinalizationVerifier(key).then((verifier) => ({ verifier }));
         certificateInitializations.set(key, pending);
         pending.catch(() => { if (certificateInitializations.get(key) === pending) certificateInitializations.delete(key); });
         if (certificateInitializations.size > 4) certificateInitializations.delete(certificateInitializations.keys().next().value!);

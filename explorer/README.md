@@ -71,6 +71,31 @@ publication remain retryable. Combined responses are bounded to 8 MiB and
 4096 ancestry headers; requests exceeding the supported ancestry length return
 a terminal error.
 
+### SQL analysis
+
+The **search** button opens the SQL popup with its previous draft and results.
+Choose an example, edit it, and use **run query** or Command/Ctrl+Enter.
+The schema and query guide lists the available columns and address syntax.
+
+Results include a table and, when suitable columns are present, a chart.
+Aliases `x` and `y` select chart axes; the chart controls can also change them.
+Single-row numeric results appear as totals. Balance history is plotted by
+state operation location because account-state rows have no timestamp.
+`finalized_ts` in block queries is the publisher's observed time.
+SQL results are index data and do not carry the certificate and proof checks
+used by the account and block viewers.
+
+The popup shows elapsed request-and-decode time, returned rows, columns,
+Arrow batches, and the observed Store sequence. The SQL service returns one
+complete response and exposes no scan progress or server execution timing,
+so the progress bar is indeterminate. Cancel or closing the popup stops the
+browser request; it does not guarantee that server computation has stopped.
+
+The editor accepts one `SELECT` or `WITH` query, caps the result at 1,000 rows,
+and uses a 30-second request deadline without automatic retries. The row cap
+does not bound scanned input; use indexed predicates and bounded examples.
+The editor guard is a convenience, not authorization on the SQL service.
+
 ### Why SQL?
 
 The indexer publishes every finalized block to complementary surfaces
