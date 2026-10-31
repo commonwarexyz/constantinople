@@ -967,6 +967,14 @@ body {
 }
 
 .block-row {
+    width: 100%;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--theme-text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
     display: grid;
     grid-template-columns: var(--block-log-columns);
     align-items: center;
@@ -975,6 +983,16 @@ body {
     border-bottom: 1px solid var(--theme-border);
     overflow: hidden;
     animation: block-row-in 180ms ease-out both;
+}
+
+.block-row:hover,
+.block-row:focus-visible {
+    background: var(--theme-row-alt);
+}
+
+.block-row:focus-visible {
+    outline: 1px solid var(--theme-accent);
+    outline-offset: -1px;
 }
 
 .block-row:last-child {

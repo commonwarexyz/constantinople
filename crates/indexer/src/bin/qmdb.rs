@@ -12,6 +12,7 @@ use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
 use constantinople_indexer::{
     adapter::{self, BoxError, Profile},
+    explorer,
     namespaces::{STATE_PROOF_CHUNK_SIZE, state_qmdb_client, transactions_qmdb_client},
 };
 use constantinople_primitives::{Account, AccountKey};
@@ -36,7 +37,7 @@ type AccountValue = FixedBytes<{ Account::SIZE }>;
 type TransactionValue = commonware_cryptography::sha256::Digest;
 
 fn build_routes(client: &StoreClient) -> Result<Router, BoxError> {
-    Ok(Router::new()
+    Ok(explorer::router(client)?
         .nest_service(
             "/state",
             unordered_operation_log_stack::<

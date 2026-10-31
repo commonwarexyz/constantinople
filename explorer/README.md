@@ -1,8 +1,8 @@
 # constantinople / explorer
 
-A small React + Vite app that streams newly finalized blocks from the
-constantinople indexer's SQL metadata path, verifies submitted-transaction
-proofs through QMDB, and renders both as they arrive.
+A React + Vite app for finalized blocks, accounts, and wallet transactions.
+The browser verifies finalization certificates and QMDB proofs before displaying
+authenticated balances or transaction results.
 
 ## What it does
 
@@ -35,36 +35,41 @@ Account nonce advancement and missing SQL metadata do not prove rejection, so
 unresolved submissions keep their reservations. Reload retries proof errors after
 backend or verifier repairs.
 
-The explorer distinguishes validator-reported finalization from verified
-certificates and proofs. Once the reported height is published, its certificate
-and `tx_meta` row are read concurrently. The reported height is a lookup hint;
-the `tx_meta` row records the transaction's containing height and QMDB
-location. Reconciliation checks the certificate at that height and the
-transaction body digest. It authenticates the parent header through the
-certified header's parent digest and checks the location within the block's
-own transaction appends before verifying the QMDB operation-log proof under
-`/transactions`. The parent header read starts once the certificate verifies,
-overlapping the `tx_meta` read. Block 1 needs no parent read: genesis is never
-uploaded, but its empty body places block 1's appends right after the start
-of its certified range. Together these checks authenticate the exact inclusion height.
-The UI records finalization observation and successful proof verification
+Wallet balances, account pages, and transaction reconciliation each use one
+combined response from `qmdb-indexer`. It contains the certificate, account
+proof when present, signed transaction bodies, and one transaction multi-proof
+for the page. WebAssembly initialization overlaps the request. The browser
+verifies the certificate and proofs locally, recomputes transaction digests,
+and derives sender, recipient, value, and nonce from their authenticated bodies.
+Account-list heights and indices remain SQL hints; block and single-transaction
+views authenticate the transaction's exact inclusion height and index.
+The UI records validator-reported finalization and successful proof verification
 separately.
 
-Account pages show the certificate as soon as it is verified and load state
-and transaction proofs concurrently. Each `tx_activity` row carries its
-transaction's QMDB location, so activity proofs need no further SQL reads.
-One QMDB multi-proof authenticates all distinct locations and their expected
-digests on the selected page under one retained certificate. Duplicate locations
-must agree on the digest. A newer page shares one certificate refresh across its
-rows. The ten-row page fits the service's 1024-location limit; oversized batches
-are rejected before making a request. A failed batch leaves every row waiting
-or in error according to the same retry rules as individual proofs. Each row's
-shared byte count is the full multi-proof size, not an additional per-row cost.
-Account-state retries do not restart transaction proofs already in progress.
+An account page selects a published, certified snapshot and retains its height
+and digest while paging through ten transactions at a time. Changing the
+activity filter retains that snapshot; refreshing selects a new one. Wallet
+balance requests omit activity. A returned account update proves membership
+under the snapshot's state root. This historical proof does not establish that
+the update is the latest for the account, and an absent account result does not
+prove nonexistence. Activity proofs authenticate returned transactions but do
+not prove that the index supplied the complete account history.
 
-The publication target's Store sequence becomes the minimum sequence for
-related SQL, Simplex, and QMDB reads. A lagging query node must catch up instead
-of returning a stale miss.
+Clicking a homepage block opens its transactions in pages of 50. A block can be
+covered by a later finalization certificate. The response carries the intervening
+headers, and the browser verifies their hashes and heights back to the requested
+block and its parent. Their transaction boundaries identify the block's own
+appends. Each returned location must fill the requested interval and verify
+against the covering certificate's transaction root. This also authenticates
+empty blocks. Transaction reconciliation uses the same ancestry and membership
+checks to establish the exact inclusion height.
+
+The server selects a target covered by both publication and a certificate.
+Related Store reads use its sequence as a minimum visibility floor; the
+certificate's digest, roots, and tips identify the snapshot. Temporary gaps in
+publication remain retryable. Combined responses are bounded to 8 MiB and
+4096 ancestry headers; requests exceeding the supported ancestry length return
+a terminal error.
 
 ### Why SQL?
 
@@ -88,7 +93,7 @@ The indexer publishes every finalized block to complementary surfaces
 | Env var | Default | Notes |
 | ------- | ------- | ----- |
 | `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
-| `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service. Matches the local-deploy `--qmdb-indexer-port` default. |
+| `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service, including combined account, block, and transaction reads. Matches the local-deploy `--qmdb-indexer-port` default. |
 | `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for Simplex artifacts and provable-target updates. |
 | `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction admission endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
@@ -99,8 +104,22 @@ server can talk to them cross-origin without a Vite proxy.
 ## Local development
 
 ```sh
-npm install
+just explorer-install
+cd explorer
 npm run dev
+```
+
+The four `@exowarexyz` browser packages must support the indexer's proof APIs.
+Their `2026.9.0` npm release lacks the standalone verifier required by the
+explorer. Until matching packages are published and pinned, use the Exoware
+revision pinned in the root [`Cargo.toml`](../Cargo.toml). Build `sdk/ts`,
+`qmdb/ts`, `simplex/ts`, and `sql/ts` in that checkout, then install them together
+from this repository's root:
+
+```sh
+just explorer-install --no-save --package-lock=false \
+  /path/to/exoware/sdk/ts /path/to/exoware/qmdb/ts \
+  /path/to/exoware/simplex/ts /path/to/exoware/sql/ts
 ```
 
 The dev server defaults to <http://localhost:5173>. To get live data,

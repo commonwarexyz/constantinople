@@ -13,7 +13,7 @@ use crate::{
 };
 use bytes::{BufMut, Bytes};
 use commonware_codec::{
-    Buf, DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write,
+    Buf, DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Viewing, Write,
     types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
@@ -226,40 +226,6 @@ impl<H: Hasher> Clone for LazySignedTransaction<H> {
     }
 }
 
-/// A cursor over encoded bytes that shares storage only for retained fields.
-struct BytesView<'a> {
-    bytes: &'a Bytes,
-    pos: usize,
-}
-
-impl bytes::Buf for BytesView<'_> {
-    #[inline]
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.pos
-    }
-
-    #[inline]
-    fn chunk(&self) -> &[u8] {
-        &self.bytes[self.pos..]
-    }
-
-    #[inline]
-    fn advance(&mut self, cnt: usize) {
-        assert!(cnt <= self.remaining(), "advance past end of buffer");
-        self.pos += cnt;
-    }
-
-    #[inline]
-    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
-        assert!(len <= self.remaining(), "copy_to_bytes past end of buffer");
-        let bytes = self.bytes.slice(self.pos..self.pos + len);
-        self.pos += len;
-        bytes
-    }
-}
-
-impl Buf for BytesView<'_> {}
-
 impl<H> LazySignedTransaction<H>
 where
     H: Hasher,
@@ -282,7 +248,7 @@ where
                     .pending
                     .as_ref()
                     .expect("pending bytes must exist when value is absent");
-                SignedTransaction::decode(BytesView { bytes, pos: 0 }).ok()
+                SignedTransaction::decode(Viewing::new(bytes)).ok()
             })
             .as_ref()
     }

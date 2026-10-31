@@ -7,7 +7,7 @@ validators into an [exoware](https://exoware.xyz) store via
 The validator-side indexer is **publish-only**. Querying is served by the
 `chain-indexer` Store, by the
 [`exoware-sql`](https://docs.rs/exoware-sql) SQL server for metadata tables,
-and by `qmdb-indexer` for QMDB operation-log proofs.
+and by `qmdb-indexer` for QMDB operation-log proofs and combined explorer reads.
 
 ## Storage paths
 
@@ -63,8 +63,9 @@ The digest-keyed `tx_meta` row contract is:
 
 A transaction proof needs the finalized height that contains the transaction
 and its QMDB location. `tx_meta` carries both, so a digest lookup is one point
-read. Each `tx_activity` row also carries its transaction's `qmdb_location`, so
-account pages prove their rows without reading `tx_meta`.
+read. Each `tx_activity` row also carries its transaction's `qmdb_location`.
+Combined account reads use those locations for one multi-proof and fetch the
+signed transaction bodies with a batch of digest-keyed `tx_meta` lookups.
 
 Proofs become queryable once a grouped publication barrier covers the upload
 that carried the transaction. The publisher writes append-only publication
@@ -72,20 +73,22 @@ targets in the same Store batch that establishes coverage in both QMDB
 families. Their big-endian height keys make one reverse range read return the
 newest covered block digest.
 
-The explorer uses that range read only to initialize or recover its direct
+The explorer homepage uses that range read to initialize or recover its direct
 Store subscription. Each target update includes the atomic Store batch
-sequence. Related SQL, Simplex, and QMDB reads use that sequence as their
-freshness floor.
+sequence. Combined explorer reads select a certified target covered by the
+publication boundary, then use its sequence as the minimum visibility floor
+for related SQL, Simplex, and QMDB reads. The certificate's digest, roots, and
+tips identify the snapshot independently of that floor.
 
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate. Height/latest reads start from a
 finalization certificate, verify the commitment/header relationship, and fetch
 the full body only when requested. A height finalized through a descendant
 certificate, or backfilled after downtime, may have no certificate available at
-capture. Explorer can authenticate that height using a verified descendant
-certificate and the parent-header chain. It batches header reads using SQL
-digest hints and verifies every link. Missing proof inputs remain retryable
-while their uploads catch up.
+capture. Combined explorer reads assemble a descendant certificate and the
+parent-header chain using batched SQL digest lookups. The browser verifies
+every link and proves the requested transactions against the certified QMDB
+root. Missing proof inputs remain retryable while their uploads catch up.
 
 [kvschema]: https://docs.rs/exoware-sql/latest/exoware_sql/struct.KvSchema.html
 
@@ -119,7 +122,36 @@ while their uploads catch up.
   so the explorer can reach the `sql.v1.Service` `Subscribe` RPC.
 - `[[bin]] qmdb-indexer` — QMDB Connect facade over the same Store. It mounts
   account-state operation logs at `/state` and transaction-hash operation logs
-  at `/transactions`.
+  at `/transactions`, alongside the combined reads below.
+
+## Combined explorer reads
+
+These GET routes return certificates and raw QMDB proofs for independent client
+verification. They share the QMDB service's CORS configuration.
+
+| Route | Parameters | Result |
+| ----- | ---------- | ------ |
+| `/explorer/accounts/{account}` | 32-byte hex account; optional `mode=all\|sent\|received`, 24-byte hex `cursor`, paired `at` height and `digest`, or `activity=false` | Account update proof when indexed, plus up to ten transactions under one certified snapshot. |
+| `/explorer/blocks/{height}` | Positive height; optional decimal `offset` | Up to 50 consecutive transactions, with a certificate and ancestry proving the block's own transaction interval. |
+| `/explorer/transactions/{digest}` | 32-byte hex transaction digest | One transaction with its exact inclusion height and proof. |
+
+Block reads discover transaction digests from consecutive QMDB operations,
+then fetch bodies through the digest primary key. A later certificate can cover
+a block that has no certificate of its own. Account pagination supplies both the
+snapshot height and digest to retain the same view while publication advances.
+
+All-activity pages seek directly from the cursor and read at most 11 activity-index
+rows. Sent and received filters use the existing primary index and may scan
+additional history before filling a page, especially when matches are sparse.
+
+Responses encode bytes as hex and 64-bit integers as decimal strings. The
+limits are 4096 ancestry headers, 1 MiB per proof, and 8 MiB per response.
+Malformed requests return 400, temporarily unavailable publication or evidence
+returns 503, invalid stored evidence returns 500, and work exceeding the
+supported bounds returns 422.
+Account proofs establish historical membership, and a missing update is not a
+nonexistence proof. Account transaction lists carry membership proofs for their
+returned rows without a claim of completeness.
 
 ## Back-pressure model
 

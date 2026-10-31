@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod adapter_metrics;
 pub mod client;
 pub mod codec;
+pub mod explorer;
 pub mod namespaces;
 pub mod publisher;
 mod simplex_block;
