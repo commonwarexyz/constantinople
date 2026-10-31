@@ -580,7 +580,7 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{Sealable as _, Transaction, verify_transactions};
     use commonware_codec::{Copying, DecodeExt as _, Encode as _};
@@ -606,7 +606,7 @@ mod tests {
         bytes
     };
 
-    fn ed25519_signer(seed: u64) -> ed25519::SigningKey {
+    pub(crate) fn ed25519_signer(seed: u64) -> ed25519::SigningKey {
         <ed25519::SigningKey as commonware_cryptography::Signer>::from_seed(seed)
     }
 
@@ -622,7 +622,10 @@ mod tests {
         )
     }
 
-    fn ed25519_transaction(signer: &ed25519::SigningKey, nonce: u64) -> SignedTransaction<Sha256> {
+    pub(crate) fn ed25519_transaction(
+        signer: &ed25519::SigningKey,
+        nonce: u64,
+    ) -> SignedTransaction<Sha256> {
         unsigned(TransactionPublicKey::ed25519(signer.public_key()), nonce).seal_and_sign(
             signer,
             NAMESPACE,
@@ -649,7 +652,7 @@ mod tests {
         )
     }
 
-    fn webauthn_signer(seed: u8) -> SigningKey {
+    pub(crate) fn webauthn_signer(seed: u8) -> SigningKey {
         let mut rng = test_rng();
         for _ in 0..seed {
             let _ = SigningKey::generate_from_rng(&mut rng);
@@ -691,7 +694,10 @@ mod tests {
         TransactionSignature::secp256r1(signature, authenticator_data, client_data_json).unwrap()
     }
 
-    fn webauthn_transaction(signer: &SigningKey, nonce: u64) -> SignedTransaction<Sha256> {
+    pub(crate) fn webauthn_transaction(
+        signer: &SigningKey,
+        nonce: u64,
+    ) -> SignedTransaction<Sha256> {
         let sealed = unsigned(webauthn_public_key(signer), nonce).seal(&mut Sha256::default());
         let signature = webauthn_signature_with(signer, sealed.seal().as_ref(), Vec::new());
         SignedTransaction::new_unchecked(sealed, signature)

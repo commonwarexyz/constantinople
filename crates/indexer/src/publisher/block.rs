@@ -458,7 +458,7 @@ mod tests {
         let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
-                body: vec![lazy],
+                body: vec![lazy].into(),
             },
             sha256::Digest::EMPTY,
         ));
@@ -497,7 +497,7 @@ mod tests {
         EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(leader, transactions_range),
-                body,
+                body: body.into(),
             },
             sha256::Digest::EMPTY,
         ))

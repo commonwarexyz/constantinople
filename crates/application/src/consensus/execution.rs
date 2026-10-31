@@ -57,10 +57,8 @@
 //! keeps making progress — a proposal is always produced. The accepted body settles to the same
 //! slots under the verifier's plan.
 //! `execute_body` prepares a proposed body, recomputes execution, and compares
-//! the resulting commitments to the header. Certified apply shallow-clones the
-//! block's lazy body (per-transaction handles whose decode cache stays shared)
-//! to move it into the prepare job, without building an intermediate
-//! materialized transaction vector. Preparing a transfer does
+//! the resulting commitments to the header. Certified apply shares ownership of
+//! the block's immutable lazy body with the prepare job. Preparing a transfer does
 //! not invent a second transaction identifier: it reads the transaction's sealed
 //! message digest. For lazily encoded block bodies, whichever consumer first
 //! materializes the transaction computes that seal once and caches the decoded

@@ -180,11 +180,9 @@ where
             return None;
         }
 
-        // The glue actor retains its own references to the block, so the
-        // header and lazy body are cloned out of the shared reference
-        // (per-transaction refcount bumps) instead of moved.
+        // The worker jobs share the immutable body independently of the block header.
         let header = block.header.clone();
-        let body = Arc::new(block.body.clone());
+        let body = Arc::clone(&block.body);
         drop(block);
 
         // Signature verification needs only the block body, so it starts
@@ -287,7 +285,7 @@ where
         St: Strategy,
     {
         let strategy = self.strategy.clone();
-        let body = block.body.clone();
+        let body = Arc::clone(&block.body);
         let work_size = body.len();
         let height = block.header.height;
         let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());

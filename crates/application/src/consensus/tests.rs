@@ -251,7 +251,11 @@ fn sized_unverified_block(
         - body.iter().map(|tx| tx.encode_size()).sum::<usize>();
     let payload_size = remaining - remaining.encode_size();
     body.push(lazy(payload_size));
-    let block = Block { header, body }.seal(&mut sha256::Sha256::default());
+    let block = Block {
+        header,
+        body: body.into(),
+    }
+    .seal(&mut sha256::Sha256::default());
     assert_eq!(block.encode_size(), encoded_size);
     assert_eq!(block.encode().len(), encoded_size);
     block

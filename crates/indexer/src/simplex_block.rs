@@ -29,5 +29,12 @@ where
     let header = header.into_inner();
     let body_cfg = (cfg.max_transactions, ());
     let body = Vec::<LazySignedTransaction<H>>::decode_cfg(body, &body_cfg)?;
-    Ok(Sealed::new_unchecked(Block { header, body }, seal).into())
+    Ok(Sealed::new_unchecked(
+        Block {
+            header,
+            body: body.into(),
+        },
+        seal,
+    )
+    .into())
 }

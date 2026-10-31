@@ -226,6 +226,40 @@ impl<H: Hasher> Clone for LazySignedTransaction<H> {
     }
 }
 
+/// A cursor over encoded bytes that shares storage only for retained fields.
+struct BytesView<'a> {
+    bytes: &'a Bytes,
+    pos: usize,
+}
+
+impl bytes::Buf for BytesView<'_> {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        &self.bytes[self.pos..]
+    }
+
+    #[inline]
+    fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.remaining(), "advance past end of buffer");
+        self.pos += cnt;
+    }
+
+    #[inline]
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        assert!(len <= self.remaining(), "copy_to_bytes past end of buffer");
+        let bytes = self.bytes.slice(self.pos..self.pos + len);
+        self.pos += len;
+        bytes
+    }
+}
+
+impl Buf for BytesView<'_> {}
+
 impl<H> LazySignedTransaction<H>
 where
     H: Hasher,
@@ -248,7 +282,7 @@ where
                     .pending
                     .as_ref()
                     .expect("pending bytes must exist when value is absent");
-                SignedTransaction::decode(bytes.clone()).ok()
+                SignedTransaction::decode(BytesView { bytes, pos: 0 }).ok()
             })
             .as_ref()
     }
@@ -486,12 +520,15 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, Transaction, TransactionPublicKey,
+        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction,
+        TransactionPublicKey,
+        auth::tests::{ed25519_signer, ed25519_transaction, webauthn_signer, webauthn_transaction},
         signed::Signable,
     };
     use bytes::Bytes;
     use commonware_codec::{
-        Copying, DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
+        Copying, DecodeExt as _, Encode as _, EncodeSize as _, FixedSize as _, ReadExt as _,
+        Write as _,
     };
     use commonware_cryptography::{Hasher, Signer, secp256r1::standard as secp256r1, sha256};
     use commonware_cryptography_curve25519::signing as ed25519;
@@ -663,6 +700,131 @@ mod test {
                 .is_none(),
             "nested sender decode should still fail after reading pending bytes"
         );
+    }
+
+    fn lazy_signed_view_fixtures() -> [SignedTransaction<sha256::Sha256>; 2] {
+        [
+            ed25519_transaction(&ed25519_signer(0), 0),
+            webauthn_transaction(&webauthn_signer(0), 1),
+        ]
+    }
+
+    fn lazy_signed_view_read(
+        payload: &[u8],
+    ) -> Result<LazySignedTransaction<sha256::Sha256>, commonware_codec::Error> {
+        let mut encoded = Vec::new();
+        payload.len().write(&mut encoded);
+        encoded.extend_from_slice(payload);
+        LazySignedTransaction::read(&mut Bytes::from(encoded))
+    }
+
+    #[test]
+    fn lazy_signed_view_matches_owned_cursor() {
+        for transaction in lazy_signed_view_fixtures() {
+            let payload = transaction.encode();
+            let expected = SignedTransaction::<sha256::Sha256>::decode(payload.clone()).unwrap();
+            let lazy = lazy_signed_view_read(&payload).unwrap();
+            assert_eq!(lazy.encoded_signed_transaction(), payload);
+            assert_eq!(lazy.get(), Some(&expected));
+            assert_eq!(lazy.encoded_signed_transaction(), payload);
+            assert_eq!(lazy.get().unwrap().encode(), payload);
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_defers_invalid_sender() {
+        for transaction in lazy_signed_view_fixtures() {
+            let mut payload = transaction.encode().to_vec();
+            payload[..TransactionPublicKey::SIZE].copy_from_slice(&invalid_public_key_bytes());
+            let expected =
+                SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&payload))
+                    .unwrap();
+            let lazy = lazy_signed_view_read(&payload).unwrap();
+            assert!(expected.value().sender().is_none());
+            assert!(lazy.get().unwrap().value().sender().is_none());
+            assert_eq!(lazy.get().unwrap().encode().as_ref(), payload);
+            assert_eq!(lazy.encoded_signed_transaction().as_ref(), payload);
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_rejects_truncation_and_trailing_data() {
+        for transaction in lazy_signed_view_fixtures() {
+            let payload = transaction.encode();
+            for end in 0..payload.len() {
+                let truncated = &payload[..end];
+                assert!(
+                    SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(truncated))
+                        .is_err()
+                );
+                if let Ok(lazy) = lazy_signed_view_read(truncated) {
+                    assert!(lazy.get().is_none(), "accepted truncation at {end}");
+                }
+            }
+
+            let mut trailing = payload.to_vec();
+            trailing.push(0);
+            assert!(matches!(
+                SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&trailing)),
+                Err(commonware_codec::Error::ExtraData(1))
+            ));
+            assert!(lazy_signed_view_read(&trailing).unwrap().get().is_none());
+
+            let mut zero_value = payload.to_vec();
+            let value_start = TransactionPublicKey::SIZE + crate::AccountKey::SIZE;
+            zero_value[value_start..value_start + u64::SIZE].fill(0);
+            assert!(
+                SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&zero_value))
+                    .is_err()
+            );
+            assert!(lazy_signed_view_read(&zero_value).unwrap().get().is_none());
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_shares_success_and_failure_cache() {
+        for transaction in lazy_signed_view_fixtures() {
+            for valid in [true, false] {
+                let mut payload = transaction.encode().to_vec();
+                if !valid {
+                    payload.push(0);
+                }
+                let lazy = lazy_signed_view_read(&payload).unwrap();
+                let cloned = lazy.clone();
+                assert!(std::sync::Arc::ptr_eq(&lazy.value, &cloned.value));
+                assert!(lazy.value.get().is_none());
+                std::thread::scope(|scope| {
+                    let first = scope.spawn(|| lazy.get());
+                    let second = scope.spawn(|| cloned.get());
+                    match (first.join().unwrap(), second.join().unwrap()) {
+                        (Some(first), Some(second)) => {
+                            assert!(valid);
+                            assert!(std::ptr::eq(first, second));
+                        }
+                        (None, None) => assert!(!valid),
+                        _ => panic!("shared cache returned different outcomes"),
+                    }
+                });
+                assert_eq!(lazy.value.get().unwrap().is_some(), valid);
+                assert_eq!(cloned.get().is_some(), valid);
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_sender_survives_outer_drop() {
+        for transaction in lazy_signed_view_fixtures() {
+            let expected_sender = transaction.value().sender().unwrap().clone();
+            let payload = transaction.encode();
+            for shared in [false, true] {
+                let lazy = lazy_signed_view_read(&payload).unwrap();
+                let cloned = shared.then(|| lazy.clone());
+                let owned = lazy.into_value().unwrap();
+                drop(cloned);
+                assert_eq!(owned.value().sender(), Some(&expected_sender));
+                assert_eq!(owned.encode(), payload);
+            }
+        }
     }
 
     fn invalid_public_key_bytes() -> [u8; TransactionPublicKey::SIZE] {
