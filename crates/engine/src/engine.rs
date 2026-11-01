@@ -63,7 +63,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU64, NZUsize, non_empty_range, union};
+use commonware_utils::{NZDuration, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
     Application, StateSyncTarget, TransactionHistoryTarget,
 };
@@ -334,8 +334,8 @@ where
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
+                    fetch_timeout: NZDuration!(STATE_SYNC_TIMEOUT),
+                    fetch_retry_delay: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
                     max_serve_ops: NZU64!(4096),
@@ -350,8 +350,8 @@ where
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
+                    fetch_timeout: NZDuration!(STATE_SYNC_TIMEOUT),
+                    fetch_retry_delay: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
                     max_serve_ops: NZU64!(4096),
@@ -580,7 +580,8 @@ where
                 leader_timeout: Duration::from_secs(4),
                 certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
-                fetch_timeout: Duration::from_secs(4),
+                fetch_timeout: NZDuration!(Duration::from_secs(4)),
+                fetch_retry_delay: Duration::from_secs(4),
                 view_retention: ACTIVITY_TIMEOUT,
                 skip: SkipPolicy::Enabled {
                     timeout: Duration::from_secs(11),
@@ -641,8 +642,8 @@ where
                 peer_provider: self.manager.clone(),
                 blocker: self.blocker.clone(),
                 mailbox_size: MAILBOX_SIZE,
-                timeout: STATE_SYNC_TIMEOUT,
-                fetch_retry_timeout: STATE_SYNC_RETRY,
+                fetch_timeout: NZDuration!(STATE_SYNC_TIMEOUT),
+                fetch_retry_delay: STATE_SYNC_RETRY,
                 priority_requests: false,
                 priority_responses: false,
             },
