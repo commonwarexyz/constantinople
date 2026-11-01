@@ -8,21 +8,21 @@
 //!
 //! Account execution is based on block-start state. A sender spends only the
 //! balance it had at the start of the block, and credits created by the same
-//! block cannot fund later debits in that block. The executor therefore builds
-//! deterministic account effects first, then applies those effects to loaded
-//! accounts all or nothing.
+//! block cannot fund later debits in that block. What a body changes therefore
+//! follows from its transfers alone, so verification plans the body with
+//! `commonware_glue::transfers` before reading any account, then settles the
+//! loaded accounts all or nothing.
 //!
-//! The executor builds one account-touch plan for each block. Transfers whose
-//! non-self sender/recipient accounts are unique in the block stay on a discrete
-//! lane and can write their sender and recipient accounts directly. Transfers
-//! that touch contended accounts go through the general account-owned lane: each
-//! affected account is loaded once, receives its accumulated nonce/debit/credit
-//! effect, and writes once. If any lane fails a nonce check, balance check, or
-//! checked credit addition, the whole block body is invalid and no partial state
-//! is applied.
+//! The plan holds each account the body touches once, with its debit and credit
+//! sums and its nonce effects in block order. Each account is loaded once,
+//! settled once, and written once. If any nonce is refused, any debit exceeds
+//! its account's starting balance, or any final balance overflows, the whole
+//! block body is invalid and no partial state is applied. A proposer instead
+//! selects its body one candidate at a time, dropping each that cannot settle,
+//! so the body it proposes settles under the verifier's plan.
 //!
 //! Touched accounts are staged out of the unordered state QMDB in one read,
-//! and final account values are recorded against the staged read indices, so
+//! and final account values are recorded as one slot per staged read, so
 //! merkleization reuses each key's resolved location. The state commitment
 //! depends on the final key/value set. Transaction history is append-only, so
 //! transaction digests are still appended in block order.
@@ -30,7 +30,7 @@
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
-    BufferPooler, Clock, Metrics, Storage,
+    Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
 use commonware_storage::mmr;
@@ -49,9 +49,9 @@ mod tests;
 mod time;
 
 pub use db::{
-    DatabaseReaders, Databases, StateBatch, StateDatabase, StateOperation, StateStaged,
-    StateSyncTarget, StateUpdates, TransactionDatabase, TransactionHistoryDb,
-    TransactionHistoryOperation, TransactionHistoryTarget,
+    DatabaseReaders, Databases, StateBatch, StateDatabase, StateOperation, StateSlots, StateStaged,
+    StateSyncTarget, TransactionDatabase, TransactionHistoryDb, TransactionHistoryOperation,
+    TransactionHistoryTarget,
 };
 pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
@@ -92,6 +92,7 @@ pub type FinalizedHookFn<C, H, P> = Arc<
 type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
+const INVALID_TRANSACTION_FLOOR: &str = "invalid transaction floor";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
@@ -99,7 +100,7 @@ const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 pub struct Application<E, H, C, S, P, I, St>
 where
     H: Hasher,
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     St: Strategy,
@@ -118,7 +119,7 @@ where
 impl<E, H, C, S, P, I, St> Clone for Application<E, H, C, S, P, I, St>
 where
     H: Hasher,
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     P: Clone,
@@ -142,7 +143,7 @@ where
 impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
 where
     H: Hasher,
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     St: Strategy,

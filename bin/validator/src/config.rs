@@ -8,8 +8,8 @@ use commonware_cryptography::{
         dkg::feldman_desmedt as dkg,
         primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
     },
-    ed25519,
 };
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
@@ -156,7 +156,7 @@ pub struct ValidatorConfig {
     /// the simplex vote journal.
     #[serde(default = "default_history_page_cache_bytes")]
     pub history_page_cache_bytes: usize,
-    /// Capacity of the decompressed public key cache.
+    /// Capacity of the decompressed secp256r1 (WebAuthn) public key cache.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
@@ -218,25 +218,25 @@ struct PeersFile {
 /// Decoded key material and network info ready for use by the engine.
 pub struct DecodedConfig {
     /// This validator's ed25519 private key.
-    pub signer: ed25519::PrivateKey,
+    pub signer: ed25519::SigningKey,
     /// This validator's ed25519 public key.
-    pub public_key: ed25519::PublicKey,
+    pub public_key: ed25519::VerifyingKey,
     /// Decoded DKG output (threshold public material).
-    pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
+    pub dkg_output: dkg::Output<MinSig, ed25519::VerifyingKey>,
     /// DKG share for this validator. `None` for secondary (non-voting) validators.
     pub share: Option<Share>,
     /// Genesis leader public key.
-    pub genesis_leader: ed25519::PublicKey,
+    pub genesis_leader: ed25519::VerifyingKey,
     /// Local p2p bind address.
     pub listen_bind: SocketAddr,
     /// Advertised p2p address other peers dial.
     pub listen_advertise: SocketAddr,
     /// Primary (voting) validators in DKG order.
-    pub primary_participants: Vec<ed25519::PublicKey>,
+    pub primary_participants: Vec<ed25519::VerifyingKey>,
     /// Secondary (non-voting) validators.
-    pub secondary_participants: Vec<ed25519::PublicKey>,
+    pub secondary_participants: Vec<ed25519::VerifyingKey>,
     /// Bootstrapper peers with resolved addresses.
-    pub bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    pub bootstrappers: Vec<Bootstrapper<ed25519::VerifyingKey>>,
     /// Storage partition prefix for this validator.
     pub partition_prefix: String,
 }
@@ -266,7 +266,7 @@ pub struct LoadedConfig {
     /// block, finalization, and marshal archives, transaction history, and
     /// the simplex vote journal.
     pub history_page_cache_bytes: usize,
-    /// Capacity of the decompressed public key cache.
+    /// Capacity of the decompressed secp256r1 (WebAuthn) public key cache.
     pub public_key_cache_size: usize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
     pub otel: Option<(String, f64)>,
@@ -284,15 +284,15 @@ fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
     from_hex(hex_str).unwrap_or_else(|| panic!("bad {field_name} hex"))
 }
 
-fn decode_private_key(hex_str: &str) -> ed25519::PrivateKey {
+fn decode_private_key(hex_str: &str) -> ed25519::SigningKey {
     let bytes = decode_hex("private_key", hex_str);
-    ed25519::PrivateKey::read(&mut Copying(&bytes)).expect("failed to decode private key")
+    ed25519::SigningKey::read(&mut Copying(&bytes)).expect("failed to decode private key")
 }
 
 fn decode_dkg_output(
     hex_str: &str,
     num_validators: u32,
-) -> dkg::Output<MinSig, ed25519::PublicKey> {
+) -> dkg::Output<MinSig, ed25519::VerifyingKey> {
     let bytes = decode_hex("dkg_output", hex_str);
     dkg::Output::read_cfg(
         &mut Copying(&bytes),
@@ -311,9 +311,9 @@ fn decode_share_opt(hex_str: &str) -> Option<Share> {
     Some(Share::read(&mut Copying(&bytes)).expect("failed to decode DKG share"))
 }
 
-fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
+fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::VerifyingKey {
     let bytes = decode_hex(field_name, hex_str);
-    ed25519::PublicKey::read(&mut Copying(&bytes)).expect("failed to decode public key")
+    ed25519::VerifyingKey::read(&mut Copying(&bytes)).expect("failed to decode public key")
 }
 
 fn load_validator_config(path: &Path) -> ValidatorConfig {
@@ -353,9 +353,9 @@ fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::Ip
 fn decode_with_network(
     config: ValidatorConfig,
     public_listen: SocketAddr,
-    primary_participants: Vec<ed25519::PublicKey>,
-    secondary_participants: Vec<ed25519::PublicKey>,
-    bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    primary_participants: Vec<ed25519::VerifyingKey>,
+    secondary_participants: Vec<ed25519::VerifyingKey>,
+    bootstrappers: Vec<Bootstrapper<ed25519::VerifyingKey>>,
     otel: Option<(String, f64)>,
     json_logs: bool,
 ) -> LoadedConfig {
@@ -428,8 +428,8 @@ fn decode_with_network(
 fn decode_participants(
     primary_hex: &[String],
     secondary_hex: &[String],
-    self_key: &ed25519::PublicKey,
-) -> (Vec<ed25519::PublicKey>, Vec<ed25519::PublicKey>) {
+    self_key: &ed25519::VerifyingKey,
+) -> (Vec<ed25519::VerifyingKey>, Vec<ed25519::VerifyingKey>) {
     let primary = primary_hex
         .iter()
         .map(|hex_str| decode_public_key("primary_validators", hex_str))
@@ -582,8 +582,8 @@ mod tests {
             dkg::feldman_desmedt as dkg,
             primitives::{group::Share, sharing::Mode, variant::MinSig},
         },
-        ed25519,
     };
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_formatting::hex;
     use commonware_utils::{N3f1, TryCollect};
     use std::{
@@ -642,25 +642,25 @@ mod tests {
     /// `secondary_count` secondaries. Primary seeds 0..primary_count, secondary
     /// seeds 1_000_000..1_000_000+secondary_count (matches deploy-side offsets).
     struct Cluster {
-        primary_signers: Vec<ed25519::PrivateKey>,
-        primary_keys: Vec<ed25519::PublicKey>,
-        secondary_signers: Vec<ed25519::PrivateKey>,
-        secondary_keys: Vec<ed25519::PublicKey>,
+        primary_signers: Vec<ed25519::SigningKey>,
+        primary_keys: Vec<ed25519::VerifyingKey>,
+        secondary_signers: Vec<ed25519::SigningKey>,
+        secondary_keys: Vec<ed25519::VerifyingKey>,
         dkg_output_hex: String,
-        shares: BTreeMap<ed25519::PublicKey, Share>,
+        shares: BTreeMap<ed25519::VerifyingKey, Share>,
     }
 
     impl Cluster {
         fn new(primary_count: u64, secondary_count: u64) -> Self {
             let primary_signers = (0..primary_count)
-                .map(ed25519::PrivateKey::from_seed)
+                .map(ed25519::SigningKey::from_seed)
                 .collect::<Vec<_>>();
             let primary_keys = primary_signers
                 .iter()
                 .map(Signer::public_key)
                 .collect::<Vec<_>>();
             let secondary_signers = (0..secondary_count)
-                .map(|i| ed25519::PrivateKey::from_seed(1_000_000 + i))
+                .map(|i| ed25519::SigningKey::from_seed(1_000_000 + i))
                 .collect::<Vec<_>>();
             let secondary_keys = secondary_signers
                 .iter()
@@ -772,7 +772,7 @@ mod tests {
         }
     }
 
-    fn bootstrapper_entry(public_key: &ed25519::PublicKey) -> NamedBootstrapperEntry {
+    fn bootstrapper_entry(public_key: &ed25519::VerifyingKey) -> NamedBootstrapperEntry {
         let name = hex(&public_key.encode());
         NamedBootstrapperEntry {
             public_key: name.clone(),
@@ -1440,7 +1440,7 @@ hosts:
         let secondary0_key = &cluster.secondary_keys[0];
         // An extra ed25519 host present in hosts.yaml but listed in neither
         // primary_validators nor secondary_validators — must be ignored.
-        let stranger = ed25519::PrivateKey::from_seed(9_999_999).public_key();
+        let stranger = ed25519::SigningKey::from_seed(9_999_999).public_key();
 
         let primary0_name = hex(&primary0_key.encode());
         let primary1_name = hex(&primary1_key.encode());

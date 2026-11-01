@@ -7,27 +7,6 @@ import {
 } from './submissionResponse.ts';
 import { boundedSubmissionSignal, SUBMISSION_TIMEOUT_MS } from './submissionRequest.ts';
 
-export interface AccountView {
-    readonly balance: number;
-    readonly nonce: NonceView;
-}
-
-export interface NonceView {
-    readonly base: number;
-    readonly bitmap: number;
-}
-
-export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
-    const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);
-    if (response.status === 404) {
-        return null;
-    }
-    if (!response.ok) {
-        throw new Error(`account lookup failed with HTTP ${response.status}`);
-    }
-    return response.json();
-}
-
 export async function submitTransactions(
     baseUrl: string,
     batch: Uint8Array,

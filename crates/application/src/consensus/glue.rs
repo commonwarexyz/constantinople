@@ -4,13 +4,13 @@ use super::{
     Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
     history::header_range_to_target,
 };
-use commonware_consensus::marshal::ancestry::Ancestry;
+use commonware_consensus::{Handoff, marshal::ancestry::Ancestry};
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
-    Application as CApplication, Input as CInput, Proposed, db::DatabaseSet,
+    Application as CApplication, Finality, Input as CInput, Proposed, db::DatabaseSet,
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, qmdb::sync::Target as AnyTarget, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
@@ -18,10 +18,11 @@ use constantinople_primitives::SealedBlock;
 use futures::{FutureExt, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 impl<E, H, C, S, P, I, St> CApplication<E> for Application<E, H, C, S, P, I, St>
 where
-    E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
+    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
     C: Digest,
     S: Scheme<PublicKey = P>,
@@ -67,6 +68,25 @@ where
         )
     }
 
+    /// Stages the block that [`propose`](Self::propose) would build, or
+    /// declines with [`Handoff::Wait`] when no block is built.
+    ///
+    /// Consensus relays the staged block before the parent certifies and votes
+    /// for it once the parent certifies. If another block replaces the parent
+    /// first, consensus asks again for the same view on the replacement.
+    async fn prepare(
+        &mut self,
+        context: (E, Self::Context),
+        ancestry: impl Ancestry<Self::Block>,
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+        input: CInput<Self::Input, Self::Provider>,
+    ) -> Handoff<Proposed<Self, E>> {
+        self.propose(context, ancestry, batches, input)
+            .instrument(tracing::info_span!("application.prepare"))
+            .await
+            .map_or(Handoff::Wait, Handoff::Stage)
+    }
+
     async fn propose(
         &mut self,
         context: (E, Self::Context),
@@ -91,44 +111,45 @@ where
         result
     }
 
-    async fn verify(
+    /// Processes a block on its parent's state.
+    ///
+    /// A candidate is checked in full by `verify_child`, which checks its signatures alongside
+    /// its execution. Honest voters already accepted a finalized block, so it is only replayed.
+    /// Its parent may no longer be stored, so the replay takes the transaction-history floor from
+    /// the block's header.
+    async fn process(
         &mut self,
         context: (E, Self::Context),
         ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+        finality: Finality,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let mut ancestry = Box::pin(ancestry);
         let block = Arc::from(ancestry.next().await?);
+        let result = match finality {
+            // The parent fetch is passed as a future so verify_child can start
+            // signature verification (which needs only the block body) while the
+            // parent is still in flight.
+            Finality::Candidate => {
+                self.verify_child(
+                    context,
+                    block,
+                    ancestry.next().map(|parent| parent.map(Arc::from)),
+                    batches,
+                )
+                .await
+            }
+            Finality::Finalized => self.apply_block(context, &block, batches).await,
+        };
 
-        // The parent fetch is passed as a future so verify_child can start
-        // signature verification (which needs only the block body) while the
-        // parent is still in flight.
-        let result = self
-            .verify_child(
-                context,
-                block,
-                ancestry.next().map(|parent| parent.map(Arc::from)),
-                batches,
-            )
-            .await;
-
-        // verify_child's offloaded tasks release the body and parent (early
-        // rejections drop inline), so only the drained ancestry stream
-        // remains; the span keeps its drop cost visible in traces.
+        // verify_child's offloaded tasks release a candidate's body and parent, and early
+        // rejections drop them inline. The span keeps the drained ancestry stream's drop cost
+        // visible in traces.
         {
-            let _cleanup = tracing::info_span!("application.verify.cleanup").entered();
+            let _cleanup = tracing::info_span!("application.process.cleanup").entered();
             drop(ancestry);
         }
         result
-    }
-
-    async fn apply(
-        &mut self,
-        context: (E, Self::Context),
-        block: &Self::Block,
-        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
-    ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
-        self.apply_block(context, block, batches).await
     }
 
     async fn capture(

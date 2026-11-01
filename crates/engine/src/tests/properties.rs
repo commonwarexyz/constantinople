@@ -1,8 +1,9 @@
-use crate::tests::common::{RestartBarrier, ValidatorState};
+use crate::tests::common::{RestartBarrier, TestPublicKey, ValidatorState};
 use commonware_cryptography::PublicKey;
 use commonware_glue::simulate::{
     exit::ExitCondition, property::Property, tracker::ProgressTracker,
 };
+use commonware_runtime::Metrics as _;
 use std::{future::Future, pin::Pin};
 
 #[derive(Clone, Copy)]
@@ -232,11 +233,21 @@ impl<P: PublicKey> ExitCondition<P, ValidatorState> for StateSyncReadyAtHeight {
 
     fn reached<'a>(
         &'a self,
-        _tracker: &'a ProgressTracker<P>,
+        tracker: &'a ProgressTracker<P>,
         states: &'a [&'a ValidatorState],
         target_count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
         Box::pin(async move {
+            // The simulator evaluates this condition after every finalization
+            // update and handles crash and schedule events only while no update
+            // is pending. A block at the target height needs a view at least as
+            // high, so until some validator finalizes one, answer without
+            // querying validators, whose replies would hold that loop and could
+            // keep fault events from ever running.
+            if tracker.max_round().map_or(0, |round| round.view().get()) < self.height {
+                return Ok(false);
+            }
+
             let mut finalized = 0usize;
             let mut handoff = false;
 
@@ -286,6 +297,52 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState> for LateJoine
                 "no validator both used startup state sync and advanced beyond the synced height"
                     .to_string(),
             )
+        })
+    }
+}
+
+/// Requires some incoming leader to have relayed its prepared term-start
+/// proposal before the parent certified, and no leader to have voted for one
+/// before then.
+#[derive(Clone, Copy)]
+pub(crate) struct PipelinedHandoffs;
+
+impl Property<TestPublicKey, ValidatorState> for PipelinedHandoffs {
+    fn name(&self) -> &str {
+        "pipelined_handoffs"
+    }
+
+    fn check<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<TestPublicKey>,
+        states: &'a [&'a ValidatorState],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let state = states
+                .first()
+                .ok_or_else(|| "no active validator".to_string())?;
+            let metrics = state.context.encode();
+            let handoff_events = |event: &str| -> u64 {
+                let label = format!("event=\"{event}\"");
+                metrics
+                    .lines()
+                    .filter(|line| line.contains("_handoff_events_total{") && line.contains(&label))
+                    .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+                    .sum()
+            };
+            if handoff_events("RelayedBeforeCertification") == 0 {
+                return Err(
+                    "no leader relayed a prepared proposal before its parent certified".to_string(),
+                );
+            }
+            let early_votes = handoff_events("VotedBeforeCertification");
+            if early_votes > 0 {
+                return Err(format!(
+                    "{early_votes} prepared proposals were voted on before their parents certified"
+                ));
+            }
+
+            Ok(())
         })
     }
 }

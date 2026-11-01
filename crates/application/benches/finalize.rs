@@ -7,11 +7,17 @@
 //! and the gain is too small to carry that hazard. Asserts all three
 //! schedules produce identical roots.
 
+// The layout of the main future nests deeper than the compiler's default limit.
+#![recursion_limit = "256"]
+
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Runner as _, Spawner as _, Supervisor as _, buffer::paged::CacheRef, tokio,
+    BLOB_PAGE_SIZE, Runner as _, Spawner as _, Supervisor as _,
+    buffer::paged::{self, CacheRef},
+    tokio,
 };
 use commonware_storage::{
     journal::contiguous::{
@@ -21,7 +27,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize};
+use commonware_utils::{NZU64, NZUsize};
 use constantinople_application::{
     consensus::{self, Databases},
     executor::PreparedTransfer,
@@ -34,11 +40,16 @@ use std::{
 };
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 type Dbs = Databases<tokio::Context, Sha256, EightCap, Rayon>;
 
 const ACCOUNTS: u64 = 1_000_000;
+const CACHE_BYTES: usize = 512 * 1024 * 1024;
 const TXS: usize = 32_768;
 const WARMUP: usize = 3;
 const ITERS: usize = 10;
@@ -90,17 +101,11 @@ fn transaction_config(strategy: Rayon, cache: &CacheRef) -> keyless_fixed::Compa
 
 fn transfers() -> Vec<PreparedTransfer> {
     (0..TXS)
-        .map(|i| {
-            let sender = key(i as u64);
-            let recipient = key(TXS as u64 + i as u64);
-            PreparedTransfer {
-                sender,
-                recipient,
-                sender_prefix: sender.prefix(),
-                recipient_prefix: recipient.prefix(),
-                value: 1,
-                nonce: 0,
-            }
+        .map(|i| PreparedTransfer {
+            sender: key(i as u64),
+            recipient: key(TXS as u64 + i as u64),
+            value: 1,
+            nonce: 0,
         })
         .collect()
 }
@@ -109,7 +114,10 @@ fn main() {
     tokio::Runner::new(tokio::Config::default().with_worker_threads(8)).start(
         |context| async move {
             let strategy = Rayon::new(NonZeroUsize::new(8).expect("threads")).expect("rayon pool");
-            let cache = CacheRef::from_pooler(&context, NZU16!(8192), NZUsize!(65_536));
+            let cache = CacheRef::new(
+                paged::page_size(BLOB_PAGE_SIZE),
+                NZUsize!(CACHE_BYTES / BLOB_PAGE_SIZE as usize),
+            );
             let dbs = Dbs::init(
                 context.child("dbs"),
                 (
@@ -146,9 +154,9 @@ fn main() {
             for iter in 0..(WARMUP + ITERS) {
                 for variant in 0..3 {
                     let (state_batch, mut transaction_batch) = dbs.new_batches().await;
-                    let (staged, updates) =
+                    let (staged, slots) =
                         consensus::compute(state_batch, Arc::clone(&transfers), &strategy).await;
-                    let updates = updates.expect("compute");
+                    let slots = slots.expect("compute");
                     for digest in &digests {
                         transaction_batch = transaction_batch.append(*digest);
                     }
@@ -157,14 +165,14 @@ fn main() {
                     let (state, transactions) = match variant {
                         // Strictly sequential.
                         0 => {
-                            let state = staged.merkleize(updates, Vec::new()).await.expect("state");
+                            let state = staged.merkleize(slots, Vec::new()).await.expect("state");
                             let transactions = transaction_batch.merkleize().await.expect("txs");
                             (state, transactions)
                         }
                         // futures::join! on one task (production's finalize_execution).
                         1 => {
                             let (state, transactions) = futures::join!(
-                                staged.merkleize(updates, Vec::new()),
+                                staged.merkleize(slots, Vec::new()),
                                 transaction_batch.merkleize()
                             );
                             (state.expect("state"), transactions.expect("txs"))
@@ -175,7 +183,7 @@ fn main() {
                                 .child("tx_merkleize")
                                 .shared(true)
                                 .spawn(move |_| async move { transaction_batch.merkleize().await });
-                            let state = staged.merkleize(updates, Vec::new()).await.expect("state");
+                            let state = staged.merkleize(slots, Vec::new()).await.expect("state");
                             let transactions = handle.await.expect("task").expect("txs");
                             (state, transactions)
                         }

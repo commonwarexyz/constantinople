@@ -56,5 +56,5 @@ explorer-build:
   npm --prefix explorer run build
 
 # Install Explorer dependencies.
-explorer-install:
-  npm --prefix explorer install
+explorer-install *args='':
+  npm --prefix explorer install $@

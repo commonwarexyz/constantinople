@@ -34,6 +34,17 @@ test('block subscription queries SQL after the target and keeps its sequence flo
     await stream.return();
 });
 
+for (const sequenceNumber of [undefined, 22n]) {
+    test(`block metadata rejects an unproven query floor: ${sequenceNumber}`, async () => {
+        const target = proofTarget(7n, 23n, 0xa5);
+        const sql = sqlClient(async () => ({
+            ...queryResult(23n, 7n, target.blockDigest, 9n), sequenceNumber,
+        }));
+        const stream = subscribeBlocksFromTargets(sql, targets(target));
+        await assert.rejects(stream.next(), /evaluated below the proof target sequence/);
+    });
+}
+
 test('missing block metadata retries without dropping the target', async () => {
     const target = proofTarget(8n, 29n, 0x3c);
     let targetPulls = 0;
@@ -324,7 +335,7 @@ test('metadata subscription resumes live after a lost cursor while point reads c
     assert.equal(source.stopped(), true);
 });
 
-function streamingSql(frames: DecodedQueryResult[], query: BlockMetadataSqlClient['query']) {
+function streamingSql(frames: (DecodedQueryResult & { sequenceNumber: bigint })[], query: BlockMetadataSqlClient['query']) {
     let ready!: () => void;
     const received = new Promise<void>((resolve) => { ready = resolve; });
     let stopped = false;
@@ -358,7 +369,7 @@ function queryResult(
     height?: bigint,
     blockDigest?: Uint8Array,
     txCount?: bigint,
-): DecodedQueryResult {
+): DecodedQueryResult & { sequenceNumber: bigint } {
     if (height === undefined || blockDigest === undefined || txCount === undefined) {
         return { sequenceNumber, table: testTable([]) };
     }

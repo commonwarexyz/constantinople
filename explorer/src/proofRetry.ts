@@ -5,8 +5,6 @@ const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
 const CONSISTENCY_NOT_READY = 'CONSISTENCY_NOT_READY';
 const SERIALIZED_CONSISTENCY_NOT_READY =
     /^(?:HTTP error: 409 )?\[aborted\] minimum consistency token is not yet visible\b/i;
-const RETRYABLE_PROOF_ERROR =
-    /tx_meta missing|tx digest .* (missing at height|is not finalized yet)|finalization missing|QMDB transaction proof response missing|not yet covered by a provable finalization|out_of_range|unavailable/i;
 const ACCOUNT_SERVICE_ERROR = /\[unavailable\]/i;
 
 // Fetch and response-body failures have different messages across runtimes.
@@ -16,14 +14,6 @@ const NETWORK_FAILURE_MESSAGE =
 
 // Bounds the walk so a cyclic cause chain cannot hang classification.
 const MAX_CAUSE_DEPTH = 8;
-
-const ACCOUNT_INDEXER_LAG_ERRORS = [
-    /^finalization missing at height \d+$/,
-    /^account location \d+ is outside finalized state range$/,
-    /^transaction location \d+ is not yet covered by a provable finalization$/,
-    /^\[out_of_range\] requested proof tip is not published yet$/,
-    /^\[out_of_range\] requested location \d+ is above published writer watermark \d+$/,
-];
 
 export const NETWORK_RECONNECT_DELAY_MS = 5_000;
 
@@ -46,16 +36,7 @@ export interface ErrorInfo {
 }
 
 export function isRetryableProofError(error: unknown): boolean {
-    const detail = errorMessage(error);
-    return (
-        isConsistencyNotReadyError(error) ||
-        RETRYABLE_PROOF_ERROR.test(detail) ||
-        isTransportFailure(error)
-    );
-}
-
-export function isMissingAccountProofError(detail: string): boolean {
-    return /^account .+ is not indexed$/.test(detail);
+    return accountRetryReason(error) !== undefined;
 }
 
 export function isRetryableAccountProofError(error: unknown): boolean {
@@ -66,10 +47,7 @@ export function isRetryableAccountProofError(error: unknown): boolean {
 // depend on the backend recovering. Anything else is terminal.
 export function accountRetryReason(error: unknown): AccountRetryReason | undefined {
     const detail = errorMessage(error);
-    if (
-        isConsistencyNotReadyError(error) ||
-        ACCOUNT_INDEXER_LAG_ERRORS.some((pattern) => pattern.test(detail))
-    ) {
+    if (isConsistencyNotReadyError(error)) {
         return 'waiting for indexer';
     }
     if (isTransportFailure(error) || ACCOUNT_SERVICE_ERROR.test(detail)) {

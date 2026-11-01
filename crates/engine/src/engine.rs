@@ -49,8 +49,9 @@ use commonware_macros::boxed;
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
-    BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
-    buffer::paged::CacheRef, spawn_cell,
+    BLOB_PAGE_SIZE, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
+    buffer::paged::{self, CacheRef},
+    spawn_cell,
 };
 use commonware_storage::{
     archive::{prunable, prunable::Archive as PrunableArchive},
@@ -62,12 +63,12 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
+use commonware_utils::{NZDuration, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
     Application, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{BlockCfg, PublicKeyCache, proposal::MAXIMUM_BLOCK_SIZE};
+use constantinople_primitives::{BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
@@ -82,17 +83,16 @@ pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::
 
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
-const MAX_BLOCK_SIZE: NonZero<usize> = NZUsize!(MAXIMUM_BLOCK_SIZE);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
-const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
+// Each physical page (the logical page and its CRC record) fills exactly one blob page.
+const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = paged::page_size(BLOB_PAGE_SIZE);
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
-const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -211,7 +211,7 @@ where
 /// Fully assembled validator engine.
 pub struct Engine<E, C, M, B, H, V, L, St, I, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
+    E: Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -257,7 +257,7 @@ where
 
 impl<E, C, M, B, H, V, L, St, I, O> Engine<E, C, M, B, H, V, L, St, I, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
+    E: Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -316,8 +316,8 @@ where
     /// Initializes the full engine stack.
     #[boxed]
     pub async fn new(context: E, config: Config<C, M, B, V, St, I, H, O>) -> Self {
-        let state_page_cache = page_cache(&context, "state", config.state_page_cache_bytes);
-        let history_page_cache = page_cache(&context, "history", config.history_page_cache_bytes);
+        let state_page_cache = page_cache("state", config.state_page_cache_bytes);
+        let history_page_cache = page_cache("history", config.history_page_cache_bytes);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
         let scheme =
@@ -334,8 +334,8 @@ where
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
+                    fetch_timeout: NZDuration!(STATE_SYNC_TIMEOUT),
+                    fetch_retry_delay: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
                     max_serve_ops: NZU64!(4096),
@@ -350,8 +350,8 @@ where
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
+                    fetch_timeout: NZDuration!(STATE_SYNC_TIMEOUT),
+                    fetch_retry_delay: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
                     max_serve_ops: NZU64!(4096),
@@ -496,13 +496,11 @@ where
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
-                max_block_size: MAX_BLOCK_SIZE,
-                block_codec_cfg: config.block_codec.clone(),
+                block_codec_config: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 records: shard_records,
-                background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
             },
         );
@@ -582,7 +580,8 @@ where
                 leader_timeout: Duration::from_secs(4),
                 certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
-                fetch_timeout: Duration::from_secs(4),
+                fetch_timeout: NZDuration!(Duration::from_secs(4)),
+                fetch_retry_delay: Duration::from_secs(4),
                 view_retention: ACTIVITY_TIMEOUT,
                 skip: SkipPolicy::Enabled {
                     timeout: Duration::from_secs(11),
@@ -643,8 +642,8 @@ where
                 peer_provider: self.manager.clone(),
                 blocker: self.blocker.clone(),
                 mailbox_size: MAILBOX_SIZE,
-                timeout: STATE_SYNC_TIMEOUT,
-                fetch_retry_timeout: STATE_SYNC_RETRY,
+                fetch_timeout: NZDuration!(STATE_SYNC_TIMEOUT),
+                fetch_retry_delay: STATE_SYNC_RETRY,
                 priority_requests: false,
                 priority_responses: false,
             },
@@ -708,16 +707,12 @@ where
 }
 
 // Each cache allocates its full capacity up front, so the budgets partition
-// memory rather than cap it lazily.
-fn page_cache<E: BufferPooler + Metrics>(
-    context: &E,
-    name: &'static str,
-    bytes: usize,
-) -> CacheRef {
-    CacheRef::from_pooler(
-        &context.child(name),
+// memory rather than cap it lazily. A budget counts blob pages, the on-disk
+// size of each cached page.
+fn page_cache(name: &'static str, bytes: usize) -> CacheRef {
+    CacheRef::new(
         PAGE_CACHE_PAGE_SIZE,
-        NonZero::new(bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+        NonZero::new(bytes / BLOB_PAGE_SIZE as usize)
             .unwrap_or_else(|| panic!("{name} page cache must hold at least one page")),
     )
 }
@@ -754,7 +749,7 @@ async fn init_finalizations_archive<E, H, P, V>(
     items_per_section: NonZero<u64>,
 ) -> PrunableArchive<EightCap, E, H::Digest, EngineFinalization<P, V, H>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
+    E: Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -790,7 +785,7 @@ async fn init_finalized_blocks_archive<E, H, P>(
     items_per_section: NonZero<u64>,
 ) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
+    E: Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
 {
@@ -882,7 +877,8 @@ mod unit_tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Digest, Digestible, Signer, ed25519, sha256};
+    use commonware_cryptography::{Digest, Digestible, Signer, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
     use commonware_utils::{NZU16, non_empty_range};
@@ -897,12 +893,12 @@ mod unit_tests {
     #[test]
     fn engine_block_preserves_inner_wire_encoding() {
         let mut rng = StdRng::from_seed([17u8; 32]);
-        let signer = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::SigningKey::random(&mut rng);
         let coding_config = CodingConfig {
             minimum_shards: NZU16!(2),
             extra_shards: NZU16!(2),
         };
-        let parent = EngineCommitment::<sha256::Sha256, ed25519::PublicKey>::from((
+        let parent = EngineCommitment::<sha256::Sha256, ed25519::VerifyingKey>::from((
             sha256::Digest::EMPTY,
             sha256::Digest::EMPTY,
             sha256::Digest::EMPTY,
@@ -924,11 +920,11 @@ mod unit_tests {
         };
         let inner = Block::new(header, Vec::new()).seal(&mut sha256::Sha256::default());
         let encoded = inner.encode();
-        let block: EngineBlock<sha256::Sha256, ed25519::PublicKey> = inner.into();
+        let block: EngineBlock<sha256::Sha256, ed25519::VerifyingKey> = inner.into();
 
         assert_eq!(block.encode(), encoded);
         assert_eq!(
-            EngineBlock::<sha256::Sha256, ed25519::PublicKey>::decode_cfg(
+            EngineBlock::<sha256::Sha256, ed25519::VerifyingKey>::decode_cfg(
                 encoded.clone(),
                 &BlockCfg::default(),
             )
@@ -940,7 +936,7 @@ mod unit_tests {
 
     #[test]
     fn shard_limit_accepts_maximum_proposals() {
-        let signer = ed25519::PrivateKey::from_seed(13);
+        let signer = ed25519::SigningKey::from_seed(13);
         let public_key = TransactionPublicKey::ed25519(signer.public_key());
         let transaction = Transaction::<sha256::Digest>::new(
             public_key.clone(),
@@ -961,7 +957,7 @@ mod unit_tests {
                 leader: signer.public_key(),
                 parent: (
                     View::new(u64::MAX),
-                    EngineCommitment::<sha256::Sha256, ed25519::PublicKey>::default(),
+                    EngineCommitment::<sha256::Sha256, ed25519::VerifyingKey>::default(),
                 ),
             },
             parent: sha256::Digest::EMPTY,
@@ -972,14 +968,14 @@ mod unit_tests {
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
         };
-        let block: EngineBlock<sha256::Sha256, ed25519::PublicKey> =
+        let block: EngineBlock<sha256::Sha256, ed25519::VerifyingKey> =
             Block::new(header, vec![transaction; transaction_count])
                 .seal(&mut sha256::Sha256::default())
                 .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
         assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < 4096);
         type TestShard = Shard<
-            EngineBlock<sha256::Sha256, ed25519::PublicKey>,
+            EngineBlock<sha256::Sha256, ed25519::VerifyingKey>,
             ReedSolomon<sha256::Sha256>,
             sha256::Sha256,
         >;
@@ -995,13 +991,13 @@ mod unit_tests {
             let encoded = coded.shard(0).expect("shard zero should exist").encode();
             assert!(encoded.len() <= MAXIMUM_MESSAGE_SIZE as usize);
 
-            TestShard::decode_cfg(encoded.clone(), &MAX_BLOCK_SIZE)
+            TestShard::decode_cfg(encoded.clone(), &MAXIMUM_BLOCK_SIZE)
                 .expect("the derived limit should accept a maximum proposal");
-            TestShard::decode_cfg(encoded.clone(), &NonZero::new(block.encode_size()).unwrap())
+            TestShard::decode_cfg(encoded.clone(), &block.encode_size())
                 .expect("the exact block budget should accept its shard");
 
             // Removing one coding word per original shard must reject the same proposal.
-            let smaller_budget = NonZero::new(block.encode_size() - 2 * shards).unwrap();
+            let smaller_budget = block.encode_size() - 2 * shards;
             assert!(TestShard::decode_cfg(encoded, &smaller_budget).is_err());
         }
     }

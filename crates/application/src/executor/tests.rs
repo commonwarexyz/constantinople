@@ -1,636 +1,695 @@
-use super::{Changeset, PreparedTransfer, State, compute, prepare_transfer};
+//! Settlement rules exercised through `commonware_glue::transfers`, plus randomized comparisons
+//! against a direct model of the rules.
+
+use super::{PreparedTransfer, account_slots, starting_accounts};
 use commonware_codec::FixedSize as _;
-use commonware_cryptography::{Signer, ed25519, sha256};
+use commonware_glue::transfers::{Plan, Selection};
+use commonware_parallel::{Rayon, Sequential, Strategy};
+use commonware_storage::qmdb::any::batch::Slot;
+use commonware_utils::TestRng;
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
-    TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce,
 };
-use core::num::NonZeroU64;
-use std::collections::HashSet;
+use rand::RngExt as _;
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
-const NAMESPACE: &[u8] = b"executor-test";
+/// Block-start accounts by key. An absent key holds the default account.
+type State = BTreeMap<AccountKey, Account>;
 
-type TestHasher = sha256::Sha256;
-type TestTransaction = VerifiedTransaction<TestHasher>;
+/// Settled slots by key, sorted by key.
+type Settled = Vec<(AccountKey, Slot<Account>)>;
 
-#[derive(Debug, Clone)]
-struct TestSigner {
-    key: ed25519::PrivateKey,
-    public_key: ed25519::PublicKey,
+fn key(index: u8) -> AccountKey {
+    AccountKey::from([index; AccountKey::SIZE])
 }
 
-impl TestSigner {
-    fn from_seed(seed: u64) -> Self {
-        let key = ed25519::PrivateKey::from_seed(seed);
-        let public_key = key.public_key();
-        Self { key, public_key }
-    }
-
-    fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
-        Transaction::new(
-            TransactionPublicKey::ed25519(self.key.public_key()),
-            TransactionPublicKey::ed25519(to),
-            NonZeroU64::new(value).expect("test values must be non-zero"),
-            nonce,
-        )
-        .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
-    }
-}
-
-fn account(balance: u64, nonce: u64) -> Account {
+const fn account(balance: u64, base: u64) -> Account {
     Account {
         balance,
-        nonce: Nonce::new(nonce, 0),
+        nonce: Nonce::new(base, 0),
     }
 }
 
-fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
-    AccountKey::from_public_key(&TransactionPublicKey::ed25519(public_key.clone()))
+const fn transfer(
+    sender: AccountKey,
+    recipient: AccountKey,
+    value: u64,
+    nonce: u64,
+) -> PreparedTransfer {
+    PreparedTransfer {
+        sender,
+        recipient,
+        value,
+        nonce,
+    }
 }
 
-fn changeset_account(
-    changeset: &[(AccountKey, Account)],
-    public_key: ed25519::PublicKey,
-) -> Account {
-    let account_key = account_key(&public_key);
-    changeset
-        .iter()
-        .find_map(|(candidate, account)| (candidate == &account_key).then_some(*account))
-        .expect("account should be in changeset")
+fn sorted(keys: &[AccountKey], slots: Vec<Slot<Account>>) -> Settled {
+    let mut settled: Settled = keys.iter().copied().zip(slots).collect();
+    settled.sort_unstable_by_key(|(key, _)| *key);
+    settled
 }
 
-fn run(accounts: &State, transactions: &[TestTransaction]) -> Option<Changeset> {
-    let transfers = transactions
+/// Settles `transfers` as one body, as a verifier does, with a plan keyed by `seed`.
+fn verify(
+    state: &State,
+    transfers: &[PreparedTransfer],
+    seed: u64,
+    strategy: &impl Strategy,
+) -> Option<Settled> {
+    let plan = Plan::with_seed(transfers, seed, strategy).ok()?;
+    let reads = plan
+        .keys()
         .iter()
-        .map(prepare_transfer)
-        .collect::<Option<Vec<_>>>()?;
-    compute(accounts, &transfers)
+        .map(|key| state.get(key).copied())
+        .collect();
+    let slots = plan.settle(&starting_accounts(reads), strategy).ok()?;
+    Some(sorted(plan.keys(), account_slots(slots)))
+}
+
+/// Selects from `rounds` in order, as a proposer does, returning each round's accepted flags and
+/// the slot of every touched key.
+fn select(state: &State, rounds: &[Vec<PreparedTransfer>], seed: u64) -> (Vec<Vec<bool>>, Settled) {
+    let mut selection = Selection::with_seed(seed);
+    let mut accepted = Vec::with_capacity(rounds.len());
+    for round in rounds {
+        let touched = selection.touch(round);
+        let reads = selection.keys()[touched]
+            .iter()
+            .map(|key| state.get(key).copied())
+            .collect();
+        selection.register(starting_accounts(reads));
+        accepted.push(selection.apply(round));
+    }
+    let keys = selection.keys().to_vec();
+    let slots = account_slots(selection.settle(&Sequential));
+    (accepted, sorted(&keys, slots))
+}
+
+/// The transfers of `rounds` that `accepted` marks, in block order.
+fn survivors(rounds: &[Vec<PreparedTransfer>], accepted: &[Vec<bool>]) -> Vec<PreparedTransfer> {
+    rounds
+        .iter()
+        .flatten()
+        .zip(accepted.iter().flatten())
+        .filter_map(|(transfer, accepted)| accepted.then_some(*transfer))
+        .collect()
+}
+
+/// The slots that change state.
+fn written(settled: &Settled) -> Settled {
+    settled
+        .iter()
+        .filter(|(_, slot)| !matches!(slot, Slot::Keep))
+        .cloned()
+        .collect()
+}
+
+/// The slot settlement writes for a key that starts as `read` and ends as `settled`.
+fn expected_slot(read: Option<Account>, settled: Account) -> Slot<Account> {
+    if settled == read.unwrap_or_default() {
+        Slot::Keep
+    } else if settled == Account::default() {
+        Slot::Delete
+    } else {
+        Slot::Put(settled)
+    }
+}
+
+/// One key's progress through a body in the model.
+#[derive(Clone, Copy)]
+struct Entry {
+    start: Account,
+    nonce: Nonce,
+    debits: u64,
+    credits: u64,
+}
+
+impl Entry {
+    fn settled(&self) -> Option<Account> {
+        Some(Account {
+            balance: self
+                .start
+                .balance
+                .checked_sub(self.debits)?
+                .checked_add(self.credits)?,
+            nonce: self.nonce,
+        })
+    }
+}
+
+/// A direct model of the settlement rules, applying transfers one at a time.
+struct Model<'a> {
+    state: &'a State,
+    entries: BTreeMap<AccountKey, Entry>,
+}
+
+impl<'a> Model<'a> {
+    const fn new(state: &'a State) -> Self {
+        Self {
+            state,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn entry(&self, key: &AccountKey) -> Entry {
+        self.entries.get(key).copied().unwrap_or_else(|| {
+            let start = self.state.get(key).copied().unwrap_or_default();
+            Entry {
+                start,
+                nonce: start.nonce,
+                debits: 0,
+                credits: 0,
+            }
+        })
+    }
+
+    /// Applies `transfer`'s nonce and sums, returning the entries it leaves, or `None` if its
+    /// nonce is refused or a sum overflows.
+    fn step(&self, transfer: &PreparedTransfer) -> Option<Vec<(AccountKey, Entry)>> {
+        let mut sender = self.entry(&transfer.sender);
+        if !sender.nonce.consume(transfer.nonce) {
+            return None;
+        }
+        sender.debits = sender.debits.checked_add(transfer.value)?;
+        if transfer.sender == transfer.recipient {
+            sender.credits = sender.credits.checked_add(transfer.value)?;
+            return Some(vec![(transfer.sender, sender)]);
+        }
+        let mut recipient = self.entry(&transfer.recipient);
+        recipient.credits = recipient.credits.checked_add(transfer.value)?;
+        Some(vec![
+            (transfer.sender, sender),
+            (transfer.recipient, recipient),
+        ])
+    }
+
+    /// The slot of every key touched so far, or `None` if any cannot settle.
+    fn settled(&self) -> Option<Settled> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| {
+                let read = self.state.get(key).copied();
+                Some((*key, expected_slot(read, entry.settled()?)))
+            })
+            .collect()
+    }
+
+    /// Settles `transfers` as one body: every transfer must apply, and every key must settle once
+    /// all of them have.
+    fn verify(state: &State, transfers: &[PreparedTransfer]) -> Option<Settled> {
+        let mut model = Model::new(state);
+        for transfer in transfers {
+            let entries = model.step(transfer)?;
+            model.entries.extend(entries);
+        }
+        model.settled()
+    }
+
+    /// Accepts each transfer that applies and leaves every key it touches able to settle.
+    fn select(state: &State, rounds: &[Vec<PreparedTransfer>]) -> (Vec<Vec<bool>>, Settled) {
+        let mut model = Model::new(state);
+        let mut touched = Vec::new();
+        let mut accepted = Vec::with_capacity(rounds.len());
+        for round in rounds {
+            let mut flags = Vec::with_capacity(round.len());
+            for transfer in round {
+                touched.extend([transfer.sender, transfer.recipient]);
+                let entries = model
+                    .step(transfer)
+                    .filter(|entries| entries.iter().all(|(_, entry)| entry.settled().is_some()));
+                flags.push(entries.is_some());
+                model.entries.extend(entries.into_iter().flatten());
+            }
+            accepted.push(flags);
+        }
+        let mut settled = model.settled().expect("accepted transfers settle");
+        for key in touched {
+            if !model.entries.contains_key(&key) {
+                settled.push((key, Slot::Keep));
+            }
+        }
+        settled.sort_unstable_by_key(|(key, _)| *key);
+        settled.dedup_by_key(|(key, _)| *key);
+        (accepted, settled)
+    }
 }
 
 #[test]
 fn executes_run_ahead_nonces() {
-    let signer = TestSigner::from_seed(2);
-    let recipient = TestSigner::from_seed(3);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
-
-    let transactions = vec![
-        signer.sign(recipient.public_key.clone(), 3, 2),
-        signer.sign(recipient.public_key.clone(), 4, 0),
-        signer.sign(recipient.public_key.clone(), 2, 1),
+    let [sender, recipient] = [key(1), key(2)];
+    let state = State::from([(sender, account(10, 0))]);
+    let body = [
+        transfer(sender, recipient, 3, 2),
+        transfer(sender, recipient, 4, 0),
+        transfer(sender, recipient, 2, 1),
     ];
-    let changeset = run(&accounts, &transactions).expect("valid batch should execute");
-
-    let sender = changeset_account(&changeset, signer.public_key);
-    let recipient = changeset_account(&changeset, recipient.public_key);
-    assert_eq!(sender.balance, 1);
-    assert_eq!(sender.nonce.base, 3);
-    assert_eq!(recipient.balance, DEFAULT_ACCOUNT_BALANCE + 9);
-}
-
-#[test]
-fn rejects_insufficient_balance() {
-    let signer = TestSigner::from_seed(0);
-    let recipient = TestSigner::from_seed(1);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(5, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
-
-    let transactions = vec![signer.sign(recipient.public_key, 6, 0)];
-    assert!(run(&accounts, &transactions).is_none());
-}
-
-#[test]
-fn rejects_duplicate_run_ahead_nonce() {
-    let signer = TestSigner::from_seed(4);
-    let recipient = TestSigner::from_seed(5);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
-
-    let transactions = vec![
-        signer.sign(recipient.public_key.clone(), 3, 2),
-        signer.sign(recipient.public_key, 4, 2),
-    ];
-    assert!(run(&accounts, &transactions).is_none());
-}
-
-#[test]
-fn rejects_far_ahead_duplicate_nonce() {
-    let signer = TestSigner::from_seed(6);
-    let recipient = TestSigner::from_seed(7);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
-
-    let nonce = NONCE_BITMAP_CAPACITY + 1;
-    let transactions = vec![
-        signer.sign(recipient.public_key.clone(), 3, nonce),
-        signer.sign(recipient.public_key, 4, nonce),
-    ];
-    assert!(run(&accounts, &transactions).is_none());
-}
-
-#[test]
-fn executes_multi_sender_batch() {
-    let sender_a = TestSigner::from_seed(10);
-    let sender_b = TestSigner::from_seed(11);
-    let recipient = TestSigner::from_seed(12);
-
-    let mut accounts = State::new();
-    accounts.insert(account_key(&sender_a.public_key), account(11, 0));
-    accounts.insert(account_key(&sender_b.public_key), account(13, 0));
-    accounts.insert(account_key(&recipient.public_key), account(5, 0));
-
-    let transactions = vec![
-        sender_a.sign(recipient.public_key.clone(), 4, 0),
-        sender_b.sign(recipient.public_key.clone(), 6, 0),
-    ];
-    let changeset = run(&accounts, &transactions).expect("valid batch should execute");
-
+    let settled = verify(&state, &body, 0, &Sequential).expect("valid body settles");
     assert_eq!(
-        changeset_account(&changeset, sender_a.public_key),
-        account(7, 1)
-    );
-    assert_eq!(
-        changeset_account(&changeset, sender_b.public_key),
-        account(7, 1)
-    );
-    assert_eq!(
-        changeset_account(&changeset, recipient.public_key),
-        account(15, 0)
+        settled,
+        [
+            (sender, Slot::Put(account(1, 3))),
+            (
+                recipient,
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 9, 0))
+            ),
+        ]
     );
 }
 
 #[test]
-fn credits_apply_to_post_debit_sender_state() {
-    let sender_a = TestSigner::from_seed(50);
-    let sender_b = TestSigner::from_seed(51);
-
-    let mut accounts = State::new();
-    accounts.insert(account_key(&sender_a.public_key), account(10, 0));
-    accounts.insert(account_key(&sender_b.public_key), account(10, 0));
-
-    let transactions = vec![
-        sender_a.sign(sender_b.public_key.clone(), 4, 0),
-        sender_b.sign(sender_a.public_key.clone(), 3, 0),
-    ];
-    let changeset = run(&accounts, &transactions).expect("valid batch should execute");
-
-    assert_eq!(
-        changeset_account(&changeset, sender_a.public_key),
-        account(9, 1)
-    );
-    assert_eq!(
-        changeset_account(&changeset, sender_b.public_key),
-        account(11, 1)
-    );
-}
-
-#[test]
-fn rejects_spend_funded_by_in_block_credit() {
-    let payer = TestSigner::from_seed(52);
-    let middle = TestSigner::from_seed(53);
-    let sink = TestSigner::from_seed(54);
-
-    let mut accounts = State::new();
-    accounts.insert(account_key(&payer.public_key), account(10, 0));
-    accounts.insert(account_key(&middle.public_key), account(0, 0));
-    accounts.insert(account_key(&sink.public_key), account(0, 0));
-
-    let transactions = vec![
-        payer.sign(middle.public_key.clone(), 10, 0),
-        middle.sign(sink.public_key, 1, 0),
-    ];
-    let transfers = prepared(&transactions);
-
-    assert!(compute(&accounts, &transfers).is_none());
-}
-
-#[test]
-fn self_transfer_only_bumps_nonce() {
-    let signer = TestSigner::from_seed(0);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(9, 3));
-
-    let transactions = vec![signer.sign(signer.public_key.clone(), 4, 3)];
-    let changeset = run(&accounts, &transactions).expect("self-transfer should execute");
-
-    assert_eq!(
-        changeset_account(&changeset, signer.public_key),
-        account(9, 4)
-    );
-}
-
-#[test]
-fn rejects_unfunded_self_transfer() {
-    let signer = TestSigner::from_seed(42);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(0, 0));
-
-    let transactions = vec![signer.sign(signer.public_key.clone(), 1, 0)];
-    let transfers = prepared(&transactions);
-
-    assert!(compute(&accounts, &transfers).is_none());
-}
-
-#[test]
-fn rejects_recipient_overflow() {
-    let signer = TestSigner::from_seed(40);
-    let recipient = TestSigner::from_seed(41);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), account(u64::MAX, 0));
-
-    let transactions = vec![signer.sign(recipient.public_key, 1, 0)];
-    assert!(run(&accounts, &transactions).is_none());
-}
-
-fn contended_accounts(account_count: usize) -> (State, Vec<TestSigner>) {
-    let signers: Vec<TestSigner> = (0..account_count as u64)
-        .map(TestSigner::from_seed)
-        .collect();
-    let mut accounts = State::new();
-    for signer in &signers {
-        accounts.insert(account_key(&signer.public_key), account(1_000, 0));
+fn rejects_refused_nonces() {
+    let [sender, recipient] = [key(1), key(2)];
+    let state = State::from([(sender, account(10, 1))]);
+    let far = NONCE_BITMAP_CAPACITY + 5;
+    for body in [
+        // Stale: consumed before the block.
+        vec![transfer(sender, recipient, 1, 0)],
+        // Repeated in the run-ahead window.
+        vec![
+            transfer(sender, recipient, 1, 3),
+            transfer(sender, recipient, 1, 3),
+        ],
+        // Repeated beyond the window.
+        vec![
+            transfer(sender, recipient, 1, far),
+            transfer(sender, recipient, 1, far),
+        ],
+        // A self-transfer consumes its nonce too.
+        vec![
+            transfer(sender, sender, 1, 1),
+            transfer(sender, recipient, 1, 1),
+        ],
+    ] {
+        assert_eq!(verify(&state, &body, 0, &Sequential), None, "{body:?}");
     }
-    (accounts, signers)
-}
-
-fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer> {
-    transactions
-        .iter()
-        .map(prepare_transfer)
-        .collect::<Option<Vec<_>>>()
-        .expect("transactions should prepare")
 }
 
 #[test]
-fn contended_general_account_load_keys_are_deduplicated() {
-    let sender = TestSigner::from_seed(80);
-    let recipient = TestSigner::from_seed(81);
-    let transactions = (0..4)
-        .map(|nonce| sender.sign(recipient.public_key.clone(), 1, nonce))
-        .collect::<Vec<_>>();
-    let transfers = prepared(&transactions);
-    let plan = super::execution_plan(&transfers).expect("execution plan");
-    let keys = plan.general.account_keys();
-    let unique = keys.iter().copied().collect::<HashSet<_>>();
+fn spends_only_block_start_balances() {
+    let [payer, middle, sink] = [key(1), key(2), key(3)];
+    let state = State::from([(payer, account(10, 0)), (middle, account(0, 1))]);
 
-    assert!(plan.discrete.transfers.is_empty());
-    assert_eq!(keys.len(), unique.len());
-    assert_eq!(keys.len(), 2);
-    assert!(unique.contains(&account_key(&sender.public_key)));
-    assert!(unique.contains(&account_key(&recipient.public_key)));
+    // Middle's credit cannot fund its spend in the same block.
+    let body = [transfer(payer, middle, 10, 0), transfer(middle, sink, 1, 1)];
+    assert_eq!(verify(&state, &body, 0, &Sequential), None);
+
+    // Credits apply after debits, so a pair of accounts can swap value.
+    let state = State::from([(payer, account(10, 0)), (middle, account(10, 0))]);
+    let body = [transfer(payer, middle, 4, 0), transfer(middle, payer, 3, 0)];
+    assert_eq!(
+        verify(&state, &body, 0, &Sequential).expect("swap settles"),
+        [
+            (payer, Slot::Put(account(9, 1))),
+            (middle, Slot::Put(account(11, 1))),
+        ]
+    );
 }
 
 #[test]
-fn execution_plan_keeps_unique_transfers_discrete_in_mixed_batches() {
-    let key = |seed| account_key(&TestSigner::from_seed(seed).public_key);
-    let transfer = |sender, recipient, nonce| super::PreparedTransfer {
-        sender,
-        recipient,
-        sender_prefix: sender.prefix(),
-        recipient_prefix: recipient.prefix(),
-        value: 1,
-        nonce,
-    };
+fn self_transfers_debit_and_credit_their_sender() {
+    let [sender, recipient] = [key(1), key(2)];
+    let state = State::from([(sender, account(9, 3))]);
 
-    let repeated = key(90);
-    let transfers = vec![
-        transfer(key(80), key(81), 0),
-        transfer(repeated, key(82), 0),
-        transfer(repeated, key(83), 1),
-        transfer(key(84), key(85), 0),
+    // Spending the whole balance on a self-transfer leaves it unchanged and consumes the nonce.
+    let body = [transfer(sender, sender, 9, 3)];
+    assert_eq!(
+        verify(&state, &body, 0, &Sequential).expect("self-transfer settles"),
+        [(sender, Slot::Put(account(9, 4)))]
+    );
+
+    // The self-transfer's debit and the send's together fit the starting balance.
+    let body = [
+        transfer(sender, sender, 4, 3),
+        transfer(sender, recipient, 5, 4),
     ];
-    let plan = super::execution_plan(&transfers).expect("execution plan");
+    assert_eq!(
+        verify(&state, &body, 0, &Sequential).expect("body settles"),
+        [
+            (sender, Slot::Put(account(4, 5))),
+            (
+                recipient,
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 5, 0))
+            ),
+        ]
+    );
 
-    assert_eq!(plan.discrete.transfers.len(), 2);
-    assert_eq!(plan.discrete.sender_keys.len(), 2);
-    assert_eq!(plan.discrete.recipient_keys.len(), 2);
-    assert_eq!(plan.general.account_keys().len(), 3);
+    // Debits past the starting balance are rejected, and a self-transfer's credit cannot fund them.
+    for body in [
+        vec![
+            transfer(sender, sender, 5, 3),
+            transfer(sender, recipient, 5, 4),
+        ],
+        vec![
+            transfer(sender, sender, 9, 3),
+            transfer(sender, recipient, 9, 4),
+        ],
+        vec![transfer(sender, sender, 10, 3)],
+    ] {
+        assert_eq!(verify(&state, &body, 0, &Sequential), None, "{body:?}");
+    }
+
+    // Selection drops the send that the self-transfer's debit leaves unaffordable.
+    let rounds = vec![vec![
+        transfer(sender, sender, 5, 3),
+        transfer(sender, recipient, 5, 4),
+        transfer(sender, recipient, 4, 4),
+    ]];
+    let (accepted, settled) = select(&state, &rounds, 0);
+    assert_eq!(accepted, [vec![true, false, true]]);
+    assert_eq!(
+        settled,
+        [
+            (sender, Slot::Put(account(5, 5))),
+            (
+                recipient,
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 4, 0))
+            ),
+        ]
+    );
 }
 
 #[test]
-fn mixed_discrete_and_general_execution_writes_each_account_once() {
-    let discrete_sender = TestSigner::from_seed(100);
-    let discrete_recipient = TestSigner::from_seed(101);
-    let repeated_sender = TestSigner::from_seed(102);
-    let general_recipient = TestSigner::from_seed(103);
+fn rejects_unaffordable_and_overflowing_sums() {
+    let [poor, rich, recipient] = [key(1), key(2), key(3)];
+    let state = State::from([
+        (poor, account(5, 0)),
+        (rich, account(u64::MAX, 0)),
+        (recipient, account(u64::MAX - 1, 0)),
+    ]);
+    for body in [
+        vec![transfer(poor, recipient, 6, 0)],
+        vec![transfer(poor, rich, 3, 0), transfer(poor, rich, 3, 1)],
+        vec![transfer(rich, recipient, 2, 0)],
+        // Debits that sum past u64::MAX.
+        vec![
+            transfer(rich, poor, u64::MAX, 0),
+            transfer(rich, poor, u64::MAX, 1),
+        ],
+        // Credits that sum past u64::MAX.
+        vec![
+            transfer(rich, poor, u64::MAX, 0),
+            transfer(recipient, poor, u64::MAX - 1, 0),
+        ],
+    ] {
+        assert_eq!(verify(&state, &body, 0, &Sequential), None, "{body:?}");
+    }
 
-    let mut accounts = State::new();
-    accounts.insert(account_key(&discrete_sender.public_key), account(10, 0));
-    accounts.insert(account_key(&discrete_recipient.public_key), account(5, 0));
-    accounts.insert(account_key(&repeated_sender.public_key), account(10, 0));
-    accounts.insert(account_key(&general_recipient.public_key), account(7, 0));
+    // A final balance at u64::MAX fits, though a credit arrives before the debit it nets with.
+    let body = [transfer(poor, rich, 1, 0), transfer(rich, recipient, 1, 0)];
+    assert_eq!(
+        verify(&state, &body, 0, &Sequential).expect("body settles"),
+        [
+            (poor, Slot::Put(account(4, 1))),
+            (rich, Slot::Put(account(u64::MAX, 1))),
+            (recipient, Slot::Put(account(u64::MAX, 0))),
+        ]
+    );
+}
 
-    let transactions = vec![
-        discrete_sender.sign(discrete_recipient.public_key.clone(), 3, 0),
-        repeated_sender.sign(general_recipient.public_key.clone(), 2, 0),
-        repeated_sender.sign(general_recipient.public_key.clone(), 2, 1),
+#[test]
+fn selection_drops_what_cannot_settle() {
+    let [alice, bob, carol, rich] = [key(1), key(2), key(3), key(4)];
+    let state = State::from([
+        (alice, account(50, 1)),
+        (bob, account(30, 0)),
+        (rich, account(u64::MAX - 10, 0)),
+    ]);
+    let rounds = vec![
+        vec![
+            // Stale nonce.
+            transfer(alice, carol, 10, 0),
+            // Spends most of Alice's balance.
+            transfer(alice, bob, 40, 1),
+            // Alice's credit cannot fund Bob.
+            transfer(bob, carol, 40, 0),
+            // Affordable from Bob's start.
+            transfer(bob, carol, 30, 0),
+            // Repeats Bob's nonce.
+            transfer(bob, carol, 1, 0),
+        ],
+        vec![
+            // A self-transfer above Alice's start.
+            transfer(alice, alice, 60, 2),
+            // A self-transfer Alice's start covers, but not with her accepted debit.
+            transfer(alice, alice, 20, 2),
+            // A self-transfer that fits the rest of Alice's start.
+            transfer(alice, alice, 10, 2),
+            // Would overflow Rich, who no accepted transfer touches.
+            transfer(carol, rich, 20, 0),
+            // Carol is read in a later round.
+            transfer(carol, alice, 10, 0),
+        ],
     ];
-    let changeset = run(&accounts, &transactions).expect("valid mixed batch should execute");
-    let unique = changeset.iter().map(|(key, _)| key).collect::<HashSet<_>>();
-
-    assert_eq!(changeset.len(), unique.len());
+    let (accepted, settled) = select(&state, &rounds, 0);
     assert_eq!(
-        changeset_account(&changeset, discrete_sender.public_key),
-        account(7, 1)
+        accepted,
+        [
+            vec![false, true, false, true, false],
+            vec![false, false, true, false, true],
+        ]
     );
     assert_eq!(
-        changeset_account(&changeset, discrete_recipient.public_key),
-        account(8, 0)
-    );
-    assert_eq!(
-        changeset_account(&changeset, repeated_sender.public_key),
-        account(6, 2)
-    );
-    assert_eq!(
-        changeset_account(&changeset, general_recipient.public_key),
-        account(11, 0)
+        settled,
+        [
+            (alice, Slot::Put(account(20, 3))),
+            (bob, Slot::Put(account(40, 1))),
+            (carol, Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 20, 1))),
+            (rich, Slot::Keep),
+        ]
     );
 }
 
-#[test]
-fn executes_large_contended_batch() {
-    // Contended accounts: senders overlap recipients, each signs several
-    // transactions in out-of-order (run-ahead) nonces, and round 2 is a
-    // self-transfer for every account. Every transaction is valid.
-    let account_count = 600usize;
-    let (accounts, signers) = contended_accounts(account_count);
+/// Draws a block-start state over `keys`. A `reachable` state holds only accounts settlement can
+/// write: one that has consumed no nonce holds at least the default balance.
+fn random_state(rng: &mut TestRng, keys: &[AccountKey], reachable: bool) -> State {
+    const BALANCES: [u64; 11] = [
+        0,
+        1,
+        5,
+        50,
+        DEFAULT_ACCOUNT_BALANCE - 1,
+        DEFAULT_ACCOUNT_BALANCE,
+        DEFAULT_ACCOUNT_BALANCE + 1,
+        1_000,
+        u64::MAX / 2,
+        u64::MAX - 5,
+        u64::MAX,
+    ];
+    const BASES: [u64; 6] = [0, 0, 1, 2, 1_000, u64::MAX - 1];
+    let mut state = State::new();
+    for key in keys {
+        if rng.random_range(0..4) == 0 {
+            continue;
+        }
+        let bitmap = if rng.random_bool(0.5) {
+            0
+        } else {
+            rng.random::<u64>() & rng.random::<u64>()
+        };
+        let mut account = Account {
+            balance: BALANCES[rng.random_range(0..BALANCES.len())],
+            nonce: Nonce::new(BASES[rng.random_range(0..BASES.len())], bitmap),
+        };
+        if reachable && account.nonce == Nonce::default() {
+            account.balance = account.balance.max(DEFAULT_ACCOUNT_BALANCE);
+        }
+        state.insert(*key, account);
+    }
+    state
+}
 
-    let mut transactions = Vec::new();
-    for round in 0..4u64 {
-        for (index, signer) in signers.iter().enumerate() {
-            let recipient = if round == 2 {
-                signer.public_key.clone()
+/// Draws a body from `senders` to `recipients`. Each transfer is adversarial with probability
+/// `noise`: its nonce is stale, run ahead, past the window, a repeat, or unusable, and its value
+/// may exhaust or overflow balances. The rest draw small values and each sender's next sequential
+/// nonce. A fifth of the transfers are self-transfers.
+fn random_body(
+    rng: &mut TestRng,
+    state: &State,
+    senders: &[AccountKey],
+    recipients: &[AccountKey],
+    len: usize,
+    noise: f64,
+) -> Vec<PreparedTransfer> {
+    const VALUES: [u64; 10] = [
+        1,
+        2,
+        3,
+        10,
+        49,
+        50,
+        100,
+        u64::MAX / 2,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let mut next: BTreeMap<AccountKey, u64> = BTreeMap::new();
+    let mut used: Vec<(AccountKey, u64)> = Vec::new();
+    (0..len)
+        .map(|_| {
+            let sender = senders[rng.random_range(0..senders.len())];
+            let recipient = if rng.random_range(0..5) == 0 {
+                sender
             } else {
-                signers[(index * 7 + 1) % account_count].public_key.clone()
+                recipients[rng.random_range(0..recipients.len())]
             };
-            transactions.push(signer.sign(recipient, 1, round));
+            let base = state.get(&sender).copied().unwrap_or_default().nonce.base;
+            let sequential = next.entry(sender).or_insert(base);
+            let (value, nonce) = if rng.random_bool(noise) {
+                let value = VALUES[rng.random_range(0..VALUES.len())];
+                let nonce = match rng.random_range(0..6) {
+                    0 => base.saturating_sub(1),
+                    1 => base.saturating_add(rng.random_range(1..=NONCE_BITMAP_CAPACITY)),
+                    2 => base.saturating_add(NONCE_BITMAP_CAPACITY + rng.random_range(1..=3)),
+                    3 => used
+                        .iter()
+                        .rev()
+                        .find(|(key, _)| *key == sender)
+                        .map_or(base, |(_, nonce)| *nonce),
+                    4 => u64::MAX,
+                    _ => *sequential,
+                };
+                (value, nonce)
+            } else {
+                let nonce = *sequential;
+                *sequential = sequential.saturating_add(1);
+                (rng.random_range(1..=10), nonce)
+            };
+            used.push((sender, nonce));
+            transfer(sender, recipient, value, nonce)
+        })
+        .collect()
+}
+
+/// Splits `body` into between one and four rounds of candidates.
+fn random_rounds(rng: &mut TestRng, body: &[PreparedTransfer]) -> Vec<Vec<PreparedTransfer>> {
+    let mut rounds = Vec::new();
+    let mut rest = body;
+    for _ in 0..rng.random_range(0..4) {
+        let (round, tail) = rest.split_at(rng.random_range(0..=rest.len()));
+        rounds.push(round.to_vec());
+        rest = tail;
+    }
+    rounds.push(rest.to_vec());
+    rounds
+}
+
+/// Draws a small key universe, so transfers contend for the same accounts.
+fn random_keys(rng: &mut TestRng) -> Vec<AccountKey> {
+    const UNIVERSES: [u8; 7] = [1, 2, 3, 4, 6, 8, 32];
+    (1..=UNIVERSES[rng.random_range(0..UNIVERSES.len())])
+        .map(key)
+        .collect()
+}
+
+/// Adversarial fractions of the randomized bodies.
+const NOISE: [f64; 4] = [0.0, 0.05, 0.25, 0.75];
+
+/// One randomized small case: a state, whether it is reachable, and a body.
+fn random_case(rng: &mut TestRng) -> (State, bool, Vec<PreparedTransfer>) {
+    let keys = random_keys(rng);
+    let reachable = rng.random_bool(0.75);
+    let state = random_state(rng, &keys, reachable);
+    let len = rng.random_range(0..=40);
+    let noise = NOISE[rng.random_range(0..NOISE.len())];
+    let body = random_body(rng, &state, &keys, &keys, len, noise);
+    (state, reachable, body)
+}
+
+#[test]
+fn verification_matches_model() {
+    let mut rng = TestRng::new(7);
+    let mut settled = 0;
+    for case in 0..20_000u64 {
+        let (state, reachable, body) = random_case(&mut rng);
+        let expected = Model::verify(&state, &body);
+        assert_eq!(
+            verify(&state, &body, case, &Sequential),
+            expected,
+            "case {case}"
+        );
+        if let Some(slots) = expected {
+            settled += 1;
+            if reachable {
+                assert!(
+                    slots.iter().all(|(_, slot)| matches!(slot, Slot::Put(_))),
+                    "case {case}: every key a body changes is written"
+                );
+            }
         }
     }
-    let transfers = prepared(&transactions);
-
-    assert!(compute(&accounts, &transfers).is_some());
+    assert!(settled > 2_000, "only {settled} bodies settled");
 }
 
 #[test]
-fn rejects_large_duplicate_nonce_batch() {
-    // A duplicate nonce makes the batch invalid.
-    let account_count = 600usize;
-    let (accounts, signers) = contended_accounts(account_count);
+fn selection_matches_model_and_verifies() {
+    let mut rng = TestRng::new(8);
+    let mut dropped = 0;
+    for case in 0..20_000u64 {
+        let (state, _, body) = random_case(&mut rng);
+        let rounds = random_rounds(&mut rng, &body);
+        let (accepted, settled) = select(&state, &rounds, case);
+        assert_eq!(
+            (accepted.clone(), settled.clone()),
+            Model::select(&state, &rounds),
+            "case {case}"
+        );
 
-    let mut transactions = Vec::new();
-    for (index, signer) in signers.iter().enumerate() {
-        let recipient = signers[(index + 1) % account_count].public_key.clone();
-        transactions.push(signer.sign(recipient.clone(), 1, 0));
-        transactions.push(signer.sign(recipient.clone(), 2, 0)); // duplicate nonce
-        transactions.push(signer.sign(recipient, 1, 1));
+        // The accepted body settles to the same writes under verification.
+        let survivors = survivors(&rounds, &accepted);
+        dropped += body.len() - survivors.len();
+        let verified = verify(&state, &survivors, case, &Sequential).expect("survivors settle");
+        assert_eq!(written(&verified), written(&settled), "case {case}");
     }
-    let transfers = prepared(&transactions);
+    assert!(dropped > 20_000, "only {dropped} candidates dropped");
+}
 
-    assert!(compute(&accounts, &transfers).is_none());
+/// Keys enough for plans and settlement to split among workers.
+fn many_keys(count: u32) -> Vec<AccountKey> {
+    (0..count)
+        .map(|index| {
+            let mut raw = [0u8; AccountKey::SIZE];
+            raw[..4].copy_from_slice(&index.to_le_bytes());
+            AccountKey::from(raw)
+        })
+        .collect()
+}
+
+/// A funded state over `keys` whose accounts have consumed varied nonces.
+fn funded_state(rng: &mut TestRng, keys: &[AccountKey]) -> State {
+    keys.iter()
+        .map(|key| (*key, account(1_000_000, rng.random_range(0..3))))
+        .collect()
 }
 
 #[test]
-fn failed_debit_rejects_batch() {
-    // A failed debit rejects the whole batch, even when its recipient is near
-    // overflow.
-    let broke = TestSigner::from_seed(1);
-    let funded = TestSigner::from_seed(2);
-    let recipient = TestSigner::from_seed(3);
+fn parallel_settlement_matches_model() {
+    let strategy = Rayon::new(NonZeroUsize::new(4).unwrap()).expect("rayon pool");
+    let keys = many_keys(40_000);
+    let mut rng = TestRng::new(9);
+    for (case, noise) in [0.0, 0.0, 0.0001, 0.001].into_iter().enumerate() {
+        // Senders are funded, and the remaining recipients start absent.
+        let senders = &keys[..rng.random_range(2_000..30_000)];
+        let state = funded_state(&mut rng, senders);
+        let body = random_body(&mut rng, &state, senders, &keys, 50_000, noise);
+        let expected = Model::verify(&state, &body);
+        assert_eq!(expected.is_some(), noise == 0.0, "case {case}");
+        assert_eq!(
+            verify(&state, &body, case as u64, &strategy),
+            expected,
+            "case {case}"
+        );
 
-    let mut accounts = State::new();
-    accounts.insert(account_key(&broke.public_key), account(0, 0)); // cannot pay
-    accounts.insert(account_key(&funded.public_key), account(100, 0));
-    accounts.insert(
-        account_key(&recipient.public_key),
-        Account {
-            balance: u64::MAX - 1,
-            nonce: Nonce::new(0, 0),
-        },
-    );
-
-    let transactions = [
-        broke.sign(recipient.public_key.clone(), 1, 0), // debit fails
-        funded.sign(recipient.public_key, 1, 0),
-    ];
-    let transfers = prepared(&transactions);
-
-    assert!(compute(&accounts, &transfers).is_none());
-}
-
-#[test]
-fn prefix_collision_only_demotes_to_the_general_lane() {
-    // Touch counting keys accounts by their 64-bit prefix, so two distinct
-    // keys sharing a prefix look contended and route to the general lane.
-    // That demotion must not change the computed accounts.
-    let key = |bytes: [u8; 2]| {
-        let mut raw = [0u8; AccountKey::SIZE];
-        raw[..8].copy_from_slice(&[7; 8]);
-        raw[8..10].copy_from_slice(&bytes);
-        AccountKey::from(raw)
-    };
-    let sender_a = key([1, 0]);
-    let sender_b = key([2, 0]);
-    assert_ne!(sender_a, sender_b);
-    assert_eq!(sender_a.prefix(), sender_b.prefix());
-    let recipient_a = AccountKey::from([3; AccountKey::SIZE]);
-    let recipient_b = AccountKey::from([4; AccountKey::SIZE]);
-
-    let transfer = |sender: AccountKey, recipient: AccountKey, value, nonce| PreparedTransfer {
-        sender,
-        recipient,
-        sender_prefix: sender.prefix(),
-        recipient_prefix: recipient.prefix(),
-        value,
-        nonce,
-    };
-    let transfers = [
-        transfer(sender_a, recipient_a, 3, 0),
-        transfer(sender_b, recipient_b, 5, 0),
-    ];
-
-    let mut accounts = State::new();
-    accounts.insert(sender_a, account(10, 0));
-    accounts.insert(sender_b, account(20, 0));
-
-    let changeset = compute(&accounts, &transfers).expect("collision batch executes");
-
-    let balance = |key: AccountKey| {
-        changeset
-            .iter()
-            .find_map(|(candidate, account)| (*candidate == key).then_some(account.balance))
-            .expect("account should be in changeset")
-    };
-    assert_eq!(changeset.len(), 4);
-    assert_eq!(balance(sender_a), 7);
-    assert_eq!(balance(sender_b), 15);
-    assert_eq!(balance(recipient_a), DEFAULT_ACCOUNT_BALANCE + 3);
-    assert_eq!(balance(recipient_b), DEFAULT_ACCOUNT_BALANCE + 5);
-}
-
-/// Runs the selective executor over `transfers` against `state`, returning
-/// the applied flags and the final account values keyed by account.
-fn run_selective(
-    state: &State,
-    transfers: &[PreparedTransfer],
-) -> (Vec<bool>, Vec<(AccountKey, Account)>) {
-    let mut executor = super::SelectiveExecutor::new();
-    let keys = executor.begin_round(transfers);
-    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
-    executor.register(&values);
-    let applied = executor.apply(transfers);
-    let changes = executor
-        .into_updates()
-        .into_iter()
-        .map(|(index, account)| (keys[index], account.expect("touched accounts are written")))
-        .collect();
-    (applied, changes)
-}
-
-/// The load-bearing invariant of best-effort proposing: the surviving subset
-/// re-executes cleanly under the all-or-nothing path with identical writes.
-fn assert_survivors_verify(
-    state: &State,
-    transfers: &[PreparedTransfer],
-    applied: &[bool],
-    selective_changes: &[(AccountKey, Account)],
-) {
-    let survivors: Vec<PreparedTransfer> = transfers
-        .iter()
-        .zip(applied)
-        .filter_map(|(transfer, applied)| applied.then_some(*transfer))
-        .collect();
-    let baseline = compute(state, &survivors).expect("survivors must verify all-or-nothing");
-    let mut selective = selective_changes.to_vec();
-    selective.sort_unstable_by_key(|(key, _)| *key);
-    assert_eq!(baseline, selective, "proposer and verifier writes diverge");
-}
-
-fn one_prepared(
-    sender: &TestSigner,
-    to: &ed25519::PublicKey,
-    value: u64,
-    nonce: u64,
-) -> PreparedTransfer {
-    prepare_transfer(&sender.sign(to.clone(), value, nonce)).expect("prepare must succeed")
-}
-
-#[test]
-fn selective_drops_stale_and_duplicate_nonces() {
-    let alice = TestSigner::from_seed(1);
-    let bob = TestSigner::from_seed(2);
-    let carol = TestSigner::from_seed(3);
-    let mut state = State::new();
-    // Alice's nonce 0 was already consumed upstream.
-    state.insert(account_key(&alice.public_key), account(1_000, 1));
-    state.insert(account_key(&bob.public_key), account(1_000, 0));
-
-    let transfers = vec![
-        one_prepared(&alice, &carol.public_key, 10, 0), // stale: consumed upstream
-        one_prepared(&alice, &carol.public_key, 20, 1), // valid
-        one_prepared(&bob, &carol.public_key, 30, 0),   // valid
-        one_prepared(&bob, &carol.public_key, 40, 0),   // duplicate of the previous nonce
-    ];
-    let (applied, changes) = run_selective(&state, &transfers);
-    assert_eq!(applied, vec![false, true, true, false]);
-    assert_survivors_verify(&state, &transfers, &applied, &changes);
-
-    let carol_final = changeset_account(&changes, carol.public_key);
-    assert_eq!(carol_final.balance, DEFAULT_ACCOUNT_BALANCE + 50);
-}
-
-#[test]
-fn selective_enforces_block_start_balances() {
-    let alice = TestSigner::from_seed(4);
-    let bob = TestSigner::from_seed(5);
-    let carol = TestSigner::from_seed(6);
-    let mut state = State::new();
-    state.insert(account_key(&alice.public_key), account(100, 0));
-    state.insert(account_key(&bob.public_key), account(30, 0));
-
-    let transfers = vec![
-        // Alice funds Bob, but the credit cannot fund Bob's spend below.
-        one_prepared(&alice, &bob.public_key, 100, 0),
-        one_prepared(&bob, &carol.public_key, 50, 0), // exceeds Bob's start balance
-        one_prepared(&bob, &carol.public_key, 30, 0), // affordable from start
-    ];
-    let (applied, changes) = run_selective(&state, &transfers);
-    assert_eq!(applied, vec![true, false, true]);
-    assert_survivors_verify(&state, &transfers, &applied, &changes);
-
-    let bob_final = changeset_account(&changes, bob.public_key);
-    assert_eq!(bob_final.balance, 100); // 30 - 30 + 100
-}
-
-#[test]
-fn selective_drops_unaffordable_self_transfers_and_credit_overflow() {
-    let alice = TestSigner::from_seed(7);
-    let bob = TestSigner::from_seed(8);
-    let rich = TestSigner::from_seed(9);
-    let mut state = State::new();
-    state.insert(account_key(&alice.public_key), account(50, 0));
-    state.insert(account_key(&rich.public_key), account(u64::MAX - 10, 0));
-    state.insert(account_key(&bob.public_key), account(100, 0));
-
-    let transfers = vec![
-        one_prepared(&alice, &alice.public_key, 60, 0), // self-transfer above start
-        one_prepared(&alice, &alice.public_key, 50, 0), // affordable self-transfer
-        one_prepared(&bob, &rich.public_key, 20, 0),    // would overflow rich
-        one_prepared(&bob, &alice.public_key, 10, 0),   // fine
-    ];
-    let (applied, changes) = run_selective(&state, &transfers);
-    assert_eq!(applied, vec![false, true, false, true]);
-    assert_survivors_verify(&state, &transfers, &applied, &changes);
-
-    // The failed self-transfer consumed nothing: nonce 0 stayed available.
-    let alice_final = changeset_account(&changes, alice.public_key);
-    assert_eq!(alice_final.balance, 60); // 50 + 10
-}
-
-#[test]
-fn selective_multi_round_matches_single_pass() {
-    let alice = TestSigner::from_seed(10);
-    let bob = TestSigner::from_seed(11);
-    let carol = TestSigner::from_seed(12);
-    let mut state = State::new();
-    state.insert(account_key(&alice.public_key), account(1_000, 0));
-    state.insert(account_key(&bob.public_key), account(1_000, 0));
-
-    let first = vec![
-        one_prepared(&alice, &carol.public_key, 10, 0),
-        one_prepared(&alice, &carol.public_key, 10, 0), // duplicate: dropped
-    ];
-    let second = vec![
-        one_prepared(&bob, &carol.public_key, 5, 0), // refill round, new accounts
-        one_prepared(&alice, &carol.public_key, 7, 1), // refill touching known accounts
-    ];
-
-    // Two rounds through one executor (the refill shape)...
-    let mut executor = super::SelectiveExecutor::new();
-    let keys = executor.begin_round(&first);
-    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
-    executor.register(&values);
-    assert_eq!(executor.apply(&first), vec![true, false]);
-    let more = executor.begin_round(&second);
-    assert_eq!(more.len(), 1, "only Bob's account is new");
-    let values: Vec<Option<Account>> = more.iter().map(|key| state.get(key).copied()).collect();
-    executor.register(&values);
-    assert_eq!(executor.apply(&second), vec![true, true]);
-    let mut all_keys = keys;
-    all_keys.extend(more);
-    let mut multi: Vec<(AccountKey, Account)> = executor
-        .into_updates()
-        .into_iter()
-        .map(|(index, account)| (all_keys[index], account.expect("written")))
-        .collect();
-    multi.sort_unstable_by_key(|(key, _)| *key);
-
-    // ...must match the survivors executed in one all-or-nothing pass.
-    let survivors = vec![first[0], second[0], second[1]];
-    let baseline = compute(&state, &survivors).expect("survivors verify");
-    assert_eq!(baseline, multi);
+        let rounds = random_rounds(&mut rng, &body);
+        let (accepted, settled) = select(&state, &rounds, case as u64);
+        assert_eq!(
+            (accepted.clone(), settled),
+            Model::select(&state, &rounds),
+            "case {case}"
+        );
+        let survivors = survivors(&rounds, &accepted);
+        let verified = verify(&state, &survivors, case as u64, &strategy);
+        assert!(verified.is_some(), "case {case}");
+        assert_eq!(verified, Model::verify(&state, &survivors), "case {case}");
+    }
 }

@@ -6,7 +6,8 @@ use super::{
     traces::CaptureTraces,
 };
 use commonware_codec::Encode;
-use commonware_cryptography::{ed25519::PublicKey, sha256::Sha256};
+use commonware_cryptography::sha256::Sha256;
+use commonware_cryptography_curve25519::signing::VerifyingKey;
 use commonware_runtime::{
     Metrics, Spawner as _, Supervisor as _,
     telemetry::metrics::{Histogram, MetricsExt as _},
@@ -81,7 +82,7 @@ pub(super) struct FinalizedUploadProducer {
 impl FinalizedUploadProducer {
     pub(super) async fn enqueue(
         self,
-        block: EngineBlock<Sha256, PublicKey>,
+        block: EngineBlock<Sha256, VerifyingKey>,
         artifacts: FinalizedArtifacts<Sha256>,
         trace: Span,
     ) {

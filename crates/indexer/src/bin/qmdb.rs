@@ -5,20 +5,27 @@
 //! transaction-hash history under `/transactions`.
 
 use axum::Router;
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use commonware_codec::FixedSize;
 use commonware_cryptography::sha256::Sha256;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
 use constantinople_indexer::{
     adapter::{self, BoxError, Profile},
+    explorer,
     namespaces::{STATE_PROOF_CHUNK_SIZE, state_qmdb_client, transactions_qmdb_client},
 };
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::service::server::{keyless_operation_log_stack, unordered_operation_log_stack};
 use exoware_sdk::StoreClient;
+use std::time::Duration;
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 const PROFILE: Profile = Profile {
     name: "qmdb-indexer",
@@ -30,7 +37,7 @@ type AccountValue = FixedBytes<{ Account::SIZE }>;
 type TransactionValue = commonware_cryptography::sha256::Digest;
 
 fn build_routes(client: &StoreClient) -> Result<Router, BoxError> {
-    Ok(Router::new()
+    Ok(explorer::router(client)?
         .nest_service(
             "/state",
             unordered_operation_log_stack::<

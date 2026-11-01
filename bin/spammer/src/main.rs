@@ -16,6 +16,7 @@ mod submitter;
 use accounts::{SpamAccount, generate_accounts, resolve_seed_offset};
 use clap::Parser;
 use cli::Cli;
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
@@ -25,14 +26,18 @@ use signer::{Tx, sign_batch};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use submitter::{RelayerSubmitter, Stats};
 use tokio::sync::mpsc;
 use tracing::info;
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 fn main() {
     let cli = Cli::parse();

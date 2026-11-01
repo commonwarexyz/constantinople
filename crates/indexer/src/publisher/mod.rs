@@ -411,6 +411,55 @@ fn retry_backoff(attempt: u32) -> Duration {
     INITIAL.saturating_mul(factor).min(MAX)
 }
 
+/// Threshold signing fixtures for publisher tests.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use commonware_cryptography::{
+        Signer as _,
+        bls12381::{
+            dkg::feldman_desmedt::deal,
+            primitives::{sharing::Mode, variant::MinSig},
+        },
+    };
+    use commonware_cryptography_curve25519::signing::{SigningKey, VerifyingKey};
+    use commonware_math::algebra::Random as _;
+    use commonware_utils::{N3f1, TryCollect as _, ordered::Set};
+    use constantinople_engine::ThresholdScheme;
+    use rand::CryptoRng;
+
+    pub(crate) type Scheme = ThresholdScheme<VerifyingKey, MinSig>;
+
+    /// Deals a threshold key to `n` random Ed25519 participants, returning
+    /// every participant's signer and a verifier.
+    pub(crate) fn threshold(
+        rng: &mut impl CryptoRng,
+        namespace: &[u8],
+        n: u32,
+    ) -> (Vec<Scheme>, Scheme) {
+        let participants: Set<_> = (0..n)
+            .map(|_| SigningKey::random(&mut *rng).public_key())
+            .try_collect()
+            .expect("random participants are distinct");
+        let (output, shares) =
+            deal::<MinSig, _, N3f1>(rng, Mode::NonZeroCounter, participants.clone())
+                .expect("deal should succeed");
+        let schemes = shares
+            .into_iter()
+            .map(|(_, share)| {
+                Scheme::signer(
+                    namespace,
+                    participants.clone(),
+                    output.public().clone(),
+                    share,
+                )
+                .expect("every share belongs to a participant")
+            })
+            .collect();
+        let verifier = Scheme::verifier(namespace, participants, output.public().clone());
+        (schemes, verifier)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

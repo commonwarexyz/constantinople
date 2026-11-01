@@ -16,6 +16,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::range::NonEmptyRange;
+use std::sync::Arc;
 
 /// A block header containing metadata, consensus context, and state commitment roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,7 +184,7 @@ where
     /// decoding does not pay the per-transaction decode + seal-hash cost on the
     /// caller's thread. Materialization is typically driven in parallel at
     /// verify time via a [`commonware_parallel::Strategy`].
-    pub body: Vec<LazySignedTransaction<H>>,
+    pub body: Arc<Vec<LazySignedTransaction<H>>>,
 }
 
 impl<C, P, H> Clone for Block<C, P, H>
@@ -195,7 +196,7 @@ where
     fn clone(&self) -> Self {
         Self {
             header: self.header.clone(),
-            body: self.body.clone(),
+            body: Arc::clone(&self.body),
         }
     }
 }
@@ -216,7 +217,7 @@ where
         let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
-            body: body.into_iter().map(LazySignedTransaction::new).collect(),
+            body: Arc::new(body.into_iter().map(LazySignedTransaction::new).collect()),
         })
     }
 }
@@ -251,7 +252,7 @@ where
     pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
             header,
-            body: body.into_iter().map(LazySignedTransaction::new).collect(),
+            body: Arc::new(body.into_iter().map(LazySignedTransaction::new).collect()),
         }
     }
 }
@@ -293,7 +294,7 @@ where
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
             header: Header::read_cfg(&mut buf, &())?,
-            body: Vec::read_cfg(&mut buf, &tx_vec_cfg)?,
+            body: Arc::read_cfg(&mut buf, &tx_vec_cfg)?,
         })
     }
 }
@@ -394,14 +395,15 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Signer, ed25519, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography::{Signer, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use rand::{SeedableRng, rngs::StdRng};
 
-    fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
+    fn test_context() -> Context<sha256::Digest, ed25519::VerifyingKey> {
         let mut rng = StdRng::from_seed([7u8; 32]);
-        let leader = ed25519::PrivateKey::random(&mut rng).public_key();
+        let leader = ed25519::SigningKey::random(&mut rng).public_key();
         Context {
             round: Round::new(Epoch::zero(), View::zero()),
             leader,
@@ -409,7 +411,7 @@ mod tests {
         }
     }
 
-    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey> {
+    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey> {
         Header {
             context: test_context(),
             parent: sha256::Digest::EMPTY,
@@ -430,7 +432,7 @@ mod tests {
         header.write(&mut buf);
 
         let decoded =
-            Header::<sha256::Digest, sha256::Digest, ed25519::PublicKey>::decode_cfg(buf, &())
+            Header::<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>::decode_cfg(buf, &())
                 .expect("decoding should succeed");
         assert_eq!(decoded, header);
     }
@@ -447,18 +449,77 @@ mod tests {
 
     #[test]
     fn block_codec_roundtrip_empty_body() {
-        let block =
-            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(test_header(), vec![]);
+        let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
+            test_header(),
+            vec![],
+        );
 
         let mut buf = Vec::with_capacity(block.encode_size());
         block.write(&mut buf);
 
-        let decoded = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::decode_cfg(
+        let decoded = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::decode_cfg(
             buf,
             &BlockCfg::default(),
         )
         .expect("decoding should succeed");
         assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn cloned_block_shares_body_and_preserves_deferred_wire_bytes() {
+        type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+        let payload_size =
+            crate::Transaction::<sha256::Digest>::SIZE + crate::TransactionSignature::MIN_SIZE;
+        let mut encoded = test_header().encode().to_vec();
+        2usize.write(&mut encoded);
+        for fill in [0xfe, 0xff] {
+            payload_size.write(&mut encoded);
+            encoded.resize(encoded.len() + payload_size, fill);
+        }
+        let block = TestBlock::decode_cfg(encoded.clone(), &BlockCfg::default()).unwrap();
+        let weak = Arc::downgrade(&block.body);
+
+        let cloned = block.clone();
+
+        assert!(Arc::ptr_eq(&block.body, &cloned.body));
+        assert_eq!(block.body.as_ptr(), cloned.body.as_ptr());
+        assert_eq!(cloned.encode().as_ref(), encoded.as_slice());
+        drop(block);
+        assert_eq!(weak.strong_count(), 1);
+        for transaction in cloned.body.iter() {
+            assert!(transaction.get().is_none());
+        }
+        assert_eq!(cloned.encode().as_ref(), encoded.as_slice());
+        drop(cloned);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn constructed_block_clones_share_materialized_transactions() {
+        let mut rng = StdRng::from_seed([31; 32]);
+        let signer = ed25519::SigningKey::random(&mut rng);
+        let key = crate::TransactionPublicKey::ed25519(signer.public_key());
+        let transaction = crate::Transaction::<sha256::Digest>::new(
+            key.clone(),
+            key,
+            core::num::NonZeroU64::MIN,
+            0,
+        )
+        .seal_and_sign(
+            &signer,
+            crate::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
+        let block = Block::new(test_header(), vec![transaction]);
+
+        let cloned = block.clone();
+
+        assert!(Arc::ptr_eq(&block.body, &cloned.body));
+        assert!(core::ptr::eq(
+            block.body[0].get().unwrap(),
+            cloned.body[0].get().unwrap()
+        ));
+        assert_eq!(block.encode(), cloned.encode());
     }
 
     fn encoded_block_with_size(size: usize) -> Vec<u8> {
@@ -489,7 +550,7 @@ mod tests {
 
     #[test]
     fn block_codec_enforces_encoded_size_limit() {
-        type TestBlock = Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+        type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
 
         for size in [MAXIMUM_BLOCK_SIZE - 1, MAXIMUM_BLOCK_SIZE] {
             let mut encoded = encoded_block_with_size(size);
@@ -507,8 +568,10 @@ mod tests {
 
     #[test]
     fn block_encode_size_matches_written() {
-        let block =
-            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(test_header(), vec![]);
+        let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
+            test_header(),
+            vec![],
+        );
         let expected = block.encode_size();
 
         let mut buf = Vec::new();
@@ -535,7 +598,7 @@ mod tests {
         )
         .expect("test WebAuthn signature should encode");
         let signed = crate::SignedTransaction::new_unchecked(sealed, signature);
-        let block = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(
+        let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
             test_header(),
             vec![signed],
         );
@@ -543,7 +606,7 @@ mod tests {
         let encoded = block.encode();
         let mut reader = encoded;
         let _decoded =
-            <Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
+            <Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
                 &mut reader,
                 &BlockCfg::default(),
             )

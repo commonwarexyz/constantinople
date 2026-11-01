@@ -1,16 +1,14 @@
 //! Execution and commitment checks for consensus blocks.
 //!
-//! This module is the consensus-facing wrapper around the account executor. It
-//! prepares block bodies, stages the state needed for account execution,
-//! computes final account values and transaction-history updates, and returns
-//! the merkleized commitments that consensus proposes, verifies, or applies.
+//! This module drives the transfer settlement in [`crate::executor`] against the state database.
+//! It prepares block bodies, stages the accounts a body touches, settles the body's transfers with
+//! [`commonware_glue::transfers`], appends transaction-history entries, and returns the merkleized
+//! commitments that consensus proposes, verifies, or applies.
 //!
-//! The important invariant is that account execution is based on block-start
-//! state. Nonces and spends are sender-local, and credits from this block are
-//! not available for spending until the block has finished executing. Because of
-//! that rule, execution can build deterministic account effects from the
-//! transfer list before looking at account state, then apply those effects to
-//! loaded accounts all or nothing.
+//! A body settles against block-start state. Nonces and spends are sender-local, and credits from
+//! the block cannot fund its spends, so which accounts a body changes, and how, follows from its
+//! transfers before any account is read. Verification therefore plans the body, reads every
+//! account it touches once, and settles the whole body or rejects it.
 //!
 //! ```text
 //! body transactions
@@ -24,55 +22,43 @@
 //! prepared transfers                                             |
 //!        |                                                       |
 //!        v                                                       |
-//! build account-touch execution plan                             |
+//! Plan::new: each touched account once, with its debit and       |
+//! credit sums and its nonce effects in block order               |
+//!        |                                                       |
+//!        v                                                       v
+//! stage the plan's accounts in one read            transaction-history append
 //!        |                                                       |
 //!        v                                                       |
-//! stage unique senders/recipients/general accounts               |
+//! Plan::settle: one slot per staged account                      |
 //!        |                                                       |
-//!        +--> discrete lane -- check nonce/debit, apply credits  |
-//!        |                                                       |
-//!        +--> general lane -- check/apply each account once      |
-//!        |                                                       |
-//!        v                                                       |
-//! indexed StateUpdates ------------------------------------------+
-//!        |
-//!        v
-//! staged state batch + transaction-history batch
+//!        v                                                       v
+//! staged state merkleize          +           transaction-history merkleize
 //!        |
 //!        v
 //! merkleized commitments
 //! ```
 //!
-//! The account-touch plan has two lanes. The discrete lane contains only
-//! transfers whose non-self sender and recipient accounts are unique in the
-//! block, so each loaded account produces exactly one final write. The general
-//! lane contains every transfer that touches a contended account. It aggregates
-//! one effect per affected account: sent nonces, non-self debit total,
-//! self-transfer affordability floor, and recipient credit total. The account is
-//! loaded once, checked once, and written once. Credits are added after debit
-//! affordability is checked, so an in-block credit cannot fund an in-block
-//! spend. If any debit check or credit addition fails in either lane, the whole
-//! batch is rejected; there is no partial execution state to reconcile.
-//!
-//! Account state is loaded with one awaited QMDB `stage` call, which returns
-//! the loaded values plus a staged batch that retains each key's resolved
-//! location. Every staged account produces exactly one final value, so the
-//! writes are `(staged read index, account)` updates that skip key
-//! re-resolution when the staged batch merkleizes. Transaction history is
-//! append-only: transaction digests are appended in block order, so the
+//! Account state is read with one awaited QMDB `stage` call, which returns the starting accounts
+//! plus a staged batch that retains each key's resolved location, so merkleizing the settled slots
+//! skips key re-resolution. A plan's key order is unspecified and can differ between plans of the
+//! same body, and the state root does not depend on it: the staged merkleize resolves each slot to
+//! its key, so the root depends only on each key's final value. A body that cannot settle (a
+//! refused nonce, a debit beyond a starting balance, or a final balance past `u64::MAX`) is
+//! rejected whole, with no partial state to reconcile. Which offending account and reason a plan
+//! reports may differ between plans, so a rejection only marks the body invalid. Transaction
+//! history is append-only: transaction digests are appended in block order, so the
 //! transaction-history commitment still reflects block order.
 //!
-//! Proposing, verifying, and applying certified blocks all use this same
-//! transition. `execute_proposal` builds a proposal best effort: malformed or
-//! inapplicable candidates are dropped individually, the block tops up from
-//! the mempool toward the proposal budget, and an empty selection proposes an
-//! empty block so an idle chain keeps making progress — a proposal is always
-//! produced.
+//! Proposing, verifying, and applying certified blocks all use this same transition.
+//! `execute_proposal` builds a proposal best effort with a [`Selection`]: malformed candidates are
+//! dropped, the rest apply one at a time in block order against block-start state, a candidate that
+//! cannot settle with those accepted before it is dropped, the block tops up from the mempool
+//! toward the proposal budget, and an empty selection proposes an empty block so an idle chain
+//! keeps making progress — a proposal is always produced. The accepted body settles to the same
+//! slots under the verifier's plan.
 //! `execute_body` prepares a proposed body, recomputes execution, and compares
-//! the resulting commitments to the header. Certified apply shallow-clones the
-//! block's lazy body (per-transaction handles whose decode cache stays shared)
-//! to move it into the prepare job, without building an intermediate
-//! materialized transaction vector. Preparing a transfer does
+//! the resulting commitments to the header. Certified apply shares ownership of
+//! the block's immutable lazy body with the prepare job. Preparing a transfer does
 //! not invent a second transaction identifier: it reads the transaction's sealed
 //! message digest. For lazily encoded block bodies, whichever consumer first
 //! materializes the transaction computes that seal once and caches the decoded
@@ -80,32 +66,35 @@
 //!
 //! Parallel fan-out comes from the supplied `Strategy`, which decides per
 //! operation whether fanning out beats staying serial. The strategy drives
-//! preparation and QMDB merkleization beneath the batch APIs; per-account
-//! mutation is a few instructions per account, so it runs as one serial pass.
-//! QMDB reads stay on the async path and are not run inside `Strategy`
+//! preparation, planning, settlement, and QMDB merkleization beneath the batch
+//! APIs. QMDB reads stay on the async path and are not run inside `Strategy`
 //! workers.
 
 use super::{
-    MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
+    INVALID_TRANSACTION_FLOOR, MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
-    db::{
-        self, StateBatch, StateStaged, StateUpdates, TransactionBatch, apply_transaction_digests,
-    },
+    db::{self, StateBatch, StateSlots, StateStaged, TransactionBatch, apply_transaction_digests},
     reject_verify,
 };
-use crate::executor::{self, PreparedTransfer};
+use crate::executor::{self, PreparedTransfer, TransferAccount};
 use commonware_codec::EncodeSize as _;
 use commonware_consensus::types::Round;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_glue::stateful::db::Merkleized as _;
-use commonware_parallel::Strategy;
-use commonware_runtime::{
-    BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
+use commonware_glue::{
+    stateful::db::Merkleized as _,
+    transfers::{Plan, Selection},
 };
-use commonware_storage::{merkle::Family, mmr, qmdb::chain::Bounds, translator::EightCap};
+use commonware_parallel::Strategy;
+use commonware_runtime::{Clock, Metrics, Storage, telemetry::traces::TracedExt as _};
+use commonware_storage::{
+    merkle::Family,
+    mmr,
+    qmdb::{Error as QmdbError, chain::Bounds},
+    translator::EightCap,
+};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
+use constantinople_primitives::{AccountKey, Header, LazySignedTransaction, SignedTransaction};
 use std::{
     future::{Future, ready},
     pin::Pin,
@@ -116,7 +105,7 @@ use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -126,7 +115,7 @@ where
 
 pub(super) struct BlockExecution<E, H, S>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -139,7 +128,7 @@ where
 
 impl<E, H, S> BlockExecution<E, H, S>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -148,48 +137,55 @@ where
     }
 }
 
-/// Stages and executes a batch from a deterministic account-touch plan.
+/// Settles a body's transfers against the batch's block-start state.
 ///
-/// Consumes the batch to stage every account the plan touches, then computes
-/// each staged account's final value. Unique transfers use the discrete lane.
-/// Transfers touching contended accounts use the general lane, which loads each
-/// affected account once and applies its accumulated effect. Returns the staged
-/// batch alongside `None` if any transfer fails its nonce or balance check or
-/// overflows a recipient (the whole batch is rejected).
+/// Plans the transfers, consumes the batch to stage every account the plan touches, and settles the
+/// plan into one slot per staged account. Returns the staged batch alongside `None` if the body
+/// cannot settle (the whole body is rejected).
 #[tracing::instrument(name = "application.execute.compute", level = "info", skip_all)]
 pub async fn compute<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
     transfers: Arc<Vec<PreparedTransfer>>,
     strategy: &S,
-) -> (StateStaged<E, H, EightCap, S>, Option<StateUpdates>)
+) -> (StateStaged<E, H, EightCap, S>, Option<StateSlots>)
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
     let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
     let work_size = transfers.len();
-    let plan = {
-        let transfers = Arc::clone(&transfers);
-        strategy.spawn(work_size, move |_: S| {
-            plan_span.in_scope(|| executor::execution_plan(&transfers))
-        })
-    }
-    .await;
-    let Some(plan) = plan else {
-        return (stage_empty(batch).await, None);
-    };
-    let (staged, values) = load_accounts(batch, &plan.discrete, &plan.general).await;
-    let build_span = info_span!(
-        "application.execute.build",
-        accounts = values.len().traced()
-    );
-    let updates = strategy
-        .spawn(work_size, move |_: S| {
-            build_span.in_scope(|| build_updates(plan, transfers, values))
+    let plan = strategy
+        .spawn(work_size, move |s: S| {
+            plan_span.in_scope(|| Plan::new(transfers.as_slice(), &s))
         })
         .await;
-    (staged, updates)
+    let Ok(plan) = plan else {
+        return (stage_empty(batch).await, None);
+    };
+
+    // One staged QMDB read lets the storage layer sort and batch journal
+    // positions, and each key's resolved location is reused when the staged
+    // batch merkleizes.
+    let (reads, staged) = {
+        let keys: Vec<&AccountKey> = plan.keys().iter().collect();
+        batch
+            .stage(&keys)
+            .await
+            .expect("account state loading must succeed")
+    };
+    let settle_span = info_span!("application.execute.settle", accounts = plan.len().traced());
+    let work_size = plan.len();
+    let slots = strategy
+        .spawn(work_size, move |s: S| {
+            settle_span.in_scope(|| {
+                plan.settle(&executor::starting_accounts(reads), &s)
+                    .ok()
+                    .map(executor::account_slots)
+            })
+        })
+        .await;
+    (staged, slots)
 }
 
 /// Stages a batch with no reads, for paths that reject or skip execution.
@@ -197,7 +193,7 @@ pub(super) async fn stage_empty<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
 ) -> StateStaged<E, H, EightCap, S>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -206,124 +202,6 @@ where
         .await
         .expect("staging no reads must succeed");
     staged
-}
-
-struct LoadedAccounts {
-    /// Staged values in read order: senders, then recipients, then general.
-    values: Vec<Option<Account>>,
-    sender_len: usize,
-    recipient_len: usize,
-}
-
-impl LoadedAccounts {
-    const fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    fn senders(&self) -> &[Option<Account>] {
-        &self.values[..self.sender_len]
-    }
-
-    fn recipients(&self) -> &[Option<Account>] {
-        &self.values[self.sender_len..self.sender_len + self.recipient_len]
-    }
-
-    fn general(&self) -> &[Option<Account>] {
-        &self.values[self.sender_len + self.recipient_len..]
-    }
-}
-
-async fn load_accounts<E, H, S>(
-    batch: StateBatch<E, H, EightCap, S>,
-    discrete: &executor::DiscreteWorkload,
-    general: &executor::GeneralWorkload,
-) -> (StateStaged<E, H, EightCap, S>, LoadedAccounts)
-where
-    E: BufferPooler + Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let sender_len = discrete.sender_keys.len();
-    let recipient_len = discrete.recipient_keys.len();
-    let general_len = general.account_keys().len();
-    let keys = discrete
-        .sender_keys
-        .iter()
-        .chain(&discrete.recipient_keys)
-        .chain(general.account_keys())
-        .collect::<Vec<_>>();
-
-    // One staged QMDB read lets the storage layer sort and batch journal
-    // positions across all lanes, and each key's resolved location is reused
-    // when the staged batch merkleizes.
-    let (values, staged) = batch
-        .stage(keys.as_slice())
-        .await
-        .expect("account state loading must succeed");
-    assert_eq!(values.len(), sender_len + recipient_len + general_len);
-    (
-        staged,
-        LoadedAccounts {
-            values,
-            sender_len,
-            recipient_len,
-        },
-    )
-}
-
-/// Computes the final value of every staged account.
-///
-/// Update indices follow the staged read order (discrete senders, discrete
-/// recipients, then general accounts), and every staged account produces
-/// exactly one final value, so the writes enumerate directly into indexed
-/// updates. The per-account arithmetic is a few instructions, so one serial
-/// pass into the updates vector beats parallel fan-out and its intermediate
-/// buffers.
-fn build_updates(
-    plan: executor::ExecutionPlan,
-    transfers: Arc<Vec<PreparedTransfer>>,
-    values: LoadedAccounts,
-) -> Option<StateUpdates> {
-    let executor::ExecutionPlan { discrete, general } = &plan;
-    let mut updates = StateUpdates::with_capacity(values.len());
-
-    // Discrete senders: one write per transfer, in transfer order.
-    for (transfer_index, value) in discrete.transfers.iter().zip(values.senders()) {
-        let transfer = &transfers[*transfer_index];
-        let mut account = value.unwrap_or_default();
-        if account.balance < transfer.value || !account.nonce.consume(transfer.nonce) {
-            return None;
-        }
-        if transfer.sender != transfer.recipient {
-            account.balance -= transfer.value;
-        }
-        updates.push((updates.len(), Some(account)));
-    }
-
-    // Discrete recipients: one write per non-self transfer, in transfer
-    // order. The zip is exhaustive because recipient_keys was built from
-    // exactly the non-self transfers (asserted against the staged read count
-    // in load_accounts).
-    let non_self = discrete.transfers.iter().filter(|&&transfer_index| {
-        transfers[transfer_index].sender != transfers[transfer_index].recipient
-    });
-    for (transfer_index, value) in non_self.zip(values.recipients()) {
-        let transfer = &transfers[*transfer_index];
-        let mut account = value.unwrap_or_default();
-        executor::apply_credit(&mut account, transfer.value)?;
-        updates.push((updates.len(), Some(account)));
-    }
-
-    // General lane: one write per affected account, in account order.
-    if !general.is_empty() {
-        let written = executor::apply_general_accounts(values.general(), general, &transfers)?;
-        for account in written {
-            updates.push((updates.len(), Some(account)));
-        }
-    }
-
-    assert_eq!(updates.len(), values.len());
-    Some(updates)
 }
 
 pub fn prepare_signed<H, S>(
@@ -376,17 +254,19 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 ///
 /// Verification is all or nothing, but a proposer chooses the block body:
 /// each candidate (the supplied selection first, then mempool refills)
-/// executes against block-start account state in block order, and any
+/// applies against block-start account state in block order, and any
 /// transaction that does not apply — malformed encoding, stale nonce
 /// (typically a transaction that already landed in an ancestor block),
 /// unaffordable value, or credit overflow — is dropped instead of dooming the
 /// proposal. Each refill asks the mempool for the block's remaining headroom
 /// (it knows the proposal budget; we report the bytes already included), so
-/// the block fills toward the budget even when the seed was small. `stage` +
-/// `expand` load each round's new accounts incrementally. The loop ends when
-/// the mempool has nothing left that fits or the build deadline passes. The
-/// surviving body re-executes cleanly under all-or-nothing verification with
-/// identical account writes.
+/// the block fills toward the budget even when the seed was small. Each round
+/// reads only the accounts it touches for the first time, through `stage` for
+/// the first round and `expand` after, in the selection's key order, so the
+/// staged slots line up with the selection's keys. The loop ends when the
+/// mempool has nothing left that fits or the build deadline passes. The
+/// surviving body settles under all-or-nothing verification to the same
+/// slots.
 ///
 /// Each round starts appending its accepted digests before the next refill.
 /// When offloaded, the append can overlap later rounds and the final state
@@ -407,7 +287,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     input: &mut I,
 ) -> ProposalExecution<E, H, S>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -416,7 +296,7 @@ where
 {
     let mut unstaged = Some(state_batch);
     let mut staged: Option<StateStaged<E, H, EightCap, S>> = None;
-    let mut selector = executor::SelectiveExecutor::new();
+    let mut selection: Selection<AccountKey, TransferAccount> = Selection::new();
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
@@ -442,10 +322,10 @@ where
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
         let work_size = candidates.len();
-        let (candidates_back, prepared, transfers, selector_back, missing) = strategy
+        let (candidates_back, prepared, transfers, selection_back, touched) = strategy
             .spawn(work_size, {
                 let accounts_span = accounts_span.clone();
-                let mut selector = selector;
+                let mut selection = selection;
                 move |s: S| {
                     let (prepared, transfers) = prepare_span.in_scope(|| {
                         let prepared: Vec<Option<(PreparedTransfer, H::Digest)>> = s
@@ -460,39 +340,41 @@ where
                             .collect();
                         (prepared, transfers)
                     });
-                    let missing = accounts_span.in_scope(|| selector.begin_round(&transfers));
-                    (candidates, prepared, transfers, selector, missing)
+                    let touched = accounts_span.in_scope(|| selection.touch(&transfers));
+                    (candidates, prepared, transfers, selection, touched)
                 }
             })
             .await;
         candidates = candidates_back;
-        selector = selector_back;
-        accounts_span.record("keys", missing.len().traced());
+        selection = selection_back;
+        accounts_span.record("keys", touched.len().traced());
 
         // Load block-start values for accounts this round touches for the
         // first time; later rounds expand the same staged read space, whose
-        // indices continue exactly where the selector's dense table does.
-        if !missing.is_empty() {
-            let stage_span = info_span!("application.execute.stage", keys = missing.len().traced());
+        // slots continue exactly where the selection's keys do.
+        if !touched.is_empty() {
+            let stage_span = info_span!("application.execute.stage", keys = touched.len().traced());
             async {
-                let keys: Vec<&_> = missing.iter().collect();
-                if let Some(batch) = unstaged.take() {
-                    let (values, next) = batch
+                let keys: Vec<&AccountKey> = selection.keys()[touched.clone()].iter().collect();
+                let reads = if let Some(batch) = unstaged.take() {
+                    let (reads, next) = batch
                         .stage(&keys)
                         .await
                         .expect("account state loading must succeed");
-                    selector.register(&values);
                     staged = Some(next);
+                    reads
                 } else {
-                    let (_, values, next) = staged
+                    let (range, reads, next) = staged
                         .take()
                         .expect("staged batch exists after the first round")
                         .expand(&keys)
                         .await
                         .expect("account state loading must succeed");
-                    selector.register(&values);
+                    debug_assert_eq!(range, touched);
                     staged = Some(next);
-                }
+                    reads
+                };
+                selection.register(executor::starting_accounts(reads));
             }
             .instrument(stage_span)
             .await;
@@ -507,14 +389,14 @@ where
             dropped = tracing::field::Empty,
         );
         let work_size = transfers.len();
-        let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
+        let (selection_back, body_back, chunk, included_delta, dropped_bytes) = strategy
             .spawn(work_size, {
                 let span = select_span.clone();
-                let mut selector = selector;
+                let mut selection = selection;
                 let mut body = body;
                 move |_: S| {
                     span.in_scope(|| {
-                        let applied = selector.apply(&transfers);
+                        let applied = selection.apply(&transfers);
                         let mut flags = applied.into_iter();
                         let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
                         let mut included = 0usize;
@@ -531,12 +413,12 @@ where
                                 dropped += transaction.encode_size();
                             }
                         }
-                        (selector, body, chunk, included, dropped)
+                        (selection, body, chunk, included, dropped)
                     })
                 }
             })
             .await;
-        selector = selector_back;
+        selection = selection_back;
         body = body_back;
         included_bytes += included_delta;
         select_span.record("dropped", dropped_bytes.traced());
@@ -579,13 +461,17 @@ where
         None => stage_empty(unstaged.take().expect("nothing was staged")).await,
     };
 
-    // Compute final account values while any offloaded history append drains.
-    let updates_span = info_span!(
-        "application.execute.updates",
-        accounts = tracing::field::Empty
+    // Settle the accepted transfers while any offloaded history append drains.
+    let settle_span = info_span!(
+        "application.execute.settle",
+        accounts = selection.keys().len().traced()
     );
-    let updates = updates_span.in_scope(|| selector.into_updates());
-    updates_span.record("accounts", updates.len().traced());
+    let work_size = selection.keys().len();
+    let slots = strategy
+        .spawn(work_size, move |s: S| {
+            settle_span.in_scope(|| executor::account_slots(selection.settle(&s)))
+        })
+        .await;
 
     // Pass the append future into `finalize_child` so any remaining work can
     // overlap state merkleization. Empty selections need no append job.
@@ -602,7 +488,7 @@ where
     ProposalExecution {
         block: finalize_child(
             staged,
-            updates,
+            slots,
             transaction_batch,
             parent_floor,
             body.len(),
@@ -622,7 +508,7 @@ pub(super) async fn execute_body<E, H, S>(
     body: PreparedBody<H>,
 ) -> Result<BlockExecution<E, H, S>>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -644,16 +530,16 @@ where
     let apply = strategy.spawn(work_size, move |_: S| {
         apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
     });
-    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
+    let (staged, slots) = compute(state_batch, transfers, &strategy).await;
 
     // Join the append before surfacing a rejection so its panics propagate
     // and no job outlives this call.
     let transaction_batch = apply.await;
-    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
+    let slots = slots.ok_or(STATIC_INVALID_TRANSACTION)?;
 
     Ok(finalize_child(
         staged,
-        state_updates,
+        slots,
         ready(transaction_batch),
         parent_floor,
         transaction_count,
@@ -672,7 +558,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     strategy: S,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -688,18 +574,23 @@ where
                 .with_inactivity_floor(transaction_floor)
         })
     });
-    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
+    let (staged, slots) = compute(state_batch, transfers, &strategy).await;
 
     // Join the append before surfacing a rejection so its panics propagate
     // and no job outlives this call.
     let transaction_batch = apply.await;
-    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
+    let slots = slots.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    Ok(
-        db::finalize_execution(staged, state_updates, ready(transaction_batch))
-            .await
-            .expect("database merkleization during replay must succeed"),
-    )
+    // The replayed header supplies the transaction-history floor, and merkleize
+    // rejects a floor below the parent's or past this block's commit. Any other
+    // merkleize failure is a storage failure.
+    match db::finalize_execution(staged, slots, ready(transaction_batch)).await {
+        Ok(merkleized) => Ok(merkleized),
+        Err(QmdbError::FloorRegressed(..) | QmdbError::FloorBeyondSize(..)) => {
+            Err(INVALID_TRANSACTION_FLOOR)
+        }
+        Err(error) => panic!("database merkleization during replay must succeed: {error:?}"),
+    }
 }
 
 pub(super) fn commitments_match<E, C, P, H, S>(
@@ -707,7 +598,7 @@ pub(super) fn commitments_match<E, C, P, H, S>(
     execution: &BlockExecution<E, H, S>,
 ) -> bool
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -740,21 +631,21 @@ where
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
 async fn finalize_child<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
-    state_updates: StateUpdates,
+    state_slots: StateSlots,
     transaction_batch: impl Future<Output = TransactionBatch<E, H, S>>,
     parent_floor: mmr::Location,
     transaction_count: usize,
     expect_message: &'static str,
 ) -> BlockExecution<E, H, S>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
     let transaction_batch =
         async move { transaction_batch.await.with_inactivity_floor(parent_floor) };
     let (state, transactions) =
-        db::finalize_execution(state_staged, state_updates, transaction_batch)
+        db::finalize_execution(state_staged, state_slots, transaction_batch)
             .await
             .expect(expect_message);
     let state_sync_range = range_from_bounds(state.bounds());

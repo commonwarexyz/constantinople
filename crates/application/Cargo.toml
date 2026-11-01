@@ -40,15 +40,16 @@ constantinople-mempool = { workspace = true, features = ["mocks"] }
 
 # Commonware
 commonware-actor.workspace = true
+commonware-allocator.workspace = true
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519.workspace = true
 
 # Other
 rand.workspace = true
 criterion.workspace = true
-mimalloc.workspace = true
 
 [[bench]]
 name = "executor"

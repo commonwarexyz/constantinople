@@ -1,11 +1,17 @@
 use super::EngineApplication;
 use crate::block::{EngineBlock, EngineCommitment};
-use commonware_consensus::CertifiableBlock as _;
-use commonware_cryptography::{
-    Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
+use commonware_consensus::{
+    Block as _, CertifiableBlock as _, Handoff, Heightable as _,
+    marshal::ancestry,
+    simplex::types::Context,
+    types::{Epoch, Height, Round, View},
 };
+use commonware_cryptography::{
+    Digested, Digestible as _, Signer as _, bls12381::primitives::variant::MinSig, sha256,
+};
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_glue::stateful::{
-    Application as StatefulApplication,
+    Application as StatefulApplication, Input,
     db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _},
 };
 use commonware_parallel::Sequential;
@@ -26,15 +32,15 @@ use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{Account, AccountKey, Nonce, PublicKeyCache};
 use std::sync::{Arc, Mutex};
 
-type TestCommitment = EngineCommitment<sha256::Sha256, ed25519::PublicKey>;
-type TestBlock = EngineBlock<sha256::Sha256, ed25519::PublicKey>;
-type TestHook = FinalizedHookFn<TestCommitment, sha256::Sha256, ed25519::PublicKey>;
+type TestCommitment = EngineCommitment<sha256::Sha256, ed25519::VerifyingKey>;
+type TestBlock = EngineBlock<sha256::Sha256, ed25519::VerifyingKey>;
+type TestHook = FinalizedHookFn<TestCommitment, sha256::Sha256, ed25519::VerifyingKey>;
 type TestApp = EngineApplication<
     deterministic::Context,
     sha256::Sha256,
-    ed25519::PublicKey,
+    ed25519::VerifyingKey,
     MinSig,
-    StaticTransactionSource<TestCommitment, ed25519::PublicKey, sha256::Sha256>,
+    StaticTransactionSource<TestCommitment, ed25519::VerifyingKey, sha256::Sha256>,
     Sequential,
 >;
 type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;
@@ -42,7 +48,7 @@ type TestBatches =
     <TestDbs as commonware_glue::stateful::db::DatabaseSet<deterministic::Context>>::Merkleized;
 
 async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBatches, TestBlock) {
-    let cache = CacheRef::from_pooler(context, NZU16!(16), NZUsize!(4096));
+    let cache = CacheRef::new(NZU16!(16), NZUsize!(4096));
     let state_config = FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: "hook-state-merkle-journal".into(),
@@ -109,7 +115,7 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
     let inner = Application::new(
         context.child("app"),
         Sequential,
-        ed25519::PrivateKey::from_seed(1).public_key(),
+        ed25519::SigningKey::from_seed(1).public_key(),
         TestCommitment::default(),
         b"engine-finalized-hook-test",
         PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(64)),
@@ -197,5 +203,37 @@ fn capture_is_disabled_without_a_finalized_hook() {
             dbs.readers(),
         )
         .await;
+    });
+}
+
+#[test]
+fn prepare_forwards_the_inner_stage() {
+    deterministic::Runner::default().start(|context| async move {
+        let (mut app, dbs, _, genesis) = fixture(&context).await;
+        let consensus_context = Context {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: genesis.context().leader,
+            parent: (View::zero(), TestCommitment::default()),
+        };
+
+        // The trait's default declines, so a staged block shows that the
+        // wrapper forwarded the inner application's decision with its
+        // converted block.
+        let prepared = app
+            .prepare(
+                (context.child("prepare"), consensus_context),
+                ancestry::from_iter([Digested::precomputed(genesis.clone(), genesis.digest())]),
+                dbs.new_batches().await,
+                Input {
+                    upstream: (),
+                    provider: StaticTransactionSource::new(Vec::new()),
+                },
+            )
+            .await;
+        let Handoff::Stage(prepared) = prepared else {
+            panic!("the wrapper must forward the inner application's staged block");
+        };
+        assert_eq!(prepared.block.parent(), genesis.digest());
+        assert_eq!(prepared.block.height(), Height::new(1));
     });
 }

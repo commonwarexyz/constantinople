@@ -5,6 +5,7 @@ mod ports;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use commonware_codec::{Copying, Encode, Read as CodecRead};
 use commonware_cryptography::{
     Signer,
@@ -16,8 +17,8 @@ use commonware_cryptography::{
             variant::MinSig,
         },
     },
-    ed25519,
 };
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, NZUsize, TryCollect};
@@ -30,14 +31,18 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::Level;
 use tracing_subscriber::fmt;
 use url::Url;
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 const STORAGE_CLASS: &str = "gp3";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
@@ -133,7 +138,7 @@ pub(crate) struct GenerateArgs {
     /// Rayon threads reserved for index publication.
     #[arg(long, default_value_t = default_publisher_rayon_threads())]
     indexer_publisher_rayon_threads: NonZeroUsize,
-    /// Capacity of each node's decompressed public key cache.
+    /// Capacity of each node's decompressed secp256r1 (WebAuthn) public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
     /// Maximum encoded block bytes, including framing. At most 16 MiB.
@@ -492,7 +497,7 @@ pub(crate) struct ValidatorConfig {
     /// block, finalization, and marshal archives, transaction history, and
     /// the simplex vote journal.
     history_page_cache_bytes: usize,
-    /// Capacity of the decompressed public key cache.
+    /// Capacity of the decompressed secp256r1 (WebAuthn) public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
@@ -587,17 +592,17 @@ struct SimplexMaterialConfig {
 
 pub(crate) struct ClusterMaterial {
     /// Primary (voting) validator private keys.
-    pub signers: Vec<ed25519::PrivateKey>,
+    pub signers: Vec<ed25519::SigningKey>,
     /// Primary (voting) validator public keys, in DKG order.
-    pub public_keys: Vec<ed25519::PublicKey>,
+    pub public_keys: Vec<ed25519::VerifyingKey>,
     /// Secondary (non-voting) validator private keys.
-    pub secondary_signers: Vec<ed25519::PrivateKey>,
+    pub secondary_signers: Vec<ed25519::SigningKey>,
     /// Secondary (non-voting) validator public keys.
-    pub secondary_public_keys: Vec<ed25519::PublicKey>,
+    pub secondary_public_keys: Vec<ed25519::VerifyingKey>,
     /// DKG output over the primary validators.
-    pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
+    pub dkg_output: dkg::Output<MinSig, ed25519::VerifyingKey>,
     /// DKG share per primary validator.
-    pub shares: BTreeMap<ed25519::PublicKey, Share>,
+    pub shares: BTreeMap<ed25519::VerifyingKey, Share>,
     /// Hex-encoded genesis leader public key.
     pub genesis_leader: String,
 }
@@ -766,10 +771,10 @@ pub(crate) fn generate_local_cluster_material(
     secondaries: u32,
 ) -> ClusterMaterial {
     let signers = (0..validators)
-        .map(|index| ed25519::PrivateKey::from_seed(index.into()))
+        .map(|index| ed25519::SigningKey::from_seed(index.into()))
         .collect::<Vec<_>>();
     let secondary_signers = (0..secondaries)
-        .map(|index| ed25519::PrivateKey::from_seed(SECONDARY_SEED_OFFSET + u64::from(index)))
+        .map(|index| ed25519::SigningKey::from_seed(SECONDARY_SEED_OFFSET + u64::from(index)))
         .collect::<Vec<_>>();
     build_cluster_material(
         signers,
@@ -784,19 +789,19 @@ pub(crate) fn generate_remote_cluster_material(
 ) -> ClusterMaterial {
     let mut rng = UnwrapErr(SysRng);
     let mut signers = (0..validators)
-        .map(|_| ed25519::PrivateKey::random(rng))
+        .map(|_| ed25519::SigningKey::random(rng))
         .collect::<Vec<_>>();
     signers.sort_by_key(Signer::public_key);
     let mut secondary_signers = (0..secondaries)
-        .map(|_| ed25519::PrivateKey::random(rng))
+        .map(|_| ed25519::SigningKey::random(rng))
         .collect::<Vec<_>>();
     secondary_signers.sort_by_key(Signer::public_key);
     build_cluster_material(signers, secondary_signers, &mut rng)
 }
 
 fn build_cluster_material(
-    signers: Vec<ed25519::PrivateKey>,
-    secondary_signers: Vec<ed25519::PrivateKey>,
+    signers: Vec<ed25519::SigningKey>,
+    secondary_signers: Vec<ed25519::SigningKey>,
     rng: &mut impl rand::CryptoRng,
 ) -> ClusterMaterial {
     let public_keys = signers.iter().map(Signer::public_key).collect::<Vec<_>>();
@@ -844,7 +849,7 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
     let config: SimplexMaterialConfig =
         serde_yaml::from_str(&raw).expect("failed to parse validator config");
     let bytes = from_hex(&config.dkg_output).expect("bad dkg_output hex");
-    let dkg_output = dkg::Output::<MinSig, ed25519::PublicKey>::read_cfg(
+    let dkg_output = dkg::Output::<MinSig, ed25519::VerifyingKey>::read_cfg(
         &mut Copying(&bytes),
         &(NZU32!(config.num_validators), ModeVersion::v0()),
     )
@@ -853,7 +858,7 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
 }
 
 pub(crate) fn default_bootstrappers(
-    public_keys: &[ed25519::PublicKey],
+    public_keys: &[ed25519::VerifyingKey],
 ) -> Vec<NamedBootstrapperEntry> {
     public_keys
         .iter()

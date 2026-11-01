@@ -1,12 +1,14 @@
 use commonware_codec::{Buf, EncodeSize, Error, Read, Write};
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
-    Block as ConsensusBlock, CertifiableBlock, Heightable,
+    Block as ConsensusBlock, BoundedBlock, CertifiableBlock, Heightable,
     simplex::types::Context,
     types::{Height, coding::Commitment},
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey};
-use constantinople_primitives::{Block, BlockCfg, Sealed, SealedBlock};
+use constantinople_primitives::{
+    Block, BlockCfg, Sealed, SealedBlock, proposal::MAXIMUM_BLOCK_SIZE,
+};
 use std::{fmt, ops::Deref, sync::Arc};
 
 /// The coding commitment carried by Constantinople blocks.
@@ -162,6 +164,17 @@ where
 {
     fn parent(&self) -> Self::Digest {
         self.0.parent()
+    }
+}
+
+impl<H, P> BoundedBlock for EngineBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    /// Decoding reads at most [MAXIMUM_BLOCK_SIZE] bytes under any configuration.
+    fn max_encode_size(_: &BlockCfg) -> usize {
+        MAXIMUM_BLOCK_SIZE
     }
 }
 

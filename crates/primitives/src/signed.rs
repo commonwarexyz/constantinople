@@ -8,12 +8,12 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
-    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
-    TransactionSignature,
+    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionSignature,
+    auth::verify_signatures,
 };
 use bytes::{BufMut, Bytes};
 use commonware_codec::{
-    Buf, DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write,
+    Buf, DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Viewing, Write,
     types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
@@ -248,7 +248,7 @@ where
                     .pending
                     .as_ref()
                     .expect("pending bytes must exist when value is absent");
-                SignedTransaction::decode(bytes.clone()).ok()
+                SignedTransaction::decode(Viewing::new(bytes)).ok()
             })
             .as_ref()
     }
@@ -417,8 +417,7 @@ where
 
 /// Forces the lazy transaction to decode and its sender public key to parse, in
 /// parallel with its caller. Returns `false` if decode fails or the sender is
-/// not present. Decompression is deferred to the batch build, which looks each
-/// sender up in the shared cache exactly once.
+/// not present.
 fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>) -> bool
 where
     H: Hasher,
@@ -429,11 +428,13 @@ where
     transaction.value().sender().is_some()
 }
 
-/// Verifies a slice of lazily-encoded signed transactions using batch
-/// verification.
+/// Verifies the signatures of lazily encoded signed transactions.
 ///
-/// Calling `.get()` on each [`Lazy`] forces the underlying
-/// [`SignedTransaction`] to be decoded and its seal digest computed.
+/// Every Ed25519 signature is checked in one randomized batch on `strategy`,
+/// and secp256r1 signatures are checked against keys resolved through
+/// `cache`. `rng` must be unpredictable to whoever assembled `transactions`.
+/// Decoding is forced on the calling thread, so callers should warm large
+/// slices with [`preload_transaction_slice`] first.
 ///
 /// Returns `true` if every transaction decodes and all signatures verify,
 /// `false` otherwise.
@@ -442,101 +443,61 @@ pub fn verify_transaction_batch<H, St>(
     rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
     transactions: &[LazySignedTransaction<H>],
-    signature_strategy: &St,
+    strategy: &St,
 ) -> bool
 where
     H: Hasher,
     St: Strategy,
 {
-    if transactions.is_empty() {
-        return true;
-    }
-
-    // Resolve every sender's decompressed key up front: when the active
-    // account set exceeds the cache capacity, misses dominate and would
-    // otherwise pay their curve decompression serially in the queueing
-    // loop below.
-    let mut senders = Vec::with_capacity(transactions.len());
-    for lazy in transactions {
-        let Some(transaction) = lazy.get() else {
-            return false;
-        };
-        let Some(sender) = transaction.value().sender() else {
-            return false;
-        };
-        senders.push(sender);
-    }
-    let Some(keys) = cache.decompress(&senders, signature_strategy) else {
-        return false;
-    };
-
-    // Queueing is cheap: transactions are preloaded and sender keys were
-    // resolved above. The expensive per-signature challenge hashing and the
-    // serial-vs-parallel split happen inside `verify`, which shards the batch
-    // across `signature_strategy` internally.
-    let mut verifier = TransactionBatchVerifier::new(transactions.len());
-    for (lazy, key) in transactions.iter().zip(&keys) {
-        let Some(transaction) = lazy.get() else {
-            return false;
-        };
-        if !verifier.add(
-            namespace,
-            transaction.message_digest().as_ref(),
-            key,
-            transaction.signature(),
-        ) {
-            return false;
-        }
-    }
-    verifier.verify(rng, signature_strategy)
+    verify_signatures(
+        namespace,
+        rng,
+        cache,
+        transactions,
+        LazySignedTransaction::get,
+        strategy,
+    )
 }
 
-/// Verifies lazily-encoded transactions.
+/// Verifies the signatures of decoded signed transactions.
 ///
-/// First forces each [`Lazy`] to decode and compute its seal digest, then runs
-/// batch signature verification over the warmed transactions, both on
-/// `strategy`. Returns `None` if any transaction is invalid or undecodable.
-pub fn verify_transaction_chunks<H, St>(
-    namespace: &'static [u8],
+/// See [`verify_transaction_batch`] for the verification contract.
+pub fn verify_transactions<H, St>(
+    namespace: &[u8],
     rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
-    transactions: Vec<LazySignedTransaction<H>>,
+    transactions: &[SignedTransaction<H>],
     strategy: &St,
-) -> Option<Vec<SignedTransaction<H>>>
+) -> bool
 where
     H: Hasher,
     St: Strategy,
 {
-    if transactions.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let transactions = preload_transaction_chunks(transactions, strategy)?;
-
-    if !verify_transaction_batch::<H, _>(namespace, rng, cache, &transactions, strategy) {
-        return None;
-    }
-
-    // Each lazy was forced during verification above, so materialization cannot fail here.
-    transactions
-        .into_iter()
-        .map(LazySignedTransaction::into_value)
-        .collect()
+    verify_signatures(
+        namespace,
+        rng,
+        cache,
+        transactions,
+        |transaction| Some(transaction),
+        strategy,
+    )
 }
 
 #[cfg(test)]
 mod test {
     use crate::{
-        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, Transaction,
-        TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
+        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction,
+        TransactionPublicKey,
+        auth::tests::{ed25519_signer, ed25519_transaction, webauthn_signer, webauthn_transaction},
+        signed::Signable,
     };
     use bytes::Bytes;
     use commonware_codec::{
-        Copying, DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
+        Copying, DecodeExt as _, Encode as _, EncodeSize as _, FixedSize as _, ReadExt as _,
+        Write as _,
     };
-    use commonware_cryptography::{
-        Hasher, Signer, Verifier, ed25519, secp256r1::standard as secp256r1, sha256,
-    };
+    use commonware_cryptography::{Hasher, Signer, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, deterministic};
@@ -564,7 +525,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_ed25519() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(test_rng());
+        let private_key = ed25519::SigningKey::random(test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -582,7 +543,7 @@ mod test {
     #[test]
     fn signed_into_inner_returns_sealed() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(test_rng());
+        let private_key = ed25519::SigningKey::random(test_rng());
         let signed = MockValue([9, 10, 11, 12]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         let seal = *signed.message_digest();
@@ -595,7 +556,7 @@ mod test {
     #[test]
     fn wrong_namespace_fails_verification() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(test_rng());
+        let private_key = ed25519::SigningKey::random(test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(!signed.verify(b"wrong namespace", &private_key.public_key()));
@@ -615,7 +576,7 @@ mod test {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let hasher = &mut sha256::Sha256::default();
-            let private_key = ed25519::PrivateKey::random(test_rng());
+            let private_key = ed25519::SigningKey::random(test_rng());
             let public_key = TransactionPublicKey::ed25519(private_key.public_key());
             let signed = Transaction::new(
                 public_key.clone(),
@@ -627,28 +588,21 @@ mod test {
 
             assert_eq!(signed.value().sender(), Some(&public_key));
 
-            let sender = signed
-                .value()
-                .sender()
-                .expect("signed sender should decode");
-            let keys = cache
-                .decompress(&[sender], &Sequential)
-                .expect("valid sender key");
-            let mut verifier = TransactionBatchVerifier::new(1);
-            assert!(verifier.add(
+            let lazy = [LazySignedTransaction::new(signed)];
+            assert!(super::verify_transaction_batch(
                 NAMESPACE,
-                signed.message_digest().as_ref(),
-                &keys[0],
-                signed.signature(),
+                &mut test_rng(),
+                &cache,
+                &lazy,
+                &Sequential,
             ));
-            assert!(verifier.verify(&mut test_rng(), &Sequential));
         });
     }
 
     #[test]
     fn preload_transaction_chunks_forces_nested_signature_inputs() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(test_rng());
+        let private_key = ed25519::SigningKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),
@@ -682,7 +636,7 @@ mod test {
     #[test]
     fn lazy_signed_transaction_exposes_pending_bytes_without_materializing() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(test_rng());
+        let private_key = ed25519::SigningKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),
@@ -712,6 +666,131 @@ mod test {
                 .is_none(),
             "nested sender decode should still fail after reading pending bytes"
         );
+    }
+
+    fn lazy_signed_view_fixtures() -> [SignedTransaction<sha256::Sha256>; 2] {
+        [
+            ed25519_transaction(&ed25519_signer(0), 0),
+            webauthn_transaction(&webauthn_signer(0), 1),
+        ]
+    }
+
+    fn lazy_signed_view_read(
+        payload: &[u8],
+    ) -> Result<LazySignedTransaction<sha256::Sha256>, commonware_codec::Error> {
+        let mut encoded = Vec::new();
+        payload.len().write(&mut encoded);
+        encoded.extend_from_slice(payload);
+        LazySignedTransaction::read(&mut Bytes::from(encoded))
+    }
+
+    #[test]
+    fn lazy_signed_view_matches_owned_cursor() {
+        for transaction in lazy_signed_view_fixtures() {
+            let payload = transaction.encode();
+            let expected = SignedTransaction::<sha256::Sha256>::decode(payload.clone()).unwrap();
+            let lazy = lazy_signed_view_read(&payload).unwrap();
+            assert_eq!(lazy.encoded_signed_transaction(), payload);
+            assert_eq!(lazy.get(), Some(&expected));
+            assert_eq!(lazy.encoded_signed_transaction(), payload);
+            assert_eq!(lazy.get().unwrap().encode(), payload);
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_defers_invalid_sender() {
+        for transaction in lazy_signed_view_fixtures() {
+            let mut payload = transaction.encode().to_vec();
+            payload[..TransactionPublicKey::SIZE].copy_from_slice(&invalid_public_key_bytes());
+            let expected =
+                SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&payload))
+                    .unwrap();
+            let lazy = lazy_signed_view_read(&payload).unwrap();
+            assert!(expected.value().sender().is_none());
+            assert!(lazy.get().unwrap().value().sender().is_none());
+            assert_eq!(lazy.get().unwrap().encode().as_ref(), payload);
+            assert_eq!(lazy.encoded_signed_transaction().as_ref(), payload);
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_rejects_truncation_and_trailing_data() {
+        for transaction in lazy_signed_view_fixtures() {
+            let payload = transaction.encode();
+            for end in 0..payload.len() {
+                let truncated = &payload[..end];
+                assert!(
+                    SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(truncated))
+                        .is_err()
+                );
+                if let Ok(lazy) = lazy_signed_view_read(truncated) {
+                    assert!(lazy.get().is_none(), "accepted truncation at {end}");
+                }
+            }
+
+            let mut trailing = payload.to_vec();
+            trailing.push(0);
+            assert!(matches!(
+                SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&trailing)),
+                Err(commonware_codec::Error::ExtraData(1))
+            ));
+            assert!(lazy_signed_view_read(&trailing).unwrap().get().is_none());
+
+            let mut zero_value = payload.to_vec();
+            let value_start = TransactionPublicKey::SIZE + crate::AccountKey::SIZE;
+            zero_value[value_start..value_start + u64::SIZE].fill(0);
+            assert!(
+                SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&zero_value))
+                    .is_err()
+            );
+            assert!(lazy_signed_view_read(&zero_value).unwrap().get().is_none());
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_shares_success_and_failure_cache() {
+        for transaction in lazy_signed_view_fixtures() {
+            for valid in [true, false] {
+                let mut payload = transaction.encode().to_vec();
+                if !valid {
+                    payload.push(0);
+                }
+                let lazy = lazy_signed_view_read(&payload).unwrap();
+                let cloned = lazy.clone();
+                assert!(std::sync::Arc::ptr_eq(&lazy.value, &cloned.value));
+                assert!(lazy.value.get().is_none());
+                std::thread::scope(|scope| {
+                    let first = scope.spawn(|| lazy.get());
+                    let second = scope.spawn(|| cloned.get());
+                    match (first.join().unwrap(), second.join().unwrap()) {
+                        (Some(first), Some(second)) => {
+                            assert!(valid);
+                            assert!(std::ptr::eq(first, second));
+                        }
+                        (None, None) => assert!(!valid),
+                        _ => panic!("shared cache returned different outcomes"),
+                    }
+                });
+                assert_eq!(lazy.value.get().unwrap().is_some(), valid);
+                assert_eq!(cloned.get().is_some(), valid);
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_signed_view_sender_survives_outer_drop() {
+        for transaction in lazy_signed_view_fixtures() {
+            let expected_sender = transaction.value().sender().unwrap().clone();
+            let payload = transaction.encode();
+            for shared in [false, true] {
+                let lazy = lazy_signed_view_read(&payload).unwrap();
+                let cloned = shared.then(|| lazy.clone());
+                let owned = lazy.into_value().unwrap();
+                drop(cloned);
+                assert_eq!(owned.value().sender(), Some(&expected_sender));
+                assert_eq!(owned.encode(), payload);
+            }
+        }
     }
 
     fn invalid_public_key_bytes() -> [u8; TransactionPublicKey::SIZE] {

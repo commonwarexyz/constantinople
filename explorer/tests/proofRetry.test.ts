@@ -8,12 +8,10 @@ import {
     accountRetryReason,
     errorMessage,
     isConsistencyNotReadyError,
-    isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
     retryAccountWork,
 } from '../src/proofRetry.ts';
-import { transactionProofTip } from '../src/proofMath.ts';
 
 const CONSISTENCY_NOT_READY = '[aborted] minimum consistency token is not yet visible';
 const NETWORK_FAILURES = [
@@ -28,13 +26,6 @@ const NETWORK_FAILURES = [
     'Error in input stream',
     'NetworkError when attempting to fetch resource.',
 ];
-
-test('SQL tx metadata misses are retried while the indexer catches up', () => {
-    assert.equal(
-        isRetryableProofError('tx digest 1adb68d9800...a2a15bb3 is not finalized yet'),
-        true,
-    );
-});
 
 test('sequence freshness gates are retried while a query node catches up', () => {
     for (const detail of [CONSISTENCY_NOT_READY, `HTTP error: 409 ${CONSISTENCY_NOT_READY}`]) {
@@ -137,7 +128,7 @@ test('Unknown errors without a network fetch cause remain terminal', async (t) =
     }
 });
 
-test('account work remains pending beyond the old retry bound', async () => {
+test('account work retries with bounded backoff until completion', async () => {
     const controller = new AbortController();
     const delays: number[] = [];
     let attempts = 0;
@@ -190,115 +181,30 @@ test('account work stops when retry backoff is aborted', async () => {
     assert.equal(attempts, 1);
 });
 
-test('account proof retries adopt a newer published target', async () => {
-    const controller = new AbortController();
-    let publishedTarget = { height: 41n, sequenceNumber: 700n };
-    const attempts: Array<{ height: bigint; sequenceNumber: bigint }> = [];
-
-    const result = await retryAccountWork(
-        async () => {
-            const target = publishedTarget;
-            attempts.push(target);
-            if (target.height === 41n) {
-                throw new Error('account location 303 is outside finalized state range');
-            }
-            return target;
-        },
-        controller.signal,
-        isRetryableAccountProofError,
-        {
-            wait: async () => {
-                publishedTarget = { height: 42n, sequenceNumber: 705n };
-                return true;
-            },
-        },
-    );
-
-    assert.deepEqual(attempts, [
-        { height: 41n, sequenceNumber: 700n },
-        { height: 42n, sequenceNumber: 705n },
-    ]);
-    assert.deepEqual(result, { height: 42n, sequenceNumber: 705n });
-});
-
 test('immutable Simplex configuration errors are terminal', () => {
     assert.equal(isRetryableProofError('failed to decode Simplex verification material'), false);
     assert.equal(isRetryableProofError('Simplex verification material contains trailing bytes'), false);
 });
 
-test('QMDB transaction root mismatches are terminal', () => {
-    assert.equal(
-        isRetryableProofError(
-            'historical ops root did not match expected root · height 337 · location 4865826 · tip 4865827 · proof start 4865826 · ops 1 · block index 17845 · block txs 17846',
-        ),
-        false,
-    );
-});
-
-test('non-indexer proof errors are not retried forever', () => {
-    assert.equal(isRetryableProofError('transaction location 3 is not a transaction append of block 7 · appends 4..7'), false);
-});
-
-test('QMDB transaction proof tip uses inclusive operation location', () => {
-    assert.equal(transactionProofTip(128n), 127n);
-});
-
-test('account proof index catch-up errors are retried', () => {
-    assert.equal(
-        isRetryableAccountProofError('account location 303 is outside finalized state range'),
-        true,
-    );
-    assert.equal(
-        isRetryableAccountProofError('[out_of_range] requested proof tip is not published yet'),
-        true,
-    );
-    assert.equal(
-        isRetryableAccountProofError(
-            '[out_of_range] requested location 304 is above published writer watermark 303',
-        ),
-        true,
-    );
-    assert.equal(isRetryableAccountProofError('finalization missing at height 42'), true);
-    assert.equal(isRetryableAccountProofError('[unavailable] transport disconnected'), true);
-    assert.equal(isRetryableAccountProofError(ConnectError.from(new TypeError('Failed to fetch'))), true);
-});
-
-test('missing account proof rows are not retried as index catch-up', () => {
-    const detail = 'account a0bf226776...6068e27a is not indexed';
-    assert.equal(isMissingAccountProofError(detail), true);
-    assert.equal(isRetryableAccountProofError(detail), false);
-});
-
-test('account retries distinguish indexer lag from service errors', () => {
-    for (const detail of [
-        CONSISTENCY_NOT_READY,
-        'finalization missing at height 42',
-        'transaction location 9 is not yet covered by a provable finalization',
-        '[out_of_range] requested proof tip is not published yet',
-    ]) {
-        assert.equal(accountRetryReason(new Error(detail)), 'waiting for indexer', detail);
-    }
+test('account retries distinguish consistency lag from service errors', () => {
+    assert.equal(accountRetryReason(new Error(CONSISTENCY_NOT_READY)), 'waiting for indexer');
     for (const error of [
-        new Error('[unavailable] transport disconnected'),
+        new ConnectError('transport disconnected', Code.Unavailable),
         ConnectError.from(new TypeError('Failed to fetch')),
     ]) {
         assert.equal(accountRetryReason(error), 'retrying after service error', error.message);
-    }
-    for (const detail of ['SQL transaction body does not match transaction digest']) {
-        assert.equal(accountRetryReason(new Error(detail)), undefined, detail);
-        assert.equal(isRetryableAccountProofError(new Error(detail)), false, detail);
     }
 });
 
 test('account retries report each retryable failure before waiting', async () => {
     const controller = new AbortController();
     const events: string[] = [];
-    const failures = ['[unavailable] transport disconnected', 'finalization missing at height 42'];
+    const failures = [new ConnectError('transport disconnected', Code.Unavailable), new Error(CONSISTENCY_NOT_READY)];
 
     const result = await retryAccountWork(
         async () => {
             const failure = failures.shift();
-            if (failure) throw new Error(failure);
+            if (failure) throw failure;
             return 'ready';
         },
         controller.signal,
@@ -316,22 +222,19 @@ test('account retries report each retryable failure before waiting', async () =>
     assert.deepEqual(events, ['retrying after service error', 'wait', 'waiting for indexer', 'wait']);
 });
 
-test('QMDB account root mismatches are terminal', () => {
-    assert.equal(isRetryableAccountProofError('historical ops root did not match expected root'), false);
-});
-
 test('deterministic account proof failures are terminal', async () => {
     const details = [
         'finalized artifact is missing certified header bytes',
         'finalized artifact commitment does not match certificate payload',
         'historical ops root did not match expected root',
-        'account proof value does not match account index row',
-        'QMDB account proof evaluated before the requested Store sequence',
-        'QMDB transaction proof evaluated before the requested Store sequence',
-        'SQL query evaluated before the requested Store sequence',
+        'account update is outside certified state interval',
+        'transaction body does not match requested digest',
+        'transaction is not at its claimed owning-block append position',
+        'aggregate response exceeds size limit',
     ];
 
     for (const detail of details) {
+        assert.equal(isRetryableProofError(new Error(detail)), false);
         const controller = new AbortController();
         let attempts = 0;
 
@@ -349,11 +252,4 @@ test('deterministic account proof failures are terminal', async () => {
         );
         assert.equal(attempts, 1);
     }
-});
-
-test('rows newer than the provable finalization are retried until coverage catches up', () => {
-    const detail = 'transaction location 7849756400 is not yet covered by a provable finalization';
-
-    assert.equal(isRetryableAccountProofError(detail), true);
-    assert.equal(isRetryableProofError(detail), true);
 });

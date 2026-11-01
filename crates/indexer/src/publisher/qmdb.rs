@@ -1376,18 +1376,15 @@ mod tests {
     use bytes::Bytes;
     use commonware_codec::Decode as _;
     use commonware_consensus::{
-        simplex::{
-            scheme::bls12381_threshold::standard,
-            types::{Context as SimplexContext, Finalization, Finalize, Proposal},
-        },
+        simplex::types::{Context as SimplexContext, Finalization, Finalize, Proposal},
         types::{Round, View},
     };
     use commonware_cryptography::{
         Signer as _,
         bls12381::primitives::variant::MinSig,
-        ed25519,
         sha256::{Digest as Sha256Digest, Sha256},
     };
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_parallel::Sequential;
     use commonware_runtime::{
         Metrics as _, Runner as _, Supervisor as _,
@@ -1407,9 +1404,9 @@ mod tests {
     };
     use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
-    type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
+    type TestCommitment = EngineCommitment<Sha256, ed25519::VerifyingKey>;
     type TestFinalization =
-        Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, TestCommitment>;
+        Finalization<ThresholdScheme<ed25519::VerifyingKey, MinSig>, TestCommitment>;
 
     #[derive(Clone, Debug)]
     struct CapturedSpan {
@@ -1514,7 +1511,7 @@ mod tests {
         let upload = queued_upload(1, state, transactions);
         let encoded = upload.encode();
         assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 1]);
-        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
         )
@@ -1534,7 +1531,7 @@ mod tests {
             let mut unsupported = encoded.to_vec();
             unsupported[index] ^= u8::MAX;
             assert!(
-                QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+                QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::decode_cfg(
                     Bytes::from(unsupported),
                     &QueuedFinalizedUploadCfg::default(),
                 )
@@ -1560,7 +1557,7 @@ mod tests {
         );
         upload.finalization = None;
         let encoded = upload.encode();
-        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
         )
@@ -1635,7 +1632,7 @@ mod tests {
         };
 
         let captured =
-            CapturedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::from_finalized_artifacts(
+            CapturedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::from_finalized_artifacts(
                 &block,
                 Some(finalization.clone()),
                 1,
@@ -1646,11 +1643,12 @@ mod tests {
         assert_eq!(captured.encode(), decoded.encode());
         assert_eq!(captured.encode_size(), decoded.encode_size());
 
-        let round_trip = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
-            captured.encode(),
-            &QueuedFinalizedUploadCfg::default(),
-        )
-        .expect("captured payload decodes");
+        let round_trip =
+            QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::decode_cfg(
+                captured.encode(),
+                &QueuedFinalizedUploadCfg::default(),
+            )
+            .expect("captured payload decodes");
         assert_eq!(round_trip.state.operations, state_bytes[1..2]);
         assert_eq!(round_trip.transactions.operations, transaction_bytes[1..2]);
     }
@@ -1664,13 +1662,13 @@ mod tests {
             let (reporter, certificate_uploader) =
                 crate::CertificateReporter::<
                     Sha256,
-                    ed25519::PublicKey,
-                    ThresholdScheme<ed25519::PublicKey, MinSig>,
+                    ed25519::VerifyingKey,
+                    ThresholdScheme<ed25519::VerifyingKey, MinSig>,
                 >::connect(
                     context.child("simplex"), &store.url, Some("writer-key"), 2
                 )
                 .expect("certificate reporter connects");
-            let (publisher, worker) = Publisher::<Sha256, ed25519::PublicKey>::connect(
+            let (publisher, worker) = Publisher::<Sha256, ed25519::VerifyingKey>::connect(
                 context.child("qmdb_publisher"),
                 &store.url,
                 Some("writer-key"),
@@ -2411,7 +2409,7 @@ mod tests {
                 .expect("seed stale target");
             let metrics = super::super::PublisherMetrics::new(&context.child("publisher"));
 
-            let Err(error) = Publisher::<Sha256, ed25519::PublicKey>::connect(
+            let Err(error) = Publisher::<Sha256, ed25519::VerifyingKey>::connect(
                 context.child("publisher_task"),
                 &url,
                 None,
@@ -2678,7 +2676,7 @@ mod tests {
                     Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
                         .seal(&mut Sha256::default()),
                 );
-                let upload = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig> {
+                let upload = QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig> {
                     block,
                     finalization: None,
                     finalized_ts_micros: 1,
@@ -2686,7 +2684,7 @@ mod tests {
                     transactions,
                 };
                 let decoded =
-                    QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+                    QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::decode_cfg(
                         upload.encode(),
                         &QueuedFinalizedUploadCfg::default(),
                     )
@@ -2777,7 +2775,7 @@ mod tests {
                 StateOperation::CommitFloor(None, Location::new(0)),
                 StateOperation::CommitFloor(None, Location::new(1)),
             ]);
-            let signer = ed25519::PrivateKey::from_seed(7);
+            let signer = ed25519::SigningKey::from_seed(7);
             let key = TransactionPublicKey::ed25519(signer.public_key());
             let transaction =
                 Transaction::<Sha256Digest>::new(key.clone(), key, NonZeroU64::MIN, 0)
@@ -2895,8 +2893,8 @@ mod tests {
                 Location::new(0),
             )];
             for index in 0u64.. {
-                let sender = ed25519::PrivateKey::from_seed(index * 2);
-                let receiver = ed25519::PrivateKey::from_seed(index * 2 + 1);
+                let sender = ed25519::SigningKey::from_seed(index * 2);
+                let receiver = ed25519::SigningKey::from_seed(index * 2 + 1);
                 let sender_key = TransactionPublicKey::ed25519(sender.public_key());
                 let receiver_key = TransactionPublicKey::ed25519(receiver.public_key());
                 let transaction = Transaction::<Sha256Digest>::new(
@@ -3014,7 +3012,7 @@ mod tests {
             .await
             .expect("connect publisher");
 
-            let signer = ed25519::PrivateKey::from_seed(7);
+            let signer = ed25519::SigningKey::from_seed(7);
             let key = TransactionPublicKey::ed25519(signer.public_key());
             let transaction = |nonce| {
                 Transaction::<Sha256Digest>::new(key.clone(), key.clone(), NonZeroU64::MIN, nonce)
@@ -3061,14 +3059,14 @@ mod tests {
             let first_header = test_block(1, &first_state, &first_transactions)
                 .header
                 .clone();
-            let first_block: EngineBlock<Sha256, ed25519::PublicKey> =
+            let first_block: EngineBlock<Sha256, ed25519::VerifyingKey> =
                 Block::new(first_header, vec![first_transaction])
                     .seal(&mut Sha256::default())
                     .into();
             let second_header = test_block(2, &second_state, &second_transactions)
                 .header
                 .clone();
-            let second_block: EngineBlock<Sha256, ed25519::PublicKey> =
+            let second_block: EngineBlock<Sha256, ed25519::VerifyingKey> =
                 Block::new(second_header, vec![second_transaction])
                     .seal(&mut Sha256::default())
                     .into();
@@ -3304,18 +3302,18 @@ mod tests {
         height: u64,
         state: QueuedAuthenticatedRange<Sha256Digest>,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
-    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey, MinSig> {
+    ) -> QueuedFinalizedUpload<Sha256, ed25519::VerifyingKey, MinSig> {
         let block = test_block(height, &state, &transactions);
         let finalization = test_finalization(&block);
         queued_upload_from(block, finalization, state, transactions)
     }
 
     fn queued_upload_from(
-        block: EngineBlock<Sha256, ed25519::PublicKey>,
+        block: EngineBlock<Sha256, ed25519::VerifyingKey>,
         finalization: TestFinalization,
         state: QueuedAuthenticatedRange<Sha256Digest>,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
-    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey, MinSig> {
+    ) -> QueuedFinalizedUpload<Sha256, ed25519::VerifyingKey, MinSig> {
         let upload = QueuedFinalizedUpload {
             finalized_ts_micros: i64::try_from(block.header.height).expect("height fits timestamp"),
             block,
@@ -3331,10 +3329,10 @@ mod tests {
         height: u64,
         state: &QueuedAuthenticatedRange<Sha256Digest>,
         transactions: &QueuedAuthenticatedRange<Sha256Digest>,
-    ) -> EngineBlock<Sha256, ed25519::PublicKey> {
+    ) -> EngineBlock<Sha256, ed25519::VerifyingKey> {
         let state_root = queued_range_root(state, state.start);
         let transactions_root = queued_range_root(transactions, transactions.start);
-        let leader = ed25519::PrivateKey::from_seed(height).public_key();
+        let leader = ed25519::SigningKey::from_seed(height).public_key();
         let header = Header {
             context: SimplexContext {
                 round: Round::zero(),
@@ -3389,7 +3387,6 @@ mod tests {
         batch
             .merkleize(&memory, &hasher)
             .root(
-                &memory,
                 &hasher,
                 QmdbFamily::inactive_peaks(
                     Location::new(range.end),
@@ -3399,19 +3396,18 @@ mod tests {
             .expect("reconstruct queued range root")
     }
 
-    fn test_finalization(block: &EngineBlock<Sha256, ed25519::PublicKey>) -> TestFinalization {
+    fn test_finalization(block: &EngineBlock<Sha256, ed25519::VerifyingKey>) -> TestFinalization {
         let mut rng = StdRng::from_seed([7; 32]);
-        let fixture = standard::fixture::<MinSig, _>(&mut rng, b"qmdb-test", 4);
+        let (schemes, verifier) = crate::publisher::fixture::threshold(&mut rng, b"qmdb-test", 4);
         let commitment = test_commitment(*block.seal());
         let proposal = Proposal::new(block.header.context.round, View::zero(), commitment);
-        let finalizes = fixture
-            .schemes
+        let finalizes = schemes
             .iter()
             .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("sign finalization"))
             .collect::<Vec<_>>();
         let finalizes = commonware_utils::iter::NonEmpty::try_new(finalizes.iter())
             .expect("test finalizations are non-empty");
-        Finalization::from_finalizes(&fixture.verifier, finalizes, &Sequential)
+        Finalization::from_finalizes(&verifier, finalizes, &Sequential)
             .expect("assemble finalization")
     }
 
