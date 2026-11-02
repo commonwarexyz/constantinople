@@ -72,6 +72,8 @@ fn verify(
 fn select(state: &State, rounds: &[Vec<PreparedTransfer>], seed: u64) -> (Vec<Vec<bool>>, Settled) {
     let mut selection = Selection::with_seed(seed);
     let mut accepted = Vec::with_capacity(rounds.len());
+
+    // Each round registers the starting accounts of its newly touched keys before it applies.
     for round in rounds {
         let touched = selection.touch(round);
         let reads = selection.keys()[touched]
@@ -81,6 +83,8 @@ fn select(state: &State, rounds: &[Vec<PreparedTransfer>], seed: u64) -> (Vec<Ve
         selection.register(starting_accounts(reads));
         accepted.push(selection.apply(round));
     }
+
+    // Settle every touched key and sort by key to compare with other routes.
     let keys = selection.keys().to_vec();
     let slots = account_slots(selection.settle(&Sequential));
     (accepted, sorted(&keys, slots))
@@ -167,11 +171,14 @@ impl<'a> Model<'a> {
     /// Applies `transfer`'s nonce and sums, returning the entries it leaves, or `None` if its
     /// nonce is refused or a sum overflows.
     fn step(&self, transfer: &PreparedTransfer) -> Option<Vec<(AccountKey, Entry)>> {
+        // The sender consumes the nonce and takes the debit.
         let mut sender = self.entry(&transfer.sender);
         if !sender.nonce.consume(transfer.nonce) {
             return None;
         }
         sender.debits = sender.debits.checked_add(transfer.value)?;
+
+        // A self-transfer credits the same entry, and any other transfer credits its recipient.
         if transfer.sender == transfer.recipient {
             sender.credits = sender.credits.checked_add(transfer.value)?;
             return Some(vec![(transfer.sender, sender)]);
@@ -211,6 +218,9 @@ impl<'a> Model<'a> {
         let mut model = Model::new(state);
         let mut touched = Vec::new();
         let mut accepted = Vec::with_capacity(rounds.len());
+
+        // Accept a transfer only if it applies and every key it changes can still settle. A
+        // dropped transfer leaves no entry behind.
         for round in rounds {
             let mut flags = Vec::with_capacity(round.len());
             for transfer in round {
@@ -223,7 +233,9 @@ impl<'a> Model<'a> {
             }
             accepted.push(flags);
         }
-        let mut settled = model.settled().expect("accepted transfers settle");
+
+        // Every touched key gets a slot, and a key no accepted transfer changed keeps its account.
+        let mut settled = model.settled().expect("accepted transfers must settle");
         for key in touched {
             if !model.entries.contains_key(&key) {
                 settled.push((key, Slot::Keep));
@@ -239,12 +251,16 @@ impl<'a> Model<'a> {
 fn executes_run_ahead_nonces() {
     let [sender, recipient] = [key(1), key(2)];
     let state = State::from([(sender, account(10, 0))]);
+
+    // Nonces inside the run-ahead window apply in any order.
     let body = [
         transfer(sender, recipient, 3, 2),
         transfer(sender, recipient, 4, 0),
         transfer(sender, recipient, 2, 1),
     ];
-    let settled = verify(&state, &body, 0, &Sequential).expect("valid body settles");
+    let settled = verify(&state, &body, 0, &Sequential).expect("valid body must settle");
+
+    // The sender pays all three values and consumes nonces 0 through 2.
     assert_eq!(
         settled,
         [
@@ -261,6 +277,8 @@ fn executes_run_ahead_nonces() {
 fn rejects_refused_nonces() {
     let [sender, recipient] = [key(1), key(2)];
     let state = State::from([(sender, account(10, 1))]);
+
+    // The sender has consumed nonce 0, and each body presents a nonce its account refuses.
     let far = NONCE_BITMAP_CAPACITY + 5;
     for body in [
         // Stale: consumed before the block.
@@ -281,7 +299,11 @@ fn rejects_refused_nonces() {
             transfer(sender, recipient, 1, 1),
         ],
     ] {
-        assert_eq!(verify(&state, &body, 0, &Sequential), None, "{body:?}");
+        assert_eq!(
+            verify(&state, &body, 0, &Sequential),
+            None,
+            "{body:?} must not settle"
+        );
     }
 }
 
@@ -298,7 +320,7 @@ fn spends_only_block_start_balances() {
     let state = State::from([(payer, account(10, 0)), (middle, account(10, 0))]);
     let body = [transfer(payer, middle, 4, 0), transfer(middle, payer, 3, 0)];
     assert_eq!(
-        verify(&state, &body, 0, &Sequential).expect("swap settles"),
+        verify(&state, &body, 0, &Sequential).expect("swap must settle"),
         [
             (payer, Slot::Put(account(9, 1))),
             (middle, Slot::Put(account(11, 1))),
@@ -314,7 +336,7 @@ fn self_transfers_debit_and_credit_their_sender() {
     // Spending the whole balance on a self-transfer leaves it unchanged and consumes the nonce.
     let body = [transfer(sender, sender, 9, 3)];
     assert_eq!(
-        verify(&state, &body, 0, &Sequential).expect("self-transfer settles"),
+        verify(&state, &body, 0, &Sequential).expect("self-transfer must settle"),
         [(sender, Slot::Put(account(9, 4)))]
     );
 
@@ -324,7 +346,7 @@ fn self_transfers_debit_and_credit_their_sender() {
         transfer(sender, recipient, 5, 4),
     ];
     assert_eq!(
-        verify(&state, &body, 0, &Sequential).expect("body settles"),
+        verify(&state, &body, 0, &Sequential).expect("body must settle"),
         [
             (sender, Slot::Put(account(4, 5))),
             (
@@ -346,7 +368,11 @@ fn self_transfers_debit_and_credit_their_sender() {
         ],
         vec![transfer(sender, sender, 10, 3)],
     ] {
-        assert_eq!(verify(&state, &body, 0, &Sequential), None, "{body:?}");
+        assert_eq!(
+            verify(&state, &body, 0, &Sequential),
+            None,
+            "{body:?} must not settle"
+        );
     }
 
     // Selection drops the send that the self-transfer's debit leaves unaffordable.
@@ -378,8 +404,11 @@ fn rejects_unaffordable_and_overflowing_sums() {
         (recipient, account(u64::MAX - 1, 0)),
     ]);
     for body in [
+        // A debit past the starting balance.
         vec![transfer(poor, recipient, 6, 0)],
+        // Debits that together exceed the starting balance.
         vec![transfer(poor, rich, 3, 0), transfer(poor, rich, 3, 1)],
+        // A credit that overflows the recipient.
         vec![transfer(rich, recipient, 2, 0)],
         // Debits that sum past u64::MAX.
         vec![
@@ -392,13 +421,17 @@ fn rejects_unaffordable_and_overflowing_sums() {
             transfer(recipient, poor, u64::MAX - 1, 0),
         ],
     ] {
-        assert_eq!(verify(&state, &body, 0, &Sequential), None, "{body:?}");
+        assert_eq!(
+            verify(&state, &body, 0, &Sequential),
+            None,
+            "{body:?} must not settle"
+        );
     }
 
     // A final balance at u64::MAX fits, though a credit arrives before the debit it nets with.
     let body = [transfer(poor, rich, 1, 0), transfer(rich, recipient, 1, 0)];
     assert_eq!(
-        verify(&state, &body, 0, &Sequential).expect("body settles"),
+        verify(&state, &body, 0, &Sequential).expect("body must settle"),
         [
             (poor, Slot::Put(account(4, 1))),
             (rich, Slot::Put(account(u64::MAX, 1))),
@@ -441,6 +474,9 @@ fn selection_drops_what_cannot_settle() {
             transfer(carol, alice, 10, 0),
         ],
     ];
+
+    // Selection keeps each transfer that settles with those accepted before it, and Rich, touched
+    // only by a dropped transfer, keeps its account.
     let (accepted, settled) = select(&state, &rounds, 0);
     assert_eq!(
         accepted,
@@ -479,9 +515,12 @@ fn random_state(rng: &mut TestRng, keys: &[AccountKey], reachable: bool) -> Stat
     const BASES: [u64; 6] = [0, 0, 1, 2, 1_000, u64::MAX - 1];
     let mut state = State::new();
     for key in keys {
+        // Leave about a quarter of the keys absent.
         if rng.random_range(0..4) == 0 {
             continue;
         }
+
+        // Draw a balance and a nonce, with about half the nonces showing run-ahead consumption.
         let bitmap = if rng.random_bool(0.5) {
             0
         } else {
@@ -491,6 +530,8 @@ fn random_state(rng: &mut TestRng, keys: &[AccountKey], reachable: bool) -> Stat
             balance: BALANCES[rng.random_range(0..BALANCES.len())],
             nonce: Nonce::new(BASES[rng.random_range(0..BASES.len())], bitmap),
         };
+
+        // A reachable account that has consumed no nonce holds at least the default balance.
         if reachable && account.nonce == Nonce::default() {
             account.balance = account.balance.max(DEFAULT_ACCOUNT_BALANCE);
         }
@@ -523,6 +564,8 @@ fn random_body(
         u64::MAX - 1,
         u64::MAX,
     ];
+
+    // Track each sender's next sequential nonce and every nonce drawn, for repeats.
     let mut next: BTreeMap<AccountKey, u64> = BTreeMap::new();
     let mut used: Vec<(AccountKey, u64)> = Vec::new();
     (0..len)
@@ -533,6 +576,9 @@ fn random_body(
             } else {
                 recipients[rng.random_range(0..recipients.len())]
             };
+
+            // Adversarial transfers draw extreme values and one of six nonce kinds, and the rest
+            // take small values and the sender's next sequential nonce.
             let base = state.get(&sender).copied().unwrap_or_default().nonce.base;
             let sequential = next.entry(sender).or_insert(base);
             let (value, nonce) = if rng.random_bool(noise) {
@@ -601,24 +647,32 @@ fn verification_matches_model() {
     let mut rng = TestRng::new(7);
     let mut settled = 0;
     for case in 0..20_000u64 {
+        // Verification must agree with the model under a differently keyed plan per case.
         let (state, reachable, body) = random_case(&mut rng);
         let expected = Model::verify(&state, &body);
         assert_eq!(
             verify(&state, &body, case, &Sequential),
             expected,
-            "case {case}"
+            "case {case}: verification must match the model"
         );
+
+        // A body that settles over a reachable state writes every key it changes.
         if let Some(slots) = expected {
             settled += 1;
             if reachable {
                 assert!(
                     slots.iter().all(|(_, slot)| matches!(slot, Slot::Put(_))),
-                    "case {case}: every key a body changes is written"
+                    "case {case}: a reachable body must write every key it changes"
                 );
             }
         }
     }
-    assert!(settled > 2_000, "only {settled} bodies settled");
+
+    // Enough bodies settle for the comparison to cover accepted bodies.
+    assert!(
+        settled > 2_000,
+        "more than 2,000 bodies must settle, got {settled}"
+    );
 }
 
 #[test]
@@ -626,22 +680,33 @@ fn selection_matches_model_and_verifies() {
     let mut rng = TestRng::new(8);
     let mut dropped = 0;
     for case in 0..20_000u64 {
+        // Selection must accept the same transfers and settle the same slots as the model.
         let (state, _, body) = random_case(&mut rng);
         let rounds = random_rounds(&mut rng, &body);
         let (accepted, settled) = select(&state, &rounds, case);
         assert_eq!(
             (accepted.clone(), settled.clone()),
             Model::select(&state, &rounds),
-            "case {case}"
+            "case {case}: selection must match the model"
         );
 
         // The accepted body settles to the same writes under verification.
         let survivors = survivors(&rounds, &accepted);
         dropped += body.len() - survivors.len();
-        let verified = verify(&state, &survivors, case, &Sequential).expect("survivors settle");
-        assert_eq!(written(&verified), written(&settled), "case {case}");
+        let verified =
+            verify(&state, &survivors, case, &Sequential).expect("survivors must settle");
+        assert_eq!(
+            written(&verified),
+            written(&settled),
+            "case {case}: survivors must settle to the selected writes"
+        );
     }
-    assert!(dropped > 20_000, "only {dropped} candidates dropped");
+
+    // Enough candidates drop for the comparison to cover rejections.
+    assert!(
+        dropped > 20_000,
+        "more than 20,000 candidates must drop, got {dropped}"
+    );
 }
 
 /// Keys enough for plans and settlement to split among workers.
@@ -672,24 +737,35 @@ fn parallel_settlement_matches_model() {
         let senders = &keys[..rng.random_range(2_000..30_000)];
         let state = funded_state(&mut rng, senders);
         let body = random_body(&mut rng, &state, senders, &keys, 50_000, noise);
+
+        // Verification on the pool matches the model, and only noise-free bodies settle.
         let expected = Model::verify(&state, &body);
-        assert_eq!(expected.is_some(), noise == 0.0, "case {case}");
+        assert_eq!(
+            expected.is_some(),
+            noise == 0.0,
+            "case {case}: a body must settle exactly when it carries no noise"
+        );
         assert_eq!(
             verify(&state, &body, case as u64, &strategy),
             expected,
-            "case {case}"
+            "case {case}: pool verification must match the model"
         );
 
+        // Selection matches the model, and its survivors verify on the pool.
         let rounds = random_rounds(&mut rng, &body);
         let (accepted, settled) = select(&state, &rounds, case as u64);
         assert_eq!(
             (accepted.clone(), settled),
             Model::select(&state, &rounds),
-            "case {case}"
+            "case {case}: selection must match the model"
         );
         let survivors = survivors(&rounds, &accepted);
         let verified = verify(&state, &survivors, case as u64, &strategy);
-        assert!(verified.is_some(), "case {case}");
-        assert_eq!(verified, Model::verify(&state, &survivors), "case {case}");
+        assert!(verified.is_some(), "case {case}: survivors must settle");
+        assert_eq!(
+            verified,
+            Model::verify(&state, &survivors),
+            "case {case}: survivor verification must match the model"
+        );
     }
 }

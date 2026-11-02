@@ -952,6 +952,7 @@ mod tests {
         EngineBlock::from(block)
     }
 
+    /// Finalizes `block` with votes from all four threshold fixture participants.
     fn test_finalization(
         block: &EngineBlock<Sha256, ed25519::VerifyingKey>,
     ) -> Finalization<ThresholdScheme<ed25519::VerifyingKey, MinSig>, TestCommitment> {

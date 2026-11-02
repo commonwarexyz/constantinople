@@ -11,9 +11,8 @@ use clap::Parser;
 use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use std::time::Duration;
 
-/// Pins enough memory for the default page caches plus the working set, so steady-state
-/// allocations reuse it instead of arenas that purge memory and fault it back in. Memory beyond
-/// it is kept for a minute, longer than recurring work such as metrics scrapes.
+/// Reserves an arena for the default page caches and working set, exempt from allocator purging.
+/// Other arenas delay purging to retain memory across recurring work such as metrics scrapes.
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc::new(Config {
     purge: Purge::After(Duration::from_secs(60)),

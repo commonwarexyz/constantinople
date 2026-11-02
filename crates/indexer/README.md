@@ -94,7 +94,7 @@ root. Missing proof inputs remain retryable while their uploads catch up.
 
 ## Crate contents
 
-- [`sql_schema::build_meta_schema`](src/sql_schema.rs) — the canonical
+- [`sql_schema::build_meta_schema`](src/sql_schema.rs) is the canonical
   source of truth for the live `block_meta`, `tx_meta`, `tx_activity`, and
   `account_meta` table layouts. The explorer's column-name strings live here
   too, so a schema change is a one-place edit.
@@ -116,13 +116,13 @@ root. Missing proof inputs remain retryable while their uploads catch up.
   Latest-finalized-height is derived from the Simplex finalization height index.
 - `[[bin]] chain-indexer` requires `--features chain-indexer`. It wraps
   `exoware_simulator::server::run` for local development and deployer-managed remote bundles.
-- `[[bin]] metadata-indexer` — thin wrapper that registers
+- `[[bin]] metadata-indexer` is a thin wrapper that registers
   [`build_meta_schema`](src/sql_schema.rs) onto an
   [`exoware_sql::SqlServer`](https://docs.rs/exoware-sql/latest/exoware_sql/struct.SqlServer.html)
   so the explorer can reach the `sql.v1.Service` `Subscribe` RPC.
-- `[[bin]] qmdb-indexer` — QMDB Connect facade over the same Store. It mounts
-  account-state operation logs at `/state` and transaction-hash operation logs
-  at `/transactions`, alongside the combined reads below.
+- `[[bin]] qmdb-indexer` is a QMDB Connect facade over the same Store. It
+  mounts account-state operation logs at `/state` and transaction-hash operation
+  logs at `/transactions`, alongside the combined reads below.
 
 ## Combined explorer reads
 
@@ -140,15 +140,17 @@ then fetch bodies through the digest primary key. A later certificate can cover
 a block that has no certificate of its own. Account pagination supplies both the
 snapshot height and digest to retain the same view while publication advances.
 
-All-activity pages seek directly from the cursor and read at most 11 activity-index
-rows. Sent and received filters use the existing primary index and may scan
-additional history before filling a page, especially when matches are sparse.
+All-activity pages seek directly from the cursor and read at most 11 activity
+rows, one more than a page. Sent and received filters apply the role as a row
+filter over the same key ranges, so they may scan additional history before
+filling a page when matches are sparse.
 
 Responses encode bytes as hex and 64-bit integers as decimal strings. The
 limits are 4096 ancestry headers, 1 MiB per proof, and 8 MiB per response.
 Malformed requests return 400, temporarily unavailable publication or evidence
 returns 503, invalid stored evidence returns 500, and work exceeding the
 supported bounds returns 422.
+
 Account proofs establish historical membership, and a missing update is not a
 nonexistence proof. Account transaction lists carry membership proofs for their
 returned rows without a claim of completeness.

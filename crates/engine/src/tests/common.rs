@@ -192,10 +192,15 @@ where
 
 #[derive(Clone)]
 pub(crate) struct ValidatorState {
+    /// Marshal mailbox of the validator's engine.
     pub(crate) marshal: TestMarshalMailbox,
+
+    /// Height of the state-sync floor block this validator resolved at this or
+    /// an earlier startup, if it has state-synced.
     pub(crate) startup_sync_height: Option<u64>,
+
     /// Runtime context whose metrics export covers every validator in the
-    /// simulation.
+    /// simulation, because all validators share one executor registry.
     pub(crate) context: Arc<deterministic::Context>,
 }
 

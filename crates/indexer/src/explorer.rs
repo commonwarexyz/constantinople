@@ -1,4 +1,9 @@
 //! Combined read responses carrying the evidence an explorer verifies locally.
+//!
+//! Each response anchors to one finalization certificate whose block matches a
+//! publication target. SQL metadata supplies only hints (heights, indices,
+//! locations, and digests). The client verifies every returned claim against
+//! the certificate through parent headers and QMDB proofs.
 
 use crate::{
     adapter::BoxError,
@@ -57,16 +62,33 @@ use std::{
     sync::Arc,
 };
 
+/// Maximum transactions returned on one account activity page.
 const ACCOUNT_PAGE: usize = 10;
+
+/// Maximum transactions returned on one block page.
 const BLOCK_PAGE: u64 = 50;
+
+/// Maximum parent headers linking a certificate to the requested block's parent.
 const MAX_HEADERS: u64 = 4096;
+
+/// Maximum encoded size accepted for one stored ancestor header.
 const MAX_HEADER_BYTES: usize = 512;
+
+/// Maximum encoded size accepted for one stored finalization certificate.
 const MAX_CERTIFICATE_BYTES: usize = 16 * 1024;
+
+/// Maximum encoded size of one QMDB proof in a response.
 const MAX_PROOF_BYTES: usize = 1024 * 1024;
+
+/// Largest signed transaction encoding the public codec accepts.
 const MAX_TRANSACTION_BYTES: usize = Transaction::<Digest>::SIZE + TransactionSignature::MAX_SIZE;
+
+/// Maximum serialized size of one JSON response.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 type Header = EngineHeader<Sha256, VerifyingKey>;
+
+/// Finalization certificate stored in the Simplex height index.
 type Certificate = Finalized<
     CertifiedHeader<Sha256, VerifyingKey>,
     ThresholdScheme<VerifyingKey, MinSig>,
@@ -85,22 +107,33 @@ type TransactionLog = Keyless<mmr::Family, Sha256, Digest, FixedEncoding<Digest>
 type StateOperation = unordered::Operation<mmr::Family, AccountKey, FixedEncoding<AccountValue>>;
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<Digest>>;
 
+/// Store clients shared by every explorer route.
 struct Explorer {
+    /// Publication targets keyed by big-endian height. The newest target bounds
+    /// which certificates a response may use.
     targets: PrefixedStoreClient,
+    /// Simplex certificates and headers.
     simplex: PrefixedStoreClient,
+    /// Store namespace backing the SQL metadata tables.
     sql_store: PrefixedStoreClient,
+    /// SQL metadata tables, read only for location and digest hints.
     sql: SqlContext,
+    /// Account-state QMDB operation log.
     state: StateLog,
+    /// Transaction-hash QMDB operation log.
     transactions: TransactionLog,
 }
 
 /// Build the bounded account, block, and transaction evidence routes.
 pub fn router(client: &StoreClient) -> Result<Router, BoxError> {
+    // Register the metadata tables so hint queries resolve their table names.
     let sql_store = sql_meta_client(client)?;
     let sql = SqlContext::new(sql_store.clone());
     build_meta_schema(sql_store.clone())
         .map_err(std::io::Error::other)?
         .register_all(&sql)?;
+
+    // Every route reads through the same Store clients.
     let state = Arc::new(Explorer {
         targets: publication_target_client(client)?,
         simplex: simplex_client(client)?,
@@ -116,47 +149,74 @@ pub fn router(client: &StoreClient) -> Result<Router, BoxError> {
         .with_state(state))
 }
 
+/// JSON response body shared by every explorer route.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Bundle {
+    /// Hex finalization certificate that anchors every proof in the bundle.
     certificate: String,
+    /// Hex parent headers, newest first, from below the certified header down
+    /// to the requested block's parent.
     headers: Vec<String>,
+    /// Store sequence floor covering every read behind the bundle.
     sequence_number: String,
+    /// Proof of the account's latest update, on account routes.
     account: Option<AccountProof>,
+    /// Returned transactions in page order.
     transactions: Vec<TransactionRow>,
+    /// Hex multi-proof of every returned transaction against the certified
+    /// transactions root, present when any transaction is returned.
     transactions_proof: Option<String>,
+    /// Hex activity cursor or decimal block offset of the next page.
     next_cursor: Option<String>,
 }
 
+/// Proof of an account's latest update within the certified state range.
 #[derive(Serialize)]
 struct AccountProof {
+    /// Account-state QMDB location of the update.
     location: String,
+    /// Hex operation range proof for that location.
     proof: String,
 }
 
+/// One transaction with its proven QMDB location and signed body.
 #[derive(Serialize)]
 struct TransactionRow {
+    /// Transaction-hash QMDB location covered by the bundle's proof.
     location: String,
+    /// Hex signed transaction whose digest the proof authenticates.
     body: String,
+    /// Block height, which is an unproven SQL hint on account rows.
     height: String,
+    /// Index within the block, which is an unproven SQL hint on account rows.
     index: u32,
+    /// Account role (0 sender, 1 receiver), present only on account rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<u8>,
 }
 
+/// Error response carrying the HTTP status of its failure class.
 #[derive(Debug)]
 struct Failure(StatusCode, String);
 
 impl Failure {
+    /// Malformed request.
     fn bad(message: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, message.into())
     }
+
+    /// Publication or evidence that can appear once uploads catch up.
     fn pending(message: impl Into<String>) -> Self {
         Self(StatusCode::SERVICE_UNAVAILABLE, message.into())
     }
+
+    /// Stored evidence that contradicts itself or the certified snapshot.
     fn invalid(message: impl Into<String>) -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, message.into())
     }
+
+    /// Valid request whose work exceeds the supported bounds.
     fn limit(message: impl Into<String>) -> Self {
         Self(StatusCode::UNPROCESSABLE_ENTITY, message.into())
     }
@@ -168,6 +228,7 @@ impl IntoResponse for Failure {
     }
 }
 
+/// Store client failures are retryable.
 impl From<ClientError> for Failure {
     fn from(error: ClientError) -> Self {
         Self::pending(error.to_string())
@@ -182,6 +243,8 @@ impl From<commonware_codec::Error> for Failure {
 
 impl From<QmdbError> for Failure {
     fn from(error: QmdbError) -> Self {
+        // A requested location above the published QMDB watermark means
+        // publication has not caught up, so it stays retryable.
         match error {
             QmdbError::Client(error) => error.into(),
             QmdbError::WatermarkTooLow { .. } => Self::pending(error.to_string()),
@@ -190,6 +253,7 @@ impl From<QmdbError> for Failure {
     }
 }
 
+/// Serializes a bundle, rejecting responses larger than [`MAX_RESPONSE_BYTES`].
 fn response(bundle: Bundle) -> Result<Response, Failure> {
     let bytes = serde_json::to_vec(&bundle).map_err(|error| Failure::invalid(error.to_string()))?;
     if bytes.len() > MAX_RESPONSE_BYTES {
@@ -198,6 +262,7 @@ fn response(bundle: Bundle) -> Result<Response, Failure> {
     Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response())
 }
 
+/// Raw account query parameters, validated by [`AccountRequest::parse`].
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AccountQuery {
@@ -208,20 +273,30 @@ struct AccountQuery {
     activity: Option<String>,
 }
 
+/// Raw block query parameters.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BlockQuery {
     offset: Option<String>,
 }
 
+/// Validated account request.
 struct AccountRequest {
+    /// Account whose state and activity are read.
     key: AccountKey,
+    /// Role filter (0 sent, 1 received), or `None` for all activity.
     mode: Option<u8>,
+    /// Last row of the previous page, which this page excludes.
     cursor: Option<Cursor>,
+    /// Height and digest that pin the certified snapshot across pages.
     snapshot: Option<(u64, Digest)>,
+    /// Whether to return an activity page.
     activity: bool,
 }
 
+/// Position in an account's activity, encoded as 24 big-endian bytes.
+///
+/// Pages run newest first in the derived (height, index, role) order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Cursor {
     height: u64,
@@ -237,6 +312,8 @@ impl Cursor {
             index: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
             role: u64::from_be_bytes(bytes[16..].try_into().unwrap()),
         };
+
+        // Reject positions that no activity row can occupy.
         if cursor.height == 0 || cursor.index > u64::from(u32::MAX) || cursor.role > 1 {
             return Err(Failure::bad("invalid activity cursor"));
         }
@@ -269,6 +346,8 @@ impl AccountRequest {
             _ => return Err(Failure::bad("at and digest must appear together")),
         };
         let cursor = query.cursor.as_deref().map(Cursor::parse).transpose()?;
+
+        // A filtered page continues only from a cursor with the same role.
         if cursor.is_some_and(|cursor| mode.is_some_and(|role| cursor.role != u64::from(role))) {
             return Err(Failure::bad("cursor role does not match mode"));
         }
@@ -287,6 +366,8 @@ impl AccountRequest {
     }
 }
 
+/// Parses a canonical decimal `u64`, rejecting the leading `+` that
+/// [`str::parse`] accepts.
 fn decimal(value: &str) -> Result<u64, Failure> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(Failure::bad("expected decimal u64"));
@@ -296,6 +377,7 @@ fn decimal(value: &str) -> Result<u64, Failure> {
         .map_err(|_| Failure::bad("decimal u64 overflow"))
 }
 
+/// Parses a decimal height, rejecting zero.
 fn positive(value: &str) -> Result<u64, Failure> {
     let value = decimal(value)?;
     if value == 0 {
@@ -304,6 +386,7 @@ fn positive(value: &str) -> Result<u64, Failure> {
     Ok(value)
 }
 
+/// Decodes exactly `N` bytes from hex digits of either case.
 fn hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], Failure> {
     if value.len() != N * 2 {
         return Err(Failure::bad(format!("expected {} hex characters", N * 2)));
@@ -319,6 +402,7 @@ fn hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], Failure> {
     Ok(bytes)
 }
 
+/// Encodes bytes as lowercase hex.
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -329,26 +413,38 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
+/// Certified snapshot that every read for one request is checked against.
 struct Anchor {
+    /// Encoded certificate returned to the client.
     raw: Bytes,
+    /// Certified header whose roots and ranges bound every proof.
     header: Header,
+    /// Read session shared by the request's Store reads, so its observed
+    /// sequence covers all of them.
     session: ReadSession,
+    /// SQL metadata tables read through the same session.
     sql: SqlContext,
 }
 
+/// Newest publication target and the session that observed it.
 struct Published {
+    /// Highest published block height.
     height: u64,
+    /// Digest of the published block at that height.
     digest: Digest,
+    /// Session to extend with the request's later reads.
     session: ReadSession,
 }
 
 impl Anchor {
+    /// Highest Store sequence observed by the request's reads so far.
     fn floor(&self) -> Result<u64, Failure> {
         self.session
             .evaluated_sequence()
             .ok_or_else(|| Failure::invalid("Store omitted sequence metadata"))
     }
 
+    /// Starts a bundle with the certificate and the current floor.
     fn bundle(&self) -> Result<Bundle, Failure> {
         Ok(Bundle {
             certificate: hex(&self.raw),
@@ -363,6 +459,8 @@ impl Anchor {
 }
 
 impl Explorer {
+    /// Reads the newest publication target, which bounds every certificate a
+    /// response may use.
     async fn published(&self) -> Result<Published, Failure> {
         let targets = ReadSession::monotonic(self.targets.clone(), None);
         let latest = targets
@@ -373,6 +471,8 @@ impl Explorer {
                 RangeMode::Reverse,
             )
             .await?;
+
+        // Target keys are big-endian heights and values are block digests.
         let (key, digest) = latest
             .first()
             .ok_or_else(|| Failure::pending("publication is not ready"))?;
@@ -392,6 +492,7 @@ impl Explorer {
         })
     }
 
+    /// Selects a certificate under the newest publication target.
     async fn anchor(
         &self,
         first: u64,
@@ -402,6 +503,9 @@ impl Explorer {
             .await
     }
 
+    /// Selects a finalization certificate between `first` and the publication
+    /// height, or exactly at `exact`. A forward scan picks the lowest such
+    /// certificate and a reverse scan picks the newest.
     async fn anchor_at(
         &self,
         published: &Published,
@@ -409,11 +513,17 @@ impl Explorer {
         exact: Option<(u64, Digest)>,
         reverse: bool,
     ) -> Result<Anchor, Failure> {
+        // A pinned snapshot fixes both bounds, and neither bound may pass the
+        // publication boundary.
         let lower = exact.map_or(first, |(height, _)| height);
         let upper = exact.map_or(published.height, |(height, _)| height);
         if lower > published.height || upper > published.height {
             return Err(Failure::pending("requested publication is not ready"));
         }
+
+        // Scan the Simplex height index for one certificate in the inclusive
+        // bound. Appending a zero byte makes the exclusive end key include
+        // `upper`.
         let session = published.session.with_client(self.simplex.clone());
         let start = keys::finalized_by_height(Height::new(lower));
         let mut end = keys::finalized_by_height(Height::new(upper)).to_vec();
@@ -433,6 +543,9 @@ impl Explorer {
         let height = keys::finalized_height_from_key(&key)
             .ok_or_else(|| Failure::invalid("invalid certificate key"))?
             .get();
+
+        // Bound and decode the stored certificate, then require the index key,
+        // requested bound, and certified header to agree on its height.
         if raw.len() > MAX_CERTIFICATE_BYTES {
             return Err(Failure::limit("certificate exceeds 16 KiB"));
         }
@@ -444,6 +557,10 @@ impl Explorer {
         if header.height != height || height == 0 {
             return Err(Failure::invalid("certificate height does not match index"));
         }
+
+        // The certified block must be the published block at its height, which
+        // keeps responses within the publication boundary. A pinned snapshot
+        // must also name that block.
         let marker = if height == published.height {
             published.digest
         } else {
@@ -459,6 +576,9 @@ impl Explorer {
                 "certificate does not match publication or requested digest",
             ));
         }
+
+        // SQL reads join the request session, so they observe at least the
+        // Store state that held the certificate.
         let sql = self
             .sql
             .with_read_session(session.with_client(self.sql_store.clone()));
@@ -470,11 +590,15 @@ impl Explorer {
         })
     }
 
+    /// Proves the account's latest update inside the certified state range, or
+    /// returns `None` when SQL holds no such update.
     async fn account_proof(
         &self,
         anchor: &Anchor,
         key: &AccountKey,
     ) -> Result<Option<AccountProof>, Failure> {
+        // SQL supplies only a candidate location, which the proof below must
+        // bind to the certified state root.
         let start = anchor.header.state_range.start();
         let end = anchor.header.state_range.end();
         let query = format!(
@@ -491,6 +615,9 @@ impl Explorer {
                 "account location is outside certified range",
             ));
         }
+
+        // Prove that location at the certified tip, reading QMDB at or above
+        // the request floor.
         let proof = self
             .state
             .operation_range_checkpoint(
@@ -500,6 +627,9 @@ impl Explorer {
                 Some(anchor.floor()?),
             )
             .await?;
+
+        // The proof must reproduce the certified root and contain exactly one
+        // operation, an update of the requested account.
         if proof.canonical_root::<Sha256>() != anchor.header.state_root
             || proof.encoded_operations.len() != 1
         {
@@ -514,6 +644,7 @@ impl Explorer {
                 "account proof does not contain requested update",
             ));
         }
+
         let encoded = encode_historical_operation_range_proof(&proof);
         bounded_proof(&encoded)?;
         Ok(Some(AccountProof {
@@ -522,11 +653,15 @@ impl Explorer {
         }))
     }
 
+    /// Returns one activity page with its multi-proof and the next cursor.
     async fn activity(
         &self,
         anchor: &Anchor,
         request: &AccountRequest,
     ) -> Result<(Vec<TransactionRow>, Option<String>, Option<String>), Failure> {
+        // SQL rows are untrusted hints. Each must lie within the certified
+        // height, match the filter, follow the request cursor, and strictly
+        // descend, so a page cannot repeat or reorder rows.
         let height = anchor.header.height;
         let batches = activity_rows(&anchor.sql, request, height).await?;
         let mut hints = Vec::new();
@@ -556,6 +691,9 @@ impl Explorer {
                 hints.push((cursor, digest, location));
             }
         }
+
+        // The extra row only signals another page. The next cursor is the
+        // last returned row, which the following page excludes.
         let next = if hints.len() > ACCOUNT_PAGE {
             hints[ACCOUNT_PAGE - 1].0.encode().into()
         } else {
@@ -565,6 +703,9 @@ impl Explorer {
         if hints.is_empty() {
             return Ok((Vec::new(), None, next));
         }
+
+        // The proof binds each location to its digest. Heights and indices
+        // remain hints because no proof covers them.
         let expected = hints
             .iter()
             .map(|(_, digest, location)| (*location, *digest))
@@ -583,11 +724,14 @@ impl Explorer {
         Ok((rows, Some(proof), next))
     }
 
+    /// Proves SQL-supplied (location, digest) pairs and fetches their bodies.
+    /// The proven digests must equal the supplied ones exactly.
     async fn transaction_evidence(
         &self,
         anchor: &Anchor,
         expected: &[(u64, Digest)],
     ) -> Result<(String, BTreeMap<Digest, Bytes>), Failure> {
+        // Collapse duplicate locations, rejecting two digests for one location.
         let mut locations = BTreeMap::new();
         for &(location, digest) in expected {
             if locations
@@ -597,6 +741,7 @@ impl Explorer {
                 return Err(Failure::invalid("conflicting transaction locations"));
             }
         }
+
         let (encoded, digests) = self
             .transaction_proof(anchor, &locations.keys().copied().collect::<Vec<_>>())
             .await?;
@@ -609,11 +754,15 @@ impl Explorer {
         Ok((encoded, bodies))
     }
 
+    /// Proves ascending `locations` against the certified transactions root and
+    /// returns the encoded proof with each proven digest.
     async fn transaction_proof(
         &self,
         anchor: &Anchor,
         locations: &[u64],
     ) -> Result<(String, BTreeMap<u64, Digest>), Failure> {
+        // Only appends below the certified tip can hold transactions. The tip
+        // itself is the block's commit operation.
         let range = &anchor.header.transactions_range;
         if locations
             .iter()
@@ -623,6 +772,9 @@ impl Explorer {
                 "requested transactions are beyond the certified history",
             ));
         }
+
+        // Request one multi-proof at the certified tip, reading QMDB at or
+        // above the request floor.
         let requested = locations
             .iter()
             .copied()
@@ -636,6 +788,9 @@ impl Explorer {
                 Some(anchor.floor()?),
             )
             .await?;
+
+        // The proof must verify against the certified root and cover exactly
+        // the requested locations.
         if proof.ops_root != anchor.header.transactions_root
             || proof.operations.len() != locations.len()
             || !proof.verify::<Sha256>()
@@ -644,6 +799,9 @@ impl Explorer {
                 "transaction proof does not match certified root",
             ));
         }
+
+        // Each proven operation must be an append, whose value is the
+        // transaction digest.
         let mut digests = BTreeMap::new();
         for ((location, bytes), expected) in proof.operations.iter().zip(locations) {
             if location.as_u64() != *expected {
@@ -658,16 +816,20 @@ impl Explorer {
             };
             digests.insert(*expected, digest);
         }
+
         let encoded = encode_historical_multi_proof(&proof);
         bounded_proof(&encoded)?;
         Ok((hex(&encoded), digests))
     }
 
+    /// Fetches signed bodies for proven transaction digests. Bodies come from
+    /// SQL, so each must decode and hash to its proven digest.
     async fn bodies(
         &self,
         anchor: &Anchor,
         digests: impl Iterator<Item = Digest>,
     ) -> Result<BTreeMap<Digest, Bytes>, Failure> {
+        // Look up bodies by the digest primary key, at most one row per digest.
         let expected = digests.collect::<BTreeSet<_>>();
         let literals = expected
             .iter()
@@ -679,6 +841,8 @@ impl Explorer {
             expected.len()
         );
         let batches = query_rows(&anchor.sql, &query, expected.len()).await?;
+
+        // Accept each requested digest once, with a body that matches it.
         let mut bodies = BTreeMap::new();
         for batch in &batches {
             for row in 0..batch.num_rows() {
@@ -693,17 +857,24 @@ impl Explorer {
                 }
             }
         }
+
+        // A missing body means its SQL upload has not caught up.
         if bodies.len() != expected.len() {
             return Err(Failure::pending("transaction bodies are not ready"));
         }
         Ok(bodies)
     }
 
+    /// Links the certified header down to the parent of the block at `height`.
+    /// Returns the hex parent headers, the block's header, and the block's own
+    /// transaction interval [start, end).
     async fn ancestry(
         &self,
         anchor: &Anchor,
         height: u64,
     ) -> Result<(Vec<String>, Header, u64, u64), Failure> {
+        // The chain must reach the requested block's parent, or block 1 itself,
+        // within the ancestry bound.
         let lowest = height.saturating_sub(1).max(1);
         let count = anchor
             .header
@@ -713,10 +884,14 @@ impl Explorer {
         if count > MAX_HEADERS {
             return Err(Failure::limit("certificate ancestry exceeds 4096 headers"));
         }
+
+        // The certified header may itself be the requested block.
         let mut headers = Vec::new();
         let mut current = anchor.header.clone();
         let mut block = (current.height == height).then(|| current.clone());
         if count > 0 {
+            // Read one SQL digest hint per height below the certificate. Hints
+            // only locate headers, since each header is verified below.
             let query = format!(
                 "SELECT height, digest FROM block_meta WHERE height >= {lowest} AND height < {} ORDER BY height DESC LIMIT {count}",
                 current.height
@@ -737,6 +912,8 @@ impl Explorer {
             if hints.len() != count as usize {
                 return Err(Failure::pending("ancestor metadata is not ready"));
             }
+
+            // Fetch every hinted header in one batched Simplex read.
             let keys = hints
                 .values()
                 .map(keys::header_by_digest)
@@ -748,6 +925,10 @@ impl Explorer {
                 .await?
                 .collect()
                 .await?;
+
+            // Walk down from the certificate. Each header must have its height
+            // and hinted digest, and its child must name it as both parent block
+            // and consensus parent.
             for ancestor_height in (lowest..current.height).rev() {
                 let digest = hints[&ancestor_height];
                 let bytes = raw
@@ -771,6 +952,11 @@ impl Explorer {
                 current = ancestor;
             }
         }
+
+        // Block 1 has no parent header, so its interval starts after the
+        // initial commit at the start of its range. Every later block starts
+        // where its parent's range ends, and every interval ends before the
+        // block's own commit.
         let block =
             block.ok_or_else(|| Failure::invalid("requested block is missing from ancestry"))?;
         let start = if height == 1 {
@@ -790,14 +976,21 @@ impl Explorer {
     }
 }
 
+/// Serves an account's latest proven update and one activity page under a
+/// single certified snapshot.
 async fn account(
     State(explorer): State<Arc<Explorer>>,
     Path(account): Path<String>,
     Query(query): Query<AccountQuery>,
 ) -> Result<Response, Failure> {
     let request = AccountRequest::parse(&account, query)?;
+
+    // Anchor to the newest certificate under the publication boundary, or to
+    // the pinned snapshot.
     let anchor = explorer.anchor(1, request.snapshot, true).await?;
     let mut bundle = anchor.bundle()?;
+
+    // Prove the account update and the activity page against the same anchor.
     let (account, activity) =
         tokio::try_join!(explorer.account_proof(&anchor, &request.key), async {
             if request.activity {
@@ -812,10 +1005,14 @@ async fn account(
         bundle.transactions_proof,
         bundle.next_cursor,
     ) = activity;
+
+    // Report the floor after every read, since each read can raise it.
     bundle.sequence_number = anchor.floor()?.to_string();
     response(bundle)
 }
 
+/// Serves one page of a block's transactions, proven through the lowest
+/// certificate at or above the block.
 async fn block(
     State(explorer): State<Arc<Explorer>>,
     Path(height): Path<String>,
@@ -828,8 +1025,13 @@ async fn block(
         .map(decimal)
         .transpose()?
         .unwrap_or(0);
+
+    // Link the lowest covering certificate down to the block's parent, which
+    // fixes the block's own transaction interval.
     let anchor = explorer.anchor(height, None, false).await?;
     let (headers, _, start, end) = explorer.ancestry(&anchor, height).await?;
+
+    // Offsets are block indices, and every returned index must fit in a `u32`.
     let count = end - start;
     if offset > count {
         return Err(Failure::bad("block offset exceeds transaction count"));
@@ -840,6 +1042,8 @@ async fn block(
     }
     let mut bundle = anchor.bundle()?;
     bundle.headers = headers;
+
+    // Prove the page's locations and fetch bodies for the proven digests.
     if offset < page_end {
         let locations = (start + offset..start + page_end).collect::<Vec<_>>();
         let (proof, digests) = explorer.transaction_proof(&anchor, &locations).await?;
@@ -856,16 +1060,22 @@ async fn block(
             .collect();
         bundle.transactions_proof = Some(proof);
     }
+
+    // Return the next page's offset while transactions remain.
     bundle.next_cursor = (page_end < count).then(|| page_end.to_string());
+
+    // Report the floor after every read, since each read can raise it.
     bundle.sequence_number = anchor.floor()?.to_string();
     response(bundle)
 }
 
+/// Serves one transaction with its exact inclusion height and proof.
 async fn transaction(
     State(explorer): State<Arc<Explorer>>,
     Path(digest): Path<String>,
 ) -> Result<Response, Failure> {
     let digest = Digest::from(hex_bytes::<32>(&digest)?);
+
     // Discover the owning height under the published visibility floor, then bind
     // the location to that block's authenticated append interval.
     let published = explorer.published().await?;
@@ -885,6 +1095,9 @@ async fn transaction(
     if height == 0 {
         return Err(Failure::invalid("invalid transaction height"));
     }
+
+    // The SQL height and location are hints. The certificate, ancestry, and
+    // proof must confirm that the location lies in that block's interval.
     let anchor = explorer.anchor_at(&published, height, None, false).await?;
     let (headers, _, start, end) = explorer.ancestry(&anchor, height).await?;
     if location < start || location >= end {
@@ -894,6 +1107,8 @@ async fn transaction(
     }
     let index = u32::try_from(location - start)
         .map_err(|_| Failure::limit("transaction index exceeds supported range"))?;
+
+    // The proof must authenticate exactly this digest at the hinted location.
     let (proof, bodies) = explorer
         .transaction_evidence(&anchor, &[(location, digest)])
         .await?;
@@ -907,10 +1122,13 @@ async fn transaction(
         role: None,
     }];
     bundle.transactions_proof = Some(proof);
+
+    // Report the floor after every read, since each read can raise it.
     bundle.sequence_number = anchor.floor()?.to_string();
     response(bundle)
 }
 
+/// Rejects an encoded proof larger than [`MAX_PROOF_BYTES`].
 fn bounded_proof(bytes: &[u8]) -> Result<(), Failure> {
     if bytes.len() > MAX_PROOF_BYTES {
         return Err(Failure::limit("proof exceeds 1 MiB"));
@@ -918,6 +1136,8 @@ fn bounded_proof(bytes: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Bounds and decodes a stored signed transaction, requiring its message digest
+/// to equal the proven `digest`.
 fn transaction_body(bytes: &[u8], digest: &Digest) -> Result<Bytes, Failure> {
     if bytes.len() > MAX_TRANSACTION_BYTES {
         return Err(Failure::limit(
@@ -932,14 +1152,19 @@ fn transaction_body(bytes: &[u8], digest: &Digest) -> Result<Bytes, Failure> {
     Ok(bytes)
 }
 
+/// Reads at most one row beyond an activity page, newest first, after the
+/// request cursor and at or below the certified `height`.
 async fn activity_rows(
     sql: &SqlContext,
     request: &AccountRequest,
     height: u64,
 ) -> Result<Vec<RecordBatch>, Failure> {
+    // A cursor above the certified height belongs to a later snapshot.
     if request.cursor.is_some_and(|cursor| cursor.height > height) {
         return Err(Failure::bad("cursor exceeds certified height"));
     }
+
+    // Sent and received filters apply the role as a row predicate.
     let mut predicate = format!("account = X'{}'", hex(request.key.as_ref()));
     if let Some(role) = request.mode {
         predicate.push_str(&format!(" AND role = {role}"));
@@ -968,6 +1193,8 @@ async fn activity_rows(
         ranges.push(format!("height <= {height}"));
     }
 
+    // Query the ranges in order, carrying the remaining budget so the total
+    // stays within one page plus one row.
     let mut remaining = ACCOUNT_PAGE + 1;
     let mut batches = Vec::new();
     for range in ranges {
@@ -984,6 +1211,8 @@ async fn activity_rows(
     Ok(batches)
 }
 
+/// Runs a SQL query, rejecting results with more than `max` rows and dropping
+/// empty batches.
 async fn query_rows(
     sql: &SqlContext,
     query: &str,
@@ -1012,6 +1241,8 @@ async fn query_rows(
     Ok(nonempty)
 }
 
+/// Maps a Store client error anywhere in the DataFusion source chain to a
+/// retryable failure and anything else to invalid evidence.
 fn sql_error(error: datafusion::error::DataFusionError) -> Failure {
     let mut source: &dyn std::error::Error = &error;
     loop {
@@ -1026,6 +1257,8 @@ fn sql_error(error: datafusion::error::DataFusionError) -> Failure {
     Failure::invalid(error.to_string())
 }
 
+/// Returns a typed column, rejecting a wrong type or a missing or null value at
+/// `row`.
 fn array<A: Array + 'static>(
     batch: &RecordBatch,
     column: usize,

@@ -58,14 +58,28 @@ static ALLOC: MiMalloc = MiMalloc::new(Config {
 type Db = StateDatabase<tokio::Context, Sha256, EightCap, Rayon>;
 type Batch = StateBatch<tokio::Context, Sha256, EightCap, Rayon>;
 
+/// Funded accounts seeded into the state database.
 const ACCOUNTS: u64 = 1_000_000;
+
+/// Default page-cache size, in bytes.
 const CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Default transfers per block, as a comma-separated list.
 const COUNTS: &str = "32768,65536,131072";
+
+/// Transfers each account sends in the shared fixtures.
 const SHARED_FANOUT: usize = 8;
+
+/// Senders, and separately recipients, in the hot fixture.
 const HOT_ACCOUNTS: usize = 64;
+
+/// Default untimed warmup iterations.
 const WARMUP: u32 = 2;
+
+/// Default timed iterations.
 const ITERS: u32 = 10;
 
+/// A pattern of transfers between accounts.
 #[derive(Clone, Copy)]
 enum Fixture {
     /// Each account pays the next, as the spammer does: every account but the ends is touched
@@ -90,6 +104,7 @@ impl Fixture {
         Self::Hot,
     ];
 
+    /// The fixture's name in reports and in `CONSTANTINOPLE_BENCH_FIXTURE`.
     const fn name(self) -> &'static str {
         match self {
             Self::Ring => "ring",
@@ -114,7 +129,10 @@ const fn transfer(sender: AccountKey, recipient: AccountKey, nonce: u64) -> Prep
     }
 }
 
+/// Verification stages, in the order they run.
 const VERIFY_STAGES: &[&str] = &["plan", "stage", "settle", "merkleize"];
+
+/// Proposal stages, in the order they run.
 const PROPOSE_STAGES: &[&str] = &["touch", "stage", "apply", "settle", "merkleize"];
 
 /// Verifies `body` as `consensus::compute` does, timing each stage. Returns the stage times, the
@@ -124,6 +142,7 @@ async fn verify(
     body: &Arc<Vec<PreparedTransfer>>,
     strategy: &Rayon,
 ) -> (Vec<Duration>, usize, String) {
+    // Plan the body on the pool before reading any account.
     let start = Instant::now();
     let transfers = Arc::clone(body);
     let plan = strategy
@@ -131,12 +150,16 @@ async fn verify(
             Plan::new(transfers.as_slice(), &s)
         })
         .await
-        .expect("body plans");
+        .expect("body must plan");
+
+    // One staged read covers every account the plan touches.
     let planned = Instant::now();
     let (reads, staged) = {
         let keys: Vec<&AccountKey> = plan.keys().iter().collect();
-        batch.stage(&keys).await.expect("stage")
+        batch.stage(&keys).await.expect("staging must succeed")
     };
+
+    // Settle on the pool and count the slots that change state.
     let read = Instant::now();
     let slots = strategy
         .spawn(plan.len(), move |s: Rayon| {
@@ -144,16 +167,20 @@ async fn verify(
                 .map(account_slots)
         })
         .await
-        .expect("body settles");
+        .expect("body must settle");
     let settled = Instant::now();
     let writes = slots
         .iter()
         .filter(|slot| !matches!(slot, Slot::Keep))
         .count();
+
+    // Merkleizing resolves each slot to its staged key.
     let merkleized = staged
         .merkleize(slots, Vec::new())
         .await
         .expect("merkleize");
+
+    // Each stage runs from the end of the previous one.
     let done = Instant::now();
     let times = vec![
         planned - start,
@@ -176,7 +203,11 @@ async fn propose(
     let mut unstaged = Some(batch);
     let mut staged = None;
     let mut accepted = 0;
+
+    // Each round touches its keys, stages only the new ones, and applies its candidates. Stage
+    // times accumulate across rounds.
     for round in rounds {
+        // The selection moves into the touch job and back.
         let start = Instant::now();
         let (back, touched) = {
             let round = Arc::clone(round);
@@ -189,25 +220,29 @@ async fn propose(
                 .await
         };
         selection = back;
+
+        // The first round stages a fresh batch, and later rounds expand it.
         let touched_at = Instant::now();
         if !touched.is_empty() {
             let keys: Vec<&AccountKey> = selection.keys()[touched].iter().collect();
             let reads = if let Some(batch) = unstaged.take() {
-                let (reads, next) = batch.stage(&keys).await.expect("stage");
+                let (reads, next) = batch.stage(&keys).await.expect("staging must succeed");
                 staged = Some(next);
                 reads
             } else {
                 let (_, reads, next) = staged
                     .take()
-                    .expect("staged after the first round")
+                    .expect("a staged batch must exist after the first round")
                     .expand(&keys)
                     .await
-                    .expect("expand");
+                    .expect("expanding must succeed");
                 staged = Some(next);
                 reads
             };
             selection.register(starting_accounts(reads));
         }
+
+        // Apply the round on the pool, counting the accepted candidates.
         let read = Instant::now();
         let (back, flags) = {
             let round = Arc::clone(round);
@@ -226,7 +261,9 @@ async fn propose(
         times[1] += read - touched_at;
         times[2] += applied - read;
     }
-    let staged = staged.expect("a round staged");
+
+    // Settle every touched key once, then merkleize the slots.
+    let staged = staged.expect("at least one round must stage accounts");
     let start = Instant::now();
     let slots = strategy
         .spawn(selection.keys().len(), move |s: Rayon| {
@@ -244,6 +281,7 @@ async fn propose(
     (times, accepted, root_hex(merkleized.root()))
 }
 
+/// The state database configuration, with every journal on `cache`.
 fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
     FixedConfig {
         merkle_config: MmrConfig {
@@ -297,6 +335,8 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
             })
             .collect(),
     };
+
+    // Every seeded account starts at nonce 0, so sequential nonces let every transfer apply.
     let mut nonces = vec![0u64; ACCOUNTS as usize];
     pairs
         .into_iter()
@@ -310,7 +350,10 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
 
 /// Medians of each stage over the timed iterations.
 struct Stages {
+    /// Stage names, in the order they run.
     names: &'static [&'static str],
+
+    /// Each stage's samples, one per timed iteration.
     samples: Vec<Vec<Duration>>,
 }
 
@@ -322,6 +365,7 @@ impl Stages {
         }
     }
 
+    /// Records one timed iteration, with one time per stage.
     fn record(&mut self, times: &[Duration]) {
         assert_eq!(times.len(), self.names.len());
         for (samples, time) in self.samples.iter_mut().zip(times) {
@@ -335,6 +379,7 @@ impl Stages {
         sorted[sorted.len() / 2]
     }
 
+    /// Formats each stage's median and the median, minimum, and maximum per-iteration totals.
     fn report(&self) -> String {
         let mut line = String::new();
         for (name, samples) in self.names.iter().zip(&self.samples) {
@@ -344,8 +389,14 @@ impl Stages {
             .map(|iter| self.samples.iter().map(|samples| samples[iter]).sum())
             .collect();
         let (min, max) = (
-            totals.iter().min().expect("timed iterations"),
-            totals.iter().max().expect("timed iterations"),
+            totals
+                .iter()
+                .min()
+                .expect("at least one iteration must be timed"),
+            totals
+                .iter()
+                .max()
+                .expect("at least one iteration must be timed"),
         );
         line += &format!(
             " | total {:.3?} (min {min:.3?} max {max:.3?})",
@@ -359,6 +410,7 @@ fn root_hex(root: impl core::fmt::Debug) -> String {
     format!("{root:?}")
 }
 
+/// Reads `name` from the environment, or `default` when it is unset or does not parse.
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
@@ -366,6 +418,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Reads `name` from the environment, or `default` when it is unset or does not parse.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -377,6 +430,8 @@ fn main() {
     let workers = env_usize("CONSTANTINOPLE_BENCH_WORKERS", 8).max(1);
     tokio::Runner::new(tokio::Config::default().with_worker_threads(workers)).start(
         |context| async move {
+            // Read the run's settings, open the state database, and keep one page cache for
+            // every journal.
             let warmup = env_u32("CONSTANTINOPLE_BENCH_WARMUP", WARMUP);
             let iters = env_u32("CONSTANTINOPLE_BENCH_ITERS", ITERS).max(1);
             let rounds = env_usize("CONSTANTINOPLE_BENCH_ROUNDS", 4).max(1);
@@ -388,7 +443,12 @@ fn main() {
             let counts: Vec<usize> = std::env::var("CONSTANTINOPLE_BENCH_COUNTS")
                 .unwrap_or_else(|_| COUNTS.into())
                 .split(',')
-                .map(|count| count.trim().parse().expect("transfer count"))
+                .map(|count| {
+                    count
+                        .trim()
+                        .parse()
+                        .expect("each transfer count must parse")
+                })
                 .collect();
             let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
             let mode_filter = std::env::var("CONSTANTINOPLE_BENCH_MODE").ok();
@@ -405,6 +465,8 @@ fn main() {
             )
             .await;
 
+            // Seed and durably commit every account, so each iteration starts from the same
+            // state.
             let mut batch = db.new_batches().await;
             for index in 0..ACCOUNTS {
                 batch = batch.write(
@@ -430,6 +492,8 @@ fn main() {
                     let body = Arc::new(transfers(fixture, n));
                     let label = format!("{} {n} txs / {workers} workers", fixture.name());
 
+                    // Every verify iteration must reach the same writes and root, and only
+                    // iterations after the warmup are timed.
                     if mode_filter.as_deref().is_none_or(|mode| mode == "verify") {
                         let mut stages = Stages::new(VERIFY_STAGES);
                         let mut outcome = None;
@@ -444,13 +508,15 @@ fn main() {
                                 stages.record(&times);
                             }
                         }
-                        let (writes, root) = outcome.expect("iterations ran");
+                        let (writes, root) = outcome.expect("at least one iteration must run");
                         println!(
                             "verify  {label} |{} | {writes} writes root {root}",
                             stages.report()
                         );
                     }
 
+                    // Split the body into equal candidate rounds. Every candidate must apply, and
+                    // every iteration must reach the same root.
                     if mode_filter.as_deref().is_none_or(|mode| mode == "propose") {
                         let per_round = n.div_ceil(rounds);
                         let candidates: Vec<Arc<Vec<PreparedTransfer>>> = body
@@ -463,7 +529,7 @@ fn main() {
                             let batch = db.new_batches().await;
                             let (times, accepted, root) =
                                 propose(batch, &candidates, &strategy).await;
-                            assert_eq!(accepted, n, "every candidate applies");
+                            assert_eq!(accepted, n, "every candidate must apply");
                             match &outcome {
                                 None => outcome = Some(root),
                                 Some(expected) => assert_eq!(expected, &root),
@@ -476,7 +542,7 @@ fn main() {
                             "propose {label} / {} rounds |{} | root {}",
                             candidates.len(),
                             stages.report(),
-                            outcome.expect("iterations ran")
+                            outcome.expect("at least one iteration must run")
                         );
                     }
                 }

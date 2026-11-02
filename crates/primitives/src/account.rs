@@ -25,10 +25,11 @@ const ACCOUNT_KEY_SIZE: usize = ed25519::VerifyingKey::SIZE;
 
 /// Fixed-width account identifier derived from a transaction public key.
 ///
-/// An Ed25519 account is keyed by its 32-byte public-key encoding and a
-/// secp256r1 account by the SHA-256 digest of its tagged key encoding.
-/// Decoding copies bytes without interpreting them as a curve point, so
-/// state-database replay, indexing, and lookup stay on byte comparisons.
+/// An Ed25519 account is keyed by its 32-byte public-key encoding, and a
+/// secp256r1 account by the SHA-256 digest of its transaction public-key
+/// encoding, scheme byte included. Decoding copies bytes without
+/// interpreting them as a curve point, so state-database replay, indexing,
+/// and lookup stay on byte comparisons.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FixedArray)]
 #[fixed_array(infallible)]
 pub struct AccountKey {

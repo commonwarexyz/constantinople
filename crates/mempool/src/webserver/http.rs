@@ -45,12 +45,13 @@ const MIN_U64_VARINT_BYTES: usize = 1;
 /// Ingress decode and verification run on the strategy's worker pool, which
 /// consensus execution and block verification also share. Admitting one
 /// batch at a time keeps a burst of relayer posts from queueing CPU bursts
-/// ahead of consensus-critical work; excess requests wait cheaply on the
-/// semaphore in the async layer instead. The owned permit is acquired in
-/// `verify_body` -- after the request body is buffered, before the pool job
-/// dispatches -- and moves into the job itself, so slow uploads and mailbox
-/// waits never hold it and a client disconnect cannot release it while the
-/// job runs.
+/// ahead of consensus-critical work, while excess requests wait cheaply on
+/// the semaphore in the async layer.
+///
+/// The owned permit is acquired in `verify_body` after the request body is
+/// buffered and before the pool job dispatches. It moves into the job itself,
+/// so slow uploads and mailbox waits never hold it and a client disconnect
+/// cannot release it while the job runs.
 pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
 
 /// Shared state for HTTP handlers.
@@ -261,19 +262,13 @@ where
     };
 
     // Admission control: the owned permit moves into the pool job below, so
-    // it is held for exactly the job's lifetime -- a client disconnect drops
+    // it is held for exactly the job's lifetime. A client disconnect drops
     // the handler future but cannot release the permit while the
-    // (uncancellable) job still occupies the pool.
+    // uncancellable job still occupies the pool.
     let Ok(permit) = state.ingress_permits.clone().acquire_owned().await else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    // Cheap decode failures must not train the scheduler to run expensive
-    // valid batches on the async worker, so the outer job always hands off
-    // while signature verification inside it keeps adaptive scheduling. Rayon
-    // runs a spawned job inline only after a returned future has measured the
-    // hand-off round trip at its call site, so the job's future is dropped and
-    // its result returns over a channel.
     // Pool threads have an empty tracing context, so capture the caller's span explicitly.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
@@ -334,6 +329,13 @@ where
             digests,
         })
     };
+
+    // Cheap decode failures must not train the scheduler to run expensive
+    // valid batches on the async worker, so this job always hands off while
+    // signature verification inside it keeps adaptive scheduling. The
+    // scheduler inlines a call site only after an awaited future has measured
+    // its hand-off round trip, so the spawned future is dropped and the
+    // result returns over a channel.
     let (verified_tx, verified_rx) = oneshot::channel();
     drop(state.strategy.spawn(work_size, move |_| {
         let _ = verified_tx.send(job());

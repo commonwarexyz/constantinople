@@ -20,7 +20,7 @@ client.
 
 [rpc]: https://github.com/exowarexyz/monorepo/blob/main/proto/sql/v1/service.proto
 
-The UI renders a one-line block summary plus a multi-line ASCII
+The UI renders block summaries plus a multi-line ASCII
 histogram showing tx-count-per-block over the last ~80 blocks so the
 operator can see throughput scale at a glance. The histogram's y-axis
 is auto-scaled to the peak in the visible window.
@@ -41,14 +41,14 @@ proof when present, signed transaction bodies, and one transaction multi-proof
 for the page. WebAssembly initialization overlaps the request. The browser
 verifies the certificate and proofs locally, recomputes transaction digests,
 and derives sender, recipient, value, and nonce from their authenticated bodies.
-Account-list heights and indices remain SQL hints; block and single-transaction
-views authenticate the transaction's exact inclusion height and index.
-The UI records validator-reported finalization and successful proof verification
-separately.
+Account-list heights and indices are unauthenticated index hints. Block and
+single-transaction views authenticate the transaction's exact inclusion height
+and index. The UI records validator-reported finalization and successful proof
+verification separately.
 
 An account page selects a published, certified snapshot and retains its height
 and digest while paging through ten transactions at a time. Changing the
-activity filter retains that snapshot; refreshing selects a new one. Wallet
+activity filter retains that snapshot, and refreshing selects a new one. Wallet
 balance requests omit activity. A returned account update proves membership
 under the snapshot's state root. This historical proof does not establish that
 the update is the latest for the account, and an absent account result does not
@@ -65,11 +65,11 @@ empty blocks. Transaction reconciliation uses the same ancestry and membership
 checks to establish the exact inclusion height.
 
 The server selects a target covered by both publication and a certificate.
-Related Store reads use its sequence as a minimum visibility floor; the
+Related Store reads use its sequence as a minimum visibility floor, and the
 certificate's digest, roots, and tips identify the snapshot. Temporary gaps in
-publication remain retryable. Combined responses are bounded to 8 MiB and
-4096 ancestry headers; requests exceeding the supported ancestry length return
-a terminal error.
+publication remain retryable. Combined responses are bounded to 8 MiB and 4096
+ancestry headers. Requests exceeding the supported ancestry length return a
+terminal error.
 
 ### SQL analysis
 
@@ -78,7 +78,7 @@ Choose an example, edit it, and use **run query** or Command/Ctrl+Enter.
 The schema and query guide lists the available columns and address syntax.
 
 Results include a table and, when suitable columns are present, a chart.
-Aliases `x` and `y` select chart axes; the chart controls can also change them.
+Aliases `x` and `y` select chart axes, and the chart controls can also change them.
 Single-row numeric results appear as totals. Balance history is plotted by
 state operation location because account-state rows have no timestamp.
 `finalized_ts` in block queries is the publisher's observed time.
@@ -89,11 +89,11 @@ The popup shows elapsed request-and-decode time, returned rows, columns,
 Arrow batches, and the observed Store sequence. The SQL service returns one
 complete response and exposes no scan progress or server execution timing,
 so the progress bar is indeterminate. Cancel or closing the popup stops the
-browser request; it does not guarantee that server computation has stopped.
+browser request but does not guarantee that server computation has stopped.
 
 The editor accepts one `SELECT` or `WITH` query, caps the result at 1,000 rows,
 and uses a 30-second request deadline without automatic retries. The row cap
-does not bound scanned input; use indexed predicates and bounded examples.
+does not bound scanned input, so use indexed predicates and bounded examples.
 The editor guard is a convenience, not authorization on the SQL service.
 
 ### Why SQL?
@@ -174,15 +174,10 @@ just explorer-build
 The build outputs a static bundle to `explorer/dist/`. The Explorer tests run
 separately from the Rust workspace's `just test` recipe.
 
-## Styling: why we don't depend on www-sacred directly
+## Styling
 
-[SRCL / www-sacred](https://github.com/internet-development/www-sacred) is
-distributed as a Next.js + SCSS application, not as a consumable npm
-component library. Pulling it in would drag Next.js (and SCSS tooling) into
-this otherwise plain Vite/React app for no real gain.
-
-Instead, [`src/styles.css`](src/styles.css) mirrors SRCL's terminal
-aesthetic with a small set of tokens — monospace stack, OKLCH-derived dark
-palette, `tabular-nums lining-nums`, 1ch-based padding — so the look is
-recognizably "sacred" without the framework cost. If we ever need richer
-SRCL components we can vendor them piecemeal under `src/components/`.
+The explorer's terminal appearance draws from
+[SRCL / www-sacred](https://github.com/internet-development/www-sacred).
+[`STYLE_GUIDE.md`](STYLE_GUIDE.md) defines the typography, spacing, controls,
+and component rules. [`src/styles.css`](src/styles.css) implements those rules
+with shared tokens.

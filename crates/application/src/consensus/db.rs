@@ -111,10 +111,11 @@ where
 }
 
 /// Merkleizes the staged state batch, with one slot per staged read, and the
-/// transaction-history batch concurrently. `transaction_batch` is a future so
-/// a caller can keep appending to the history batch on the strategy's pool
-/// while the state merkleize runs; callers holding a finished batch pass it via
-/// [`core::future::ready`].
+/// transaction-history batch concurrently.
+///
+/// `transaction_batch` is a future so a caller can keep appending to the
+/// history batch on the strategy's pool while the state merkleize runs. A
+/// caller holding a finished batch passes it through [`core::future::ready`].
 pub(super) async fn finalize_execution<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     slots: StateSlots,
@@ -205,6 +206,9 @@ mod tests {
         let cache = CacheRef::new(NZU16!(16), NZUsize!(4096));
         let db =
             <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache), None).await;
+
+        // Commit the accounts durably so every later batch reads them as
+        // block-start state.
         let mut seed = db.new_batches().await;
         for (key, account) in accounts {
             seed = seed.write(*key, Some(*account));
@@ -218,11 +222,12 @@ mod tests {
     #[test]
     fn state_root_ignores_slot_order() {
         deterministic::Runner::default().start(|context| async move {
+            // Hold two of the four keys so the stage reads both held and
+            // absent accounts.
             let [a, b, c, d] = [1, 2, 3, 4].map(key);
             let db = seeded(context, &[(c, account(300)), (a, account(100))]).await;
 
-            // The same final key->value set must produce the same root
-            // regardless of staged read order.
+            // Stage the keys in one order and settle each to its final value.
             let (_, staged) = db
                 .new_batches()
                 .await
@@ -236,6 +241,7 @@ mod tests {
                 .expect("first order")
                 .root();
 
+            // Stage the keys in reverse order with the same final values.
             let (_, staged) = db
                 .new_batches()
                 .await
@@ -249,6 +255,8 @@ mod tests {
                 .expect("second order")
                 .root();
 
+            // The same final key->value set must produce the same root
+            // regardless of staged read order.
             assert_eq!(x, y);
         });
     }
@@ -265,6 +273,8 @@ mod tests {
                     AccountKey::from(raw)
                 })
                 .collect();
+
+            // Hold every other key so the body touches held and absent accounts.
             let held: Vec<(AccountKey, Account)> = keys
                 .iter()
                 .step_by(2)
@@ -294,20 +304,23 @@ mod tests {
             // order.
             let settle = |batch: Batch, plan: Plan<AccountKey, _>| async move {
                 let keys: Vec<&AccountKey> = plan.keys().iter().collect();
-                let (reads, staged) = batch.stage(&keys).await.expect("stage");
+                let (reads, staged) = batch.stage(&keys).await.expect("staging must succeed");
                 let slots = plan
                     .settle(&starting_accounts(reads), &Sequential)
-                    .expect("body settles");
+                    .expect("body must settle");
                 staged
                     .merkleize(account_slots(slots), Vec::new())
                     .await
                     .expect("merkleize")
                     .root()
             };
+
+            // Settle under three seeded plans, then once through `compute`
+            // with a randomly keyed plan.
             let mut roots = Vec::new();
             let mut orders = Vec::new();
             for seed in 0..3 {
-                let plan = Plan::with_seed(&body, seed, &Sequential).expect("plan");
+                let plan = Plan::with_seed(&body, seed, &Sequential).expect("body must plan");
                 orders.push(plan.keys().to_vec());
                 roots.push(settle(db.new_batches().await, plan).await);
             }
@@ -315,12 +328,14 @@ mod tests {
                 compute(db.new_batches().await, Arc::new(body), &Sequential).await;
             roots.push(
                 staged
-                    .merkleize(slots.expect("body settles"), Vec::new())
+                    .merkleize(slots.expect("body must settle"), Vec::new())
                     .await
                     .expect("merkleize")
                     .root(),
             );
 
+            // The seeds must yield distinct key orders, and every plan must
+            // reach the same root.
             assert!(
                 orders.windows(2).all(|pair| pair[0] != pair[1]),
                 "seeds must order the keys differently"

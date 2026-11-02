@@ -69,9 +69,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    /// The queued signature job owns its body, so dropping the verification future keeps the body
+    /// alive until the job runs.
     #[test]
     fn cancelled_signature_wait_keeps_queued_body_alive() {
         deterministic::Runner::default().start(|context| async move {
+            // Occupy both pool workers so the signature job stays queued
+            // behind them until they are released.
             let pool = Arc::new(ThreadPoolBuilder::new().num_threads(2).build().unwrap());
             let strategy = Rayon::with_pool(Arc::clone(&pool));
             let (entered_tx, entered_rx) = mpsc::channel();
@@ -89,6 +93,8 @@ mod tests {
                 entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             }
 
+            // A lazily decoded transaction defers parsing, so any payload of
+            // a valid length gives the job a body to own.
             let payload_size = constantinople_primitives::Transaction::<
                 commonware_cryptography::sha256::Digest,
             >::SIZE
@@ -100,6 +106,9 @@ mod tests {
                 LazySignedTransaction::<Sha256>::decode(encoded).unwrap(),
             ]);
             let weak = Arc::downgrade(&body);
+
+            // Start verification, then drop the caller's body and the future
+            // while the job is still queued.
             let future = verify_signatures(
                 StdRng::from_seed([13; 32]),
                 b"queued-body-test",
@@ -111,7 +120,11 @@ mod tests {
             drop(body);
             drop(future);
 
+            // The queued job holds the only remaining reference.
             assert_eq!(weak.strong_count(), 1);
+
+            // Releasing the workers lets the job run and drop the last
+            // reference.
             for release in releases {
                 release.send(()).unwrap();
             }

@@ -12,6 +12,7 @@ use constantinople_primitives::{SignedTransaction, Transaction, TransactionPubli
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::{num::NonZeroU64, time::Duration};
 
+/// Pins a 2 GiB arena that is never purged. Other arenas keep freed memory for ten seconds.
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc::new(Config {
     purge: Purge::After(Duration::from_secs(10)),

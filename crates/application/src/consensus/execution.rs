@@ -38,31 +38,31 @@
 //! merkleized commitments
 //! ```
 //!
-//! Account state is read with one awaited QMDB `stage` call, which returns the starting accounts
-//! plus a staged batch that retains each key's resolved location, so merkleizing the settled slots
-//! skips key re-resolution. A plan's key order is unspecified and can differ between plans of the
-//! same body, and the state root does not depend on it: the staged merkleize resolves each slot to
-//! its key, so the root depends only on each key's final value. A body that cannot settle (a
-//! refused nonce, a debit beyond a starting balance, or a final balance past `u64::MAX`) is
-//! rejected whole, with no partial state to reconcile. Which offending account and reason a plan
-//! reports may differ between plans, so a rejection only marks the body invalid. Transaction
-//! history is append-only: transaction digests are appended in block order, so the
-//! transaction-history commitment still reflects block order.
+//! Account state is read with one awaited QMDB `stage` call. It returns the starting accounts and
+//! a staged batch that retains each key's resolved location, so merkleizing the settled slots skips
+//! key re-resolution. A plan's key order is unspecified and can differ between plans of the same
+//! body. The staged merkleize resolves each slot to its key, so the state root depends only on each
+//! key's final value and not on that order.
+//!
+//! A body that cannot settle (a refused nonce, a debit beyond a starting balance, or a final
+//! balance past `u64::MAX`) is rejected whole, with no partial state to reconcile. Different plans
+//! may report a different offending account and reason, so a rejection only marks the body
+//! invalid. Transaction history is append-only, and digests are appended in block order, so the
+//! transaction-history commitment reflects block order.
 //!
 //! Proposing, verifying, and applying certified blocks all use this same transition.
-//! `execute_proposal` builds a proposal best effort with a [`Selection`]: malformed candidates are
-//! dropped, the rest apply one at a time in block order against block-start state, a candidate that
-//! cannot settle with those accepted before it is dropped, the block tops up from the mempool
-//! toward the proposal budget, and an empty selection proposes an empty block so an idle chain
-//! keeps making progress — a proposal is always produced. The accepted body settles to the same
-//! slots under the verifier's plan.
-//! `execute_body` prepares a proposed body, recomputes execution, and compares
-//! the resulting commitments to the header. Certified apply shares ownership of
-//! the block's immutable lazy body with the prepare job. Preparing a transfer does
-//! not invent a second transaction identifier: it reads the transaction's sealed
-//! message digest. For lazily encoded block bodies, whichever consumer first
-//! materializes the transaction computes that seal once and caches the decoded
-//! transaction for the other consumers.
+//! `execute_proposal` builds a proposal best effort with a [`Selection`]. Malformed candidates are
+//! dropped, and the rest apply one at a time in block order against block-start state, dropping
+//! each candidate that cannot settle with those accepted before it. The block tops up from the
+//! mempool toward the proposal budget, and an empty selection still proposes an empty block so an
+//! idle chain keeps making progress. The accepted body settles to the same slots under the
+//! verifier's plan.
+//!
+//! `execute_body` prepares a proposed body, recomputes execution, and compares the resulting
+//! commitments to the header. Certified apply shares ownership of the block's immutable lazy body
+//! with the prepare job. Preparing a transfer reads the transaction's sealed message digest as its
+//! identifier. For lazily encoded block bodies, whichever consumer first materializes the
+//! transaction computes that seal once and caches the decoded transaction for the other consumers.
 //!
 //! Parallel fan-out comes from the supplied `Strategy`, which decides per
 //! operation whether fanning out beats staying serial. The strategy drives
@@ -153,6 +153,8 @@ where
     H: Hasher,
     S: Strategy,
 {
+    // A body whose debit or credit sums overflow cannot settle, so it stages
+    // no reads and settles to `None`.
     let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
     let work_size = transfers.len();
     let plan = strategy
@@ -174,6 +176,9 @@ where
             .await
             .expect("account state loading must succeed")
     };
+
+    // The starting accounts arrive in the plan's key order, so each settled
+    // slot lines up with its staged read.
     let settle_span = info_span!("application.execute.settle", accounts = plan.len().traced());
     let work_size = plan.len();
     let slots = strategy
@@ -252,21 +257,22 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Executes a proposal's candidate transactions best effort.
 ///
-/// Verification is all or nothing, but a proposer chooses the block body:
-/// each candidate (the supplied selection first, then mempool refills)
-/// applies against block-start account state in block order, and any
-/// transaction that does not apply — malformed encoding, stale nonce
-/// (typically a transaction that already landed in an ancestor block),
-/// unaffordable value, or credit overflow — is dropped instead of dooming the
-/// proposal. Each refill asks the mempool for the block's remaining headroom
-/// (it knows the proposal budget; we report the bytes already included), so
-/// the block fills toward the budget even when the seed was small. Each round
-/// reads only the accounts it touches for the first time, through `stage` for
-/// the first round and `expand` after, in the selection's key order, so the
-/// staged slots line up with the selection's keys. The loop ends when the
-/// mempool has nothing left that fits or the build deadline passes. The
-/// surviving body settles under all-or-nothing verification to the same
+/// Verification is all or nothing, but a proposer chooses the block body. Each
+/// candidate (the supplied selection first, then mempool refills) applies
+/// against block-start account state in block order, and a transaction that
+/// does not apply is dropped without dooming the proposal. A transaction fails
+/// to apply on a malformed encoding, a stale nonce (typically one that already
+/// landed in an ancestor block), an unaffordable value, or a credit overflow.
+/// The surviving body settles under all-or-nothing verification to the same
 /// slots.
+///
+/// Each refill reports the bytes already included, and the mempool returns
+/// candidates for the headroom left under the proposal budget, so the block
+/// fills toward the budget even when the seed was small. Each round reads only
+/// the accounts it touches for the first time, through `stage` for the first
+/// round and `expand` after, in the selection's key order, so the staged slots
+/// line up with the selection's keys. The loop ends when the mempool has
+/// nothing left that fits or the build deadline passes.
 ///
 /// Each round starts appending its accepted digests before the next refill.
 /// When offloaded, the append can overlap later rounds and the final state
@@ -456,6 +462,8 @@ where
             .await;
     }
 
+    // A proposal that touched no account still merkleizes through a staged
+    // batch, so stage one with no reads.
     let staged = match staged {
         Some(staged) => staged,
         None => stage_empty(unstaged.take().expect("nothing was staged")).await,
@@ -512,6 +520,7 @@ where
     H: Hasher,
     S: Strategy,
 {
+    // A transaction that fails to decode or prepare rejects the whole body.
     let prepare_span = info_span!("application.execute.prepare", txs = body.len().traced());
     let work_size = body.len();
     let (transfers, digests) = strategy

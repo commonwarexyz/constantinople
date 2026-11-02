@@ -172,7 +172,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    /// Decoding reads at most [MAXIMUM_BLOCK_SIZE] bytes under any configuration.
+    /// Decoding reads at most [`MAXIMUM_BLOCK_SIZE`] bytes under any configuration.
     fn max_encode_size(_: &BlockCfg) -> usize {
         MAXIMUM_BLOCK_SIZE
     }

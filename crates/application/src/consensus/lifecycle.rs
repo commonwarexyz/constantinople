@@ -90,9 +90,9 @@ where
 
         // The last parent reference destroys the whole body, and transaction
         // count cannot predict whether this is it. Rayon runs a spawned job
-        // inline only after a returned future has measured the hand-off round
-        // trip at its call site, so dropping the future keeps every cleanup on
-        // a multi-worker pool, off this task.
+        // inline only after an awaited future has measured the hand-off round
+        // trip at its call site, so dropping the future unawaited keeps every
+        // cleanup off this task on a multi-worker pool.
         let drop_span = info_span!("application.propose.drop_parent");
         let drop_work = parent.body.len();
         drop(
@@ -100,6 +100,8 @@ where
                 .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
         );
 
+        // Stamp the child no earlier than its parent and commit it to the
+        // executed state and transaction-history roots.
         let header = Header {
             context,
             parent: parent_digest,
@@ -168,6 +170,7 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        // Reject an oversized block before starting any verification work.
         let encoded_size = block.encode_size();
         if encoded_size > MAXIMUM_BLOCK_SIZE {
             warn!(
@@ -197,6 +200,7 @@ where
             &self.strategy,
         );
 
+        // Wait for the parent, then reject a child stamped before it.
         let parent = parent
             .instrument(info_span!("application.verify.parent"))
             .await?;
@@ -229,9 +233,9 @@ where
 
         // The last parent reference destroys the whole body, and transaction
         // count cannot predict whether this is it. Rayon runs a spawned job
-        // inline only after a returned future has measured the hand-off round
-        // trip at its call site, so dropping the future keeps every cleanup on
-        // a multi-worker pool, off this task.
+        // inline only after an awaited future has measured the hand-off round
+        // trip at its call site, so dropping the future unawaited keeps every
+        // cleanup off this task on a multi-worker pool.
         let drop_span = info_span!("application.verify.drop_parent");
         let drop_work = parent.body.len();
         drop(
@@ -239,6 +243,7 @@ where
                 .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
         );
 
+        // A failed signature or execution check rejects the block.
         let execution = match result {
             Ok(((), execution, ())) => execution,
             Err(reason) => {
@@ -247,6 +252,8 @@ where
             }
         };
 
+        // The recomputed state and transaction-history commitments must match
+        // the header.
         if !commitments_match(&header, &execution) {
             return None;
         }
@@ -284,6 +291,7 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        // Decode the body and derive its transfers and digests on the strategy.
         let strategy = self.strategy.clone();
         let body = Arc::clone(&block.body);
         let work_size = body.len();
@@ -297,6 +305,8 @@ where
             .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
             .ok()?;
 
+        // Settle the body and append its digests, taking the transaction-history
+        // floor from the start of the header's transaction range.
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body::<E, H, St>(
             state_batch,

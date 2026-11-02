@@ -36,6 +36,7 @@ test('block subscription queries SQL after the target and keeps its sequence flo
 
 for (const sequenceNumber of [undefined, 22n]) {
     test(`block metadata rejects an unproven query floor: ${sequenceNumber}`, async () => {
+        // A missing or lower sequence cannot show that the query observed the target.
         const target = proofTarget(7n, 23n, 0xa5);
         const sql = sqlClient(async () => ({
             ...queryResult(23n, 7n, target.blockDigest, 9n), sequenceNumber,

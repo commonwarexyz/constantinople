@@ -37,6 +37,7 @@ use tracing::Level;
 use tracing_subscriber::fmt;
 use url::Url;
 
+/// Pins a 2 GiB arena that is never purged. Other arenas keep freed memory for ten seconds.
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc::new(Config {
     purge: Purge::After(Duration::from_secs(10)),
@@ -363,8 +364,8 @@ pub(crate) struct SpammerConfig {
     /// Hex-encoded ed25519 public keys of primary (voting) validators.
     ///
     /// In `--hosts` mode the spammer cannot distinguish primaries from
-    /// secondaries by host name alone — both use hex pubkeys. This list lets
-    /// the spammer target only primaries.
+    /// secondaries by host name alone, because both use hex pubkeys. This list
+    /// lets the spammer target only primaries.
     #[serde(default)]
     pub primary_validators: Vec<String>,
     /// Fractional account-count jitter per submitted batch.

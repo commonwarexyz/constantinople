@@ -131,19 +131,26 @@ type AccountProofState =
       } & VerifiedAccountProof)
     | { readonly status: 'error'; readonly detail: string };
 
+/** Verified balance and nonce state of the signed-in wallet's account. */
 interface WalletAccountView {
     readonly balance: bigint;
     readonly nonce: { readonly base: bigint; readonly bitmap: bigint };
 }
 
+/** A verified block page and the offset it was requested at. */
 type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>> & { readonly offset: bigint };
+
+/** Certified height and block digest that pin an account's pages to one snapshot. */
 type AccountSnapshot = { readonly height: bigint; readonly blockDigest: Uint8Array };
 
+/** One in-flight wallet balance read, shared by concurrent requests for the same wallet. */
 interface WalletRefresh {
     readonly wallet: ActiveWallet;
     readonly accountKey: string;
     readonly controller: AbortController;
     promise: Promise<void>;
+
+    /** Set when a finalization arrives mid-read, so one more read follows the current one. */
     again: boolean;
 }
 
@@ -179,8 +186,11 @@ export default function App() {
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [isAnalysisOpen, setIsAnalysisOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
+
+    // The address is tagged with its wallet so a late derivation cannot label a newer wallet.
     const [walletAddress, setWalletAddress] = useState<{ wallet: ActiveWallet; key: string } | null>(null);
     const walletAccountKey = walletAddress && walletAddress.wallet === wallet ? walletAddress.key : null;
+
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<WalletAccountView | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
@@ -198,12 +208,18 @@ export default function App() {
     const [blockMessage, setBlockMessage] = useState('');
     const [blockLoading, setBlockLoading] = useState(false);
     const [accountRefresh, setAccountRefresh] = useState(0);
+
+    // An account view keeps its certified snapshot across pages and filter changes until the
+    // account changes or the user refreshes.
     const accountSnapshotRef = useRef<{ account: string; target: AccountSnapshot } | null>(null);
+
+    // Asynchronous wallet reads compare against the latest wallet and address before publishing.
     const walletRefreshRef = useRef<WalletRefresh | null>(null);
     const activeWalletRef = useRef(wallet);
     const activeWalletKeyRef = useRef(walletAccountKey);
     activeWalletRef.current = wallet;
     activeWalletKeyRef.current = walletAccountKey;
+
     const [publishedProofTarget, setPublishedProofTarget] =
         useState<PublishedProofTarget | null>(null);
     const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
@@ -404,10 +420,14 @@ export default function App() {
         return () => window.removeEventListener('popstate', onPopState);
     }, []);
 
+    // Start verifier initialization at load so the first proof does not wait for WebAssembly. A
+    // failure surfaces again when a proof load initializes the verifier.
     useEffect(() => {
         void prewarmProofVerification(simplexVerificationMaterial).catch(() => {});
     }, []);
 
+    // Load one verified account page. Only the first load selects a snapshot and shows certificate
+    // progress. Later pages and filters reuse it.
     useEffect(() => {
         const controller = new AbortController();
         if (!lookupAccount) {
@@ -418,6 +438,7 @@ export default function App() {
             setAccountActivityError('');
             return;
         }
+
         const retained = accountSnapshotRef.current;
         const at = retained?.account === lookupAccount ? retained.target : undefined;
         if (!at) {
@@ -442,6 +463,8 @@ export default function App() {
             },
         }).then((bundle) => {
             if (controller.signal.aborted) return;
+
+            // The verified page pins the snapshot for this account's later pages.
             accountSnapshotRef.current = { account: lookupAccount, target: bundle.target };
             setAccountTarget(bundle.target);
             setAccountProof(bundle.account ? {
@@ -460,6 +483,8 @@ export default function App() {
         return () => controller.abort();
     }, [lookupAccount, currentAccountCursor, accountActivityMode, accountRefresh]);
 
+    // Load one verified block page. The block's certificate stays visible while another page of the
+    // same block loads.
     useEffect(() => {
         const controller = new AbortController();
         setBlockBundle((current) => current?.block.height === lookupBlock ? current : null);
@@ -694,6 +719,8 @@ export default function App() {
         };
     }, []);
 
+    // Reads the wallet's verified balance without activity. Requests for the same wallet share one
+    // read, and a read for a replaced wallet is aborted.
     const refreshAccount = (afterFinalization = false): Promise<void> => {
         if (!wallet || !walletAccountKey) return Promise.resolve();
         const existing = walletRefreshRef.current;
@@ -703,6 +730,8 @@ export default function App() {
             return existing.promise;
         }
         existing?.controller.abort();
+
+        // Results publish only while this read is not aborted and its wallet is still active.
         const controller = new AbortController();
         const current = () => !controller.signal.aborted &&
             activeWalletRef.current === wallet && activeWalletKeyRef.current === walletAccountKey;
@@ -711,6 +740,7 @@ export default function App() {
             promise: Promise.resolve(),
         };
         const promise = (async () => {
+            // Read again when a finalization arrived during the previous read.
             do {
                 refresh.again = false;
                 setAccountMessage('loading verified balance');
@@ -742,6 +772,7 @@ export default function App() {
         return promise;
     };
 
+    // A wallet change clears committed account state before the new wallet's first verified read.
     useEffect(() => {
         setAccount(null);
         committedNonceRef.current = emptyNonceState();
@@ -819,6 +850,7 @@ export default function App() {
         const normalized = normalizeAccountInput(value);
         if (!normalized) return false;
 
+        // A new account starts from a fresh snapshot, and the account view replaces any block view.
         setIsAnalysisOpen(false);
         if (normalized !== lookupAccount) accountSnapshotRef.current = null;
         setLookupAccount(normalized);
@@ -860,6 +892,7 @@ export default function App() {
     };
 
     const openBlockPage = useCallback((height: bigint) => {
+        // The block view replaces any account view and starts at the first page.
         setIsAnalysisOpen(false);
         setLookupAccount('');
         accountSnapshotRef.current = null;
@@ -873,6 +906,7 @@ export default function App() {
     }, []);
 
     const refreshAccountPage = () => {
+        // Dropping the snapshot lets the first page select the newest certified target.
         accountSnapshotRef.current = null;
         setAccountCursorStack([null]);
         setAccountRefresh((current) => current + 1);
@@ -1261,24 +1295,26 @@ function AccountPage({
     onNext: () => void;
     onRefresh: () => void;
 }) {
+    // Every row shares one multiproof, so the first row's tip describes the page. A self-transfer's
+    // two rows count as one proven location.
     const transactionProof = transactions[0]?.proof;
     const proofItems = new Set(transactions.map(({ row }) => row.location)).size;
     return (
         <section className="account-page" aria-label="account proof">
             <div className="account-page__title">
-                <span>account</span>
+                <h2>account</h2>
                 <button onClick={onRefresh}>refresh</button>
             </div>
             <div className="account-page__line">
                 <span className="account-page__prompt">address</span>
                 <CopyableValue value={account} onCopy={onCopy} />
             </div>
-            <div className="account-proof-grid account-proof-grid--account">
+            <div className="account-proof-grid">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
                 <ProofDatum
                     label="proof"
                     value={transactionProof?.status === 'verified'
-                        ? `op${transactionProof.tip} / ${proofItems}L`
+                        ? <span className="proof-badge">op{transactionProof.tip} / {proofItems}L</span>
                         : '-'}
                 />
                 <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
@@ -1294,9 +1330,9 @@ function AccountPage({
                     label="state proof"
                     value={
                         proof.status === 'verified'
-                            ? <span className="proof-badge" title={`${proof.detail}; loc ${proof.location}; ${proof.proofSizeBytes.toLocaleString()} bytes`}>
+                            ? <span className="proof-badge">
                                 <span className="tx-proof-check" aria-label="QMDB proof verified">✓</span>
-                                <span>{proof.proofSizeBytes.toLocaleString()} bytes</span>
+                                <span>loc {proof.location}</span>
                             </span>
                             : proof.status === 'missing'
                                 ? 'not available'
@@ -1305,7 +1341,7 @@ function AccountPage({
                 />
             </div>
             <div className="account-page__subhead">
-                <span>{activityMode} tx page {pageNumber}</span>
+                <h3>{activityMode} tx page {pageNumber}</h3>
                 <div className="account-page__modes" role="tablist" aria-label="account transaction filter">
                     {(['all', 'sent', 'received'] as const).map((mode) => (
                         <button
@@ -1337,20 +1373,24 @@ function AccountPage({
                         <div className="account-tx-row__main">
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue value={row.digest} onCopy={onCopy} />
-                            <span>from</span>
-                            <AccountPageAddressValue
-                                account={account}
-                                value={row.direction === 'sent' ? account : row.counterparty}
-                                onCopy={onCopy}
-                                onOpenAddress={onOpenAddress}
-                            />
-                            <span>to</span>
-                            <AccountPageAddressValue
-                                account={account}
-                                value={row.direction === 'sent' ? row.counterparty : account}
-                                onCopy={onCopy}
-                                onOpenAddress={onOpenAddress}
-                            />
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">from</span>
+                                <AccountPageAddressValue
+                                    account={account}
+                                    value={row.direction === 'sent' ? account : row.counterparty}
+                                    onCopy={onCopy}
+                                    onOpenAddress={onOpenAddress}
+                                />
+                            </span>
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">to</span>
+                                <AccountPageAddressValue
+                                    account={account}
+                                    value={row.direction === 'sent' ? row.counterparty : account}
+                                    onCopy={onCopy}
+                                    onOpenAddress={onOpenAddress}
+                                />
+                            </span>
                         </div>
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>
@@ -1380,24 +1420,27 @@ function BlockPage({
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
 }) {
+    // Rows show only for the requested offset, while the block's certificate stays visible.
     const page = bundle?.offset === offset ? bundle : null;
     const transactionProof = page?.transactions[0]?.proof;
     return (
         <section className="account-page" aria-label="certified block">
-            <div className="account-page__title">block {height.toString()}</div>
+            <div className="account-page__title">
+                <h2>block {height.toString()}</h2>
+            </div>
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : loading ? 'loading certificate' : '-'} />
                 <ProofDatum
                     label="proof"
                     value={page && transactionProof
-                        ? `op${transactionProof.tip} / ${page.transactions.length}L`
+                        ? <span className="proof-badge">op{transactionProof.tip} / {page.transactions.length}L</span>
                         : '-'}
                 />
                 <ProofDatum label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '-'} />
                 <ProofDatum label="transactions" value={bundle?.block.transactionCount.toString() ?? '-'} />
             </div>
             <div className="account-page__subhead">
-                <span>transactions / page {pageNumber}</span>
+                <h3>transactions / page {pageNumber}</h3>
                 <div className="account-page__pager">
                     <button disabled={!hasPrevious || loading} onClick={onPrevious}>prev</button>
                     <button disabled={loading || !page || page.nextOffset === null} onClick={onNext}>next</button>
@@ -1411,10 +1454,14 @@ function BlockPage({
                     <div className="account-tx-row" key={transaction.location.toString()}>
                         <div className="account-tx-row__main">
                             <CopyableValue value={transaction.digest} onCopy={onCopy} />
-                            <span>from</span>
-                            <AddressValue value={transaction.sender} onOpenAddress={onOpenAddress} />
-                            <span>to</span>
-                            <AddressValue value={transaction.recipient} onOpenAddress={onOpenAddress} />
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">from</span>
+                                <AddressValue value={transaction.sender} onOpenAddress={onOpenAddress} />
+                            </span>
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">to</span>
+                                <AddressValue value={transaction.recipient} onOpenAddress={onOpenAddress} />
+                            </span>
                         </div>
                         <div className="account-tx-row__meta">
                             <span>value {transaction.value.toString()}</span>
@@ -1756,7 +1803,7 @@ function TransactionHistory({
 
     return (
         <section className="tx-history">
-            <div className="tx-history__title">submitted transactions</div>
+            <h3 className="tx-history__title">submitted transactions</h3>
             <div className="tx-list">
                 {transactions.map((tx) => (
                     <TransactionRecord
@@ -1792,17 +1839,21 @@ function TransactionRecord({
             <div className="tx-record__primary">
                 <span className="tx-record__label">tx</span>
                 <CopyableValue value={tx.digest} onCopy={onCopy} />
-                <span className="tx-record__label">from</span>
-                <AddressValue
-                    value={tx.sender}
-                    onOpenAddress={onOpenAddress}
-                />
-                <span className="tx-record__arrow" aria-hidden="true">→</span>
-                <span className="tx-record__label">to</span>
-                <AddressValue
-                    value={tx.to}
-                    onOpenAddress={onOpenAddress}
-                />
+                <span className="tx-party">
+                    <span className="tx-record__label">from</span>
+                    <AddressValue
+                        value={tx.sender}
+                        onOpenAddress={onOpenAddress}
+                    />
+                </span>
+                <span className="tx-party">
+                    <span className="tx-record__arrow" aria-hidden="true">→</span>
+                    <span className="tx-record__label">to</span>
+                    <AddressValue
+                        value={tx.to}
+                        onOpenAddress={onOpenAddress}
+                    />
+                </span>
                 <span className="tx-record__nonce">value {tx.value}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
@@ -2008,6 +2059,7 @@ function accountFromLocation(): string {
     return pathMatch ? pathMatch[1].toLowerCase() : '';
 }
 
+/** Reads a positive u64 block height from `?block=` or `/block/<height>`. */
 function blockFromLocation(): bigint | null {
     const url = new URL(window.location.href);
     const value = url.searchParams.get('block') ?? /^\/block\/(\d+)$/.exec(url.pathname)?.[1];
@@ -2262,7 +2314,8 @@ const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
     blocks: ObservedBlock[];
     onOpenBlock: (height: bigint) => void;
 }) {
-    // Hover and focus hold the displayed rows in place for selection.
+    // Hover and focus freeze the displayed rows so new blocks do not shift a row under the pointer.
+    // Touch input pauses only through focus.
     const [pausedBlocks, setPausedBlocks] = useState<ObservedBlock[] | null>(null);
     const pointerInside = useRef(false);
     const recent = (pausedBlocks ?? blocks).slice(0, BLOCK_LOG_MAX);
@@ -2326,6 +2379,9 @@ const BlockLogRow = memo(function BlockLogRow({
     onOpenBlock: (height: bigint) => void;
 }) {
     const hash = useMemo(() => bytesToHex(block.digest), [block.digest]);
+
+    // A touch press focuses the row so the log freezes before the click lands. A canceled touch
+    // releases it.
     return (
         <button
             type="button"

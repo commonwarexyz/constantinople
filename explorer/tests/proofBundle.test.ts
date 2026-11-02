@@ -15,14 +15,21 @@ import { isRetryableAccountProofError, isRetryableProofError } from '../src/proo
 
 const options = { qmdbUrl: 'https://qmdb.example', simplexVerificationMaterial: '00' };
 const account = '11'.repeat(32);
+
+/** Returns a syntactically valid empty account response for size and encoding cases. */
 const empty = () => ({ certificate: '00', headers: [], sequenceNumber: '0', account: null, transactions: [], transactionsProof: null, nextCursor: null });
 
+/** One transaction row as encoded on the wire. */
 interface WireRow { location: string; body: string; height: string; index: number; role?: number }
+
+/** Combined indexer response as encoded on the wire. */
 interface WireBundle {
     certificate: string; headers: string[]; sequenceNumber: string;
     account: { location: string; proof: string } | null;
     transactions: WireRow[]; transactionsProof: string | null; nextCursor: string | null;
 }
+
+/** Responses and verification material produced by a real publisher and indexer. */
 interface PublisherFixture {
     verificationMaterial: string; account: string; recipient: string; transactionDigest: string;
     directBlock: WireBundle; descendantBlock: WireBundle; descendantLastPage: WireBundle;
@@ -49,6 +56,7 @@ test.before(async () => {
 });
 
 test('malformed request identities are rejected before any fetch', async (t) => {
+    // Malformed identities and a cursor without a snapshot must all fail before fetch.
     const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected fetch'); });
     const cursor = new Uint8Array(24);
     cursor[7] = 1;
@@ -65,6 +73,7 @@ test('malformed request identities are rejected before any fetch', async (t) => 
 });
 
 test('hostile wire sizes and noncanonical numbers fail before certificate verification', async () => {
+    // Every case exceeds a size bound or uses a noncanonical encoding that parsing must reject.
     const rows = [{ location: '1', body: '00', height: '1', index: 0, role: 0 }];
     const cases = [
         { ...empty(), certificate: '00'.repeat(16 * 1024 + 1) },
@@ -84,6 +93,7 @@ test('hostile wire sizes and noncanonical numbers fail before certificate verifi
 });
 
 test('response byte limit applies while streaming without trusting content-length', async (t) => {
+    // Stream one chunk past the limit without a declared length. The read must fail and cancel.
     let canceled = false;
     let emitted = false;
     const fetch = t.mock.method(globalThis, 'fetch', async () => new Response(new ReadableStream({
@@ -98,6 +108,7 @@ test('response byte limit applies while streaming without trusting content-lengt
 });
 
 test('aggregate availability is retryable while unsupported work is terminal', async (t) => {
+    // A 503 becomes a retryable Unavailable error.
     let status = 503;
     const fetch = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status }));
     await assert.rejects(loadTransactionBundle({ ...options, digest: account }), (error: unknown) => {
@@ -107,6 +118,8 @@ test('aggregate availability is retryable while unsupported work is terminal', a
         assert.equal(isRetryableProofError(error), true);
         return true;
     });
+
+    // A 422 for work the indexer does not support is terminal.
     status = 422;
     await assert.rejects(loadTransactionBundle({ ...options, digest: account }), (error: unknown) => {
         assert.equal(isRetryableAccountProofError(error), false);
@@ -117,6 +130,7 @@ test('aggregate availability is retryable while unsupported work is terminal', a
 });
 
 test('network failures in aggregate fetch and response streams remain retryable', async (t) => {
+    // A browser network TypeError from either fetch or the body stream must classify as retryable.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     let stage: 'fetch' | 'stream' = 'fetch';
@@ -138,6 +152,7 @@ test('network failures in aggregate fetch and response streams remain retryable'
 });
 
 test('aggregate gateway failures retry while native invalid-data responses are terminal', async (t) => {
+    // Gateway statuses are retryable and an internal server error is terminal.
     let status = 502;
     t.mock.method(globalThis, 'fetch', async () => new Response(null, { status }));
     for (const entry of [[502, true], [503, true], [504, true], [500, false]] as const) {
@@ -152,6 +167,7 @@ test('aggregate gateway failures retry while native invalid-data responses are t
 });
 
 test('aggregate transport classification preserves cancellation and invalid bodies', async (t) => {
+    // An abort propagates unchanged, and a TypeError that is not a network failure stays terminal.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const abort = new DOMException('caller canceled', 'AbortError');
@@ -163,6 +179,8 @@ test('aggregate transport classification preserves cancellation and invalid bodi
         assert.equal(isRetryableProofError(error), false);
         return true;
     });
+
+    // Malformed JSON and invalid UTF-8 are terminal data errors.
     for (const body of ['{', new Uint8Array([0xff])]) {
         t.mock.method(globalThis, 'fetch', async () => new Response(body));
         await assert.rejects(loadAccountBundle(opts), (error: unknown) => {
@@ -174,6 +192,7 @@ test('aggregate transport classification preserves cancellation and invalid bodi
 });
 
 test('already canceled loads issue no request', async (t) => {
+    // A signal aborted before the load must reject with its reason before fetch.
     const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected fetch'); });
     const signal = AbortSignal.abort(new Error('account changed'));
     await assert.rejects(loadAccountBundle({ ...options, account, signal }), /account changed/);
@@ -181,6 +200,7 @@ test('already canceled loads issue no request', async (t) => {
 });
 
 test('real publisher certificates and proofs authenticate direct, descendant, empty and paginated blocks', async () => {
+    // Block 1 is certified directly, and verification material is normalized before use.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     const direct = await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock);
@@ -188,6 +208,8 @@ test('real publisher certificates and proofs authenticate direct, descendant, em
     assert.equal(direct.transactions.length, 3);
     assert.equal(direct.block.transactionCount, 3n);
     assert.deepEqual(await verifyBlockBundle({ ...opts, height: 1n, simplexVerificationMaterial: `\n${fixture.verificationMaterial.toUpperCase()}\n` }, fixture.directBlock), direct);
+
+    // Block 2 is covered by the certificate for block 3, and its proofs are attributed to block 2.
     const descendant = await verifyBlockBundle({ ...opts, height: 2n }, fixture.descendantBlock);
     assert.equal(descendant.target.height, 3n);
     assert.equal(descendant.block.height, 2n);
@@ -196,10 +218,14 @@ test('real publisher certificates and proofs authenticate direct, descendant, em
     assert.equal(descendant.transactions.length, 50);
     assert.equal(descendant.nextOffset, 50n);
     assert.ok(descendant.transactions.every((row) => row.proof.height === 2n && row.proof.view === 2n));
+
+    // The second page continues at the next location and ends pagination.
     const last = await verifyBlockBundle({ ...opts, height: 2n, offset: 50n }, fixture.descendantLastPage);
     assert.equal(last.transactions.length, 5);
     assert.equal(last.nextOffset, null);
     assert.equal(last.transactions[0]!.location, descendant.transactions.at(-1)!.location + 1n);
+
+    // An empty block and a single transaction both authenticate against the same chain.
     const emptyBlock = await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
     assert.equal(emptyBlock.block.transactionCount, 0n);
     assert.deepEqual(emptyBlock.transactions, []);
@@ -209,6 +235,8 @@ test('real publisher certificates and proofs authenticate direct, descendant, em
 });
 
 test('repeated certificates reuse only the last authenticated target and still hash transaction bodies', async (t) => {
+    // Prime the cache with a different certificate, then count header and body hashes. The
+    // certified header for block 1 is the last bytes of its certificate.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
@@ -219,6 +247,8 @@ test('repeated certificates reuse only the last authenticated target and still h
         toHex(new Uint8Array(bytes as ArrayBuffer)) === header).length;
     const bodyHashes = () => digest.mock.calls.filter(({ arguments: [, bytes] }) => bytes.byteLength === 82).length;
 
+    // Repeating a certificate skips header verification but still hashes every body, and the
+    // sequence comes from each response.
     const first = await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock);
     assert.equal(headerHashes(), 1);
     assert.equal(bodyHashes(), 3);
@@ -228,6 +258,7 @@ test('repeated certificates reuse only the last authenticated target and still h
     assert.equal(bodyHashes(), 6);
     assert.equal(headerHashes(), 1);
 
+    // Only the most recent certificate is cached, so switching back verifies again.
     await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
     await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock);
     assert.equal(headerHashes(), 2);
@@ -235,6 +266,8 @@ test('repeated certificates reuse only the last authenticated target and still h
 });
 
 test('certificate reuse requires every signed and unsigned byte to match', async () => {
+    // Flip a signature byte, a header byte, or append a byte. Each change must fail full
+    // verification and leave the cached good certificate usable.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), height: 1n };
     const expected = await verifyBlockBundle(opts, fixture.directBlock);
@@ -253,6 +286,7 @@ test('certificate reuse requires every signed and unsigned byte to match', async
 });
 
 test('returned target buffers cannot mutate a reused certificate target', async () => {
+    // Zero every buffer in a fresh result and a cached result, then verify again unchanged.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     await verifyBlockBundle({ ...opts, height: 3n }, fixture.emptyBlock);
@@ -269,6 +303,7 @@ test('returned target buffers cannot mutate a reused certificate target', async 
 });
 
 test('single-transaction finalization reports its owning block before membership verification', async () => {
+    // The covering certificate is above the block, yet finalization reports the owning block.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), digest: fixture.transactionDigest };
     const block = await verifyBlockBundle({ ...fixtureOptions(fixture), height: 2n }, fixture.descendantBlock);
@@ -278,6 +313,8 @@ test('single-transaction finalization reports its owning block before membership
     const proof = await verifyTransactionBundle({ ...opts, onFinalizationVerified }, fixture.transactionBundle);
     assert.deepEqual(observed, [{ height: block.block.height, view: block.block.view }]);
     assert.equal(proof.height, observed[0]!.height);
+
+    // A corrupted multiproof still reports finalization first and then fails membership.
     const invalid = structuredClone(fixture.transactionBundle);
     const bytes = fromHex(invalid.transactionsProof!);
     bytes[bytes.length - 1] ^= 1;
@@ -288,6 +325,7 @@ test('single-transaction finalization reports its owning block before membership
 });
 
 test('historical block appends remain provable below a later inactivity floor', async () => {
+    // Locations below the covering target's start remain provable through the transaction root.
     const fixture = await publisherFixture();
     const block = await verifyBlockBundle({ ...fixtureOptions(fixture), height: 1n }, fixture.historicalBlock);
     assert.ok(block.target.height >= block.block.height + 2n);
@@ -296,6 +334,7 @@ test('historical block appends remain provable below a later inactivity floor', 
 });
 
 test('historical single transactions remain provable below a later inactivity floor', async () => {
+    // The proven location lies below the start of a later covering target.
     const fixture = await publisherFixture();
     const proof = await verifyTransactionBundle({ ...fixtureOptions(fixture), digest: fixture.historicalDigest }, fixture.historicalTransaction);
     const covering = await verifyBlockBundle({ ...fixtureOptions(fixture), height: 3n }, fixture.emptyBlock);
@@ -304,6 +343,7 @@ test('historical single transactions remain provable below a later inactivity fl
 });
 
 test('historical account activity remains provable below the snapshot inactivity floor', async () => {
+    // At least one activity row lies below the snapshot's transaction range start.
     const fixture = await publisherFixture();
     const bundle = await verifyAccountBundle({ ...fixtureOptions(fixture), account: fixture.account }, fixture.accountWithHistory);
     assert.ok(bundle.target.height >= 4n);
@@ -312,11 +352,14 @@ test('historical account activity remains provable below the snapshot inactivity
 });
 
 test('cached verifiers remain bound to their BLS verification material', async () => {
+    // Cache a verifier for the real material, then try a valid but different group key.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), height: 1n };
     const expected = await verifyBlockBundle(opts, fixture.directBlock);
+
+    // Negating the compressed group key gives a valid point with a different signing identity. It
+    // must fail without disturbing the verifier cached for the real material.
     const wrongMaterial = fromHex(fixture.verificationMaterial);
-    // Negating the compressed group key gives a valid point with a different signing identity.
     wrongMaterial[0] ^= 0x20;
     await assert.rejects(verifyBlockBundle({
         ...opts, simplexVerificationMaterial: Buffer.from(wrongMaterial).toString('hex'),
@@ -328,6 +371,7 @@ test('cached verifiers remain bound to their BLS verification material', async (
 });
 
 test('canceling one concurrent aggregate load leaves the other caller independent', async (t) => {
+    // Hold both fetches open so the first caller cancels while both are in flight.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const first = new AbortController();
@@ -345,6 +389,8 @@ test('canceling one concurrent aggregate load leaves the other caller independen
     const canceled = loadAccountBundle({ ...opts, signal: first.signal });
     const rejected = assert.rejects(canceled, /first caller canceled/);
     const surviving = loadAccountBundle({ ...opts, signal: second.signal });
+
+    // Cancel the first caller and answer both. Only the first rejects.
     await ready;
     first.abort(new Error('first caller canceled'));
     for (const respond of responses) respond(new Response(JSON.stringify(fixture.accountBundle)));
@@ -357,6 +403,7 @@ test('canceling one concurrent aggregate load leaves the other caller independen
 });
 
 test('account rows derive fields from authenticated bodies and keep the snapshot across pages', async () => {
+    // The first page derives direction, counterparty, and value from the signed bodies.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const first = await verifyAccountBundle(opts, fixture.accountBundle);
@@ -366,9 +413,13 @@ test('account rows derive fields from authenticated bodies and keep the snapshot
     assert.equal(first.page.rows[0]!.direction, 'sent');
     assert.equal(first.page.rows[0]!.counterparty, fixture.account);
     assert.equal(first.page.rows[0]!.value, 1n);
+
+    // The next page stays on the first page's snapshot and returns no repeated transactions.
     const next = await verifyAccountBundle({ ...opts, cursor: first.page.nextCursor, at: { height: first.target.height, blockDigest: first.target.blockDigest } }, fixture.accountNext);
     assert.equal(next.page.rows[0]!.blockIndex, 44);
     assert.ok(next.page.rows.every((row) => !first.page.rows.some((prior) => prior.digest === row.digest)));
+
+    // Received mode, balance-only, and missing account updates each verify independently.
     const received = await verifyAccountBundle({ ...opts, account: fixture.recipient, mode: 'received' }, fixture.recipientBundle);
     assert.ok(received.page.rows.every((row) => row.direction === 'received' && row.counterparty === fixture.account));
     const onlyState = await verifyAccountBundle({ ...opts, includeTransactions: false }, fixture.accountStateOnly);
@@ -377,12 +428,15 @@ test('account rows derive fields from authenticated bodies and keep the snapshot
     const unknown = await verifyAccountBundle(opts, { ...fixture.accountBundle, account: null });
     assert.equal(unknown.account, null);
     assert.equal(unknown.page.rows.length, 10);
+
+    // A later visibility floor does not change the authenticated snapshot.
     const laterFloor = await verifyAccountBundle(opts, { ...fixture.accountBundle, sequenceNumber: '18446744073709551615' });
     assert.deepEqual(laterFloor.account, first.account);
     assert.deepEqual(laterFloor.page, first.page);
 });
 
 test('the full supported WebAuthn encoding verifies at the 919-byte boundary', async () => {
+    // A maximum-size WebAuthn transaction verifies alone and within its block.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     const wire = fixture.webauthnBundle;
@@ -394,12 +448,15 @@ test('the full supported WebAuthn encoding verifies at the 919-byte boundary', a
     assert.ok(transaction);
     assert.equal(transaction.sender, transaction.recipient);
     assert.equal(transaction.location, proof.location);
+
+    // One extra byte exceeds the wire limit.
     const malformed = structuredClone(wire);
     malformed.transactions[0]!.body += '00';
     await assert.rejects(verifyTransactionBundle({ ...opts, digest: fixture.webauthnDigest }, malformed), /oversized signed transaction/);
 });
 
 test('self-transfer roles share one proven location and SQL display hints cannot change authenticated fields', async () => {
+    // Present one self-transfer as both its received and sent rows under one multiproof.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const self = fixture.transactionBundle.transactions[0]!;
@@ -413,15 +470,20 @@ test('self-transfer roles share one proven location and SQL display hints cannot
     assert.deepEqual(verified.page.rows.map(({ direction }) => direction), ['received', 'sent']);
     assert.ok(verified.page.rows.every(({ counterparty }) => counterparty === fixture.account));
     assert.equal(verified.transactionProofs[0]!.location, verified.transactionProofs[1]!.location);
+
+    // Extra unauthenticated fields on the rows are ignored.
     const hints = { ...wire, transactions: wire.transactions.map((row) => ({
         ...row, value: '999999', nonce: '999999', sender: 'ff'.repeat(32), recipient: 'ee'.repeat(32), digest: 'dd'.repeat(32),
     })) };
     assert.deepEqual(await verifyAccountBundle(opts, hints), verified);
+
+    // A duplicated role or a conflicting index at the same location is rejected.
     await assert.rejects(verifyAccountBundle(opts, { ...wire, transactions: [wire.transactions[1]!, wire.transactions[1]!] }));
     await assert.rejects(verifyAccountBundle(opts, { ...wire, transactions: [{ ...wire.transactions[0]!, index: self.index + 1 }, wire.transactions[1]!] }));
 });
 
 test('every aggregate view finishes with one fetch and no legacy proof or metadata requests', async (t) => {
+    // Serve exactly one uncached response per load and record each URL.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     const responses = [fixture.accountBundle, fixture.descendantBlock, fixture.transactionBundle];
@@ -433,6 +495,8 @@ test('every aggregate view finishes with one fetch and no legacy proof or metada
         assert.ok(response, 'only one request per aggregate load');
         return new Response(JSON.stringify(response));
     });
+
+    // Each view issues exactly its combined request and consumes exactly one response.
     await loadAccountBundle({ ...opts, account: fixture.account });
     await loadBlockBundle({ ...opts, height: 2n });
     await loadTransactionBundle({ ...opts, digest: fixture.transactionDigest });
@@ -451,6 +515,9 @@ test('real aggregate proofs reject altered certificates, ancestry, positions, bo
         const bytes = fromHex(value); bytes[byte] ^= 1;
         return Buffer.from(bytes).toString('hex');
     };
+
+    // Each mutation of a block page breaks the certificate, the ancestry chain, a row position, a
+    // signed body field, the multiproof, page coverage, or the next offset.
     for (const mutate of [
         (wire: WireBundle) => { wire.certificate = mutated(wire.certificate); },
         (wire: WireBundle) => { wire.headers[0] = mutated(wire.headers[0]!); },
@@ -472,6 +539,9 @@ test('real aggregate proofs reject altered certificates, ancestry, positions, bo
         await assert.rejects(verifyBlockBundle({ ...opts, height: 2n }, wire));
     }
     await assert.rejects(verifyTransactionBundle({ ...opts, digest: 'ff'.repeat(32) }, fixture.transactionBundle), /requested digest/);
+
+    // Account pages reject a different snapshot, a different account, a forged cursor, a changed
+    // state proof or location, and a page that does not follow the requested cursor.
     const accountOpts = { ...opts, account: fixture.account };
     const first = await verifyAccountBundle(accountOpts, fixture.accountBundle);
     await assert.rejects(verifyAccountBundle({ ...accountOpts, at: { height: 3n, blockDigest: new Uint8Array(32) } }, fixture.accountBundle), /requested snapshot/);
@@ -487,6 +557,7 @@ test('real aggregate proofs reject altered certificates, ancestry, positions, bo
 });
 
 test('cancellation during finalization never returns a completed proof or account page', async () => {
+    // Abort from the finalization callback. Verification must stop with that reason.
     const fixture = await publisherFixture();
     const controller = new AbortController();
     let finalized = 0;
@@ -498,6 +569,7 @@ test('cancellation during finalization never returns a completed proof or accoun
 });
 
 test('a fetch completing after cancellation cannot publish the previous request', async (t) => {
+    // Hold the fetch open, abort, and then deliver a valid response. The load must still reject.
     const fixture = await publisherFixture();
     const controller = new AbortController();
     let respond!: (response: Response) => void;
@@ -516,6 +588,7 @@ test('a fetch completing after cancellation cannot publish the previous request'
 });
 
 test('standalone WASM proves the existing multiproof without transport and rejects changed context', async () => {
+    // The fixture multiproof verifies directly against its root, tip, and expected digests.
     const fixture = JSON.parse(await readFile(new URL('../../tests/fixtures/transactionActivityProof.json', import.meta.url), 'utf8')) as {
         root: string; tip: string; proof: string; operations: Array<{ location: string; digest: string }>;
     };
@@ -526,6 +599,8 @@ test('standalone WASM proves the existing multiproof without transport and rejec
     const verified = await prove();
     assert.equal(verified.proofSizeBytes, fixture.proof.length / 2);
     assert.deepEqual(verified.operations.map(({ location }) => location), expected.map(({ location }) => location));
+
+    // Changing the root, tip, a location, a digest, or a proof byte must fail.
     await assert.rejects(prove(new Uint8Array(32)));
     await assert.rejects(prove(undefined, BigInt(fixture.tip) + 1n));
     await assert.rejects(prove(undefined, undefined, expected.map((entry, index) => index === 0 ? { ...entry, location: 0n } : entry)));
@@ -535,6 +610,7 @@ test('standalone WASM proves the existing multiproof without transport and rejec
 });
 
 test('certified header binding consumes every byte after the signed commitment', async () => {
+    // The certificate header is the commitment followed by the block header it commits to.
     const header = executionHeader();
     const digest = await hash(header);
     const payload = concat(digest, new Uint8Array(68));
@@ -543,6 +619,8 @@ test('certified header binding consumes every byte after the signed commitment',
         payload, header: concat(payload, header), certificate: new Uint8Array(),
     };
     assert.equal((await finalizedTargetFromCertificate(certificate)).height, 1n);
+
+    // Trailing bytes, a commitment mismatch, and a header digest mismatch are each rejected.
     await assert.rejects(finalizedTargetFromCertificate({ ...certificate, header: concat(certificate.header, new Uint8Array([0])) }), /trailing bytes/);
     const wrong = payload.slice(); wrong[0] ^= 1;
     await assert.rejects(finalizedTargetFromCertificate({ ...certificate, payload: wrong }), /does not match certificate payload/);
@@ -550,16 +628,20 @@ test('certified header binding consumes every byte after the signed commitment',
 });
 
 test('header decoding rejects noncanonical and overflowing varints even with matching hashes', async () => {
+    // A matching digest does not excuse a noncanonical or overflowing epoch varint.
     for (const header of [
         executionHeader(new Uint8Array([0x80, 0])),
         executionHeader(new Uint8Array([...Array<number>(9).fill(0xff), 2])),
     ]) await assert.rejects(authenticatedHeader(header, await hash(header), 1n), /canonical|exceeds u64/);
+
+    // A valid header must still match the expected height and digest.
     const header = executionHeader();
     await assert.rejects(authenticatedHeader(header, await hash(header), 2n), /chain height/);
     const mutated = header.slice(); mutated[mutated.length - 1] ^= 1;
     await assert.rejects(authenticatedHeader(mutated, await hash(header), 1n), /certified digest/);
 });
 
+/** Encodes a minimal block header at height 1 with nonempty state and transaction ranges. */
 function executionHeader(epoch = new Uint8Array([0])): Uint8Array {
     return concat(epoch, new Uint8Array([9]), new Uint8Array(32), new Uint8Array([8]),
         new Uint8Array(100), new Uint8Array(32), u64(1n), u64(0n),

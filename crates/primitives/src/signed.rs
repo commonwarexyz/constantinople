@@ -3,8 +3,8 @@
 //! This module builds on the [`Sealed`] wrapper to add cryptographic
 //! signatures:
 //!
-//! - [`Signed`] — A [`Sealed`] value with an attached signature over its seal.
-//! - [`Signable`] — A convenience trait for types that are [`Sealable`],
+//! - [`Signed`]: A [`Sealed`] value with an attached signature over its seal.
+//! - [`Signable`]: A convenience trait for types that are [`Sealable`],
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
@@ -588,6 +588,7 @@ mod test {
 
             assert_eq!(signed.value().sender(), Some(&public_key));
 
+            // The signature verifies through the lazy batch path.
             let lazy = [LazySignedTransaction::new(signed)];
             assert!(super::verify_transaction_batch(
                 NAMESPACE,
@@ -668,6 +669,7 @@ mod test {
         );
     }
 
+    /// Returns one valid transaction for each signature scheme.
     fn lazy_signed_view_fixtures() -> [SignedTransaction<sha256::Sha256>; 2] {
         [
             ed25519_transaction(&ed25519_signer(0), 0),
@@ -675,6 +677,8 @@ mod test {
         ]
     }
 
+    /// Reads a lazy transaction from `payload` behind its length prefix,
+    /// deferring decoding of the payload itself.
     fn lazy_signed_view_read(
         payload: &[u8],
     ) -> Result<LazySignedTransaction<sha256::Sha256>, commonware_codec::Error> {
@@ -687,9 +691,13 @@ mod test {
     #[test]
     fn lazy_signed_view_matches_owned_cursor() {
         for transaction in lazy_signed_view_fixtures() {
+            // Decode the same payload eagerly and lazily.
             let payload = transaction.encode();
             let expected = SignedTransaction::<sha256::Sha256>::decode(payload.clone()).unwrap();
             let lazy = lazy_signed_view_read(&payload).unwrap();
+
+            // The lazy value matches the eager one, and its pending bytes stay
+            // intact after decoding and re-encode to the same payload.
             assert_eq!(lazy.encoded_signed_transaction(), payload);
             assert_eq!(lazy.get(), Some(&expected));
             assert_eq!(lazy.encoded_signed_transaction(), payload);
@@ -700,12 +708,17 @@ mod test {
     #[test]
     fn lazy_signed_view_defers_invalid_sender() {
         for transaction in lazy_signed_view_fixtures() {
+            // Replace the sender with bytes that are not a valid public key.
+            // Sender parsing is deferred, so the transaction still decodes.
             let mut payload = transaction.encode().to_vec();
             payload[..TransactionPublicKey::SIZE].copy_from_slice(&invalid_public_key_bytes());
             let expected =
                 SignedTransaction::<sha256::Sha256>::decode(Bytes::copy_from_slice(&payload))
                     .unwrap();
             let lazy = lazy_signed_view_read(&payload).unwrap();
+
+            // Both decoders accept the transaction and report no sender, and
+            // the lazy value preserves the original bytes.
             assert!(expected.value().sender().is_none());
             assert!(lazy.get().unwrap().value().sender().is_none());
             assert_eq!(lazy.get().unwrap().encode().as_ref(), payload);
@@ -716,6 +729,8 @@ mod test {
     #[test]
     fn lazy_signed_view_rejects_truncation_and_trailing_data() {
         for transaction in lazy_signed_view_fixtures() {
+            // Every strict prefix fails eager decoding, and any prefix the
+            // length-prefixed read accepts fails to decode lazily.
             let payload = transaction.encode();
             for end in 0..payload.len() {
                 let truncated = &payload[..end];
@@ -724,10 +739,14 @@ mod test {
                         .is_err()
                 );
                 if let Ok(lazy) = lazy_signed_view_read(truncated) {
-                    assert!(lazy.get().is_none(), "accepted truncation at {end}");
+                    assert!(
+                        lazy.get().is_none(),
+                        "truncation at {end} must fail lazy decoding"
+                    );
                 }
             }
 
+            // One trailing byte fails both decoders.
             let mut trailing = payload.to_vec();
             trailing.push(0);
             assert!(matches!(
@@ -736,6 +755,7 @@ mod test {
             ));
             assert!(lazy_signed_view_read(&trailing).unwrap().get().is_none());
 
+            // A zero transfer value fails both decoders.
             let mut zero_value = payload.to_vec();
             let value_start = TransactionPublicKey::SIZE + crate::AccountKey::SIZE;
             zero_value[value_start..value_start + u64::SIZE].fill(0);
@@ -751,14 +771,20 @@ mod test {
     fn lazy_signed_view_shares_success_and_failure_cache() {
         for transaction in lazy_signed_view_fixtures() {
             for valid in [true, false] {
+                // A trailing byte makes the payload undecodable.
                 let mut payload = transaction.encode().to_vec();
                 if !valid {
                     payload.push(0);
                 }
+
+                // A clone shares the undecoded cache slot with the original.
                 let lazy = lazy_signed_view_read(&payload).unwrap();
                 let cloned = lazy.clone();
                 assert!(std::sync::Arc::ptr_eq(&lazy.value, &cloned.value));
                 assert!(lazy.value.get().is_none());
+
+                // Concurrent decodes through both handles observe one outcome,
+                // and a success yields the same decoded value.
                 std::thread::scope(|scope| {
                     let first = scope.spawn(|| lazy.get());
                     let second = scope.spawn(|| cloned.get());
@@ -768,9 +794,11 @@ mod test {
                             assert!(std::ptr::eq(first, second));
                         }
                         (None, None) => assert!(!valid),
-                        _ => panic!("shared cache returned different outcomes"),
+                        _ => panic!("handles sharing a cache must observe one outcome"),
                     }
                 });
+
+                // The shared slot keeps the outcome for later reads.
                 assert_eq!(lazy.value.get().unwrap().is_some(), valid);
                 assert_eq!(cloned.get().is_some(), valid);
             }
@@ -782,6 +810,9 @@ mod test {
         for transaction in lazy_signed_view_fixtures() {
             let expected_sender = transaction.value().sender().unwrap().clone();
             let payload = transaction.encode();
+
+            // Materializing a sole or shared lazy value and then dropping every
+            // other handle leaves the owned sender and encoding intact.
             for shared in [false, true] {
                 let lazy = lazy_signed_view_read(&payload).unwrap();
                 let cloned = shared.then(|| lazy.clone());

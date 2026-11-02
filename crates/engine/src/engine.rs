@@ -87,8 +87,10 @@ const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
-// Each physical page (the logical page and its CRC record) fills exactly one blob page.
+
+/// Each physical page (the logical page and its CRC record) fills exactly one blob page.
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = paged::page_size(BLOB_PAGE_SIZE);
+
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
@@ -707,8 +709,8 @@ where
 }
 
 // Each cache allocates its full capacity up front, so the budgets partition
-// memory rather than cap it lazily. A budget counts blob pages, the on-disk
-// size of each cached page.
+// memory. A cache holds the budget divided by the blob page size, because each
+// cached page occupies one blob page.
 fn page_cache(name: &'static str, bytes: usize) -> CacheRef {
     CacheRef::new(
         PAGE_CACHE_PAGE_SIZE,

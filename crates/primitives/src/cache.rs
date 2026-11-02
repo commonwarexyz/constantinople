@@ -22,8 +22,8 @@ use std::{collections::HashMap, sync::Arc};
 ///
 /// Secp256r1 keys are stored compressed on the wire, and recovering the SEC1
 /// `y` coordinate is a significant part of per-signature verification cost.
-/// Ed25519 keys are never cached: batch verification decompresses each
-/// distinct Ed25519 key once per batch from its raw encoding.
+/// Ed25519 keys are never cached, because batch verification decompresses
+/// each distinct Ed25519 key once per batch from its raw encoding.
 #[derive(Clone)]
 pub struct PublicKeyCache {
     inner: Arc<RwLock<Cache<TransactionPublicKey, VerifyingKey>>>,
@@ -39,11 +39,12 @@ impl PublicKeyCache {
         }
     }
 
-    /// Resolves every key in `keys` to its decompressed form: hits share the
-    /// read lock, unique misses are decompressed once each on `strategy` and
-    /// inserted under a single write lock, so a miss-heavy batch pays neither
-    /// serial curve arithmetic nor per-key lock traffic — even when one cold
-    /// sender signs every transaction in the batch.
+    /// Resolves every key in `keys` to its decompressed form.
+    ///
+    /// Hits share the read lock, and unique misses are decompressed once each
+    /// on `strategy` and inserted under a single write lock. A miss-heavy
+    /// batch therefore pays neither serial curve arithmetic nor per-key lock
+    /// traffic, even when one cold sender signs every transaction in the batch.
     ///
     /// Returns `None` if any key is not a secp256r1 key encoding a valid
     /// curve point.
@@ -185,6 +186,9 @@ mod tests {
             let cache = PublicKeyCache::new(context, NZUsize!(4));
             let ed25519 =
                 TransactionPublicKey::ed25519(ed25519::SigningKey::random(test_rng()).public_key());
+
+            // An Ed25519 key fails resolution alone and fails a batch before
+            // any of its secp256r1 keys are inserted.
             assert!(decompress_one(&cache, &ed25519).is_none());
             assert!(
                 cache

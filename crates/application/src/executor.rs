@@ -53,9 +53,9 @@ where
 
 /// A state account as [`commonware_glue::transfers`] settles it.
 ///
-/// Settlement needs the account trait on the stored type, which this crate can only implement on
-/// its own type. The wrapper has the layout of [`Account`], so converting staged reads and settled
-/// slots reuses their buffers.
+/// This crate can implement the settlement account trait only on its own types, so settlement runs
+/// on this wrapper. The wrapper has the layout of [`Account`], so converting staged reads and
+/// settled slots reuses their buffers.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct TransferAccount(pub Account);

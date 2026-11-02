@@ -113,10 +113,10 @@ where
 
     /// Processes a block on its parent's state.
     ///
-    /// A candidate is checked in full by `verify_child`, which checks its signatures alongside
-    /// its execution. Honest voters already accepted a finalized block, so it is only replayed.
-    /// Its parent may no longer be stored, so the replay takes the transaction-history floor from
-    /// the block's header.
+    /// `verify_child` checks a candidate in full, verifying its signatures alongside its
+    /// execution. Honest voters already accepted a finalized block, so it is only replayed. Its
+    /// parent may not be stored, so the replay takes the transaction-history floor from the
+    /// block's header.
     async fn process(
         &mut self,
         context: (E, Self::Context),

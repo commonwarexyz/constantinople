@@ -46,8 +46,7 @@ constantinople-mempool = { path = "crates/mempool" }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
-# Commonware
-# Match Exoware so public Rust types use the same crate versions.
+# Commonware versions must match Exoware so public Rust types are compatible.
 commonware-actor = "2026.10.0"
 commonware-allocator = "2026.10.0"
 commonware-p2p = "2026.10.0"

@@ -14,18 +14,24 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+/// Store rows returned to SQL queries, with the number of open range scans.
 #[derive(Default)]
 struct Reads {
     range_rows: AtomicUsize,
     point_rows: AtomicUsize,
     active_scans: AtomicUsize,
+    /// Signaled when the last open range scan closes.
     idle: Notify,
 }
 
 impl Reads {
+    /// Waits for every range scan to close, then returns and resets the range
+    /// and point row counts.
     async fn finish(&self) -> (usize, usize) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
+                // Register for the notification before checking, so a scan that
+                // closes in between still wakes the waiter.
                 let idle = self.idle.notified();
                 if self.active_scans.load(Ordering::SeqCst) == 0 {
                     break;
@@ -42,11 +48,13 @@ impl Reads {
     }
 }
 
+/// RocksDB query backend that counts the rows it returns.
 struct CountingStore {
     store: Arc<RocksStore>,
     reads: Arc<Reads>,
 }
 
+/// Range scan that counts returned rows and reports when it closes.
 struct CountingScan {
     scan: <RocksStore as Query>::RangeScan,
     reads: Arc<Reads>,
@@ -122,6 +130,7 @@ impl Query for CountingStore {
     }
 }
 
+/// Decodes the activity position of every returned row.
 fn cursors(batches: &[RecordBatch]) -> Vec<Cursor> {
     batches
         .iter()
@@ -135,6 +144,9 @@ fn cursors(batches: &[RecordBatch]) -> Vec<Cursor> {
         .collect()
 }
 
+/// Asserts that seeking from `cursor` returns the same page as one disjunctive
+/// cursor predicate while reading at most one page plus one row. With `deep`,
+/// the disjunctive query must scan the prefix the seek skips.
 async fn compare_page(
     sql: &SqlContext,
     reads: &Reads,
@@ -143,6 +155,7 @@ async fn compare_page(
     expected: &[(u64, u64, u64)],
     deep: bool,
 ) {
+    // Run the single-predicate reference query and record its reads.
     let request = AccountRequest {
         key: AccountKey::from(account),
         mode: None,
@@ -162,8 +175,13 @@ async fn compare_page(
     );
     let old = query_rows(sql, &old_query, 11).await.unwrap();
     let old_reads = reads.finish().await;
+
+    // Run the cursor seek and record its reads.
     let new = activity_rows(sql, &request, 4096).await.unwrap();
     let new_reads = reads.finish().await;
+
+    // Both queries must return the expected page. The seek must stay within the
+    // page budget, and a deep reference query must scan the skipped prefix.
     let tuples = |batches: &[RecordBatch]| {
         cursors(batches)
             .into_iter()
@@ -190,6 +208,7 @@ async fn compare_page(
 
 #[tokio::test]
 async fn activity_cursor_seeks_read_only_the_remaining_page() {
+    // Serve a RocksDB Store whose query service counts returned rows.
     let store = Arc::new(RocksStore::open_owned(tempfile::tempdir().unwrap(), None).unwrap());
     let reads = Arc::new(Reads::default());
     let query = Arc::new(CountingStore {
@@ -205,12 +224,18 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Register the metadata schema over that Store.
     let client = writer_store_client(&url, None).unwrap();
     let client = sql_meta_client(&client).unwrap();
     let schema = build_meta_schema(client.clone()).unwrap();
     let sql = SqlContext::new(client);
     let mut writer = schema.batch_writer();
     schema.register_all(&sql).unwrap();
+
+    // Write one account with 4096 rows at one height, one with a row at each of
+    // 4096 heights, and one whose page spans two heights. Writes must not count
+    // as query reads.
     let mut insert = |account, height, index| {
         let row = encode_tx_activity_row(TxActivityRow {
             account,
@@ -238,6 +263,7 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
     writer.flush().await.unwrap();
     assert_eq!(reads.finish().await, (0, 0));
 
+    // A deep cursor within one height seeks past the newer indices.
     compare_page(
         &sql,
         &reads,
@@ -254,6 +280,8 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
         true,
     )
     .await;
+
+    // A deep cursor across heights seeks past the newer heights.
     compare_page(
         &sql,
         &reads,
@@ -270,6 +298,8 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
         true,
     )
     .await;
+
+    // A page that spans two heights composes the cursor's suffix ranges.
     let composed = [(2, 2, 0), (2, 1, 0), (2, 0, 0)]
         .into_iter()
         .chain((13..=20).rev().map(|index| (1, index, 0)))
@@ -287,6 +317,9 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
         false,
     )
     .await;
+
+    // The first possible position leaves no suffix range, so it returns no rows
+    // without reading the Store.
     let request = AccountRequest {
         key: AccountKey::from([3; 32]),
         mode: None,
@@ -305,6 +338,7 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
             .is_empty()
     );
     assert_eq!(reads.finish().await, (0, 0));
+
     server.abort();
     let _ = server.await;
 }

@@ -412,6 +412,8 @@ fn replay_rejects_invalid_body() {
             leader: leader.public_key(),
             parent: (View::zero(), *parent.seal()),
         };
+
+        // Both transfers spend the sender's nonce 0, so the body cannot settle.
         let header = unexecuted_child_header(&parent, &consensus_context);
         let block = Block::<sha256::Digest, _, sha256::Sha256>::new(
             header,
@@ -422,6 +424,7 @@ fn replay_rejects_invalid_body() {
         )
         .seal(&mut sha256::Sha256::default());
 
+        // Replaying the block as finalized must reject it.
         let result = StatefulApplication::process(
             &mut app,
             (context.child("replay"), consensus_context),
@@ -435,8 +438,8 @@ fn replay_rejects_invalid_body() {
     });
 }
 
-/// Replay takes the transaction-history floor from the block's header, so an
-/// uncertified ancestor can name a floor past its own commit.
+/// Replay takes the transaction-history floor from the block's header, so it
+/// must reject a header whose floor lies past the block's own commit.
 #[test]
 fn replay_rejects_transaction_floor_past_commit() {
     deterministic::Runner::default().start(|context| async move {
@@ -454,13 +457,15 @@ fn replay_rejects_transaction_floor_past_commit() {
             parent: (View::zero(), *parent.seal()),
         };
 
-        // An empty body appends only its commit, at the parent's history size.
+        // An empty body appends only its commit, at the parent's history size,
+        // so a range starting one past it names a floor beyond the commit.
         let commit = parent.header.transactions_range.end();
         let mut header = unexecuted_child_header(&parent, &consensus_context);
         header.transactions_range = non_empty_range!(commit + 1, commit + 2);
         let block = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
             .seal(&mut sha256::Sha256::default());
 
+        // Replay must reject the floor as invalid instead of panicking.
         let result = StatefulApplication::process(
             &mut app,
             (context.child("replay"), consensus_context),
@@ -600,6 +605,8 @@ fn prepare_stages_the_block_propose_builds() {
             provider: TestSource::new(vec![vec![transaction.clone()]]),
         };
 
+        // Prepare must stage a block, and propose must build one from the same
+        // inputs.
         let Handoff::Stage(prepared) = StatefulApplication::prepare(
             &mut app,
             (context.child("prepare"), consensus_context.clone()),
@@ -648,6 +655,8 @@ fn prepare_restages_on_a_replacement_parent() {
             recipient,
             ..
         } = Box::pin(verify_harness(&context)).await;
+
+        // Every build forks fresh batches from its parent's merkleized state.
         let fork = |parent: &<TestDbs as DatabaseSet<deterministic::Context>>::Merkleized| {
             <TestDbs as DatabaseSet<deterministic::Context>>::fork_batches(parent)
         };
@@ -766,7 +775,7 @@ fn prepare_restages_on_a_replacement_parent() {
             Finality::Finalized,
         )
         .await
-        .expect("the block applies on P2's state");
+        .expect("the block must apply on P2's state");
         assert!(
             <TestDbs as DatabaseSet<deterministic::Context>>::matches_sync_targets(
                 &applied,
@@ -789,8 +798,9 @@ fn prepare_restages_on_a_replacement_parent() {
     });
 }
 
-/// Pins the application's own decline: the stateful actor declines an empty
-/// ancestry before it would call `prepare`.
+/// The application declines to prepare without a parent. The stateful actor
+/// declines an empty ancestry before calling `prepare`, so this checks the
+/// application on its own.
 #[test]
 fn prepare_waits_without_a_parent() {
     deterministic::Runner::default().start(|context| async move {
@@ -807,6 +817,7 @@ fn prepare_waits_without_a_parent() {
             parent: (View::zero(), *parent.seal()),
         };
 
+        // An empty ancestry offers no parent to build on, so prepare must wait.
         let prepared = StatefulApplication::prepare(
             &mut app,
             (context.child("prepare"), consensus_context),
@@ -953,6 +964,8 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             transaction_target,
         );
 
+        // Propose an empty child while the local clock is still behind the
+        // parent.
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
             leader: leader.public_key(),
@@ -970,6 +983,7 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             .expect("empty proposal must succeed");
         assert_eq!(proposed.block.header.timestamp, parent.header.timestamp);
 
+        // Replaying the proposal reaches the roots its header commits to.
         let replayed = StatefulApplication::process(
             &mut app,
             (context.child("replay"), consensus_context.clone()),
@@ -1149,8 +1163,8 @@ fn build_timeout_bounds_refill_rounds() {
         let refill_one = transfer(&harness.alt_sender, &harness.recipient, 3);
         let never_pulled = transfer(&harness.recipient, &harness.sender, 4);
 
-        // Each mempool round trip burns 60ms of virtual time — past the 50ms
-        // build deadline after one refill.
+        // Each mempool round trip burns 60ms of virtual time, so one refill
+        // passes the 50ms build deadline.
         let slow = |batches| DelayedSource {
             context: context.child("slow_clock"),
             delay: Duration::from_millis(60),

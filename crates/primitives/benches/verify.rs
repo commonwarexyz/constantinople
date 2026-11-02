@@ -28,6 +28,7 @@ use p256::{
 };
 use std::{hint::black_box, num::NonZeroU64, time::Duration};
 
+/// Pins a 2 GiB arena that is never purged. Other arenas keep freed memory for ten seconds.
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc::new(Config {
     purge: Purge::After(Duration::from_secs(10)),
@@ -38,17 +39,30 @@ static ALLOC: MiMalloc = MiMalloc::new(Config {
 type TestHasher = sha256::Sha256;
 type Ed25519Signer = ed25519::SigningKey;
 
+/// Namespace every benchmark transaction is signed under.
 const NAMESPACE: &[u8] = b"verify-bench";
+
+/// Worker threads in the verification pool.
 const WORKERS: usize = 8;
+
+/// Public key cache capacity, large enough that a warm cache never evicts.
 const CACHE_CAPACITY: usize = 100_000;
 
+/// One benchmarked block body composition.
 struct Shape {
+    /// Benchmark label.
     name: &'static str,
+    /// Ed25519 transactions in the body.
     ed25519_transactions: usize,
+    /// Distinct Ed25519 signers, assigned to transactions round robin.
     ed25519_signers: usize,
+    /// WebAuthn transactions spread evenly through the body, each from a new
+    /// signer.
     secp256r1_transactions: usize,
 }
 
+/// Bodies with distinct senders at increasing sizes, heavy sender reuse, and
+/// a mix of Ed25519 and WebAuthn senders.
 const SHAPES: &[Shape] = &[
     Shape {
         name: "distinct_1k",
@@ -82,6 +96,7 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
+/// Builds an unsigned transfer of one unit from `sender` to itself.
 fn unsigned(sender: TransactionPublicKey, nonce: u64) -> Transaction<sha256::Digest> {
     Transaction::new(
         sender.clone(),
@@ -91,6 +106,7 @@ fn unsigned(sender: TransactionPublicKey, nonce: u64) -> Transaction<sha256::Dig
     )
 }
 
+/// Encodes `bytes` as unpadded base64url, the WebAuthn challenge encoding.
 fn base64_url_no_pad(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
@@ -105,14 +121,20 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
     out
 }
 
+/// Builds a transfer from `signer` whose WebAuthn assertion challenges the
+/// transaction's signed digest.
 fn webauthn_transaction(signer: &SigningKey, nonce: u64) -> SignedTransaction<TestHasher> {
     let sender = TransactionPublicKey::secp256r1(
         secp256r1::PublicKey::decode(Copying(
             signer.verifying_key().to_sec1_point(true).as_bytes(),
         ))
-        .expect("compressed SEC1 key"),
+        .expect("compressed SEC1 key must decode"),
     );
     let sealed = unsigned(sender, nonce).seal(&mut TestHasher::default());
+
+    // The authenticator signs its data, with only the user-verified flag set,
+    // followed by the SHA-256 digest of the client data JSON that embeds the
+    // challenge.
     let mut authenticator_data = vec![0; 37];
     authenticator_data[32] = 0x04;
     let client_data_json = format!(
@@ -125,16 +147,17 @@ fn webauthn_transaction(signer: &SigningKey, nonce: u64) -> SignedTransaction<Te
     let signature: p256::ecdsa::Signature = signer.sign(&payload);
     let signature =
         secp256r1::Signature::decode(Copying(signature.normalize_s().to_bytes().as_slice()))
-            .expect("fixed-size signature");
+            .expect("normalized signature must decode");
     let signature =
         TransactionSignature::secp256r1(signature, authenticator_data, client_data_json)
-            .expect("assertion fits");
+            .expect("assertion must fit the signature size bounds");
     SignedTransaction::new_unchecked(sealed, signature)
 }
 
 /// Encodes the shape's block body as lazily decoded transactions are framed in
 /// a block.
 fn encoded_body(shape: &Shape) -> Bytes {
+    // Sign the Ed25519 transactions with signers assigned round robin.
     let signers: Vec<Ed25519Signer> = (0..shape.ed25519_signers as u64)
         .map(Ed25519Signer::from_seed)
         .collect();
@@ -146,12 +169,15 @@ fn encoded_body(shape: &Shape) -> Bytes {
                     .seal_and_sign(signer, NAMESPACE, &mut TestHasher::default())
             })
             .collect();
+
+    // Spread the WebAuthn transactions evenly between Ed25519 transactions.
     let mut rng = test_rng();
     for i in 0..shape.secp256r1_transactions {
         let signer = SigningKey::generate_from_rng(&mut rng);
         let position = (i + 1) * transactions.len() / (shape.secp256r1_transactions + 1);
         transactions.insert(position, webauthn_transaction(&signer, i as u64));
     }
+
     transactions
         .into_iter()
         .map(LazySignedTransaction::new)
@@ -163,7 +189,7 @@ fn encoded_body(shape: &Shape) -> Bytes {
 fn decode_body(encoded: &Bytes) -> Vec<LazySignedTransaction<TestHasher>> {
     let mut buf = encoded.clone();
     let len = usize::read_cfg(&mut buf, &commonware_codec::RangeCfg::new(..))
-        .expect("body length prefix");
+        .expect("body must start with a length prefix");
     let body: Vec<_> = (0..len)
         .map(|_| LazySignedTransaction::read(&mut buf).expect("bench transaction must frame"))
         .collect();
@@ -171,11 +197,14 @@ fn decode_body(encoded: &Bytes) -> Vec<LazySignedTransaction<TestHasher>> {
     body
 }
 
+/// Creates an empty public key cache.
 fn new_cache() -> PublicKeyCache {
     deterministic::Runner::default()
         .start(|context| async move { PublicKeyCache::new(context, NZUsize!(CACHE_CAPACITY)) })
 }
 
+/// Decodes `body` on `strategy`, verifies every signature, and requires both
+/// to succeed.
 fn verify(cache: &PublicKeyCache, body: &[LazySignedTransaction<TestHasher>], strategy: &Rayon) {
     let valid = preload_transaction_slice(body, strategy)
         && verify_transaction_batch(NAMESPACE, &mut test_rng(), cache, body, strategy);
@@ -183,7 +212,7 @@ fn verify(cache: &PublicKeyCache, body: &[LazySignedTransaction<TestHasher>], st
 }
 
 fn bench(c: &mut Criterion) {
-    let strategy = Rayon::new(NZUsize!(WORKERS)).expect("rayon pool");
+    let strategy = Rayon::new(NZUsize!(WORKERS)).expect("rayon pool must build");
     let mut group = c.benchmark_group("verify");
     group.sample_size(10);
     for shape in SHAPES {
@@ -191,6 +220,8 @@ fn bench(c: &mut Criterion) {
         let transactions = shape.ed25519_transactions + shape.secp256r1_transactions;
         group.throughput(Throughput::Elements(transactions as u64));
 
+        // The warm cache is filled by one untimed verification and shared
+        // across iterations.
         let warm = new_cache();
         verify(&warm, &decode_body(&encoded), &strategy);
         group.bench_function(BenchmarkId::new(shape.name, "warm"), |b| {
@@ -200,6 +231,8 @@ fn bench(c: &mut Criterion) {
                 BatchSize::PerIteration,
             );
         });
+
+        // The cold cache is rebuilt, untimed, for every iteration.
         group.bench_function(BenchmarkId::new(shape.name, "cold"), |b| {
             b.iter_batched(
                 || (new_cache(), decode_body(&encoded)),

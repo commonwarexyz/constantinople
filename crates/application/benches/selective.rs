@@ -35,8 +35,8 @@ fn key(index: u64) -> AccountKey {
 }
 
 /// `n` transfers with unique senders, to unique or shared recipients. When `stale_every > 0`,
-/// every `stale_every`-th transfer carries an already-consumed nonce, which only selection can
-/// drop.
+/// every `stale_every`-th transfer carries an already-consumed nonce. Verification rejects a body
+/// holding one, so only selection runs on those fixtures.
 fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTransfer>) {
     let mut state = State::with_capacity(2 * n);
     let mut transfers = Vec::with_capacity(n);
@@ -47,6 +47,8 @@ fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTr
         } else {
             key(u64::MAX - i)
         };
+
+        // A stale sender has already consumed nonce 0, and its transfer below reuses it.
         let mut nonce = Nonce::default();
         if stale_every > 0 && (i as usize).is_multiple_of(stale_every) {
             assert!(nonce.consume(0));
@@ -82,8 +84,9 @@ fn run<T>(label: &str, n: usize, mut op: impl FnMut() -> T) {
     println!("  {label:28} {avg:>10.2?}  ({tps:.2} Melem/s)");
 }
 
+/// Settles a clean body as one batch, as a verifier does.
 fn verify(state: &State, transfers: &[PreparedTransfer]) -> Vec<Slot<Account>> {
-    let plan = Plan::new(transfers, &Sequential).expect("clean body plans");
+    let plan = Plan::new(transfers, &Sequential).expect("clean body must plan");
     let reads = plan
         .keys()
         .iter()
@@ -91,10 +94,12 @@ fn verify(state: &State, transfers: &[PreparedTransfer]) -> Vec<Slot<Account>> {
         .collect();
     let slots = plan
         .settle(&starting_accounts(reads), &Sequential)
-        .expect("clean body settles");
+        .expect("clean body must settle");
     account_slots(slots)
 }
 
+/// Selects from `transfers` in one round, as a proposer does, returning the accepted count and
+/// the slots.
 fn select(state: &State, transfers: &[PreparedTransfer]) -> (usize, Vec<Slot<Account>>) {
     let mut selection: Selection<AccountKey, TransferAccount> = Selection::new();
     let touched = selection.touch(transfers);

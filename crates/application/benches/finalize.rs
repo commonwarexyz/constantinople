@@ -1,11 +1,8 @@
-//! Measures the dual-merkleize scheduling in `finalize_execution`: sequential
-//! awaits versus `futures::join!` versus spawning the transaction-history
-//! merkleize on its own task. The spawned variant measures ~1ms faster at 32k
-//! txs (the state merkleize has long single-threaded phases that leave pool
-//! workers idle), but production joins both merkleizes on a single task: a
-//! spawned child makes glue's verify cancellation observable mid-finalize,
-//! and the gain is too small to carry that hazard. Asserts all three
-//! schedules produce identical roots.
+//! Compares sequential, joined, and separately spawned scheduling of the two
+//! merkleizes in `finalize_execution`. Production joins both futures on the
+//! calling task so their lifetimes are tied to the caller; dropping a spawned
+//! task's handle does not stop the task. All three schedules must produce
+//! identical roots.
 
 // The layout of the main future nests deeper than the compiler's default limit.
 #![recursion_limit = "256"]
@@ -49,7 +46,10 @@ static ALLOC: MiMalloc = MiMalloc::new(Config {
 type Dbs = Databases<tokio::Context, Sha256, EightCap, Rayon>;
 
 const ACCOUNTS: u64 = 1_000_000;
+
+/// Page-cache size shared by both databases, in bytes.
 const CACHE_BYTES: usize = 512 * 1024 * 1024;
+
 const TXS: usize = 32_768;
 const WARMUP: usize = 3;
 const ITERS: usize = 10;

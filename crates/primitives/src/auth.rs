@@ -357,14 +357,14 @@ impl From<ed25519::Signature> for TransactionSignature {
     }
 }
 
-/// Verifies the signatures of every transaction yielded by `transaction`.
+/// Verifies the signature of the transaction that `transaction` projects from
+/// each of `items`.
 ///
 /// Every Ed25519 signature is checked in one randomized batch on `strategy`.
 /// The batch verifier groups signers by their raw key encoding and
-/// decompresses each distinct key once, so Ed25519 keys are passed through
-/// as encoded rather than resolved through `cache`. Secp256r1 (WebAuthn)
-/// signatures are checked individually against keys resolved through
-/// `cache`.
+/// decompresses each distinct key once, so Ed25519 keys bypass `cache`.
+/// Secp256r1 (WebAuthn) signatures are checked individually against keys
+/// resolved through `cache`.
 ///
 /// `rng` seeds the batch's random coefficients and must be unpredictable to
 /// whoever assembled `items`.
@@ -383,8 +383,10 @@ where
     T: Sync,
     H: Hasher,
 {
-    // Batch entries borrow a verifying key, which the transaction encoding
-    // does not hold, so the Ed25519 keys are copied out in item order.
+    // Split the items by scheme and reject any item that fails to decode or
+    // pairs a key with another scheme's signature. Batch entries borrow a
+    // verifying key that the transaction encoding does not hold, so Ed25519
+    // keys are copied out in item order.
     let mut ed25519_keys = Vec::with_capacity(items.len());
     let mut secp256r1 = Vec::new();
     for item in items {
@@ -415,12 +417,14 @@ where
             rng,
             items,
             |index, item| {
-                let transaction = transaction(item).expect("every item decoded above");
+                let transaction = transaction(item).expect("every item must have decoded above");
                 ed25519_entry(namespace, transaction, &ed25519_keys[index])
             },
             strategy,
         )
     } else {
+        // A mixed batch collects its Ed25519 transactions in item order, so
+        // each batch index lines up with its key in `ed25519_keys`.
         let transactions: Vec<_> = items
             .iter()
             .filter_map(&transaction)
@@ -443,20 +447,22 @@ where
 
 /// Returns the Ed25519 key held by an Ed25519 transaction public key encoding.
 ///
-/// Every 32-byte string decodes; an encoding that is not a curve point fails
-/// signature verification instead.
+/// Every 32-byte string decodes, and an encoding that is not a curve point
+/// fails signature verification.
 fn ed25519_key(encoded: &[u8; TransactionPublicKey::SIZE]) -> ed25519::VerifyingKey {
     ed25519::VerifyingKey::read(&mut Copying(&encoded[1..1 + ed25519::VerifyingKey::SIZE]))
-        .expect("Ed25519 verifying keys decode from any 32 bytes")
+        .expect("Ed25519 verifying key decoding must accept any 32 bytes")
 }
 
+/// Builds the batch entry for an Ed25519 transaction from its signed digest
+/// and the sender key copied out by [`ed25519_key`].
 fn ed25519_entry<'a, H: Hasher>(
     namespace: &'a [u8],
     transaction: &'a SignedTransaction<H>,
     key: &'a ed25519::VerifyingKey,
 ) -> BatchEntry<'a, ed25519::VerifyingKey> {
     let TransactionSignature::Ed25519 { signature, .. } = transaction.signature() else {
-        unreachable!("only Ed25519 signatures are batched");
+        unreachable!("batched transactions must carry Ed25519 signatures");
     };
     BatchEntry {
         namespace,
@@ -466,8 +472,8 @@ fn ed25519_entry<'a, H: Hasher>(
     }
 }
 
-/// Verifies secp256r1 WebAuthn assertions, whose challenge is the signed
-/// transaction digest.
+/// Verifies secp256r1 WebAuthn assertions. Each assertion's challenge must be
+/// the signed digest of its transaction.
 fn verify_secp256r1<H: Hasher>(
     cache: &PublicKeyCache,
     transactions: &[&SignedTransaction<H>],
@@ -477,13 +483,23 @@ fn verify_secp256r1<H: Hasher>(
         return true;
     }
 
+    // Resolve every sender through the shared cache. Any sender that is not a
+    // valid secp256r1 point fails the whole batch.
     let senders: Vec<_> = transactions
         .iter()
-        .map(|transaction| transaction.value().sender().expect("sender decoded"))
+        .map(|transaction| {
+            transaction
+                .value()
+                .sender()
+                .expect("every queued sender must have decoded")
+        })
         .collect();
     let Some(keys) = cache.decompress(&senders, strategy) else {
         return false;
     };
+
+    // Check each assertion against its resolved key and fold the results on
+    // `strategy`.
     strategy.fold(
         transactions.iter().zip(&keys),
         || true,
@@ -495,7 +511,7 @@ fn verify_secp256r1<H: Hasher>(
                 ..
             } = transaction.signature()
             else {
-                unreachable!("only secp256r1 signatures are queued");
+                unreachable!("queued transactions must carry secp256r1 signatures");
             };
             valid
                 && verify_webauthn_assertion(
@@ -598,18 +614,20 @@ pub(crate) mod tests {
 
     const NAMESPACE: &[u8] = b"constantinople-tx";
 
-    /// The Ed25519 encoding of `y = 2`, which is not the `y` coordinate of
-    /// any curve point.
+    /// The Ed25519 encoding of `y = 2`. No curve point has that `y`
+    /// coordinate.
     const NOT_A_POINT: [u8; 32] = {
         let mut bytes = [0; 32];
         bytes[0] = 2;
         bytes
     };
 
+    /// Returns the deterministic Ed25519 signer for `seed`.
     pub(crate) fn ed25519_signer(seed: u64) -> ed25519::SigningKey {
         <ed25519::SigningKey as commonware_cryptography::Signer>::from_seed(seed)
     }
 
+    /// Builds an unsigned transfer of one unit from `sender` to itself.
     fn unsigned(
         sender: TransactionPublicKey,
         nonce: u64,
@@ -617,11 +635,12 @@ pub(crate) mod tests {
         Transaction::new(
             sender.clone(),
             sender,
-            NonZeroU64::new(1).expect("non-zero"),
+            NonZeroU64::new(1).expect("transfer value must be non-zero"),
             nonce,
         )
     }
 
+    /// Builds a transfer from `signer` that carries a valid Ed25519 signature.
     pub(crate) fn ed25519_transaction(
         signer: &ed25519::SigningKey,
         nonce: u64,
@@ -652,6 +671,7 @@ pub(crate) mod tests {
         )
     }
 
+    /// Returns a deterministic P-256 signer that differs for each `seed`.
     pub(crate) fn webauthn_signer(seed: u8) -> SigningKey {
         let mut rng = test_rng();
         for _ in 0..seed {
@@ -660,6 +680,7 @@ pub(crate) mod tests {
         SigningKey::generate_from_rng(&mut rng)
     }
 
+    /// Returns the secp256r1 transaction public key of `signer`.
     fn webauthn_public_key(signer: &SigningKey) -> TransactionPublicKey {
         TransactionPublicKey::secp256r1(
             secp256r1::PublicKey::decode(Copying(
@@ -669,6 +690,10 @@ pub(crate) mod tests {
         )
     }
 
+    /// Builds a WebAuthn assertion by `signer` over `challenge`.
+    ///
+    /// Empty `authenticator_data` is replaced by 37 bytes with only the
+    /// user-verified flag set.
     fn webauthn_signature_with(
         signer: &SigningKey,
         challenge: &[u8],
@@ -678,6 +703,9 @@ pub(crate) mod tests {
             authenticator_data = vec![0; 37];
             authenticator_data[32] = WEBAUTHN_USER_VERIFIED_FLAG;
         }
+
+        // The authenticator signs its data followed by the SHA-256 digest of
+        // the client data JSON that embeds the challenge.
         let client_data_json = format!(
             r#"{{"type":"webauthn.get","challenge":"{}"}}"#,
             base64_url_no_pad(challenge)
@@ -694,6 +722,8 @@ pub(crate) mod tests {
         TransactionSignature::secp256r1(signature, authenticator_data, client_data_json).unwrap()
     }
 
+    /// Builds a transfer from `signer` whose WebAuthn assertion challenges the
+    /// transaction's signed digest.
     pub(crate) fn webauthn_transaction(
         signer: &SigningKey,
         nonce: u64,
@@ -750,6 +780,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ed25519_batch_with_distinct_and_repeated_signers() {
+        // Three signers rotate across the batch, so each key repeats within it.
         let signers: Vec<_> = (0..3).map(ed25519_signer).collect();
         let transactions: Vec<_> = (0..12)
             .map(|nonce| ed25519_transaction(&signers[nonce as usize % 3], nonce))
@@ -771,9 +802,13 @@ pub(crate) mod tests {
             .map(|nonce| ed25519_transaction(&signers[nonce as usize % 3], nonce))
             .collect();
         for position in [0, 4, 8] {
+            // Forge one signature and expect the whole batch to fail.
             let mut batch = transactions.clone();
             batch[position] = forge(&batch[position], &signers[position % 3]);
-            assert!(!verify(&batch), "invalid signature at {position}");
+            assert!(
+                !verify(&batch),
+                "batch with an invalid signature at {position} must fail"
+            );
         }
     }
 
@@ -803,10 +838,16 @@ pub(crate) mod tests {
             webauthn_transaction(&webauthn, 3),
             ed25519_transaction(&ed25519, 4),
         ];
+
+        // Forging any Ed25519 signature fails the batch, whatever its position
+        // between WebAuthn transactions.
         for position in [0, 2, 4] {
             let mut batch = transactions.clone();
             batch[position] = forge(&batch[position], &ed25519);
-            assert!(!verify(&batch), "invalid Ed25519 signature at {position}");
+            assert!(
+                !verify(&batch),
+                "batch with an invalid Ed25519 signature at {position} must fail"
+            );
         }
 
         // A WebAuthn assertion over another transaction's digest.
@@ -826,11 +867,14 @@ pub(crate) mod tests {
 
     #[test]
     fn undecodable_ed25519_key_fails_verification() {
+        // Build a sender whose Ed25519 key decodes but is not a curve point.
         let mut encoded = [0; TransactionPublicKey::SIZE];
         encoded[1..1 + ed25519::VerifyingKey::SIZE].copy_from_slice(&NOT_A_POINT);
         let sender = TransactionPublicKey::decode(Copying(&encoded[..]))
-            .expect("Ed25519 key decoding does not validate the point");
+            .expect("Ed25519 key decoding must accept encodings that are not curve points");
 
+        // A transaction from that sender fails alone, inside an Ed25519
+        // batch, and inside a mixed batch.
         let signer = ed25519_signer(0);
         let sealed = unsigned(sender, 0).seal(&mut Sha256::default());
         let signature =
@@ -856,10 +900,10 @@ pub(crate) mod tests {
         let signer = ed25519_signer(0);
         let valid = ed25519_transaction(&signer, 0);
         let TransactionSignature::Ed25519 { signature, .. } = valid.signature() else {
-            unreachable!("Ed25519 transaction");
+            unreachable!("transaction must carry an Ed25519 signature");
         };
 
-        // Encode the same scalar as `s + L`, which still fits in 32 bytes.
+        // Encode the same scalar as `s + L`. The sum still fits in 32 bytes.
         let mut bytes: [u8; 64] = signature.as_ref().try_into().unwrap();
         let mut carry = 0u16;
         for (byte, l) in bytes[32..].iter_mut().zip(L) {
@@ -871,9 +915,12 @@ pub(crate) mod tests {
         let malleated = TransactionSignature::decode(Copying(
             &[&[ED25519_SCHEME][..], &bytes[..]].concat()[..],
         ))
-        .expect("signatures decode from any 64 bytes");
+        .expect("signature decoding must accept any 64 bytes");
 
         let other = ed25519_transaction(&ed25519_signer(1), 1);
+
+        // The malleated encoding fails a batch that the canonical encoding
+        // passes.
         assert!(verify(&[valid.clone(), other.clone()]));
         assert!(!verify(&[resign(&valid, malleated), other]));
     }
@@ -961,7 +1008,7 @@ pub(crate) mod tests {
         assert!(verify_raw_secp256r1(&verifying_key, &message, &signature));
     }
 
-    /// Only secp256r1 senders populate the cache; Ed25519 senders are batch
+    /// Only secp256r1 senders populate the cache. Ed25519 senders are batch
     /// verified from their raw encodings.
     #[test]
     fn verification_caches_only_secp256r1_keys() {

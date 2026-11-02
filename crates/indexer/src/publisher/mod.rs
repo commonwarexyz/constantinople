@@ -427,6 +427,7 @@ pub(crate) mod fixture {
     use constantinople_engine::ThresholdScheme;
     use rand::CryptoRng;
 
+    /// Threshold scheme that signs and verifies test finalizations.
     pub(crate) type Scheme = ThresholdScheme<VerifyingKey, MinSig>;
 
     /// Deals a threshold key to `n` random Ed25519 participants, returning
@@ -436,13 +437,18 @@ pub(crate) mod fixture {
         namespace: &[u8],
         n: u32,
     ) -> (Vec<Scheme>, Scheme) {
+        // Draw distinct participants and deal each one a share of a fresh
+        // group key.
         let participants: Set<_> = (0..n)
             .map(|_| SigningKey::random(&mut *rng).public_key())
             .try_collect()
-            .expect("random participants are distinct");
+            .expect("random participants must be distinct");
         let (output, shares) =
             deal::<MinSig, _, N3f1>(rng, Mode::NonZeroCounter, participants.clone())
-                .expect("deal should succeed");
+                .expect("dealing to the participants must succeed");
+
+        // Every signer and the verifier share the participant set and group
+        // public key.
         let schemes = shares
             .into_iter()
             .map(|(_, share)| {
@@ -452,7 +458,7 @@ pub(crate) mod fixture {
                     output.public().clone(),
                     share,
                 )
-                .expect("every share belongs to a participant")
+                .expect("every share must belong to a participant")
             })
             .collect();
         let verifier = Scheme::verifier(namespace, participants, output.public().clone());

@@ -424,7 +424,7 @@ fn decode_with_network(
 }
 
 /// Decode the primary/secondary hex lists from the YAML. Panics if `self_key`
-/// is absent from both lists — every node must be explicitly declared.
+/// is absent from both lists, because every node must be explicitly declared.
 fn decode_participants(
     primary_hex: &[String],
     secondary_hex: &[String],
@@ -1439,7 +1439,7 @@ hosts:
         let primary1_key = &cluster.primary_keys[1];
         let secondary0_key = &cluster.secondary_keys[0];
         // An extra ed25519 host present in hosts.yaml but listed in neither
-        // primary_validators nor secondary_validators — must be ignored.
+        // primary_validators nor secondary_validators must be ignored.
         let stranger = ed25519::SigningKey::from_seed(9_999_999).public_key();
 
         let primary0_name = hex(&primary0_key.encode());

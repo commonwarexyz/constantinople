@@ -183,7 +183,9 @@ where
     /// Each transaction is held in a [`LazySignedTransaction`] so block
     /// decoding does not pay the per-transaction decode + seal-hash cost on the
     /// caller's thread. Materialization is typically driven in parallel at
-    /// verify time via a [`commonware_parallel::Strategy`].
+    /// verify time via a [`commonware_parallel::Strategy`]. The list is shared
+    /// behind an [`Arc`], so cloning a block copies neither the transactions
+    /// nor their decoded values.
     pub body: Arc<Vec<LazySignedTransaction<H>>>,
 }
 
@@ -468,6 +470,9 @@ mod tests {
     #[test]
     fn cloned_block_shares_body_and_preserves_deferred_wire_bytes() {
         type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+
+        // Frame two minimum-size transactions of filler bytes that never
+        // decode, so the block holds only deferred wire bytes.
         let payload_size =
             crate::Transaction::<sha256::Digest>::SIZE + crate::TransactionSignature::MIN_SIZE;
         let mut encoded = test_header().encode().to_vec();
@@ -479,11 +484,14 @@ mod tests {
         let block = TestBlock::decode_cfg(encoded.clone(), &BlockCfg::default()).unwrap();
         let weak = Arc::downgrade(&block.body);
 
+        // A clone shares the body allocation and encodes the original bytes.
         let cloned = block.clone();
-
         assert!(Arc::ptr_eq(&block.body, &cloned.body));
         assert_eq!(block.body.as_ptr(), cloned.body.as_ptr());
         assert_eq!(cloned.encode().as_ref(), encoded.as_slice());
+
+        // The body outlives the original block, still fails to decode, and
+        // still encodes the original bytes. It is freed with the last clone.
         drop(block);
         assert_eq!(weak.strong_count(), 1);
         for transaction in cloned.body.iter() {
@@ -496,6 +504,7 @@ mod tests {
 
     #[test]
     fn constructed_block_clones_share_materialized_transactions() {
+        // Build a block from one signed transaction.
         let mut rng = StdRng::from_seed([31; 32]);
         let signer = ed25519::SigningKey::random(&mut rng);
         let key = crate::TransactionPublicKey::ed25519(signer.public_key());
@@ -512,8 +521,8 @@ mod tests {
         );
         let block = Block::new(test_header(), vec![transaction]);
 
+        // A clone shares the body and its decoded transactions.
         let cloned = block.clone();
-
         assert!(Arc::ptr_eq(&block.body, &cloned.body));
         assert!(core::ptr::eq(
             block.body[0].get().unwrap(),

@@ -129,6 +129,8 @@ test('Unknown errors without a network fetch cause remain terminal', async (t) =
 });
 
 test('account work retries with bounded backoff until completion', async () => {
+    // Fail thirteen times with consistency lag, then succeed. Every failure waits, and the backoff
+    // reaches its two-second cap.
     const controller = new AbortController();
     const delays: number[] = [];
     let attempts = 0;
@@ -187,6 +189,7 @@ test('immutable Simplex configuration errors are terminal', () => {
 });
 
 test('account retries distinguish consistency lag from service errors', () => {
+    // Consistency lag waits for the indexer. Unavailable and network failures are service errors.
     assert.equal(accountRetryReason(new Error(CONSISTENCY_NOT_READY)), 'waiting for indexer');
     for (const error of [
         new ConnectError('transport disconnected', Code.Unavailable),
@@ -197,6 +200,7 @@ test('account retries distinguish consistency lag from service errors', () => {
 });
 
 test('account retries report each retryable failure before waiting', async () => {
+    // A service error and then consistency lag each report their reason before the backoff wait.
     const controller = new AbortController();
     const events: string[] = [];
     const failures = [new ConnectError('transport disconnected', Code.Unavailable), new Error(CONSISTENCY_NOT_READY)];
@@ -223,6 +227,7 @@ test('account retries report each retryable failure before waiting', async () =>
 });
 
 test('deterministic account proof failures are terminal', async () => {
+    // Deterministic verification failures cannot clear on retry, so each stops after one attempt.
     const details = [
         'finalized artifact is missing certified header bytes',
         'finalized artifact commitment does not match certificate payload',

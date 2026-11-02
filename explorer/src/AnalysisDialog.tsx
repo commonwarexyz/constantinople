@@ -15,6 +15,7 @@ interface Props {
     onOpenBlock: (height: bigint) => void;
 }
 
+/** Display state of the most recent query. A canceled query keeps its SQL and elapsed time. */
 type QueryState =
     | { status: 'idle' }
     | { status: 'running'; sql: string }
@@ -26,6 +27,7 @@ const milliseconds = (value: number) => value < 1000 ? `${Math.round(value)} ms`
 export const AnalysisDialog = memo(function AnalysisDialog({
     open, endpoint, suggestedAccount, latestHeight, onClose, onOpenAccount, onOpenBlock,
 }: Props) {
+    // Examples follow the open account or wallet until the user edits the account field.
     const [exampleAccount, setExampleAccount] = useState<string | null>(null);
     const account = (exampleAccount ?? suggestedAccount).trim();
     const validAccount = /^(0x)?[0-9a-f]{64}$/i.test(account);
@@ -36,10 +38,15 @@ export const AnalysisDialog = memo(function AnalysisDialog({
     const [elapsed, setElapsed] = useState(0);
     const panel = useRef<HTMLElement>(null);
     const editor = useRef<HTMLTextAreaElement>(null);
+
+    // Whether the draft has been seeded or run, so reopening keeps the previous draft.
     const initialized = useRef(false);
+
+    // The in-flight request. Only the job stored here may publish results or errors.
     const active = useRef<{ controller: AbortController; started: number; sql: string } | null>(null);
 
     const execute = useCallback(async (statement: string) => {
+        // A new run aborts and supersedes any request still in flight.
         active.current?.controller.abort();
         const job = { controller: new AbortController(), started: performance.now(), sql: statement };
         active.current = job;
@@ -47,6 +54,8 @@ export const AnalysisDialog = memo(function AnalysisDialog({
         initialized.current = true;
         setElapsed(0);
         setQuery({ status: 'running', sql: statement });
+
+        // A superseded or canceled job finishes silently because it no longer owns the display.
         try {
             const result = await runAnalysis(endpoint, statement, job.controller.signal);
             if (active.current === job) setQuery({ status: 'complete', sql: statement, result });
@@ -64,11 +73,14 @@ export const AnalysisDialog = memo(function AnalysisDialog({
     const cancel = useCallback(() => {
         const job = active.current;
         if (!job) return;
+
+        // Release ownership before aborting so the aborted request cannot report an error.
         active.current = null;
         job.controller.abort();
         setQuery({ status: 'canceled', sql: job.sql, message: 'Request canceled.', elapsedMs: performance.now() - job.started });
     }, []);
 
+    // Seed the editor with the first example on first open only.
     useEffect(() => {
         if (open && !initialized.current) {
             setSql(presets[0].sql);
@@ -76,8 +88,11 @@ export const AnalysisDialog = memo(function AnalysisDialog({
         }
     }, [open, presets]);
 
+    // Closing the dialog cancels the request, and unmounting aborts it without updating state.
     useEffect(() => { if (!open) cancel(); }, [open, cancel]);
     useEffect(() => () => { active.current?.controller.abort(); }, []);
+
+    // Tick the elapsed time while a request runs, since the service reports no progress.
     useEffect(() => {
         if (query.status !== 'running') return;
         const timer = window.setInterval(() => {
@@ -86,6 +101,8 @@ export const AnalysisDialog = memo(function AnalysisDialog({
         return () => window.clearInterval(timer);
     }, [query.status]);
 
+    // While open, focus the editor, close on Escape, and keep Tab within the dialog. Closing
+    // returns focus to the element that opened it.
     useEffect(() => {
         if (!open) return;
         const previous = document.activeElement;
@@ -190,6 +207,9 @@ const AnalysisResults = memo(function AnalysisResults({ result, onOpenAccount, o
     const [bars, setBars] = useState(false);
     const { columns, rows, stats } = result;
     const numeric = columns.map((column, i) => column.kind === 'number' ? i : -1).filter(i => i >= 0);
+
+    // A single numeric row shows totals. Multiple rows offer a chart when a numeric column has at
+    // least one other column to plot against, and the table pages through rows 50 at a time.
     return <div className="analysis__results">
         <dl className="analysis__stats">
             <div><dt>rows</dt><dd>{stats.rowCount.toLocaleString()}{result.truncated ? '+' : ''}</dd></div>
@@ -243,6 +263,7 @@ function ResultCell({ cell, column, onOpenAccount, onOpenBlock }: {
     cell: AnalysisCell; column: AnalysisColumn;
     onOpenAccount: Props['onOpenAccount']; onOpenBlock: Props['onOpenBlock'];
 }) {
+    // Account-like and height columns link to the verified account and block viewers.
     if (/^(account|counterparty|sender|recipient)$/i.test(column.name) && /^0x[0-9a-f]{64}$/i.test(cell.text)) {
         return <button className="analysis__link" onClick={() => onOpenAccount(cell.text)}>{cell.text}</button>;
     }
@@ -261,14 +282,20 @@ function axisLabel(value: ChartValue, time: boolean, compact = false): string {
 }
 
 function ResultChart({ result, axes, bars }: { result: AnalysisResult; axes: ChartAxes; bars: boolean }) {
+    // Numeric and time axes sort by value with missing values last. Other x columns are categories
+    // drawn as bars in row order.
     const xColumn = result.columns[axes.x], yColumn = result.columns[axes.y];
     const categorical = xColumn.kind !== 'number' && xColumn.kind !== 'time';
     const ordered = result.rows.map((row, index) => ({ row, index, x: chartValue(row[axes.x]), y: chartValue(row[axes.y]) }));
     if (!categorical) ordered.sort((a, b) => a.x === null ? 1 : b.x === null ? -1 : a.x < b.x ? -1 : a.x > b.x ? 1 : 0);
     const x = chartScale(categorical ? ordered.map((_row, index) => index) : ordered.flatMap(item => item.x === null ? [] : [item.x]));
     const useBars = bars || categorical;
+
+    // Bars need zero on the y scale so their heights measure the value.
     const y = chartScale(ordered.flatMap(item => item.y === null ? [] : [item.y]), useBars);
     if (!x || !y) return <p className="analysis__muted">These axes have no plottable values. Exact values are available in the table.</p>;
+
+    // Project points into the SVG viewBox. Rows missing either value stay as gaps.
     const left = 10, right = 890, top = 15, bottom = 200;
     const points = ordered.map((item, index) => {
         const xv = categorical ? index : item.x;
@@ -276,6 +303,8 @@ function ResultChart({ result, axes, bars }: { result: AnalysisResult; axes: Cha
             ...item, px: left + x.position(xv) * (right - left), py: bottom - y.position(item.y) * (bottom - top),
         };
     });
+
+    // The line restarts after each gap instead of bridging missing values.
     let segmentStart = true;
     const path = points.map(point => {
         if (!point) { segmentStart = true; return ''; }
@@ -283,6 +312,8 @@ function ResultChart({ result, axes, bars }: { result: AnalysisResult; axes: Cha
         segmentStart = false;
         return command;
     }).join(' ');
+
+    // Bars grow from the zero line and narrow as the point count grows.
     const base = bottom - y.position(typeof y.min === 'bigint' ? 0n : 0) * (bottom - top);
     const width = Math.min(18, (right - left) / Math.max(points.length, 1) * 0.7);
     return <figure className="analysis__chart">

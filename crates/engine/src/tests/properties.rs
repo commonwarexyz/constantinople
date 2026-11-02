@@ -241,9 +241,9 @@ impl<P: PublicKey> ExitCondition<P, ValidatorState> for StateSyncReadyAtHeight {
             // The simulator evaluates this condition after every finalization
             // update and handles crash and schedule events only while no update
             // is pending. A block at the target height needs a view at least as
-            // high, so until some validator finalizes one, answer without
-            // querying validators, whose replies would hold that loop and could
-            // keep fault events from ever running.
+            // high, so until some validator finalizes such a view, answer
+            // without querying validators. Their replies would hold that loop
+            // and could keep fault events from ever running.
             if tracker.max_round().map_or(0, |round| round.view().get()) < self.height {
                 return Ok(false);
             }
@@ -318,10 +318,15 @@ impl Property<TestPublicKey, ValidatorState> for PipelinedHandoffs {
         states: &'a [&'a ValidatorState],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            // The first validator's context exports the metrics of every
+            // validator in the simulation.
             let state = states
                 .first()
                 .ok_or_else(|| "no active validator".to_string())?;
             let metrics = state.context.encode();
+
+            // Sum the handoff counter for one event across every validator's
+            // labeled series.
             let handoff_events = |event: &str| -> u64 {
                 let label = format!("event=\"{event}\"");
                 metrics
@@ -330,6 +335,9 @@ impl Property<TestPublicKey, ValidatorState> for PipelinedHandoffs {
                     .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
                     .sum()
             };
+
+            // Some leader must have relayed a prepared proposal early, and no
+            // leader may have voted for one before its parent certified.
             if handoff_events("RelayedBeforeCertification") == 0 {
                 return Err(
                     "no leader relayed a prepared proposal before its parent certified".to_string(),

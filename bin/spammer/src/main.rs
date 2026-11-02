@@ -32,6 +32,7 @@ use submitter::{RelayerSubmitter, Stats};
 use tokio::sync::mpsc;
 use tracing::info;
 
+/// Pins a 2 GiB arena that is never purged. Other arenas keep freed memory for ten seconds.
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc::new(Config {
     purge: Purge::After(Duration::from_secs(10)),

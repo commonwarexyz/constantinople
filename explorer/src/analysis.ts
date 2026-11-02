@@ -1,10 +1,17 @@
 import { DataType, SqlClient, type Table } from '@exowarexyz/sql';
 
+/** Maximum number of rows shown for one query. One extra row is requested to detect truncation. */
 export const ANALYSIS_ROW_LIMIT = 1000;
+
+/** Maximum SQL length in characters, checked before and after adding the row limit. */
 export const ANALYSIS_SQL_LIMIT = 65535;
+
+/** Client-side timeout for one analysis request. */
 export const ANALYSIS_TIMEOUT_MS = 30000;
 
+/** Chart and display category derived from a column's Arrow type. */
 export type AnalysisKind = 'number' | 'time' | 'text' | 'binary' | 'boolean' | 'other';
+
 export interface AnalysisColumn {
     readonly name: string;
     readonly type: string;
@@ -12,13 +19,18 @@ export interface AnalysisColumn {
     readonly nullable: boolean;
 }
 export interface AnalysisCell {
+    /** Raw value, with binary and decimal values replaced by their display text. */
     readonly value: string | number | bigint | boolean | null;
     readonly text: string;
+
+    /** Finite value that converts to a number without loss, or null. */
     readonly numeric: number | null;
 }
 export interface AnalysisResult {
     readonly columns: AnalysisColumn[];
     readonly rows: AnalysisCell[][];
+
+    /** Whether the server returned more than `ANALYSIS_ROW_LIMIT` rows. */
     readonly truncated: boolean;
     readonly stats: {
         readonly rowCount: number;
@@ -36,6 +48,7 @@ export interface AnalysisPreset {
     readonly requiresAccount?: boolean;
 }
 
+/** Keywords that write data, change session state, or load files, rejected anywhere in a query. */
 const COMMANDS = new Set([
     'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE',
     'COPY', 'EXEC', 'EXECUTE', 'CALL', 'SET', 'RESET', 'PREPARE', 'DEALLOCATE',
@@ -43,9 +56,15 @@ const COMMANDS = new Set([
     'LOAD', 'EXPORT', 'IMPORT', 'INTO', 'PRAGMA', 'KILL',
 ]);
 
-/** Accepts one SELECT/WITH query with ANSI quotes; this is an editor guard, not access control. */
+/**
+ * Accepts one SELECT/WITH query with ANSI quotes and wraps it in a row limit. This is an editor
+ * guard, not access control.
+ */
 export function prepareAnalysisQuery(input: string): string {
     if (input.length > ANALYSIS_SQL_LIMIT) throw new Error('SQL exceeds 65,535 characters');
+
+    // Copy the query token by token and replace comments with spaces, so the server runs exactly
+    // the text that was checked. Only whitespace and comments may follow the terminating semicolon.
     const parts: string[] = [];
     let firstWord: string | undefined;
     let depth = 0;
@@ -59,6 +78,8 @@ export function prepareAnalysisQuery(input: string): string {
             parts.push(' ');
             continue;
         }
+
+        // Track nested block comment depth so an inner terminator cannot end the outer comment.
         if (input.startsWith('/*', i)) {
             let comments = 1;
             i += 2;
@@ -72,6 +93,9 @@ export function prepareAnalysisQuery(input: string): string {
             continue;
         }
         if (ended) throw new Error('Run one SELECT or WITH query at a time');
+
+        // Quoted literals and identifiers are copied verbatim, so their contents never match a
+        // keyword. A doubled quote is an escaped quote and backslash escapes are rejected.
         if (char === "'" || char === '"') {
             const start = i++;
             let closed = false;
@@ -86,6 +110,9 @@ export function prepareAnalysisQuery(input: string): string {
             parts.push(input.slice(start, i));
             continue;
         }
+
+        // Every bare word is checked against the command denylist, and the first one selects the
+        // statement kind.
         if (/[A-Za-z_]/.test(char)) {
             const start = i++;
             while (i < input.length && /[A-Za-z_0-9]/.test(input[i])) i++;
@@ -95,6 +122,9 @@ export function prepareAnalysisQuery(input: string): string {
             parts.push(input.slice(start, i));
             continue;
         }
+
+        // A semicolon may only end the top-level statement. Dollar quoting, backticks, backslashes,
+        // and control characters are rejected because the scanner does not model them.
         if (char === '(') depth++;
         if (char === ')' && --depth < 0) throw new Error('Unbalanced SQL parentheses');
         if (char === ';') {
@@ -109,6 +139,8 @@ export function prepareAnalysisQuery(input: string): string {
         parts.push(char);
         i++;
     }
+
+    // Request one row past the display limit so the result can report truncation.
     if (depth) throw new Error('Unbalanced SQL parentheses');
     if (firstWord !== 'SELECT' && firstWord !== 'WITH') throw new Error('Start with SELECT or WITH');
     const query = `SELECT * FROM (\n${parts.join('').trim()}\n) AS analysis_result LIMIT ${ANALYSIS_ROW_LIMIT + 1}`;
@@ -134,6 +166,8 @@ function stringify(value: unknown): string {
 
 function cell(value: unknown, type: DataType, kind: AnalysisKind): AnalysisCell {
     if (value === null || value === undefined) return { value: null, text: 'NULL', numeric: null };
+
+    // Binary values display as hex and decimals as exact text, so neither is charted.
     if (kind === 'binary' && value instanceof Uint8Array) {
         const text = '0x' + Array.from(value, byte => byte.toString(16).padStart(2, '0')).join('');
         return { value: text, text, numeric: null };
@@ -147,6 +181,8 @@ function cell(value: unknown, type: DataType, kind: AnalysisKind): AnalysisCell 
             : digits + '0'.repeat(-type.scale));
         return { value: text, text, numeric: null };
     }
+
+    // Integers keep their exact bigint value, and only safe integers get a numeric view.
     if (typeof value === 'bigint') {
         const numeric = value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
         return { value, text: value.toString(), numeric };
@@ -162,6 +198,7 @@ function cell(value: unknown, type: DataType, kind: AnalysisKind): AnalysisCell 
     return { value: text, text, numeric: null };
 }
 
+/** Converts an Arrow table into display cells, keeping at most `ANALYSIS_ROW_LIMIT` rows. */
 export function normalizeAnalysisResult(table: Table, sequenceNumber: bigint | undefined, elapsedMs: number): AnalysisResult {
     const columns = table.schema.fields.map(field => ({
         name: field.name, type: field.type.toString(), kind: columnKind(field.type), nullable: field.nullable,
@@ -180,20 +217,30 @@ export function normalizeAnalysisResult(table: Table, sequenceNumber: bigint | u
 export async function runAnalysis(endpoint: string, sql: string, signal: AbortSignal): Promise<AnalysisResult> {
     const query = prepareAnalysisQuery(sql);
     signal.throwIfAborted();
+
+    // Issue a single attempt so a failed or timed-out query is not rerun on the server.
     const start = performance.now();
     const client = SqlClient.fixed(endpoint, undefined, {
         retry: { maxAttempts: 1, initialBackoffMs: 100, maxBackoffMs: 2000 },
     });
     const { table, sequenceNumber } = await client.query(query, undefined, { signal, timeoutMs: ANALYSIS_TIMEOUT_MS });
+
+    // Discard a response that arrives after cancellation.
     signal.throwIfAborted();
     const result = normalizeAnalysisResult(table, sequenceNumber, 0);
     return { ...result, stats: { ...result.stats, elapsedMs: performance.now() - start } };
 }
 
+/**
+ * Returns example queries over the 100 blocks ending at `latestHeight`. Without an account, the
+ * account examples match no rows and are marked as requiring one.
+ */
 export function analysisPresets(latestHeight: bigint, account?: string): AnalysisPreset[] {
+    // Validate both inputs before interpolating them into SQL text.
     if (latestHeight < 1n || latestHeight > (1n << 64n) - 1n) throw new Error('Height must fit a positive u64');
     const key = account?.trim().replace(/^0x/i, '');
     if (key !== undefined && !/^[0-9a-f]{64}$/i.test(key)) throw new Error('Account must be 32-byte hex');
+
     const accountFilter = key ? `account = X'${key.toLowerCase()}'` : 'FALSE';
     const lower = latestHeight > 99n ? latestHeight - 99n : 1n;
     const window = `height >= ${lower} AND height <= ${latestHeight}`;

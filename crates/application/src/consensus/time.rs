@@ -12,8 +12,8 @@ const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 /// Returns the timestamp for a child of a block stamped `parent_timestamp_ms`.
 ///
 /// The child takes the current Unix time in milliseconds, or the parent's
-/// timestamp while the local clock is behind it: a term-start proposal can
-/// build on a parent stamped ahead of the local clock, before verification of
+/// timestamp while the local clock is behind it. A term-start proposal can
+/// build on a parent stamped ahead of the local clock before verification of
 /// that parent has waited for its timestamp.
 pub(super) fn child_timestamp_ms(runtime: &impl Clock, parent_timestamp_ms: u64) -> u64 {
     let timestamp_ms = runtime
@@ -54,9 +54,12 @@ mod tests {
 
     #[test]
     fn child_timestamp_validity_bounds() {
+        // A child may share or follow its parent's timestamp but not precede it.
         assert!(is_valid_child_timestamp(10, 10));
         assert!(is_valid_child_timestamp(10, 11));
         assert!(!is_valid_child_timestamp(10, 9));
+
+        // A child is valid up to the maximum block timestamp and no further.
         assert!(is_valid_child_timestamp(10, MAX_BLOCK_TIMESTAMP_MS));
         assert!(!is_valid_child_timestamp(10, MAX_BLOCK_TIMESTAMP_MS + 1));
     }

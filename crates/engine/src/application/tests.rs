@@ -209,6 +209,8 @@ fn capture_is_disabled_without_a_finalized_hook() {
 #[test]
 fn prepare_forwards_the_inner_stage() {
     deterministic::Runner::default().start(|context| async move {
+        // Build the fixture and a round-one context whose parent is the genesis
+        // view.
         let (mut app, dbs, _, genesis) = fixture(&context).await;
         let consensus_context = Context {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -233,6 +235,8 @@ fn prepare_forwards_the_inner_stage() {
         let Handoff::Stage(prepared) = prepared else {
             panic!("the wrapper must forward the inner application's staged block");
         };
+
+        // The staged block extends genesis at height one.
         assert_eq!(prepared.block.parent(), genesis.digest());
         assert_eq!(prepared.block.height(), Height::new(1));
     });

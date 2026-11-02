@@ -1,5 +1,5 @@
 //! Measures the in-memory CPU cost of settling a block body: planning it and settling it against
-//! starting accounts already in memory. It does not read or merkleize a database; the `compute`
+//! starting accounts already in memory. It does not read or merkleize a database. The `compute`
 //! bench target measures the whole pipeline against QMDB.
 
 use ahash::AHashMap;
@@ -22,6 +22,7 @@ static ALLOC: MiMalloc = MiMalloc::new(Config {
 
 type State = AHashMap<AccountKey, Account>;
 
+/// Transfers per block in each row.
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
 
 /// Transactions each sender signs in the contended fixture.
@@ -35,7 +36,8 @@ fn key(index: u64) -> AccountKey {
 }
 
 fn executor(c: &mut Criterion) {
-    let pool = Rayon::new(NonZeroUsize::new(WORKERS).expect("workers")).expect("rayon pool");
+    let pool = Rayon::new(NonZeroUsize::new(WORKERS).expect("WORKERS must be nonzero"))
+        .expect("rayon pool");
     let mut group = c.benchmark_group("executor");
     for &transaction_count in TRANSACTION_COUNTS {
         group.throughput(Throughput::Elements(transaction_count as u64));
@@ -54,8 +56,9 @@ fn executor(c: &mut Criterion) {
     group.finish();
 }
 
+/// Plans and settles `transfers` against `state`, returning the slot count so the work is kept.
 fn settle(state: &State, transfers: &[PreparedTransfer], strategy: &impl Strategy) -> usize {
-    let plan = Plan::new(transfers, strategy).expect("bench transfers plan");
+    let plan = Plan::new(transfers, strategy).expect("bench transfers must plan");
     let reads = plan
         .keys()
         .iter()
@@ -63,10 +66,11 @@ fn settle(state: &State, transfers: &[PreparedTransfer], strategy: &impl Strateg
         .collect();
     let slots = plan
         .settle(&starting_accounts(reads), strategy)
-        .expect("bench transfers settle");
+        .expect("bench transfers must settle");
     account_slots(slots).len()
 }
 
+/// Benchmarks settling one fixture under `strategy`, labeled by fixture and transfer count.
 fn bench_settle(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     fixture: &str,
@@ -83,6 +87,8 @@ fn bench_settle(
     );
 }
 
+/// `transaction_count` transfers, each between a funded sender and an empty recipient that no
+/// other transfer touches.
 fn unique_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
     let mut state = State::new();
     let transfers = (0..transaction_count as u64)
@@ -108,6 +114,8 @@ fn unique_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
     (state, transfers)
 }
 
+/// `transaction_count` transfers among funded accounts that each send `SHARED_FANOUT` transfers,
+/// with sequential nonces, to recipients drawn from the same accounts.
 fn shared_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
     let account_count = (transaction_count / SHARED_FANOUT).max(1);
     let state = (0..account_count as u64)

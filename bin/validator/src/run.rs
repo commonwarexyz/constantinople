@@ -66,6 +66,9 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
 const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 
 const NETWORK_CHANNEL_MAILBOX_BUDGET: usize = 1_024;
+
+/// Capacity of the p2p network's internal actor mailboxes. Inbound application
+/// message capacity comes from the channel quotas.
 const NETWORK_MAILBOX_SIZE: NonZeroUsize = NZUsize!(1_000);
 
 pub(crate) type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;

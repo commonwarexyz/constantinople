@@ -1648,7 +1648,7 @@ mod tests {
                 captured.encode(),
                 &QueuedFinalizedUploadCfg::default(),
             )
-            .expect("captured payload decodes");
+            .expect("captured payload must decode");
         assert_eq!(round_trip.state.operations, state_bytes[1..2]);
         assert_eq!(round_trip.transactions.operations, transaction_bytes[1..2]);
     }
@@ -3396,6 +3396,7 @@ mod tests {
             .expect("reconstruct queued range root")
     }
 
+    /// Finalizes `block` with votes from all four threshold fixture participants.
     fn test_finalization(block: &EngineBlock<Sha256, ed25519::VerifyingKey>) -> TestFinalization {
         let mut rng = StdRng::from_seed([7; 32]);
         let (schemes, verifier) = crate::publisher::fixture::threshold(&mut rng, b"qmdb-test", 4);

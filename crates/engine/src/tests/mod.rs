@@ -87,8 +87,8 @@ struct TestEngineDefinition {
     shares: BTreeMap<TestPublicKey, Option<Share>>,
     enable_state_sync: bool,
     /// When `true`, every node re-tracks peer set 0 during `init` as
-    /// `TrackedPeers::new(primary, secondary)` — primary = nodes with a DKG
-    /// share, secondary = nodes without. Exercises the p2p discovery secondary
+    /// `TrackedPeers::new(primary, secondary)`, where primary nodes hold a DKG
+    /// share and secondary nodes do not. Exercises the p2p discovery secondary
     /// mechanism. Default `false` leaves all nodes in the primary set as
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
@@ -99,6 +99,9 @@ struct TestEngineDefinition {
     pending_sync_floor: Option<EngineFinalization<TestPublicKey, MinSig>>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
+
+    /// Simulated network message size limit in bytes. State-sync plans raise
+    /// it to admit probe responses.
     max_message_size: u32,
 }
 
@@ -126,8 +129,9 @@ impl TestEngineDefinition {
     ///
     /// Secondaries receive an ed25519 identity but no DKG share, so the engine
     /// constructs their threshold scheme in verifier mode (`me() == None`).
-    /// Simplex then runs as a silent observer: no votes, no certificates — the
-    /// node only processes inbound messages and drives its local state machine.
+    /// Simplex then runs as a silent observer that sends no votes or
+    /// certificates. The node only processes inbound messages and drives its
+    /// local state machine.
     fn with_secondaries(mut self, count: u32) -> Self {
         const SECONDARY_SEED_OFFSET: u64 = 1_000_000;
         for i in 0..count {
