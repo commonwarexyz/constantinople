@@ -16,7 +16,7 @@ use std::time::Duration;
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc::new(Config {
     purge: Purge::After(Duration::from_secs(60)),
-    reserve: Some(Reserve::pinned(12 << 30)),
+    reserve: Some(Reserve::pinned(16 << 30)),
     ..Config::DEFAULT
 });
 

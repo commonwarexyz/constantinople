@@ -475,9 +475,9 @@ fn certificate_height(bundle: &Value) -> u64 {
 }
 
 fn hex_bytes_dynamic(value: &str) -> Vec<u8> {
-    value
-        .as_bytes()
-        .chunks_exact(2)
+    let (pairs, _) = value.as_bytes().as_chunks::<2>();
+    pairs
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -595,7 +595,7 @@ async fn historical_bundles(
 fn historical_transactions_below_inactivity_floor_remain_available() {
     commonware_runtime::tokio::Runner::default().start(|context| async move {
         let fixture = fixture().await;
-        historical_bundles(context, &fixture).await;
+        Box::pin(historical_bundles(context, &fixture)).await;
     });
 }
 
@@ -700,27 +700,27 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         let router = &environment.router;
         let publisher = &environment.publisher;
         let reporter = &environment.reporter;
-        publish(&publisher, &reporter, &fixture.blocks[0], true).await;
-        publish(&publisher, &reporter, &fixture.blocks[1], false).await;
+        publish(publisher, reporter, &fixture.blocks[0], true).await;
+        publish(publisher, reporter, &fixture.blocks[1], false).await;
 
         // Block 2 has no covering certificate yet, so it stays unavailable while
         // the account view falls back to block 1's certificate.
-        let (status, _) = get(&router, "/explorer/blocks/2").await;
+        let (status, _) = get(router, "/explorer/blocks/2").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let account_path = format!("/explorer/accounts/{}", hex(fixture.account.as_ref()));
-        let lagging_account = ok(&router, &account_path).await;
+        let lagging_account = ok(router, &account_path).await;
         assert_eq!(certificate_height(&lagging_account), 1);
         assert_eq!(lagging_account["transactions"].as_array().unwrap().len(), 3);
 
         // Certifying block 3 lets block 1 prove directly and block 2 prove
         // through block 3's ancestry.
-        publish(&publisher, &reporter, &fixture.blocks[2], true).await;
-        let direct = ok(&router, "/explorer/blocks/1").await;
+        publish(publisher, reporter, &fixture.blocks[2], true).await;
+        let direct = ok(router, "/explorer/blocks/1").await;
         assert_eq!(certificate_height(&direct), 1);
         assert_eq!(direct["headers"], json!([]));
         assert_transactions(&direct, &fixture.blocks[0], 0, 3);
-        assert_transaction_proof(&client, &direct, &fixture.blocks[0]).await;
-        let descendant = ok(&router, "/explorer/blocks/2").await;
+        assert_transaction_proof(client, &direct, &fixture.blocks[0]).await;
+        let descendant = ok(router, "/explorer/blocks/2").await;
         assert_eq!(certificate_height(&descendant), 3);
         assert_eq!(
             descendant["headers"],
@@ -730,24 +730,24 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             ])
         );
         assert_transactions(&descendant, &fixture.blocks[1], 0, 50);
-        assert_transaction_proof(&client, &descendant, &fixture.blocks[2]).await;
+        assert_transaction_proof(client, &descendant, &fixture.blocks[2]).await;
 
         // Block 2 pages at 50 transactions, returns an empty page at its exact
         // count, and rejects any offset beyond it.
         assert_eq!(descendant["nextCursor"], "50");
-        let last = ok(&router, "/explorer/blocks/2?offset=50").await;
+        let last = ok(router, "/explorer/blocks/2?offset=50").await;
         assert_transactions(&last, &fixture.blocks[1], 50, 5);
         assert!(last["nextCursor"].is_null());
-        let terminal = ok(&router, "/explorer/blocks/2?offset=55").await;
+        let terminal = ok(router, "/explorer/blocks/2?offset=55").await;
         assert_transactions(&terminal, &fixture.blocks[1], 55, 0);
         assert_eq!(
-            get(&router, "/explorer/blocks/2?offset=56").await.0,
+            get(router, "/explorer/blocks/2?offset=56").await.0,
             StatusCode::BAD_REQUEST
         );
 
         // An empty block returns its certificate and parent header without a
         // proof.
-        let empty = ok(&router, "/explorer/blocks/3").await;
+        let empty = ok(router, "/explorer/blocks/3").await;
         assert_eq!(certificate_height(&empty), 3);
         assert_transactions(&empty, &fixture.blocks[2], 0, 0);
         assert_eq!(
@@ -757,13 +757,13 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
 
         // The account view proves the latest update and returns the newest ten
         // activity rows.
-        let account = ok(&router, &account_path).await;
+        let account = ok(router, &account_path).await;
         assert_eq!(certificate_height(&account), 3);
         assert_eq!(account["account"]["location"], "5");
         assert_eq!(account["transactions"].as_array().unwrap().len(), 10);
         assert_eq!(account["transactions"][0]["index"], 54);
         assert_eq!(account["transactions"][0]["role"], 0);
-        assert_transaction_proof(&client, &account, &fixture.blocks[2]).await;
+        assert_transaction_proof(client, &account, &fixture.blocks[2]).await;
 
         // A cursor on the pinned snapshot continues with the next ten rows.
         let cursor = account["nextCursor"].as_str().unwrap();
@@ -771,12 +771,12 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             "{account_path}?at=3&digest={}&cursor={cursor}",
             hex(fixture.blocks[2].block.seal().as_ref())
         );
-        let next = ok(&router, &pinned).await;
+        let next = ok(router, &pinned).await;
         assert_eq!(next["transactions"][0]["index"], 44);
         assert_eq!(next["transactions"][9]["index"], 35);
 
         // Disabling activity keeps the account proof and returns no rows.
-        let state_only = ok(&router, &format!("{account_path}?activity=false")).await;
+        let state_only = ok(router, &format!("{account_path}?activity=false")).await;
         assert!(state_only["transactions"].as_array().unwrap().is_empty());
         assert!(state_only["transactionsProof"].is_null());
         assert_eq!(state_only["account"], account["account"]);
@@ -784,7 +784,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         // The recipient has no state update, and its received filter returns
         // only receiver rows.
         let recipient = ok(
-            &router,
+            router,
             &format!(
                 "/explorer/accounts/{}?mode=received",
                 hex(fixture.recipient.as_ref())
@@ -797,14 +797,14 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
 
         // A transaction in block 2 proves through block 3's certificate.
         let digest = hex(fixture.blocks[1].transactions[54].message_digest().as_ref());
-        let transaction = ok(&router, &format!("/explorer/transactions/{digest}")).await;
+        let transaction = ok(router, &format!("/explorer/transactions/{digest}")).await;
         assert_eq!(certificate_height(&transaction), 3);
         assert_transactions(&transaction, &fixture.blocks[1], 54, 1);
 
         // After block 4 arrives, the pinned page is unchanged while the latest
         // view moves to block 4 and still reaches earlier blocks.
-        publish(&publisher, &reporter, &fixture.blocks[3], true).await;
-        let after_arrival = ok(&router, &pinned).await;
+        publish(publisher, reporter, &fixture.blocks[3], true).await;
+        let after_arrival = ok(router, &pinned).await;
         for field in [
             "certificate",
             "headers",
@@ -815,7 +815,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         ] {
             assert_eq!(after_arrival[field], next[field], "pinned field {field} must not change");
         }
-        let account_with_history = ok(&router, &account_path).await;
+        let account_with_history = ok(router, &account_path).await;
         assert_eq!(certificate_height(&account_with_history), 4);
         assert!(account_with_history["transactions"].as_array().unwrap().iter().any(|row| {
             row["location"].as_str().unwrap().parse::<u64>().unwrap()
@@ -824,10 +824,10 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
 
         // Both routes serve block 4's maximum-size WebAuthn transaction in full.
         let webauthn_digest = hex(fixture.blocks[3].transactions[1].message_digest().as_ref());
-        let webauthn_block = ok(&router, "/explorer/blocks/4").await;
+        let webauthn_block = ok(router, "/explorer/blocks/4").await;
         assert_transactions(&webauthn_block, &fixture.blocks[3], 0, 2);
         let webauthn_bundle = ok(
-            &router,
+            router,
             &format!("/explorer/transactions/{webauthn_digest}"),
         )
         .await;
@@ -842,7 +842,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
 
         // Export the bundles for browser verification tests when requested.
         if let Some(path) = std::env::var_os("EXPLORER_FIXTURE_PATH") {
-            let (historical_block, historical_transaction) = historical_bundles(context.child("historical_export"), &fixture).await;
+            let (historical_block, historical_transaction) = Box::pin(historical_bundles(context.child("historical_export"), &fixture)).await;
             let export = json!({
                 "verificationMaterial": fixture.verification_material,
                 "account": hex(fixture.account.as_ref()),

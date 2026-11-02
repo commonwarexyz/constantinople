@@ -392,7 +392,8 @@ fn hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], Failure> {
         return Err(Failure::bad(format!("expected {} hex characters", N * 2)));
     }
     let mut bytes = [0; N];
-    for (pair, output) in value.as_bytes().chunks_exact(2).zip(bytes.iter_mut()) {
+    let (pairs, _) = value.as_bytes().as_chunks::<2>();
+    for (pair, output) in pairs.iter().zip(bytes.iter_mut()) {
         let digit = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
         *output = digit(pair[0])
             .zip(digit(pair[1]))
@@ -618,15 +619,13 @@ impl Explorer {
 
         // Prove that location at the certified tip, reading QMDB at or above
         // the request floor.
-        let proof = self
-            .state
-            .operation_range_checkpoint(
-                Location::new(end - 1),
-                Location::new(location),
-                1,
-                Some(anchor.floor()?),
-            )
-            .await?;
+        let proof = Box::pin(self.state.operation_range_checkpoint(
+            Location::new(end - 1),
+            Location::new(location),
+            1,
+            Some(anchor.floor()?),
+        ))
+        .await?;
 
         // The proof must reproduce the certified root and contain exactly one
         // operation, an update of the requested account.
