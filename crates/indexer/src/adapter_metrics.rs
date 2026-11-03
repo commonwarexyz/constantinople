@@ -1,4 +1,4 @@
-//! Shared HTTP metrics for the read adapters.
+//! HTTP metrics for the explorer service.
 
 use axum::{
     body::Body,
@@ -25,7 +25,7 @@ const RESPONSE_START_BUCKETS: [f64; 10] =
     [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 30.0];
 const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
-/// HTTP metrics shared by the metadata and QMDB adapters.
+/// HTTP request metrics for one explorer service.
 #[derive(Clone, Debug)]
 pub struct AdapterMetrics {
     registry: Arc<Registry>,

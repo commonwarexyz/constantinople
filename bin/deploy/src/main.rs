@@ -61,16 +61,12 @@ const CHAIN_INDEXER_BINARY_FILE: &str = "chain-indexer";
 const CHAIN_INDEXER_CONFIG_FILE: &str = "chain-indexer.yaml";
 const CHAIN_INDEXER_DATA_DIR: &str = "chain-indexer";
 const CHAIN_INDEXER_HOST: &str = "chain-indexer";
-const METADATA_INDEXER_BINARY_FILE: &str = "metadata-indexer";
-const METADATA_INDEXER_CONFIG_FILE: &str = "metadata-indexer.yaml";
-const METADATA_INDEXER_HOST: &str = "metadata-indexer";
-const QMDB_INDEXER_BINARY_FILE: &str = "qmdb-indexer";
-const QMDB_INDEXER_CONFIG_FILE: &str = "qmdb-indexer.yaml";
-const QMDB_INDEXER_HOST: &str = "qmdb-indexer";
+const EXPLORER_INDEXER_BINARY_FILE: &str = "explorer-indexer";
+const EXPLORER_INDEXER_CONFIG_FILE: &str = "explorer-indexer.yaml";
+const EXPLORER_INDEXER_HOST: &str = "explorer-indexer";
 const SIMPLEX_VERIFICATION_MATERIAL_FILE: &str = "simplex-verification-material.hex";
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
-const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
-const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
+const DEFAULT_EXPLORER_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_MAX_IN_FLIGHT: usize = 64;
 const INDEXER_UPLOAD_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
@@ -217,19 +213,15 @@ pub(crate) struct LocalArgs {
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
     /// Local `chain-indexer` Store port.
-    #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
+    #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
     /// RocksDB parallelism for the local `chain-indexer` store. Omitted
     /// leaves RocksDB's stock parallelism.
     #[arg(long = "chain-indexer-db-parallelism")]
     chain_indexer_db_parallelism: Option<i32>,
-    /// Local `metadata-indexer` read-service port.
-    /// The explorer reads from this port via `VITE_SQL_URL`.
-    #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
-    metadata_indexer_port: u16,
-    /// Local `qmdb-indexer` read-service port.
-    #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
-    qmdb_indexer_port: u16,
+    /// Local `explorer-indexer` HTTP port.
+    #[arg(long = "explorer-indexer-port", default_value_t = DEFAULT_EXPLORER_INDEXER_PORT)]
+    explorer_indexer_port: u16,
 }
 
 #[derive(Args)]
@@ -261,12 +253,9 @@ pub(crate) struct RemoteArgs {
     /// config, or port rule is generated.
     #[arg(long = "store-url", value_parser = parse_service_url)]
     store_url: Option<String>,
-    /// Origin of an already-running metadata indexer backed by the external store.
-    #[arg(long = "metadata-indexer-url", requires = "store_url", value_parser = parse_service_url)]
-    metadata_indexer_url: Option<String>,
-    /// Origin of an already-running QMDB indexer backed by the external store.
-    #[arg(long = "qmdb-indexer-url", requires = "store_url", value_parser = parse_service_url)]
-    qmdb_indexer_url: Option<String>,
+    /// Origin of an already-running explorer indexer backed by the external store.
+    #[arg(long = "indexer-url", requires = "store_url", value_parser = parse_service_url)]
+    indexer_url: Option<String>,
     /// Store writer credential for the validator indexer secondary.
     #[arg(
         long = "store-api-key",
@@ -275,7 +264,7 @@ pub(crate) struct RemoteArgs {
         requires = "store_url"
     )]
     store_api_key: Option<String>,
-    /// Store read credential for locally deployed adapter services.
+    /// Store read credential for the managed explorer service.
     #[arg(
         long = "adapter-store-api-key",
         env = "CONSTANTINOPLE_ADAPTER_STORE_API_KEY",
@@ -317,12 +306,9 @@ pub(crate) struct RemoteArgs {
     /// leaves RocksDB's stock parallelism.
     #[arg(long = "chain-indexer-db-parallelism")]
     chain_indexer_db_parallelism: Option<i32>,
-    /// Shared `metadata-indexer` query/stream port.
-    #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
-    metadata_indexer_port: u16,
-    /// Shared `qmdb-indexer` query facade port.
-    #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
-    qmdb_indexer_port: u16,
+    /// Shared `explorer-indexer` HTTP port.
+    #[arg(long = "explorer-indexer-port", default_value_t = DEFAULT_EXPLORER_INDEXER_PORT)]
+    explorer_indexer_port: u16,
     /// Enable validator CPU profiling.
     #[arg(long, default_value_t = false)]
     profiling: bool,
@@ -551,17 +537,20 @@ pub(crate) struct ChainIndexerConfig {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct AdapterConfig {
+pub(crate) struct ExplorerIndexerConfig {
     /// Optional separate metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_port: Option<u16>,
-    /// Port the adapter listens on.
+    /// Port the explorer API listens on.
     pub port: u16,
     /// URL of the Store to read from.
     pub store_url: String,
-    /// Store read credential used by this adapter.
+    /// Store read credential used by the explorer API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Transaction admission origin, excluding the /transactions path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayer_url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -908,9 +897,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterConfig, Cli, Command, DEPLOYER_CONFIG_FILE, GenerateTarget, IndexerConfig,
-        METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_CONFIG_FILE, SIMPLEX_VERIFICATION_MATERIAL_FILE,
-        VALIDATOR_BINARY_FILE, ValidatorConfig, generate_local_cluster_material, remote,
+        Cli, Command, DEPLOYER_CONFIG_FILE, EXPLORER_INDEXER_CONFIG_FILE, ExplorerIndexerConfig,
+        GenerateTarget, IndexerConfig, SIMPLEX_VERIFICATION_MATERIAL_FILE, VALIDATOR_BINARY_FILE,
+        ValidatorConfig, generate_local_cluster_material, remote,
         simplex_verification_material_from_config, write_simplex_verification_material,
     };
     use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
@@ -1033,15 +1022,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_parses_adapter_origins_and_credentials() {
+    fn remote_parses_indexer_origin_and_credentials() {
         let mut args = remote_cli_args();
         args.extend([
             "--store-url",
             "https://store.example.com",
-            "--metadata-indexer-url",
-            "https://sql.example.com",
-            "--qmdb-indexer-url",
-            "https://qmdb.example.com",
+            "--indexer-url",
+            "https://explorer.example.com",
             "--store-api-key",
             "writer-key",
             "--adapter-store-api-key",
@@ -1062,12 +1049,8 @@ mod tests {
             Some("https://store.example.com")
         );
         assert_eq!(
-            remote.metadata_indexer_url.as_deref(),
-            Some("https://sql.example.com")
-        );
-        assert_eq!(
-            remote.qmdb_indexer_url.as_deref(),
-            Some("https://qmdb.example.com")
+            remote.indexer_url.as_deref(),
+            Some("https://explorer.example.com")
         );
         assert_eq!(remote.store_api_key.as_deref(), Some("writer-key"));
         assert_eq!(remote.adapter_store_api_key.as_deref(), Some("reader-key"));
@@ -1075,11 +1058,7 @@ mod tests {
 
     #[test]
     fn remote_service_urls_reject_invalid_values() {
-        for flag in [
-            "--store-url",
-            "--metadata-indexer-url",
-            "--qmdb-indexer-url",
-        ] {
+        for flag in ["--store-url", "--indexer-url"] {
             for value in [
                 "",
                 "service.example.com",
@@ -1136,11 +1115,7 @@ mod tests {
             "https://service.example.com/path%3F%23",
         ] {
             let mut args = remote_cli_args();
-            for flag in [
-                "--store-url",
-                "--metadata-indexer-url",
-                "--qmdb-indexer-url",
-            ] {
+            for flag in ["--store-url", "--indexer-url"] {
                 args.extend([flag, value]);
             }
             let cli = parse_cli(args).expect("service bases should parse");
@@ -1152,8 +1127,7 @@ mod tests {
             };
 
             assert_eq!(remote.store_url.as_deref(), Some(value));
-            assert_eq!(remote.metadata_indexer_url.as_deref(), Some(value));
-            assert_eq!(remote.qmdb_indexer_url.as_deref(), Some(value));
+            assert_eq!(remote.indexer_url.as_deref(), Some(value));
         }
     }
 
@@ -1182,12 +1156,12 @@ mod tests {
 
         remote::generate(&generate, remote).expect("generate remote deployment");
 
-        for filename in [METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_CONFIG_FILE] {
-            let yaml = fs::read_to_string(generate.output_dir.join(filename))
-                .expect("read generated adapter config");
-            let config: AdapterConfig = serde_yaml::from_str(&yaml).expect("decode adapter config");
-            assert_eq!(config.store_url, store_url);
-        }
+        let yaml = fs::read_to_string(generate.output_dir.join(EXPLORER_INDEXER_CONFIG_FILE))
+            .expect("read generated explorer config");
+        let config: ExplorerIndexerConfig =
+            serde_yaml::from_str(&yaml).expect("decode explorer config");
+        assert_eq!(config.store_url, store_url);
+
         let yaml = fs::read_to_string(generate.output_dir.join(DEPLOYER_CONFIG_FILE))
             .expect("read generated deployment config");
         let deployment: aws::Config =
@@ -1246,17 +1220,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_adapter_origins_each_require_external_store() {
-        for flag in ["--metadata-indexer-url", "--qmdb-indexer-url"] {
-            let mut args = remote_cli_args();
-            args.extend([flag, "https://adapter.example.com"]);
-
-            let error = parse_cli(args)
-                .err()
-                .expect("remote adapter origin without an external store should fail");
-
-            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        }
+    fn remote_indexer_origin_requires_external_store() {
+        let mut args = remote_cli_args();
+        args.extend(["--indexer-url", "https://explorer.example.com"]);
+        let error = parse_cli(args)
+            .err()
+            .expect("indexer origin requires an external Store");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
@@ -1334,21 +1304,16 @@ mod tests {
             "store_url: https://store.example.com\nupload_max_in_flight: 64\nupload_budget_bytes: 1024\n",
         )
         .expect("indexer config without an API key should parse");
-        let metadata: AdapterConfig =
-            serde_yaml::from_str("port: 8091\nstore_url: https://store.example.com\n")
-                .expect("metadata config without an API key should parse");
-        let qmdb: AdapterConfig =
+        let explorer: ExplorerIndexerConfig =
             serde_yaml::from_str("port: 8092\nstore_url: https://store.example.com\n")
-                .expect("QMDB config without an API key should parse");
+                .expect("explorer config without an API key should parse");
 
         assert_eq!(indexer.api_key, None);
-        assert_eq!(metadata.api_key, None);
-        assert_eq!(qmdb.api_key, None);
+        assert_eq!(explorer.api_key, None);
 
         for raw in [
             serde_yaml::to_string(&indexer).expect("indexer config should serialize"),
-            serde_yaml::to_string(&metadata).expect("metadata config should serialize"),
-            serde_yaml::to_string(&qmdb).expect("QMDB config should serialize"),
+            serde_yaml::to_string(&explorer).expect("explorer config should serialize"),
         ] {
             assert!(!raw.contains("api_key"));
         }
@@ -1719,5 +1684,66 @@ mod tests {
             "constantinople-deploy-{name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn removed_read_service_options_are_rejected() {
+        for flag in [
+            "--metadata-indexer-url",
+            "--qmdb-indexer-url",
+            "--metadata-indexer-port",
+            "--qmdb-indexer-port",
+            "--sql-port",
+            "--indexer-port",
+        ] {
+            let mut args = remote_cli_args();
+            args.extend([flag, "8092"]);
+            assert_eq!(
+                parse_cli(args).err().unwrap().kind(),
+                ErrorKind::UnknownArgument
+            );
+        }
+    }
+
+    #[test]
+    fn local_explorer_options_replace_legacy_ports() {
+        let base = [
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "2",
+            "--output-dir",
+            "out",
+            "local",
+        ];
+        for flag in [
+            "--metadata-indexer-port",
+            "--qmdb-indexer-port",
+            "--sql-port",
+            "--indexer-port",
+        ] {
+            let mut args = base.to_vec();
+            args.extend([flag, "8092"]);
+            assert_eq!(
+                parse_cli(args).err().unwrap().kind(),
+                ErrorKind::UnknownArgument
+            );
+        }
+        let mut args = base.to_vec();
+        args.extend([
+            "--chain-indexer-port",
+            "18090",
+            "--explorer-indexer-port",
+            "18092",
+        ]);
+        let cli = parse_cli(args).expect("custom service ports parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("generate command")
+        };
+        let GenerateTarget::Local(local) = generate.target else {
+            panic!("local target")
+        };
+        assert_eq!(local.chain_indexer_port, 18090);
+        assert_eq!(local.explorer_indexer_port, 18092);
     }
 }

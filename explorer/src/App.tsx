@@ -5,10 +5,8 @@ import {
     useMemo,
     useRef,
     useState,
-    type CSSProperties,
 } from 'react';
-import { SqlClient } from '@exowarexyz/sql';
-import { AnalysisDialog } from './AnalysisDialog';
+import { SearchForm, type SearchHandle } from './SearchForm';
 import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
@@ -18,11 +16,10 @@ import {
     toHex,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
-import {
-    wakeCoveredReconciliations,
-    type TransactionReconciliation,
-} from './reconciliationQueue';
-import { type ObservedBlock, subscribeBlocksFromTargets } from './indexer';
+import { readStoredHistory } from './historyStorage';
+import { buildHistogram, formatAverageTxPerBlock } from './histogram';
+import { type VerifiedBlock, subscribeBlocks } from './indexer';
+import { appendVerifiedBatch, EMPTY_FEED } from './feedState';
 import { submitTransactions } from './mempool';
 import {
     loadAccountBundle,
@@ -58,10 +55,6 @@ import {
     retryAccountWork,
 } from './proofRetry';
 import {
-    createSharedProofTargets,
-    type PublishedProofTarget,
-} from './proofTarget';
-import {
     clearSession,
     createWallet,
     restoreWalletSession,
@@ -73,7 +66,6 @@ import {
     WAITING_FINALIZATION_PROOF,
     assignReconciliationOrder,
     isAccountKeyHex,
-    markReconciliationCertificate,
     markReconciliationError,
     markReconciliationFetching,
     markReconciliationWaiting,
@@ -81,25 +73,21 @@ import {
     markSubmissionRejected,
     markTransactionFinalized,
     markValidatorFinalizationObserved,
-    normalizeSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
     selectReconciliations,
     shouldReconcileTransaction,
-    type BlockCertificateState,
     type SubmittedTransaction,
     type TransactionProofState,
 } from './submissionHistory';
 
-/** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
 const BLOCK_LOG_MAX = 80;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
 const HISTOGRAM_HEIGHT = 18;
 const HISTOGRAM_MAX_ROWS = 200;
-const HISTOGRAM_MIN_ROWS = 8;
-const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
+const HISTOGRAM_MIN_ROWS = 1;
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 type Status =
@@ -107,19 +95,8 @@ type Status =
     | { kind: 'live' }
     | { kind: 'error'; message: string };
 
-// The explorer subscribes to `metadata-indexer` for block rows and queries
-// `qmdb-indexer` for submitted-transaction proofs. Defaults match
-// `bin/deploy/src/local.rs`; override the VITE_* URLs for non-default deployments.
-const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
-const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
-const DEFAULT_STORE_URL = 'http://127.0.0.1:8090';
-const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
-
-const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
-const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
-const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
+const indexerUrl = import.meta.env.VITE_INDEXER_URL ?? 'http://127.0.0.1:8092';
 const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
-const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
 
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
@@ -131,19 +108,26 @@ type AccountProofState =
       } & VerifiedAccountProof)
     | { readonly status: 'error'; readonly detail: string };
 
-/** Verified balance and nonce state of the signed-in wallet's account. */
+/** A proven historical account update, bound to the wallet that requested it. */
 interface WalletAccountView {
     readonly balance: bigint;
     readonly nonce: { readonly base: bigint; readonly bitmap: bigint };
+    readonly wallet: ActiveWallet;
+    readonly accountKey: string;
+    readonly snapshotHeight: bigint;
+    readonly location: bigint;
 }
 
-/** A verified block page and the offset it was requested at. */
-type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>> & { readonly offset: bigint };
+/** A verified block page and its position in the pagination history. */
+type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>> & {
+    readonly offset: bigint;
+    readonly pageNumber: number;
+};
 
 /** Certified height and block digest that pin an account's pages to one snapshot. */
 type AccountSnapshot = { readonly height: bigint; readonly blockDigest: Uint8Array };
 
-/** One in-flight wallet balance read, shared by concurrent requests for the same wallet. */
+/** One in-flight account update read, shared by requests for the same wallet. */
 interface WalletRefresh {
     readonly wallet: ActiveWallet;
     readonly accountKey: string;
@@ -159,9 +143,30 @@ interface AccountTxWithProof {
     readonly proof: TransactionProofState;
 }
 
+interface AccountPageData {
+    readonly key: string;
+    readonly account: string;
+    readonly pageNumber: number;
+    readonly target: LatestProofTarget;
+    readonly proof: AccountProofState;
+    readonly transactions: AccountTxWithProof[];
+    readonly nextCursor: Uint8Array | null;
+}
+
+interface PageRequest {
+    readonly key: string;
+    readonly loading: boolean;
+    readonly message: string;
+}
+
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
     readonly latestBlockAt: number | null;
+}
+
+interface TransactionReconciliation {
+    readonly controller: AbortController;
+    timer: number | null;
 }
 
 function disposeReconciliation(reconciliation: TransactionReconciliation) {
@@ -172,19 +177,11 @@ function disposeReconciliation(reconciliation: TransactionReconciliation) {
 const MAX_CONCURRENT_RECONCILIATIONS = 3;
 
 export default function App() {
-    const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
-    // Cumulative counter across every block observed on the stream. Tracked
-    // independently of `blocks` so the rate keeps climbing when older entries
-    // roll off the histogram buffer.
-    const [totalTxObserved, setTotalTxObserved] = useState(0);
-    const [totalBlocksObserved, setTotalBlocksObserved] = useState(0);
-    const [observedRateWindow, setObservedRateWindow] = useState<ObservedRateWindow>({
-        firstBlockAt: null,
-        latestBlockAt: null,
-    });
+    const [feed, setFeed] = useState(EMPTY_FEED);
+    const { blocks, totalTxObserved, totalBlocksObserved, observedRateWindow } = feed;
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const [isWalletOpen, setIsWalletOpen] = useState(false);
-    const [isAnalysisOpen, setIsAnalysisOpen] = useState(false);
+    const searchRef = useRef<SearchHandle>(null);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
 
     // The address is tagged with its wallet so a late derivation cannot label a newer wallet.
@@ -203,6 +200,9 @@ export default function App() {
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
     const [lookupBlock, setLookupBlock] = useState(() => blockFromLocation());
+    const [lookupTransaction, setLookupTransaction] = useState(() => transactionFromLocation());
+    const [transactionBundle, setTransactionBundle] = useState<Awaited<ReturnType<typeof loadTransactionBundle>> | null>(null);
+    const [transactionRequest, setTransactionRequest] = useState<PageRequest>({ key: '', loading: false, message: '' });
     const [blockOffsets, setBlockOffsets] = useState<bigint[]>([0n]);
     const [blockBundle, setBlockBundle] = useState<BlockBundle | null>(null);
     const [blockMessage, setBlockMessage] = useState('');
@@ -220,18 +220,10 @@ export default function App() {
     activeWalletRef.current = wallet;
     activeWalletKeyRef.current = walletAccountKey;
 
-    const [publishedProofTarget, setPublishedProofTarget] =
-        useState<PublishedProofTarget | null>(null);
-    const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
-    const [accountProof, setAccountProof] = useState<AccountProofState>({
-        status: 'waiting',
-        detail: 'enter an account',
-    });
-    const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
-    const [accountActivityError, setAccountActivityError] = useState('');
+    const [accountPageData, setAccountPageData] = useState<AccountPageData | null>(null);
+    const [accountRequest, setAccountRequest] = useState<PageRequest>({ key: '', loading: false, message: '' });
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
-    const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [copyToast, setCopyToast] = useState('');
     const [storageError, setStorageError] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
@@ -242,16 +234,13 @@ export default function App() {
     const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
-        accountMessage === 'loading verified balance' ||
+        accountMessage === 'loading account update proof' ||
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInAccountKey = walletAccountKey;
     const historyKey = submittedTransactionHistoryKey(
         {
             indexerUrl,
-            qmdbUrl,
-            storeUrl,
-            mempoolUrl,
             simplexVerificationMaterial,
         },
         signedInAccountKey,
@@ -263,12 +252,28 @@ export default function App() {
     const reconciliationFailuresRef = useRef(new Map<string, number>());
     const reconciliationSequenceRef = useRef(0);
     const foregroundSubmissionsRef = useRef(new Set<string>());
-    const publishedProofTargetRef = useRef<PublishedProofTarget | null>(publishedProofTarget);
     activeHistoryKeyRef.current = historyKey;
     loadedHistoryKeyRef.current = loadedHistoryKey;
-    publishedProofTargetRef.current = publishedProofTarget;
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
-    const proofTargetReady = publishedProofTarget !== null;
+    const currentAccountViewKey = JSON.stringify([
+        lookupAccount, accountActivityMode, currentAccountCursor ? bytesToHex(currentAccountCursor) : null,
+    ]);
+    const pinnedAccount = accountSnapshotRef.current;
+
+    // A pending page keeps the previous rows and their proof together under the same snapshot.
+    const displayedAccount = accountPageData && (
+        accountPageData.key === currentAccountViewKey || (
+            accountPageData.account === lookupAccount && pinnedAccount?.account === lookupAccount &&
+            accountPageData.target.height === pinnedAccount.target.height &&
+            bytesToHex(accountPageData.target.blockDigest) === bytesToHex(pinnedAccount.target.blockDigest)
+        )
+    ) ? accountPageData : null;
+    const accountRequestMatches = accountRequest.key === currentAccountViewKey;
+    const accountLoading = !accountRequestMatches || accountRequest.loading;
+    const accountNextCursor = displayedAccount?.nextCursor ?? null;
+    const accountPaginationReady = !accountLoading && displayedAccount?.key === currentAccountViewKey &&
+        pinnedAccount?.account === lookupAccount;
+    const walletAccount = account?.wallet === wallet && account.accountKey === walletAccountKey ? account : null;
     const currentBlockOffset = blockOffsets[blockOffsets.length - 1] ?? 0n;
 
     const setLocalNonceState = (nextNonce: NonceState) => {
@@ -287,24 +292,6 @@ export default function App() {
         applyLocalNonceReservations();
     };
 
-    // Render delivered blocks immediately so the UI adds no buffering delay
-    // to publication or catch-up delivery.
-    const applyObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
-        if (nextBlocks.length === 0) return;
-
-        setBlocks((current) => upsertBoundedBatch(nextBlocks, current));
-        setTotalTxObserved(
-            (current) =>
-                current + nextBlocks.reduce((total, block) => total + block.txCount, 0),
-        );
-        setTotalBlocksObserved((current) => current + nextBlocks.length);
-        setObservedRateWindow((current) => ({
-            firstBlockAt: current.firstBlockAt ?? nextBlocks[0].arrivedAt,
-            latestBlockAt: nextBlocks[nextBlocks.length - 1].arrivedAt,
-        }));
-        setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
-    };
-
     useEffect(() => {
         try {
             const restoredWallet = restoreWalletSession();
@@ -319,13 +306,6 @@ export default function App() {
 
     useEffect(() => {
         const controller = new AbortController();
-        const targets = createSharedProofTargets(storeUrl, {
-            signal: controller.signal,
-            onError: (message) =>
-                setStatus({ kind: 'error', message: `proof target error: ${message}` }),
-        });
-        const blockTargets = targets.subscribe({ signal: controller.signal });
-        const proofTargets = targets.subscribe({ signal: controller.signal });
         const failed = (error: unknown) => {
             if (controller.signal.aborted) return;
             setStatus({
@@ -335,34 +315,31 @@ export default function App() {
         };
 
         (async () => {
-            for await (const block of subscribeBlocksFromTargets(new SqlClient(indexerUrl), blockTargets, {
+            for await (const batch of subscribeBlocks(indexerUrl, {
+                simplexVerificationMaterial,
                 signal: controller.signal,
                 onError: (message) =>
                     setStatus({ kind: 'error', message: `backend error: ${message}` }),
                 onReconnect: () => setStatus({ kind: 'connecting' }),
             })) {
                 if (controller.signal.aborted) return;
-                applyObservedBlocks([block]);
+                setFeed((current) => appendVerifiedBatch(current, batch));
+                setStatus({ kind: 'live' });
             }
         })().catch(failed);
 
-        (async () => {
-            for await (const target of proofTargets) {
-                if (controller.signal.aborted) return;
-                setPublishedProofTarget((current) =>
-                    current && current.height >= target.height ? current : target,
-                );
-            }
-        })().catch(failed);
-
-        return () => {
-            controller.abort();
-            targets.close();
-        };
+        return () => controller.abort();
     }, []);
 
     useEffect(() => {
-        const restored = historyKey === null ? [] : readHistory(historyKey, setStorageError);
+        let restored: SubmittedTransaction[];
+        try {
+            restored = historyKey === null ? [] : readStoredHistory(historyKey, window.localStorage);
+        } catch (error) {
+            setStorageError(storageErrorMessage(error));
+            setLoadedHistoryKey(null);
+            return;
+        }
         reservedNoncesRef.current = new Set(
             restored
                 .filter(
@@ -409,11 +386,13 @@ export default function App() {
 
     useEffect(() => {
         const onPopState = () => {
+            searchRef.current?.cancel();
             const next = accountFromLocation();
             setLookupAccount(next);
             accountSnapshotRef.current = null;
             setAccountCursorStack([null]);
             setLookupBlock(blockFromLocation());
+            setLookupTransaction(transactionFromLocation());
             setBlockOffsets([0n]);
         };
         window.addEventListener('popstate', onPopState);
@@ -426,30 +405,20 @@ export default function App() {
         void prewarmProofVerification(simplexVerificationMaterial).catch(() => {});
     }, []);
 
-    // Load one verified account page. Only the first load selects a snapshot and shows certificate
-    // progress. Later pages and filters reuse it.
+    // Publish each verified page atomically. Pagination retains the preceding page until then.
     useEffect(() => {
         const controller = new AbortController();
         if (!lookupAccount) {
-            setAccountTarget(null);
-            setAccountProof({ status: 'waiting', detail: 'enter an account' });
-            setAccountTransactions([]);
-            setAccountNextCursor(null);
-            setAccountActivityError('');
+            setAccountPageData(null);
+            setAccountRequest({ key: currentAccountViewKey, loading: false, message: '' });
             return;
         }
 
         const retained = accountSnapshotRef.current;
         const at = retained?.account === lookupAccount ? retained.target : undefined;
-        if (!at) {
-            setAccountTarget(null);
-            setAccountProof({ status: 'fetching', detail: 'fetching certified account' });
-        }
-        setAccountTransactions([]);
-        setAccountNextCursor(null);
-        setAccountActivityError('loading transactions');
+        setAccountRequest({ key: currentAccountViewKey, loading: true, message: '' });
         retryAccountWork(() => loadAccountBundle({
-            qmdbUrl,
+            indexerUrl,
             simplexVerificationMaterial,
             account: lookupAccount,
             mode: accountActivityMode,
@@ -457,31 +426,35 @@ export default function App() {
             at,
             signal: controller.signal,
         }), controller.signal, isRetryableAccountProofError, {
-            onRetry: (error) => {
-                if (!at) setAccountProof(retryingProofState(error));
-                setAccountActivityError(accountRetryReason(error) ?? errorMessage(error));
-            },
+            onRetry: (error) => setAccountRequest({
+                key: currentAccountViewKey, loading: true,
+                message: accountRetryReason(error) ?? errorMessage(error),
+            }),
         }).then((bundle) => {
             if (controller.signal.aborted) return;
 
-            // The verified page pins the snapshot for this account's later pages.
+            // Keep the page, cursor and certificate bound to one verified snapshot.
             accountSnapshotRef.current = { account: lookupAccount, target: bundle.target };
-            setAccountTarget(bundle.target);
-            setAccountProof(bundle.account ? {
-                status: 'verified', detail: `verified at height ${bundle.target.height}`, ...bundle.account,
-            } : { status: 'missing', detail: 'no indexed account update' });
-            setAccountTransactions(bundle.page.rows.map((row, index) => ({
-                row, proof: verifiedProofState(bundle.transactionProofs[index]!),
-            })));
-            setAccountNextCursor(bundle.page.nextCursor);
-            setAccountActivityError('');
+            setAccountPageData({
+                key: currentAccountViewKey,
+                account: lookupAccount,
+                pageNumber: accountCursorStack.length,
+                target: bundle.target,
+                proof: bundle.account ? {
+                    status: 'verified', detail: `historical update under snapshot ${bundle.target.height}`, ...bundle.account,
+                } : { status: 'missing', detail: 'no indexed account update' },
+                transactions: bundle.page.rows.map((row, index) => ({
+                    row, proof: verifiedProofState(bundle.transactionProofs[index]!),
+                })),
+                nextCursor: bundle.page.nextCursor,
+            });
+            setAccountRequest({ key: currentAccountViewKey, loading: false, message: '' });
         }).catch((error) => {
             if (controller.signal.aborted) return;
-            if (!at) setAccountProof({ status: 'error', detail: errorMessage(error) });
-            setAccountActivityError(errorMessage(error));
+            setAccountRequest({ key: currentAccountViewKey, loading: false, message: errorMessage(error) });
         });
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountRefresh]);
+    }, [currentAccountViewKey, accountRefresh]);
 
     // Load one verified block page. The block's certificate stays visible while another page of the
     // same block loads.
@@ -495,13 +468,13 @@ export default function App() {
         }
         setBlockLoading(true);
         retryAccountWork(() => loadBlockBundle({
-            qmdbUrl, simplexVerificationMaterial, height: lookupBlock,
+            indexerUrl, simplexVerificationMaterial, height: lookupBlock,
             offset: currentBlockOffset, signal: controller.signal,
         }), controller.signal, isRetryableAccountProofError, {
             onRetry: (error) => setBlockMessage(accountRetryReason(error) ?? errorMessage(error)),
         }).then((bundle) => {
             if (controller.signal.aborted) return;
-            setBlockBundle({ ...bundle, offset: currentBlockOffset });
+            setBlockBundle({ ...bundle, offset: currentBlockOffset, pageNumber: blockOffsets.length });
             setBlockMessage('');
             setBlockLoading(false);
         }).catch((error) => {
@@ -511,6 +484,33 @@ export default function App() {
         });
         return () => controller.abort();
     }, [lookupBlock, currentBlockOffset]);
+
+    useEffect(() => {
+        const controller = new AbortController();
+        setTransactionBundle((current) => current?.transaction.digest === lookupTransaction ? current : null);
+        if (!lookupTransaction) {
+            setTransactionRequest({ key: '', loading: false, message: '' });
+            return;
+        }
+        setTransactionRequest({ key: lookupTransaction, loading: true, message: '' });
+        retryAccountWork(() => loadTransactionBundle({
+            indexerUrl, simplexVerificationMaterial, digest: lookupTransaction,
+            signal: controller.signal,
+        }), controller.signal, isRetryableProofError, {
+            onRetry: (error) => setTransactionRequest({
+                key: lookupTransaction, loading: true,
+                message: accountRetryReason(error) ?? errorMessage(error),
+            }),
+        }).then((bundle) => {
+            if (controller.signal.aborted) return;
+            setTransactionBundle(bundle);
+            setTransactionRequest({ key: lookupTransaction, loading: false, message: '' });
+        }).catch((error) => {
+            if (controller.signal.aborted) return;
+            setTransactionRequest({ key: lookupTransaction, loading: false, message: errorMessage(error) });
+        });
+        return () => controller.abort();
+    }, [lookupTransaction]);
 
     useEffect(() => {
         const reconciliations = reconciliationsRef.current;
@@ -533,23 +533,8 @@ export default function App() {
         );
     };
 
-    const wakeReconciliations = (height: bigint) => {
-        wakeCoveredReconciliations(
-            reconciliationsRef.current,
-            height,
-            (timer) => window.clearTimeout(timer),
-            requeueReconciliation,
-        );
-    };
-
-    useEffect(() => {
-        if (historyKey === null || loadedHistoryKey !== historyKey || !publishedProofTarget) return;
-        wakeReconciliations(publishedProofTarget.height);
-    }, [publishedProofTarget, historyKey, loadedHistoryKey]);
-
     useEffect(() => {
         if (historyKey === null || loadedHistoryKey !== historyKey) return;
-        const publishedTarget = publishedProofTargetRef.current;
 
         const reconciliations = reconciliationsRef.current;
         const trackedDigests = new Set(history.map((tx) => tx.digest));
@@ -589,7 +574,6 @@ export default function App() {
             const reconciliation: TransactionReconciliation = {
                 controller: new AbortController(),
                 timer: null,
-                waitingForHeight: null,
             };
             reconciliations.set(tx.digest, reconciliation);
             const releaseReconciliation = () => {
@@ -600,34 +584,10 @@ export default function App() {
             setHistory((current) => markReconciliationFetching(tx.digest, current));
 
             loadTransactionBundle({
-                qmdbUrl,
+                indexerUrl,
                 simplexVerificationMaterial,
                 digest: tx.digest,
                 signal: reconciliation.controller.signal,
-                onFinalizationVerified: (target) => {
-                    if (
-                        reconciliation.controller.signal.aborted ||
-                        activeHistoryKeyRef.current !== historyKey ||
-                        reconciliations.get(tx.digest) !== reconciliation
-                    ) {
-                        return;
-                    }
-                    const height = Number(target.height);
-                    if (!Number.isSafeInteger(height)) {
-                        throw new Error('finalized transaction height exceeds Number.MAX_SAFE_INTEGER');
-                    }
-                    const certificate = verifiedBlockCertificateState(target);
-                    const observedAt = Date.now();
-                    setHistory((current) =>
-                        markReconciliationCertificate(
-                            tx.digest,
-                            height,
-                            certificate,
-                            observedAt,
-                            current,
-                        ),
-                    );
-                },
             })
                 .then((proof) => {
                     if (
@@ -639,19 +599,9 @@ export default function App() {
                     if (!releaseReconciliation()) return;
                     reconciliationOrderRef.current.delete(tx.digest);
                     reconciliationFailuresRef.current.delete(tx.digest);
-                    const height = Number(proof.height);
-                    const certificate = verifiedBlockCertificateState(proof);
-                    const proofState = verifiedProofState(proof);
                     const proofObservedAt = Date.now();
                     setHistory((current) =>
-                        markTransactionFinalized(
-                            tx.digest,
-                            height,
-                            certificate,
-                            proofState,
-                            proofObservedAt,
-                            current,
-                        ),
+                        markTransactionFinalized(proof, proofObservedAt, current),
                     );
                     if (wallet !== null && activeHistoryKeyRef.current === historyKey) {
                         void refreshAccount(true);
@@ -682,13 +632,6 @@ export default function App() {
                         (reconciliationFailuresRef.current.get(tx.digest) ?? 0) + 1;
                     reconciliationFailuresRef.current.set(tx.digest, failures);
 
-                    // Only publication coverage waits can be resolved by a new target.
-                    // Missing old transactions and transport failures retain their backoff.
-                    reconciliation.waitingForHeight =
-                        tx.finalizedHeight !== null &&
-                        (!publishedTarget || BigInt(tx.finalizedHeight) > publishedTarget.height)
-                            ? BigInt(tx.finalizedHeight)
-                            : null;
                     const waitingDetail = 'reconciliation retry scheduled';
                     setHistory((current) =>
                         markReconciliationWaiting(tx.digest, waitingDetail, current),
@@ -705,11 +648,9 @@ export default function App() {
                         }
                         requeueReconciliation(tx.digest);
                     }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
-                    const latest = publishedProofTargetRef.current;
-                    if (latest) wakeReconciliations(latest.height);
                 });
         }
-    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet, proofTargetReady]);
+    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet]);
 
     useEffect(() => {
         return () => {
@@ -719,7 +660,7 @@ export default function App() {
         };
     }, []);
 
-    // Reads the wallet's verified balance without activity. Requests for the same wallet share one
+    // Reads a historical account update without activity. Requests for the same wallet share one
     // read, and a read for a replaced wallet is aborted.
     const refreshAccount = (afterFinalization = false): Promise<void> => {
         if (!wallet || !walletAccountKey) return Promise.resolve();
@@ -743,22 +684,24 @@ export default function App() {
             // Read again when a finalization arrived during the previous read.
             do {
                 refresh.again = false;
-                setAccountMessage('loading verified balance');
+                setAccountMessage('loading account update proof');
                 try {
                     const bundle = await retryAccountWork(() => loadAccountBundle({
-                        qmdbUrl, simplexVerificationMaterial, account: walletAccountKey,
+                        indexerUrl, simplexVerificationMaterial, account: walletAccountKey,
                         includeTransactions: false, signal: controller.signal,
                     }), controller.signal, isRetryableAccountProofError);
                     if (!current()) return;
                     const nextAccount = bundle.account ? {
                         balance: bundle.account.balance,
                         nonce: { base: bundle.account.nonce, bitmap: bundle.account.nonceBitmap },
+                        wallet, accountKey: walletAccountKey,
+                        snapshotHeight: bundle.target.height, location: bundle.account.location,
                     } : null;
                     setAccount(nextAccount);
-                    setCommittedNonceState(accountNonceState(nextAccount));
+                    if (nextAccount) setCommittedNonceState(accountNonceState(nextAccount));
                     setAccountMessage(nextAccount
-                        ? `account update verified at height ${bundle.target.height}`
-                        : 'no indexed account update; default balance applies');
+                        ? ''
+                        : 'no account update proof');
                 } catch (error) {
                     if (!current()) return;
                     setAccountMessage(errorMessage(error));
@@ -850,15 +793,18 @@ export default function App() {
         const normalized = normalizeAccountInput(value);
         if (!normalized) return false;
 
+        searchRef.current?.cancel();
+
         // A new account starts from a fresh snapshot, and the account view replaces any block view.
-        setIsAnalysisOpen(false);
         if (normalized !== lookupAccount) accountSnapshotRef.current = null;
         setLookupAccount(normalized);
         setLookupBlock(null);
+        setLookupTransaction('');
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
         url.pathname = '/';
         url.searchParams.delete('block');
+        url.searchParams.delete('transaction');
         url.searchParams.set('account', normalized);
         const nextLocation = `${url.pathname}${url.search}${url.hash}`;
         if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
@@ -868,22 +814,17 @@ export default function App() {
         return true;
     }, [lookupAccount]);
 
-    const openAnalysis = () => {
-        setIsAnalysisOpen(true);
-        setIsWalletOpen(false);
-    };
-
-    const closeAnalysis = useCallback(() => setIsAnalysisOpen(false), []);
-
     const clearAccountLookup = () => {
-        setIsAnalysisOpen(false);
+        searchRef.current?.cancel();
         setLookupAccount('');
         setLookupBlock(null);
+        setLookupTransaction('');
         accountSnapshotRef.current = null;
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
         url.pathname = '/';
         url.searchParams.delete('block');
+        url.searchParams.delete('transaction');
         url.searchParams.delete('account');
         const nextLocation = `${url.pathname}${url.search}${url.hash}`;
         if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
@@ -893,15 +834,34 @@ export default function App() {
 
     const openBlockPage = useCallback((height: bigint) => {
         // The block view replaces any account view and starts at the first page.
-        setIsAnalysisOpen(false);
+        searchRef.current?.cancel();
         setLookupAccount('');
         accountSnapshotRef.current = null;
         setLookupBlock(height);
+        setLookupTransaction('');
         setBlockOffsets([0n]);
         const url = new URL(window.location.href);
         url.pathname = '/';
         url.searchParams.delete('account');
+        url.searchParams.delete('transaction');
         url.searchParams.set('block', height.toString());
+        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    }, []);
+
+    const openTransactionPage = useCallback((digest: string) => {
+        const normalized = normalizeAccountInput(digest);
+        if (!normalized) return;
+        searchRef.current?.cancel();
+        setIsWalletOpen(false);
+        setLookupAccount('');
+        setLookupBlock(null);
+        accountSnapshotRef.current = null;
+        setLookupTransaction(normalized);
+        const url = new URL(window.location.href);
+        url.pathname = '/';
+        url.searchParams.delete('account');
+        url.searchParams.delete('block');
+        url.searchParams.set('transaction', normalized);
         window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
     }, []);
 
@@ -913,7 +873,7 @@ export default function App() {
     };
 
     const nextAccountPage = () => {
-        if (!accountNextCursor) return;
+        if (!accountNextCursor || !accountPaginationReady) return;
         setAccountCursorStack((current) => [...current, accountNextCursor]);
     };
 
@@ -924,7 +884,6 @@ export default function App() {
     const changeAccountActivityMode = (mode: AccountActivityMode) => {
         setAccountActivityMode(mode);
         setAccountCursorStack([null]);
-        setAccountNextCursor(null);
     };
 
     // Preserve reservations until committed account state reflects finalization.
@@ -972,7 +931,7 @@ export default function App() {
             return;
         }
         const originHistoryKey = historyKey;
-        if (originHistoryKey === null) {
+        if (originHistoryKey === null || loadedHistoryKeyRef.current !== originHistoryKey) {
             setSubmitMessage('submitted transaction history is unavailable');
             return;
         }
@@ -1030,7 +989,7 @@ export default function App() {
             setSubmitMessage('submitting');
 
             const status = await submitTransactions(
-                mempoolUrl,
+                indexerUrl,
                 encodeTransactionBatch([encoded.bytes]),
             );
             if (status.status === 'pending') {
@@ -1039,7 +998,7 @@ export default function App() {
                     (current) =>
                         markSubmissionReconciling(
                             encoded.digestHex,
-                            'finality wait timed out. checking finalized proof',
+                            'submission timed out',
                             current,
                         ),
                 );
@@ -1047,12 +1006,6 @@ export default function App() {
                 return;
             }
             const outcome = singleTransactionOutcome(status);
-            if (outcome.kind === 'dropped') {
-                throw new TransactionSubmissionError(
-                    'rejected',
-                    'validator reported transaction dropped before finalization',
-                );
-            }
             if (outcome.kind === 'ambiguous') {
                 throw new TransactionSubmissionError('ambiguous', outcome.detail);
             }
@@ -1133,8 +1086,9 @@ export default function App() {
                             explorer
                         </button>
                     </h1>
+                    <SearchForm ref={searchRef} endpoint={indexerUrl} onOpenAccount={openAccountPage} onOpenTransaction={openTransactionPage} />
                     <div className="app__header-actions">
-                        {(status.kind !== 'live' || lookupAccount !== '' || lookupBlock !== null) && (
+                        {(status.kind !== 'live' || lookupAccount !== '' || lookupBlock !== null || lookupTransaction !== '') && (
                             <>
                                 <StatusBadge status={status} spinner={spinner} height={blocks[0]?.height ?? null} />
                                 <span className="app__header-separator" aria-hidden="true">
@@ -1142,14 +1096,8 @@ export default function App() {
                                 </span>
                             </>
                         )}
-                        <button className="wallet-trigger" aria-expanded={isAnalysisOpen} onClick={openAnalysis}>
-                            search
-                        </button>
-                        <span className="app__header-separator" aria-hidden="true">
-                            ⬝
-                        </span>
                         <button className="wallet-trigger" onClick={() => {
-                            setIsAnalysisOpen(false);
+                            searchRef.current?.cancel();
                             setIsWalletOpen(true);
                         }}>
                             wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
@@ -1168,14 +1116,18 @@ export default function App() {
                                 account={lookupAccount}
                                 onCopy={copyValue}
                                 onOpenAddress={openAccountPage}
-                                pageNumber={accountCursorStack.length}
-                                proof={accountProof}
-                                target={accountTarget}
-                                transactions={accountTransactions}
-                                activityError={accountActivityError}
+                                onOpenTransaction={openTransactionPage}
+                                pageNumber={displayedAccount?.pageNumber ?? accountCursorStack.length}
+                                pageRequestKey={currentAccountViewKey}
+                                retainingPage={displayedAccount !== null && displayedAccount.key !== currentAccountViewKey}
+                                proof={displayedAccount?.proof ?? { status: 'fetching', detail: 'verifying account evidence' }}
+                                target={displayedAccount?.target ?? null}
+                                transactions={displayedAccount?.transactions ?? []}
+                                activityError={accountRequestMatches ? accountRequest.message : ''}
+                                loading={accountLoading}
                                 activityMode={accountActivityMode}
-                                hasPrevious={accountCursorStack.length > 1}
-                                hasNext={accountNextCursor !== null}
+                                hasPrevious={accountPaginationReady && accountCursorStack.length > 1}
+                                hasNext={accountPaginationReady && accountNextCursor !== null}
                                 onActivityModeChange={changeAccountActivityMode}
                                 onPrevious={previousAccountPage}
                                 onNext={nextAccountPage}
@@ -1197,9 +1149,15 @@ export default function App() {
                                         setBlockOffsets((current) => [...current, next]);
                                     }
                                 }}
-                                onCopy={copyValue}
                                 onOpenAddress={openAccountPage}
+                                onOpenTransaction={openTransactionPage}
                             />
+                        ) : lookupTransaction ? (
+                            <TransactionPage digest={lookupTransaction}
+                                bundle={transactionBundle?.transaction.digest === lookupTransaction ? transactionBundle : null}
+                                message={transactionRequest.key === lookupTransaction ? transactionRequest.message : ''}
+                                loading={transactionRequest.key !== lookupTransaction || transactionRequest.loading}
+                                onCopy={copyValue} onOpenAddress={openAccountPage} onOpenBlock={openBlockPage} />
                         ) : (
                             <>
                                 <Histogram blocks={blocks} />
@@ -1214,22 +1172,13 @@ export default function App() {
                         )}
                     </section>
                 </main>
-                <AnalysisDialog
-                    open={isAnalysisOpen}
-                    endpoint={indexerUrl}
-                    suggestedAccount={lookupAccount || walletAccountKey || ''}
-                    latestHeight={blocks[0]?.height ?? null}
-                    onClose={closeAnalysis}
-                    onOpenAccount={openAccountPage}
-                    onOpenBlock={openBlockPage}
-                />
                 {isWalletOpen && (
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
                         <WalletPanel
                             wallet={wallet}
                             walletAccountKey={walletAccountKey}
                             walletMessage={walletMessage}
-                            account={account}
+                            account={walletAccount}
                             accountMessage={accountMessage}
                             toKey={toKey}
                             value={value}
@@ -1266,11 +1215,15 @@ function AccountPage({
     account,
     onCopy,
     onOpenAddress,
+    onOpenTransaction,
     pageNumber,
+    pageRequestKey,
+    retainingPage,
     proof,
     target,
     transactions,
     activityError,
+    loading,
     activityMode,
     hasPrevious,
     hasNext,
@@ -1282,11 +1235,15 @@ function AccountPage({
     account: string;
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
+    onOpenTransaction: (digest: string) => void;
     pageNumber: number;
+    pageRequestKey: string;
+    retainingPage: boolean;
     proof: AccountProofState;
     target: LatestProofTarget | null;
     transactions: AccountTxWithProof[];
     activityError: string;
+    loading: boolean;
     activityMode: AccountActivityMode;
     hasPrevious: boolean;
     hasNext: boolean;
@@ -1300,48 +1257,54 @@ function AccountPage({
     const transactionProof = transactions[0]?.proof;
     const proofItems = new Set(transactions.map(({ row }) => row.location)).size;
     return (
-        <section className="account-page" aria-label="account proof">
+        <section className="account-page" aria-label="account proof" aria-busy={loading}>
             <div className="account-page__title">
                 <h2>account</h2>
-                <button onClick={onRefresh}>refresh</button>
+                <button onClick={onRefresh} disabled={loading}>refresh</button>
             </div>
             <div className="account-page__line">
                 <span className="account-page__prompt">address</span>
                 <CopyableValue value={account} onCopy={onCopy} />
             </div>
             <div className="account-proof-grid">
-                <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
-                <ProofDatum
-                    label="proof"
-                    value={transactionProof?.status === 'verified'
-                        ? <span className="proof-badge">op{transactionProof.tip} / {proofItems}L</span>
-                        : '-'}
-                />
-                <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
-                <ProofDatum
-                    label="state"
-                    value={
-                        proof.status === 'verified'
-                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
-                            : proof.detail
-                    }
-                />
-                <ProofDatum
-                    label="state proof"
-                    value={
-                        proof.status === 'verified'
-                            ? <span className="proof-badge">
-                                <span className="tx-proof-check" aria-label="QMDB proof verified">✓</span>
-                                <span>loc {proof.location}</span>
-                            </span>
-                            : proof.status === 'missing'
-                                ? 'not available'
-                                : proof.status
-                    }
-                />
+                <div className="account-proof-grid__details">
+                    <ProofDatum label="block" pending={!target} value={target ? shortHex(bytesToHex(target.blockDigest)) : '—'} />
+                    <ProofDatum
+                        label="historical update"
+                        pending={proof.status !== 'verified'}
+                        value={
+                            proof.status === 'verified'
+                                ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
+                                : proof.status === 'missing' ? 'unknown' : '—'
+                        }
+                    />
+                </div>
+                <div className="account-proof-grid__evidence account-proof-grid__evidence--three">
+                    <ProofDatum label="cert" verified={!!target} pending={!target} value={target ? `h${target.height.toString()} / v${target.view.toString()}` : '—'} />
+                    <ProofDatum
+                        label="transaction proof"
+                        verified={transactionProof?.status === 'verified'}
+                        pending={transactionProof?.status !== 'verified'}
+                        value={transactionProof?.status === 'verified'
+                            ? <span className="proof-badge">op{transactionProof.tip} / {proofItems}L</span>
+                            : '-'}
+                    />
+                    <ProofDatum
+                        label="account proof"
+                        verified={proof.status === 'verified'}
+                        pending={proof.status !== 'verified'}
+                        value={
+                            proof.status === 'verified'
+                                ? <span className="proof-badge">loc {proof.location}</span>
+                                : proof.status === 'missing'
+                                    ? 'not available'
+                                    : '—'
+                        }
+                    />
+                </div>
             </div>
             <div className="account-page__subhead">
-                <h3>{activityMode} tx page {pageNumber}</h3>
+                <h3>page {pageNumber}</h3>
                 <div className="account-page__modes" role="tablist" aria-label="account transaction filter">
                     {(['all', 'sent', 'received'] as const).map((mode) => (
                         <button
@@ -1357,22 +1320,22 @@ function AccountPage({
                     ))}
                 </div>
                 <div className="account-page__pager">
+                    <span key={pageRequestKey} aria-hidden="true"
+                        className={`account-page__progress${loading && retainingPage ? ' account-page__progress--pending' : ''}`}>loading</span>
                     <button disabled={!hasPrevious} onClick={onPrevious}>prev</button>
                     <button disabled={!hasNext} onClick={onNext}>next</button>
                 </div>
             </div>
+            <PageStatus message={activityError || (loading && !retainingPage ? target ? 'refreshing verified selection' : 'verifying account evidence' : '')} />
             <div className="account-tx-list">
-                {activityError && (
-                    <div className="account-tx-row account-tx-row--empty">{activityError}</div>
-                )}
-                {!activityError && transactions.length === 0 && (
-                    <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
+                {!target && <PendingTransactionRow includeDigest />}
+                {target && transactions.length === 0 && (
+                    <div className="account-tx-row account-tx-row--empty">no proven transactions returned</div>
                 )}
                 {transactions.map(({ row, proof: txProof }) => (
-                    <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}-${row.direction}`}>
+                    <div className="account-tx-row" key={`${row.location}-${row.direction}`}>
                         <div className="account-tx-row__main">
-                            <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
-                            <CopyableValue value={row.digest} onCopy={onCopy} />
+                            <AddressValue kind="transaction" value={row.digest} onOpenAddress={onOpenTransaction} />
                             <span className="tx-party">
                                 <span className="account-tx-row__label">from</span>
                                 <AccountPageAddressValue
@@ -1406,7 +1369,7 @@ function AccountPage({
 
 function BlockPage({
     height, offset, bundle, message, loading, pageNumber, hasPrevious,
-    onPrevious, onNext, onCopy, onOpenAddress,
+    onPrevious, onNext, onOpenAddress, onOpenTransaction,
 }: {
     height: bigint;
     offset: bigint;
@@ -1417,43 +1380,50 @@ function BlockPage({
     hasPrevious: boolean;
     onPrevious: () => void;
     onNext: () => void;
-    onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
+    onOpenTransaction: (digest: string) => void;
 }) {
-    // Rows show only for the requested offset, while the block's certificate stays visible.
-    const page = bundle?.offset === offset ? bundle : null;
-    const transactionProof = page?.transactions[0]?.proof;
+    const pageIsCurrent = bundle?.offset === offset;
+    const transactionProof = bundle?.transactions[0]?.proof;
     return (
-        <section className="account-page" aria-label="certified block">
+        <section className="account-page" aria-label="certified block" aria-busy={loading}>
             <div className="account-page__title">
                 <h2>block {height.toString()}</h2>
             </div>
             <div className="account-proof-grid">
-                <ProofDatum label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : loading ? 'loading certificate' : '-'} />
-                <ProofDatum
-                    label="proof"
-                    value={page && transactionProof
-                        ? <span className="proof-badge">op{transactionProof.tip} / {page.transactions.length}L</span>
-                        : '-'}
-                />
-                <ProofDatum label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '-'} />
-                <ProofDatum label="transactions" value={bundle?.block.transactionCount.toString() ?? '-'} />
-            </div>
-            <div className="account-page__subhead">
-                <h3>transactions / page {pageNumber}</h3>
-                <div className="account-page__pager">
-                    <button disabled={!hasPrevious || loading} onClick={onPrevious}>prev</button>
-                    <button disabled={loading || !page || page.nextOffset === null} onClick={onNext}>next</button>
+                <div className="account-proof-grid__details">
+                    <ProofDatum pending={!bundle} label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '-'} />
+                    <ProofDatum pending={!bundle} label="transactions" value={bundle?.block.transactionCount.toString() ?? '-'} />
+                </div>
+                <div className="account-proof-grid__evidence">
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : '—'} />
+                    <ProofDatum
+                        label="transaction proof"
+                        verified={!!transactionProof}
+                        pending={!transactionProof}
+                        value={bundle && transactionProof
+                            ? <span className="proof-badge">op{transactionProof.tip} / {bundle.transactions.length}L</span>
+                            : '-'}
+                    />
                 </div>
             </div>
-            {message && <div className="account-tx-row" role="status">{message}</div>}
-            {loading && !message && <div className="account-tx-row" role="status">loading certified transactions</div>}
-            {page && page.transactions.length === 0 && <div className="account-tx-row">no transactions in this block</div>}
+            <div className="account-page__subhead">
+                <h3>page {bundle?.pageNumber ?? pageNumber}</h3>
+                <div className="account-page__pager">
+                    <span key={offset.toString()} aria-hidden="true"
+                        className={`account-page__progress${loading && bundle && !pageIsCurrent ? ' account-page__progress--pending' : ''}`}>loading</span>
+                    <button disabled={!hasPrevious || loading || !pageIsCurrent} onClick={onPrevious}>prev</button>
+                    <button disabled={loading || !pageIsCurrent || bundle?.nextOffset == null} onClick={onNext}>next</button>
+                </div>
+            </div>
+            <PageStatus message={message || (loading && !bundle ? 'verifying block evidence' : '')} />
+            {bundle && bundle.transactions.length === 0 && <div className="account-tx-row">no transactions in this block</div>}
             <div className="account-tx-list">
-                {page?.transactions.map((transaction) => (
+                {!bundle && <PendingTransactionRow includeDigest />}
+                {bundle?.transactions.map((transaction) => (
                     <div className="account-tx-row" key={transaction.location.toString()}>
                         <div className="account-tx-row__main">
-                            <CopyableValue value={transaction.digest} onCopy={onCopy} />
+                            <AddressValue kind="transaction" value={transaction.digest} onOpenAddress={onOpenTransaction} />
                             <span className="tx-party">
                                 <span className="account-tx-row__label">from</span>
                                 <AddressValue value={transaction.sender} onOpenAddress={onOpenAddress} />
@@ -1475,11 +1445,83 @@ function BlockPage({
     );
 }
 
-function ProofDatum({ label, value }: { label: string; value: React.ReactNode }) {
+function TransactionPage({ digest, bundle, message, loading, onCopy, onOpenAddress, onOpenBlock }: {
+    digest: string;
+    bundle: Awaited<ReturnType<typeof loadTransactionBundle>> | null;
+    message: string;
+    loading: boolean;
+    onCopy: (value: string) => void;
+    onOpenAddress: (value: string) => void;
+    onOpenBlock: (height: bigint) => void;
+}) {
+    const transaction = bundle?.transaction;
     return (
-        <div className="account-proof-grid__cell">
-            <span>{label}</span>
-            <strong>{value}</strong>
+        <section className="account-page" aria-label="verified transaction" aria-busy={loading}>
+            <div className="account-page__title"><h2>transaction</h2></div>
+            <div className="account-page__line">
+                <span className="account-page__prompt">hash</span>
+                <CopyableValue value={digest} onCopy={onCopy} />
+            </div>
+            <div className="account-proof-grid">
+                <div className="account-proof-grid__details">
+                    <ProofDatum pending={!bundle} label="block" value={bundle ? <button className="account-page__height-link" onClick={() => onOpenBlock(bundle.height)}>h{bundle.height.toString()}:{transaction!.index}</button> : '-'} />
+                    <ProofDatum pending={!bundle} label="location" value={bundle?.location.toString() ?? '-'} />
+                </div>
+                <div className="account-proof-grid__evidence">
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : '—'} />
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="transaction proof" value={bundle ? <span className="proof-badge">op{bundle.tip} / 1L</span> : '-'} />
+                </div>
+            </div>
+            <PageStatus message={message || (loading ? 'verifying transaction evidence' : '')} />
+            {!transaction && <PendingTransactionRow />}
+            {transaction && <div className="account-tx-row">
+                <div className="account-tx-row__main">
+                    <span className="tx-party"><span className="account-tx-row__label">from</span><AddressValue value={transaction.sender} onOpenAddress={onOpenAddress} /></span>
+                    <span className="tx-party"><span className="account-tx-row__label">to</span><AddressValue value={transaction.recipient} onOpenAddress={onOpenAddress} /></span>
+                </div>
+                <div className="account-tx-row__meta"><span>value {transaction.value.toString()}</span><span>nonce {transaction.nonce.toString()}</span></div>
+            </div>}
+        </section>
+    );
+}
+
+function VerifiedEvidence({ children }: { children: React.ReactNode }) {
+    return (
+        <span className="verified-evidence">
+            <span className="verified-evidence__check" aria-hidden="true">✓</span>
+            <span className="visually-hidden">verified in browser: </span>
+            {children}
+        </span>
+    );
+}
+
+function ProofDatum({ label, value, pending = false, verified = false }: {
+    label: string;
+    value: React.ReactNode;
+    pending?: boolean;
+    verified?: boolean;
+}) {
+    return (
+        <div className={`account-proof-grid__cell${verified ? ' verified-surface' : ''}`}>
+            <span>{verified ? <VerifiedEvidence>{label}</VerifiedEvidence> : label}</span>
+            <strong className={pending ? 'page-pending' : undefined}>{value}</strong>
+        </div>
+    );
+}
+
+function PageStatus({ message }: { message: string }) {
+    return <div className="page-status" role="status">{message || '\u00a0'}</div>;
+}
+
+function PendingTransactionRow({ includeDigest = false }: { includeDigest?: boolean }) {
+    return (
+        <div className="account-tx-row page-pending" aria-label="transaction evidence pending">
+            <div className="account-tx-row__main">
+                {includeDigest && <span className="page-pending__address">—</span>}
+                <span className="tx-party"><span className="account-tx-row__label">from</span><span className="page-pending__address">—</span></span>
+                <span className="tx-party"><span className="account-tx-row__label">to</span><span className="page-pending__address">—</span></span>
+            </div>
+            <div className="account-tx-row__meta"><span>value —</span><span>nonce —</span></div>
         </div>
     );
 }
@@ -1566,22 +1608,21 @@ function WalletPanel({
     onValueChange: (value: string) => void;
     onSubmit: () => void;
 }) {
-    const balance = account?.balance ?? 100n;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
-    const isAccountLoading = accountMessage === 'loading verified balance';
+    const showWalletMessage = walletMessage !== '' && walletMessage !== 'signed in';
+    const isAccountLoading = accountMessage === 'loading account update proof';
     const walletAccountDisplay = walletAccountKey?.toLowerCase() ?? 'not authenticated';
 
     return (
         <section className="wallet">
             <div className="wallet__header">
-                <div>
-                    <div className="wallet__label">status</div>
-                    <div className="wallet__status">
+                {showWalletMessage && (
+                    <div className="wallet__status" role="status">
                         <SpinnerText active={isWalletLoading} spinner={spinner}>
                             {walletMessage}
                         </SpinnerText>
                     </div>
-                </div>
+                )}
                 <div className="wallet__actions">
                     {!wallet && <button onClick={onSignIn}>sign in</button>}
                     {!wallet && <button onClick={onCreateWallet}>new passkey</button>}
@@ -1610,14 +1651,26 @@ function WalletPanel({
                 </div>
                 <div className="wallet__cell">
                     <span>balance</span>
-                    <strong>{balance.toLocaleString()}</strong>
+                    <strong>{account?.balance.toString() ?? 'unknown'}</strong>
                 </div>
                 <div className="wallet__cell">
-                    <span>nonce</span>
+                    <span>local draft nonce</span>
                     <strong>{nonce}</strong>
                 </div>
+                {wallet && (
+                    <div className={`wallet__cell wallet__evidence${account ? ' verified-surface' : ''}`} role="status">
+                        <span>{account ? <VerifiedEvidence>account proof</VerifiedEvidence> : 'account evidence'}</span>
+                        {accountMessage && <div className="wallet__status">{accountMessage}</div>}
+                        {account && (
+                            <div className="wallet__history-values">
+                                <span>nonce <strong>{account.nonce.base.toString()}</strong></span>
+                                <span>loc <strong>{account.location.toString()}</strong></span>
+                                <span>snapshot <strong>h{account.snapshotHeight.toString()}</strong></span>
+                            </div>
+                        )}
+                    </div>
+                )}
             </div>
-            {wallet && <div className="wallet__status" role="status">{accountMessage}</div>}
             <form
                 className="transfer"
                 onSubmit={(event) => {
@@ -1663,6 +1716,16 @@ function WalletPanel({
     );
 }
 
+function IdentifierValue({ value }: { value: string }) {
+    return (
+        <span className="copyable__value" aria-hidden="true">
+            <span className="copyable__full">{value}</span>
+            <span className="copyable__short">{shortHex(value)}</span>
+            <span className="copyable__compact">{shortHex(value, 6)}</span>
+        </span>
+    );
+}
+
 function CopyableValue({
     disabled = false,
     plain = false,
@@ -1687,22 +1750,26 @@ function CopyableValue({
 
     return (
         <button
+            aria-label={`copy ${value}`}
             className={className}
             disabled={disabled}
             onClick={handleClick}
+            title={value}
             type="button"
         >
-            <span className="copyable__value">{value}</span>
+            <IdentifierValue value={value} />
         </button>
     );
 }
 
 function AddressValue({
+    kind = 'address',
     disabled = false,
     plain = false,
     value,
     onOpenAddress,
 }: {
+    kind?: 'address' | 'transaction';
     disabled?: boolean;
     plain?: boolean;
     value: string;
@@ -1718,14 +1785,14 @@ function AddressValue({
 
     return (
         <button
-            aria-label={`open address ${value}`}
+            aria-label={`open ${kind} ${value}`}
             className={className}
             disabled={disabled}
             onClick={() => onOpenAddress(value)}
-            title="open address"
+            title={`open ${kind} ${value}`}
             type="button"
         >
-            <span className="copyable__value">{value}</span>
+            <IdentifierValue value={value} />
         </button>
     );
 }
@@ -1834,6 +1901,10 @@ function TransactionRecord({
     tx: SubmittedTransaction;
 }) {
     const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
+    const verificationError = tx.proof.status === 'error' ? tx.proof.detail
+        : tx.certificate.status === 'error' ? tx.certificate.detail : null;
+    const pending = tx.status === 'reconciling';
+    const observedInMs = tx.proofObservedInMs ?? tx.finalizationObservedInMs;
     return (
         <div className="tx-record">
             <div className="tx-record__primary">
@@ -1859,142 +1930,26 @@ function TransactionRecord({
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
             </div>
             <div className="tx-record__secondary">
-                <span className="tx-record__detail">{tx.detail}</span>
-                <span className="tx-sep" aria-hidden="true">·</span>
-                <span className="tx-label">cert</span>
-                <CertificateCell certificate={tx.certificate} finalizedHeight={tx.finalizedHeight} />
-                <span className="tx-sep" aria-hidden="true">·</span>
-                <span className="tx-label">proof</span>
-                <ProofCell ownsTx={ownsTx} proof={tx.proof} />
-                {tx.finalizationObservedInMs !== null && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">finalization observed</span>
-                        <span>{tx.finalizationObservedInMs}ms</span>
-                    </>
+                {pending && (
+                    <span className={`tx-record__state${verificationError ? ' verification-error' : ''}`}>
+                        {verificationError ? <span aria-hidden="true">!</span>
+                            : <span className="tx-proof-spinner" aria-hidden="true" />}
+                        {verificationError ? 'verification failed' : 'awaiting proof'}
+                    </span>
                 )}
-                {tx.proofObservedInMs !== null && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">proof observed</span>
-                        <span>{tx.proofObservedInMs}ms</span>
-                    </>
+                <span className={`tx-record__detail${verificationError ? ' verification-error' : ''}`}>{verificationError ?? tx.detail}</span>
+                {tx.certificate.status === 'verified' && (
+                    <VerifiedEvidence>cert</VerifiedEvidence>
                 )}
+                {ownsTx && tx.proof.status === 'verified' && (
+                    <VerifiedEvidence>transaction proof</VerifiedEvidence>
+                )}
+                {observedInMs !== null && <span className="tx-record__state">observed {observedInMs}ms</span>}
             </div>
         </div>
     );
 }
 
-function CertificateCell({
-    certificate,
-    finalizedHeight,
-}: {
-    certificate: BlockCertificateState;
-    finalizedHeight: number | null;
-}) {
-    if (certificate.status === 'verified') {
-        return (
-            <span
-                className="tx-proof-check"
-                aria-label="block certificate verified"
-                title="block certificate verified"
-            >
-                ✓
-            </span>
-        );
-    }
-    if (certificate.status === 'error') {
-        return (
-            <span className="tx-proof-error" aria-label={certificate.detail} title={certificate.detail}>
-                !
-            </span>
-        );
-    }
-    if (certificate.status === 'unavailable') {
-        return (
-            <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
-                -
-            </span>
-        );
-    }
-    if (finalizedHeight === null) {
-        return (
-            <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
-                -
-            </span>
-        );
-    }
-    return (
-        <span className="tx-proof-spinner" aria-label={certificate.detail} title={certificate.detail} />
-    );
-}
-
-function ProofCell({
-    ownsTx,
-    proof,
-}: {
-    ownsTx: boolean;
-    proof: TransactionProofState;
-}) {
-    if (!ownsTx) {
-        return (
-            <span className="tx-proof-muted" aria-label="QMDB proof not requested" title="QMDB proof not requested">
-                -
-            </span>
-        );
-    }
-    if (proof.status === 'verified') {
-        return (
-            <span className="tx-proof-check" aria-label="QMDB proof verified" title="QMDB proof verified">
-                ✓
-            </span>
-        );
-    }
-    if (proof.status === 'error') {
-        return (
-            <>
-                <span className="tx-proof-error" aria-label={proof.detail} title={proof.detail}>
-                    !
-                </span>
-                <span className="tx-proof-error-detail">{proof.detail}</span>
-            </>
-        );
-    }
-    if (proof.status === 'unavailable') {
-        return (
-            <span className="tx-proof-muted" aria-label={proof.detail} title={proof.detail}>
-                -
-            </span>
-        );
-    }
-    return (
-        <span className="tx-proof-spinner" aria-label={proof.detail} title={proof.detail} />
-    );
-}
-
-
-function upsertBoundedBatch(
-    blocks: readonly ObservedBlock[],
-    current: ObservedBlock[],
-): ObservedBlock[] {
-    const byHeight = new Map(current.map((entry) => [entry.height.toString(), entry]));
-    for (const block of blocks) {
-        byHeight.set(block.height.toString(), block);
-    }
-
-    const next = Array.from(byHeight.values());
-    next.sort((a, b) => compareBlockHeightDesc(a.height, b.height));
-    if (next.length > HISTOGRAM_MAX_COLUMNS) {
-        next.length = HISTOGRAM_MAX_COLUMNS;
-    }
-    return next;
-}
-
-function compareBlockHeightDesc(a: bigint, b: bigint): number {
-    if (a > b) return -1;
-    if (a < b) return 1;
-    return 0;
-}
 
 function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofState {
     return {
@@ -2006,24 +1961,10 @@ function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofSt
     };
 }
 
-function retryingProofState(error: unknown) {
-    return { status: 'waiting', detail: accountRetryReason(error) ?? errorMessage(error) } as const;
-}
-
-function verifiedBlockCertificateState(certificate: {
-    readonly height: bigint;
-    readonly view: bigint;
-}): BlockCertificateState {
-    return {
-        status: 'verified',
-        detail: `verified at height ${certificate.height.toString()}`,
-        height: certificate.height.toString(),
-        view: certificate.view.toString(),
-    };
-}
-
-function shortHex(value: string): string {
-    return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
+function shortHex(value: string, prefixLength = 10): string {
+    return value.length <= prefixLength + 9
+        ? value
+        : `${value.slice(0, prefixLength)}…${value.slice(-8)}`;
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -2059,6 +2000,12 @@ function accountFromLocation(): string {
     return pathMatch ? pathMatch[1].toLowerCase() : '';
 }
 
+function transactionFromLocation(): string {
+    const url = new URL(window.location.href);
+    return normalizeAccountInput(url.searchParams.get('transaction') ??
+        /^\/transaction\/([0-9a-fA-F]{64})$/.exec(url.pathname)?.[1] ?? '') ?? '';
+}
+
 /** Reads a positive u64 block height from `?block=` or `/block/<height>`. */
 function blockFromLocation(): bigint | null {
     const url = new URL(window.location.href);
@@ -2072,25 +2019,10 @@ function readHistory(
     key: string,
     onError?: (message: string) => void,
 ): SubmittedTransaction[] {
-    let raw: string | null;
     try {
-        raw = window.localStorage.getItem(key);
+        return readStoredHistory(key, window.localStorage);
     } catch (error) {
         onError?.(storageErrorMessage(error));
-        return [];
-    }
-    if (!raw) return [];
-
-    try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed)
-            ? parsed.reduce<SubmittedTransaction[]>((transactions, item) => {
-                  const transaction = normalizeSubmittedTransaction(item);
-                  if (transaction) transactions.push(transaction);
-                  return transactions;
-              }, [])
-            : [];
-    } catch {
         return [];
     }
 }
@@ -2155,7 +2087,7 @@ const ExplorerStats = memo(function ExplorerStats({
     totalTxObserved,
     observedRateWindow,
 }: {
-    blocks: ObservedBlock[];
+    blocks: VerifiedBlock[];
     totalBlocksObserved: number;
     totalTxObserved: number;
     observedRateWindow: ObservedRateWindow;
@@ -2168,7 +2100,7 @@ const ExplorerStats = memo(function ExplorerStats({
         <dl className="observed-stats" aria-label="explorer statistics">
             <ExplorerStat label="latest height" value={stats.latestHeight} />
             <ExplorerStat
-                label="observed tx/sec"
+                label="local received tx/sec"
                 value={formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
             />
             <ExplorerStat label="total txs observed" value={stats.totalTxObserved} />
@@ -2188,7 +2120,7 @@ function ExplorerStat({ label, value }: { label: string; value: string }) {
 }
 
 function buildExplorerStats(
-    blocks: ObservedBlock[],
+    blocks: VerifiedBlock[],
     totalBlocksObserved: number,
     totalTxObserved: number,
 ): {
@@ -2199,7 +2131,7 @@ function buildExplorerStats(
 } {
     let latest: bigint | null = null;
     let peak = 0;
-    for (const block of blocks) {
+    for (const block of blocks.slice(0, HISTOGRAM_MAX_COLUMNS)) {
         if (latest === null || block.height > latest) {
             latest = block.height;
         }
@@ -2208,12 +2140,11 @@ function buildExplorerStats(
         }
     }
 
-    const avg = totalBlocksObserved === 0 ? 0 : totalTxObserved / totalBlocksObserved;
     return {
         latestHeight: latest?.toString() ?? '—',
-        totalTxObserved: totalTxObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
-        peakTxPerBlock: peak === 0 ? '—' : peak.toLocaleString(),
-        avgTxPerBlock: totalBlocksObserved === 0 ? '—' : Math.round(avg).toLocaleString(),
+        totalTxObserved: totalBlocksObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
+        peakTxPerBlock: totalBlocksObserved === 0 ? '—' : peak.toLocaleString(),
+        avgTxPerBlock: formatAverageTxPerBlock(totalTxObserved, totalBlocksObserved),
     };
 }
 
@@ -2239,7 +2170,7 @@ function formatObservedTxPerSecond(
     });
 }
 
-const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
+const Histogram = memo(function Histogram({ blocks }: { blocks: VerifiedBlock[] }) {
     const frameRef = useRef<HTMLDivElement>(null);
     const measureRef = useRef<HTMLSpanElement>(null);
     const [columns, setColumns] = useState(HISTOGRAM_INITIAL_COLUMNS);
@@ -2261,9 +2192,11 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
             );
             setColumns((current) => (current === nextColumns ? current : nextColumns));
 
-            const rawRows = Math.floor(frame.clientHeight / charHeight);
-            const isMobile = window.matchMedia('(max-width: 760px)').matches;
-            const availableRows = isMobile ? rawRows : Math.floor(rawRows / 2);
+            const chart = measure.parentElement;
+            if (!chart) return;
+            const style = getComputedStyle(chart);
+            const contentHeight = chart.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+            const availableRows = Math.floor(contentHeight / charHeight);
             const nextRows = Math.max(
                 HISTOGRAM_MIN_ROWS,
                 Math.min(HISTOGRAM_MAX_ROWS, availableRows),
@@ -2281,42 +2214,37 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
         };
     }, []);
 
-    const { lines, placeholderCount } = useMemo(
+    const { lines, zeroLine, domain } = useMemo(
         () => buildHistogram(blocks, columns, rows),
         [blocks, columns, rows],
     );
+
     return (
         <div className="histogram-frame" ref={frameRef}>
-            <pre className="histogram" aria-label="recent block transaction count histogram">
+            <pre className="histogram" aria-label={`recent block transaction counts, zero to ${domain} transactions per block; dots mark empty blocks`}>
                 <span className="histogram__measure" ref={measureRef} aria-hidden="true">
                     █
                 </span>
-                {lines.map((line, index) => (
-                    <span
-                        className="histogram__line"
-                        key={index}
-                        style={histogramLineStyle(index, rows)}
-                    >
-                        {placeholderCount > 0 && (
-                            <span style={HISTOGRAM_PLACEHOLDER_STYLE}>
-                                {line.slice(0, placeholderCount)}
-                            </span>
-                        )}
-                        {line.slice(placeholderCount)}
-                    </span>
-                ))}
+                <span className="histogram__plot">
+                    {lines.map((line, index) => (
+                        <span className="histogram__line" key={index}>
+                            {line}
+                        </span>
+                    ))}
+                    <span className="histogram__zeros">{zeroLine}</span>
+                </span>
             </pre>
         </div>
     );
 });
 
 const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
-    blocks: ObservedBlock[];
+    blocks: VerifiedBlock[];
     onOpenBlock: (height: bigint) => void;
 }) {
     // Hover and focus freeze the displayed rows so new blocks do not shift a row under the pointer.
     // Touch input pauses only through focus.
-    const [pausedBlocks, setPausedBlocks] = useState<ObservedBlock[] | null>(null);
+    const [pausedBlocks, setPausedBlocks] = useState<VerifiedBlock[] | null>(null);
     const pointerInside = useRef(false);
     const recent = (pausedBlocks ?? blocks).slice(0, BLOCK_LOG_MAX);
     const formatter = useMemo(
@@ -2374,7 +2302,7 @@ const BlockLogRow = memo(function BlockLogRow({
     formatter,
     onOpenBlock,
 }: {
-    block: ObservedBlock;
+    block: VerifiedBlock;
     formatter: Intl.DateTimeFormat;
     onOpenBlock: (height: bigint) => void;
 }) {
@@ -2396,74 +2324,29 @@ const BlockLogRow = memo(function BlockLogRow({
             }}
             onClick={() => onOpenBlock(block.height)}
             aria-label={`view block ${block.height}`}
+            aria-describedby={`block-finality-${block.height}`}
         >
-            <span className="block-row__height">{block.height.toString()}</span>
+            <span className="block-row__height">
+                {block.height.toString()}
+                <span className="block-row__finality" id={`block-finality-${block.height}`}>
+                    <VerifiedEvidence>
+                        {block.height === block.finality.certifiedHeight
+                            ? `cert v${block.finality.certificateView}`
+                            : `via h${block.finality.certifiedHeight}`}
+                    </VerifiedEvidence>
+                </span>
+            </span>
             <span className="block-row__hash" title={hash}>
                 {shortHex(hash)}
             </span>
             <span className="block-row__txcount">{block.txCount.toLocaleString()}</span>
-            <span className="block-row__time">{formatter.format(block.arrivedAt)}</span>
+            <span className="block-row__time">{formatBlockTimestamp(block.timestampMs, formatter)}</span>
         </button>
     );
 });
 
-const HISTOGRAM_PLACEHOLDER_STYLE: CSSProperties = { color: '#383838' };
-
-function buildHistogram(
-    blocks: ObservedBlock[],
-    width: number,
-    rows: number,
-): { lines: string[]; placeholderCount: number } {
-    const recent = blocks.slice(0, width).reverse();
-    const placeholderCount = Math.max(0, width - recent.length);
-    let peak = 0;
-    for (const block of recent) {
-        if (block.txCount > peak) peak = block.txCount;
-    }
-
-    const ramp = BLOCK_GLYPHS.length - 1;
-    const stepsPerColumn = rows * ramp;
-    const placeholderSteps = Math.round(stepsPerColumn * 0.5);
-
-    const columnSteps: number[] = [];
-    for (let i = 0; i < placeholderCount; i++) {
-        columnSteps.push(placeholderSteps);
-    }
-    if (peak === 0) {
-        for (let i = 0; i < recent.length; i++) {
-            columnSteps.push(0);
-        }
-    } else {
-        for (const block of recent) {
-            const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
-            columnSteps.push(Math.min(stepsPerColumn, Math.max(1, scaledSteps)));
-        }
-    }
-
-    const lines: string[] = [];
-    for (let row = 0; row < rows; row++) {
-        const rowsBelow = rows - 1 - row;
-        let line = '';
-        for (const steps of columnSteps) {
-            const glyphIndex = Math.max(0, Math.min(ramp, steps - rowsBelow * ramp));
-            line += BLOCK_GLYPHS[glyphIndex];
-        }
-        lines.push(line);
-    }
-    return { lines, placeholderCount };
-}
-
-function histogramLineStyle(rowIndex: number, rows: number): CSSProperties {
-    const ratio = 1 - rowIndex / Math.max(1, rows - 1);
-    return { color: histogramLineColor(ratio) };
-}
-
-function histogramLineColor(ratio: number): string {
-    const start = [32, 34, 36];
-    const end = [255, 178, 0];
-    const mix = Math.max(0, Math.min(1, ratio));
-    const channels = start.map((value, index) =>
-        Math.round(value + (end[index] - value) * mix),
-    );
-    return `rgb(${channels[0]}, ${channels[1]}, ${channels[2]})`;
+function formatBlockTimestamp(timestampMs: bigint, formatter: Intl.DateTimeFormat): string {
+    return timestampMs >= 0n && timestampMs <= 8_640_000_000_000_000n
+        ? formatter.format(Number(timestampMs))
+        : `${timestampMs} ms`;
 }

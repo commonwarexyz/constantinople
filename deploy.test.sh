@@ -56,8 +56,7 @@ prepare_case() {
 }
 
 prepare_case
-assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
-assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
+assert_contains explorer-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains --chain-indexer-instance-type "${REMOTE_ARGS[@]}"
 assert_pair --indexer-instance-type c8a.8xlarge "${REMOTE_ARGS[@]}"
 assert_pair --worker-threads 3 "${GENERATE_ARGS[@]}"
@@ -66,55 +65,34 @@ assert_pair --indexer-worker-threads 8 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-rayon-threads 12 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-publisher-rayon-threads 4 "${GENERATE_ARGS[@]}"
 
-prepare_case --store-url https://store.example.com
-assert_pair --store-url https://store.example.com "${REMOTE_ARGS[@]}"
-assert_equal https://store.example.com "$EXPLORER_STORE_URL" "Store explorer origin"
-assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
-assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
-
 prepare_case --store-url https://store.example.com/base
 assert_pair --store-url https://store.example.com/base "${REMOTE_ARGS[@]}"
-assert_equal https://store.example.com/base "$EXPLORER_STORE_URL" "path-prefixed Store origin"
+assert_contains explorer-indexer-amd-binary "${BINARY_TARGETS[@]}"
 
 prepare_case \
     --store-url https://store.example.com \
-    --sql-url https://sql.example.com/base
-assert_pair --metadata-indexer-url https://sql.example.com/base "${REMOTE_ARGS[@]}"
-assert_equal https://sql.example.com/base "$EXPLORER_SQL_URL" "SQL explorer origin"
-assert_excludes metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
-assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
-
-prepare_case \
-    --store-url https://store.example.com \
-    --qmdb-url https://qmdb.example.com/base
-assert_pair --qmdb-indexer-url https://qmdb.example.com/base "${REMOTE_ARGS[@]}"
-assert_equal https://qmdb.example.com/base "$EXPLORER_QMDB_URL" "QMDB explorer origin"
-assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
-assert_excludes qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
-
-prepare_case \
-    --store-url https://store.example.com \
-    --sql-url https://sql.example.com \
-    --qmdb-url https://qmdb.example.com \
+    --indexer-url https://explorer.example.com/base \
     --store-api-key writer-key \
     --adapter-store-api-key reader-key
+assert_pair --indexer-url https://explorer.example.com/base "${REMOTE_ARGS[@]}"
+assert_equal https://explorer.example.com/base "$EXPLORER_INDEXER_URL" "explorer origin"
 assert_equal writer-key "$STORE_API_KEY" "writer credential"
 assert_equal reader-key "$ADAPTER_STORE_API_KEY" "reader credential"
 assert_excludes writer-key "${REMOTE_ARGS[@]}"
 assert_excludes reader-key "${REMOTE_ARGS[@]}"
 assert_excludes --store-api-key "${REMOTE_ARGS[@]}"
 assert_excludes --adapter-store-api-key "${REMOTE_ARGS[@]}"
-assert_excludes metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
-assert_excludes qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
-assert_equal 2 "${#BINARY_TARGETS[@]}" "remote adapter binary count"
+assert_excludes explorer-indexer-amd-binary "${BINARY_TARGETS[@]}"
+assert_equal 2 "${#BINARY_TARGETS[@]}" "external indexer binary count"
 
-if (prepare_case --sql-url https://sql.example.com) >/dev/null 2>&1; then
-    fail "SQL origin without Store origin should fail"
+if (prepare_case --indexer-url https://explorer.example.com) >/dev/null 2>&1; then
+    fail "indexer origin without Store origin should fail"
 fi
-
-if (prepare_case --qmdb-url https://qmdb.example.com) >/dev/null 2>&1; then
-    fail "QMDB origin without Store origin should fail"
-fi
+for option in --sql-url --qmdb-url; do
+    if (prepare_case "$option" https://old.example.com) >/dev/null 2>&1; then
+        fail "removed option $option should fail"
+    fi
+done
 
 for option in --store-api-key --adapter-store-api-key; do
     if (prepare_case "$option" secret-key) >/dev/null 2>&1; then
@@ -137,8 +115,7 @@ done
 
 for option in \
     --store-url \
-    --sql-url \
-    --qmdb-url \
+    --indexer-url \
     --store-api-key \
     --adapter-store-api-key \
     --validators \
@@ -158,8 +135,7 @@ done
 
 for mapping in \
     "--store-url STORE_URL" \
-    "--sql-url SQL_URL" \
-    "--qmdb-url QMDB_URL" \
+    "--indexer-url INDEXER_URL" \
     "--store-api-key STORE_API_KEY" \
     "--adapter-store-api-key ADAPTER_STORE_API_KEY" \
     "--validators VALIDATORS" \

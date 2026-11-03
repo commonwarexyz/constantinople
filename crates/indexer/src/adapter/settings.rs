@@ -19,6 +19,9 @@ pub(super) struct AdapterArgs {
     /// URL of the exoware Store to read from.
     #[arg(long)]
     store_url: Option<String>,
+    /// Base URL of the relayer accepting transaction submissions.
+    #[arg(long)]
+    relayer_url: Option<String>,
     /// Bind address.
     #[arg(long, default_value = "0.0.0.0")]
     host: IpAddr,
@@ -44,6 +47,8 @@ struct DeployerConfig {
     store_url: String,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    relayer_url: Option<String>,
 }
 
 pub(super) struct Settings {
@@ -52,6 +57,7 @@ pub(super) struct Settings {
     pub(super) port: u16,
     pub(super) metrics_port: Option<u16>,
     pub(super) api_key: Option<String>,
+    pub(super) relayer_url: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -124,30 +130,21 @@ fn load_deployer_config(profile: Profile, path: &Path) -> Result<DeployerConfig,
     })
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, IpAddr>) -> String {
-    let Some(rest) = url.strip_prefix("http://") else {
+fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<String, IpAddr>) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
         return url.to_string();
     };
-    let (authority, suffix) = match rest.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{suffix}")),
-        None => (rest, String::new()),
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
+    if parsed.scheme() != "http" {
+        return url.to_string();
+    }
+    let Some(ip) = parsed.host_str().and_then(|host| hosts_by_name.get(host)) else {
         return url.to_string();
     };
-    let Some(ip) = hosts_by_name.get(host) else {
-        return url.to_string();
-    };
-
-    format!("http://{ip}:{port}{suffix}")
+    parsed.set_ip_host(*ip).expect("HTTP URLs have a host");
+    parsed.into()
 }
 
-fn load_deployer_settings(
-    profile: Profile,
-    hosts_path: &Path,
-    config_path: &Path,
-) -> Result<DeployerConfig, SettingsError> {
-    let mut config = load_deployer_config(profile, config_path)?;
+fn load_deployer_hosts(hosts_path: &Path) -> Result<AHashMap<String, IpAddr>, SettingsError> {
     let raw_hosts = fs::read_to_string(hosts_path).map_err(|source| SettingsError::ReadHosts {
         path: hosts_path.to_path_buf(),
         source,
@@ -157,14 +154,11 @@ fn load_deployer_settings(
             path: hosts_path.to_path_buf(),
             source,
         })?;
-    let hosts_by_name = hosts
+    Ok(hosts
         .hosts
-        .iter()
-        .map(|host| (host.name.as_str(), host.ip))
-        .collect::<AHashMap<_, _>>();
-
-    config.store_url = resolve_named_http_url(&config.store_url, &hosts_by_name);
-    Ok(config)
+        .into_iter()
+        .map(|host| (host.name, host.ip))
+        .collect())
 }
 
 pub(super) fn load_settings(
@@ -172,9 +166,12 @@ pub(super) fn load_settings(
     args: AdapterArgs,
     environment: Environment,
 ) -> Result<Settings, SettingsError> {
-    let mut deployer = match (&args.hosts, &args.config) {
-        (Some(hosts), Some(config)) => Some(load_deployer_settings(profile, hosts, config)?),
-        (None, None) => None,
+    let (mut deployer, hosts_by_name) = match (&args.hosts, &args.config) {
+        (Some(hosts), Some(config)) => (
+            Some(load_deployer_config(profile, config)?),
+            load_deployer_hosts(hosts)?,
+        ),
+        (None, None) => (None, AHashMap::new()),
         _ => return Err(SettingsError::IncompleteDeployerMode),
     };
 
@@ -186,6 +183,11 @@ pub(super) fn load_settings(
     let metrics_port = args
         .metrics_port
         .or_else(|| deployer.as_ref().and_then(|settings| settings.metrics_port));
+    let relayer_url = args.relayer_url.or_else(|| {
+        deployer
+            .as_ref()
+            .and_then(|settings| settings.relayer_url.clone())
+    });
     let store_url = args
         .store_url
         .or_else(|| deployer.as_ref().map(|settings| settings.store_url.clone()))
@@ -205,18 +207,23 @@ pub(super) fn load_settings(
     };
 
     Ok(Settings {
-        store_url,
+        store_url: resolve_named_http_url(&store_url, &hosts_by_name),
         host: args.host,
         port,
         metrics_port,
         api_key,
+        relayer_url: relayer_url.map(|url| resolve_named_http_url(&url, &hosts_by_name)),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterArgs, Environment, Profile, STORE_URL_ENV, SettingsError, load_settings};
+    use super::{
+        AdapterArgs, Environment, Profile, STORE_URL_ENV, SettingsError, load_settings,
+        resolve_named_http_url,
+    };
     use crate::adapter::{Cli, command};
+    use ahash::AHashMap;
     use clap::FromArgMatches;
     use std::{
         fs,
@@ -224,18 +231,11 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    const PROFILES: [Profile; 2] = [
-        Profile {
-            name: "metadata-indexer",
-            about: "SQL service over Constantinople metadata tables",
-            default_port: 8091,
-        },
-        Profile {
-            name: "qmdb-indexer",
-            about: "QMDB service over Constantinople state and transaction indexes",
-            default_port: 8092,
-        },
-    ];
+    const PROFILES: [Profile; 1] = [Profile {
+        name: "explorer-indexer",
+        about: "Verified explorer API and transaction submission",
+        default_port: 8092,
+    }];
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -264,14 +264,14 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "port: {}\nmetrics_port: 9090\nstore_url: http://chain-indexer:8090\n{key}",
+                "port: {}\nmetrics_port: 9090\nstore_url: http://chain-indexer:8090\nrelayer_url: http://relayer:8080/base\n{key}",
                 profile.default_port + 10_000
             ),
         )
         .expect("config should write");
         fs::write(
             &hosts_path,
-            "monitoring:\n  public: 10.0.0.1\n  private: 10.0.0.2\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n",
+            "monitoring:\n  public: 10.0.0.1\n  private: 10.0.0.2\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n  - name: \"relayer\"\n    region: us-east-1\n    ip: 203.0.113.10\n",
         )
         .expect("hosts should write");
         (config_path, hosts_path)
@@ -294,6 +294,7 @@ mod tests {
             assert_eq!(settings.store_url, "http://environment:8090");
             assert_eq!(settings.port, profile.default_port + 10_000);
             assert!(settings.api_key.is_none());
+            assert!(settings.relayer_url.is_none());
         }
     }
 
@@ -352,6 +353,8 @@ mod tests {
                 &[
                     "--store-url".to_string(),
                     "http://cli:8090".to_string(),
+                    "--relayer-url".to_string(),
+                    "https://cli-relayer/base".to_string(),
                     "--port".to_string(),
                     (profile.default_port + 11_000).to_string(),
                     "--metrics-port".to_string(),
@@ -376,6 +379,10 @@ mod tests {
             assert_eq!(settings.port, profile.default_port + 11_000);
             assert_eq!(settings.metrics_port, Some(9099));
             assert!(settings.api_key.is_none());
+            assert_eq!(
+                settings.relayer_url.as_deref(),
+                Some("https://cli-relayer/base")
+            );
 
             let _ = fs::remove_file(config_path);
             let _ = fs::remove_file(hosts_path);
@@ -405,13 +412,109 @@ mod tests {
             )
             .expect("settings should load");
 
-            assert_eq!(settings.store_url, "http://203.0.113.9:8090");
+            assert_eq!(settings.store_url, "http://203.0.113.9:8090/");
+            assert_eq!(
+                settings.relayer_url.as_deref(),
+                Some("http://203.0.113.10:8080/base")
+            );
             assert_eq!(settings.metrics_port, Some(9090));
             assert_eq!(settings.port, profile.default_port + 10_000);
             assert_eq!(settings.api_key.as_deref(), Some("yaml-read-key"));
 
             let _ = fs::remove_file(config_path);
             let _ = fs::remove_file(hosts_path);
+        }
+    }
+
+    #[test]
+    fn service_overrides_keep_credentials_bound_to_store() {
+        let profile = PROFILES[0];
+        let (config_path, hosts_path) = deployer_files(profile, Some("yaml-read-key"));
+        for (flag, url, expected_key, expected_store, expected_relayer) in [
+            (
+                "--relayer-url",
+                "https://other-relayer",
+                Some("yaml-read-key"),
+                "http://203.0.113.9:8090/",
+                "https://other-relayer",
+            ),
+            (
+                "--store-url",
+                "http://other-store:8090",
+                None,
+                "http://other-store:8090",
+                "http://203.0.113.10:8080/base",
+            ),
+            (
+                "--relayer-url",
+                "http://relayer:8080/api",
+                Some("yaml-read-key"),
+                "http://203.0.113.9:8090/",
+                "http://203.0.113.10:8080/api",
+            ),
+            (
+                "--store-url",
+                "http://chain-indexer:9999/data",
+                None,
+                "http://203.0.113.9:9999/data",
+                "http://203.0.113.10:8080/base",
+            ),
+        ] {
+            let args = parse(
+                profile,
+                &[
+                    flag.to_string(),
+                    url.to_string(),
+                    "--hosts".to_string(),
+                    hosts_path.to_string_lossy().into_owned(),
+                    "--config".to_string(),
+                    config_path.to_string_lossy().into_owned(),
+                ],
+            );
+            let settings = load_settings(profile, args, Environment::default()).expect("settings");
+            assert_eq!(settings.api_key.as_deref(), expected_key);
+            assert_eq!(settings.store_url, expected_store);
+            assert_eq!(settings.relayer_url.as_deref(), Some(expected_relayer));
+        }
+        fs::remove_file(config_path).expect("remove config");
+        fs::remove_file(hosts_path).expect("remove hosts");
+    }
+
+    #[test]
+    fn deployer_config_can_omit_relayer() {
+        let profile = PROFILES[0];
+        let (config_path, hosts_path) = deployer_files(profile, None);
+        fs::write(
+            &config_path,
+            "port: 8092\nstore_url: http://chain-indexer:8090\n",
+        )
+        .expect("config without relayer");
+        let args = parse(
+            profile,
+            &[
+                "--hosts".to_string(),
+                hosts_path.to_string_lossy().into_owned(),
+                "--config".to_string(),
+                config_path.to_string_lossy().into_owned(),
+            ],
+        );
+        let settings = load_settings(profile, args, Environment::default()).expect("settings");
+        assert!(settings.relayer_url.is_none());
+        fs::remove_file(config_path).expect("remove config");
+        fs::remove_file(hosts_path).expect("remove hosts");
+    }
+
+    #[test]
+    fn named_http_services_resolve_paths_and_ipv6_and_preserve_tls_hostnames() {
+        let hosts =
+            AHashMap::from_iter([("service".to_string(), "2001:db8::9".parse().expect("IPv6"))]);
+        for (url, expected) in [
+            ("http://service:8090/base", "http://[2001:db8::9]:8090/base"),
+            ("https://service/base", "https://service/base"),
+            ("https://external/base", "https://external/base"),
+            ("invalid", "invalid"),
+        ] {
+            assert_eq!(resolve_named_http_url(url, &hosts), expected);
         }
     }
 }

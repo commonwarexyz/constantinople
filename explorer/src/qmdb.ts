@@ -9,6 +9,11 @@ const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
 const ACCOUNT_VALUE_BYTES = 24;
 const U64_BYTES = 8;
+const MAX_BLOCK_TIMESTAMP_MS = 7_258_118_400_000n;
+
+export const MAX_ANCESTRY_HEADERS = 4096;
+export const MAX_EXECUTION_HEADER_BYTES = 512;
+export const MAX_FINALIZATION_CERTIFICATE_BYTES = 16 * 1024;
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -26,6 +31,8 @@ export interface VerifiedFinalizationTarget {
 interface FinalizedTransactionTarget {
     readonly height: bigint;
     readonly view: bigint;
+    readonly contextView: bigint;
+    readonly timestampMs: bigint;
     readonly blockDigest: Uint8Array;
     readonly stateRoot: Uint8Array;
     readonly stateStart: bigint;
@@ -76,6 +83,9 @@ export async function authenticatedHeader(
     digest: Uint8Array,
     height: bigint,
 ): Promise<DecodedBlockHeader> {
+    if (bytes.length === 0 || bytes.length > MAX_EXECUTION_HEADER_BYTES) {
+        throw new Error('invalid or oversized execution header');
+    }
     const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes)));
     if (!bytesEqual(actual, digest)) {
         throw new Error(`block header at height ${height} does not match its certified digest`);
@@ -109,8 +119,8 @@ export async function finalizedTargetFromCertificate(
     if (certificate.payload.length !== COMMITMENT_BYTES) {
         throw new Error(`certified commitment must be ${COMMITMENT_BYTES} bytes`);
     }
-    if (certified.length <= COMMITMENT_BYTES) {
-        throw new Error('finalized artifact is missing certified header bytes');
+    if (certified.length <= COMMITMENT_BYTES || certified.length > COMMITMENT_BYTES + MAX_EXECUTION_HEADER_BYTES) {
+        throw new Error('finalized artifact has an invalid or oversized certified header');
     }
     const encodedCommitment = certified.slice(0, COMMITMENT_BYTES);
     if (!bytesEqual(encodedCommitment, certificate.payload)) {
@@ -133,6 +143,8 @@ export async function finalizedTargetFromCertificate(
     return {
         height: header.height,
         view: certificate.view,
+        contextView: header.view,
+        timestampMs: header.timestampMs,
         transactionsRoot: header.transactionsRoot,
         transactionsStart: header.transactionsStart,
         transactionsTip: header.transactionsTip,
@@ -146,6 +158,7 @@ export async function finalizedTargetFromCertificate(
 
 export interface DecodedBlockHeader {
     readonly view: bigint;
+    readonly timestampMs: bigint;
     readonly parentDigest: Uint8Array;
     readonly height: bigint;
     readonly stateRoot: Uint8Array;
@@ -172,6 +185,7 @@ function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeade
     offset = skip(bytes, offset, DIGEST_BYTES);
     const height = readHeaderU64(bytes, offset);
     const timestamp = readHeaderU64(bytes, height.offset);
+    if (timestamp.value > MAX_BLOCK_TIMESTAMP_MS) throw new Error('block timestamp exceeds protocol maximum');
     offset = timestamp.offset;
 
     const stateRoot = readBytes(bytes, offset, DIGEST_BYTES);
@@ -191,6 +205,7 @@ function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeade
     }
     return {
         view: view.value,
+        timestampMs: timestamp.value,
         parentDigest,
         height: height.value,
         stateRoot,

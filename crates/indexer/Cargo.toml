@@ -51,9 +51,12 @@ cpu-time.workspace = true
 ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true
+buffa.workspace = true
+connectrpc.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
 http-body.workspace = true
+reqwest = { workspace = true, features = ["rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -62,6 +65,9 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sign
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[build-dependencies]
+connectrpc-build.workspace = true
 
 [dev-dependencies]
 p256.workspace = true
@@ -82,12 +88,8 @@ path = "src/main.rs"
 required-features = ["chain-indexer"]
 
 [[bin]]
-name = "metadata-indexer"
-path = "src/bin/sql.rs"
-
-[[bin]]
-name = "qmdb-indexer"
-path = "src/bin/qmdb.rs"
+name = "explorer-indexer"
+path = "src/bin/explorer.rs"
 
 [lib]
 name = "constantinople_indexer"

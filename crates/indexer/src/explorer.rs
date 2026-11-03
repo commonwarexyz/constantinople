@@ -11,16 +11,12 @@ use crate::{
         STATE_PROOF_CHUNK_SIZE, publication_target_client, publication_target_key, simplex_client,
         sql_meta_client, state_qmdb_client, transactions_qmdb_client,
     },
+    proto::{self, AccountProof, ProofBundle as Bundle, TransactionRow},
     publisher::certificate::CertifiedHeader,
     sql_schema::build_meta_schema,
 };
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::{StatusCode, header::CONTENT_TYPE},
-    response::{IntoResponse, Response},
-    routing::get,
-};
+use axum::Router;
+use buffa::Message;
 use bytes::Bytes;
 use commonware_codec::{Decode, DecodeExt, FixedSize};
 use commonware_consensus::types::Height;
@@ -37,6 +33,7 @@ use commonware_storage::{
     },
 };
 use commonware_utils::sequence::FixedBytes;
+use connectrpc::{ConnectError, ErrorCode};
 use constantinople_engine::{
     ThresholdScheme,
     types::{EngineCommitment, EngineHeader},
@@ -56,11 +53,13 @@ use exoware_qmdb::{
 use exoware_sdk::{ClientError, PrefixedStoreClient, RangeMode, ReadSession, StoreClient};
 use exoware_simplex::{Finalized, keys};
 use exoware_sql::SqlContext;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
+
+mod browse;
+mod rpc;
 
 /// Maximum transactions returned on one account activity page.
 const ACCOUNT_PAGE: usize = 10;
@@ -83,7 +82,7 @@ const MAX_PROOF_BYTES: usize = 1024 * 1024;
 /// Largest signed transaction encoding the public codec accepts.
 const MAX_TRANSACTION_BYTES: usize = Transaction::<Digest>::SIZE + TransactionSignature::MAX_SIZE;
 
-/// Maximum serialized size of one JSON response.
+/// Maximum encoded size of one protobuf response.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 type Header = EngineHeader<Sha256, VerifyingKey>;
@@ -124,107 +123,56 @@ struct Explorer {
     transactions: TransactionLog,
 }
 
-/// Build the bounded account, block, and transaction evidence routes.
-pub fn router(client: &StoreClient) -> Result<Router, BoxError> {
-    // Register the metadata tables so hint queries resolve their table names.
-    let sql_store = sql_meta_client(client)?;
-    let sql = SqlContext::new(sql_store.clone());
-    build_meta_schema(sql_store.clone())
-        .map_err(std::io::Error::other)?
-        .register_all(&sql)?;
-
-    // Every route reads through the same Store clients.
-    let state = Arc::new(Explorer {
-        targets: publication_target_client(client)?,
-        simplex: simplex_client(client)?,
-        sql_store,
-        sql,
-        state: StateLog::new(state_qmdb_client(client)?, ()),
-        transactions: TransactionLog::new(transactions_qmdb_client(client)?, ()),
-    });
-    Ok(Router::new()
-        .route("/explorer/accounts/{account}", get(account))
-        .route("/explorer/blocks/{height}", get(block))
-        .route("/explorer/transactions/{digest}", get(transaction))
-        .with_state(state))
+/// Builds the generated explorer application service.
+pub fn router(client: &StoreClient, relayer_url: Option<&str>) -> Result<Router, BoxError> {
+    rpc::router(Arc::new(Explorer::new(client)?), relayer_url)
 }
 
-/// JSON response body shared by every explorer route.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Bundle {
-    /// Hex finalization certificate that anchors every proof in the bundle.
-    certificate: String,
-    /// Hex parent headers, newest first, from below the certified header down
-    /// to the requested block's parent.
-    headers: Vec<String>,
-    /// Store sequence floor covering every read behind the bundle.
-    sequence_number: String,
-    /// Proof of the account's latest update, on account routes.
-    account: Option<AccountProof>,
-    /// Returned transactions in page order.
-    transactions: Vec<TransactionRow>,
-    /// Hex multi-proof of every returned transaction against the certified
-    /// transactions root, present when any transaction is returned.
-    transactions_proof: Option<String>,
-    /// Hex activity cursor or decimal block offset of the next page.
-    next_cursor: Option<String>,
+impl Explorer {
+    fn new(client: &StoreClient) -> Result<Self, BoxError> {
+        // Register the metadata tables so hint queries resolve their table names.
+        let sql_store = sql_meta_client(client)?;
+        let sql = SqlContext::new(sql_store.clone());
+        build_meta_schema(sql_store.clone())
+            .map_err(std::io::Error::other)?
+            .register_all(&sql)?;
+
+        Ok(Self {
+            targets: publication_target_client(client)?,
+            simplex: simplex_client(client)?,
+            sql_store,
+            sql,
+            state: StateLog::new(state_qmdb_client(client)?, ()),
+            transactions: TransactionLog::new(transactions_qmdb_client(client)?, ()),
+        })
+    }
 }
 
-/// Proof of an account's latest update within the certified state range.
-#[derive(Serialize)]
-struct AccountProof {
-    /// Account-state QMDB location of the update.
-    location: String,
-    /// Hex operation range proof for that location.
-    proof: String,
-}
-
-/// One transaction with its proven QMDB location and signed body.
-#[derive(Serialize)]
-struct TransactionRow {
-    /// Transaction-hash QMDB location covered by the bundle's proof.
-    location: String,
-    /// Hex signed transaction whose digest the proof authenticates.
-    body: String,
-    /// Block height, which is an unproven SQL hint on account rows.
-    height: String,
-    /// Index within the block, which is an unproven SQL hint on account rows.
-    index: u32,
-    /// Account role (0 sender, 1 receiver), present only on account rows.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<u8>,
-}
-
-/// Error response carrying the HTTP status of its failure class.
+/// Error class shared by proof validation and the generated service.
 #[derive(Debug)]
-struct Failure(StatusCode, String);
+struct Failure(ErrorCode, String);
 
 impl Failure {
-    /// Malformed request.
     fn bad(message: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, message.into())
+        Self(ErrorCode::InvalidArgument, message.into())
     }
 
-    /// Publication or evidence that can appear once uploads catch up.
     fn pending(message: impl Into<String>) -> Self {
-        Self(StatusCode::SERVICE_UNAVAILABLE, message.into())
+        Self(ErrorCode::Unavailable, message.into())
     }
 
-    /// Stored evidence that contradicts itself or the certified snapshot.
     fn invalid(message: impl Into<String>) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, message.into())
+        Self(ErrorCode::Internal, message.into())
     }
 
-    /// Valid request whose work exceeds the supported bounds.
     fn limit(message: impl Into<String>) -> Self {
-        Self(StatusCode::UNPROCESSABLE_ENTITY, message.into())
+        Self(ErrorCode::ResourceExhausted, message.into())
     }
 }
 
-impl IntoResponse for Failure {
-    fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+impl From<Failure> for ConnectError {
+    fn from(error: Failure) -> Self {
+        Self::new(error.0, error.1)
     }
 }
 
@@ -253,31 +201,12 @@ impl From<QmdbError> for Failure {
     }
 }
 
-/// Serializes a bundle, rejecting responses larger than [`MAX_RESPONSE_BYTES`].
-fn response(bundle: Bundle) -> Result<Response, Failure> {
-    let bytes = serde_json::to_vec(&bundle).map_err(|error| Failure::invalid(error.to_string()))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
+/// Bounds a bundle before the transport encodes it.
+fn response(bundle: Bundle) -> Result<Bundle, Failure> {
+    if bundle.encoded_len() as usize > MAX_RESPONSE_BYTES {
         return Err(Failure::limit("aggregate response exceeds 8 MiB"));
     }
-    Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response())
-}
-
-/// Raw account query parameters, validated by [`AccountRequest::parse`].
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccountQuery {
-    mode: Option<String>,
-    cursor: Option<String>,
-    at: Option<String>,
-    digest: Option<String>,
-    activity: Option<String>,
-}
-
-/// Raw block query parameters.
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BlockQuery {
-    offset: Option<String>,
+    Ok(bundle)
 }
 
 /// Validated account request.
@@ -305,8 +234,8 @@ struct Cursor {
 }
 
 impl Cursor {
-    fn parse(value: &str) -> Result<Self, Failure> {
-        let bytes = hex_bytes::<24>(value)?;
+    fn parse(value: &[u8]) -> Result<Self, Failure> {
+        let bytes = fixed_bytes::<24>(value)?;
         let cursor = Self {
             height: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
             index: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
@@ -320,42 +249,36 @@ impl Cursor {
         Ok(cursor)
     }
 
-    fn encode(self) -> String {
+    fn encode(self) -> Vec<u8> {
         let mut bytes = [0; 24];
         bytes[..8].copy_from_slice(&self.height.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.index.to_be_bytes());
         bytes[16..].copy_from_slice(&self.role.to_be_bytes());
-        hex(&bytes)
+        bytes.to_vec()
     }
 }
 
 impl AccountRequest {
-    fn parse(account: &str, query: AccountQuery) -> Result<Self, Failure> {
-        let key = AccountKey::from(hex_bytes::<32>(account)?);
-        let mode = match query.mode.as_deref().unwrap_or("all") {
-            "all" => None,
-            "sent" => Some(0),
-            "received" => Some(1),
-            _ => return Err(Failure::bad("mode must be all, sent, or received")),
+    fn parse(query: proto::GetAccountRequest) -> Result<Self, Failure> {
+        let key = AccountKey::from(fixed_bytes::<32>(&query.account)?);
+        let mode = match query.mode.as_known() {
+            Some(proto::ActivityMode::All) => None,
+            Some(proto::ActivityMode::Sent) => Some(0),
+            Some(proto::ActivityMode::Received) => Some(1),
+            None => return Err(Failure::bad("unknown activity mode")),
         };
         let snapshot = match (query.at, query.digest) {
             (None, None) => None,
-            (Some(height), Some(digest)) => {
-                Some((positive(&height)?, Digest::from(hex_bytes::<32>(&digest)?)))
+            (Some(height), Some(digest)) if height != 0 => {
+                Some((height, Digest::from(fixed_bytes::<32>(&digest)?)))
             }
-            _ => return Err(Failure::bad("at and digest must appear together")),
+            _ => return Err(Failure::bad("positive at and digest must appear together")),
         };
         let cursor = query.cursor.as_deref().map(Cursor::parse).transpose()?;
-
-        // A filtered page continues only from a cursor with the same role.
         if cursor.is_some_and(|cursor| mode.is_some_and(|role| cursor.role != u64::from(role))) {
             return Err(Failure::bad("cursor role does not match mode"));
         }
-        let activity = match query.activity.as_deref() {
-            None | Some("true") => true,
-            Some("false") => false,
-            _ => return Err(Failure::bad("activity must be true or false")),
-        };
+        let activity = query.activity.unwrap_or(true);
         Ok(Self {
             key,
             mode,
@@ -366,41 +289,11 @@ impl AccountRequest {
     }
 }
 
-/// Parses a canonical decimal `u64`, rejecting the leading `+` that
-/// [`str::parse`] accepts.
-fn decimal(value: &str) -> Result<u64, Failure> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Failure::bad("expected decimal u64"));
-    }
+/// Checks a fixed-width application identity or cursor before reading Store.
+fn fixed_bytes<const N: usize>(value: &[u8]) -> Result<[u8; N], Failure> {
     value
-        .parse()
-        .map_err(|_| Failure::bad("decimal u64 overflow"))
-}
-
-/// Parses a decimal height, rejecting zero.
-fn positive(value: &str) -> Result<u64, Failure> {
-    let value = decimal(value)?;
-    if value == 0 {
-        return Err(Failure::bad("height must be positive"));
-    }
-    Ok(value)
-}
-
-/// Decodes exactly `N` bytes from hex digits of either case.
-fn hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], Failure> {
-    if value.len() != N * 2 {
-        return Err(Failure::bad(format!("expected {} hex characters", N * 2)));
-    }
-    let mut bytes = [0; N];
-    let (pairs, _) = value.as_bytes().as_chunks::<2>();
-    for (pair, output) in pairs.iter().zip(bytes.iter_mut()) {
-        let digit = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
-        *output = digit(pair[0])
-            .zip(digit(pair[1]))
-            .map(|(high, low)| high * 16 + low)
-            .ok_or_else(|| Failure::bad("invalid hex"))?;
-    }
-    Ok(bytes)
+        .try_into()
+        .map_err(|_| Failure::bad(format!("expected {N} bytes")))
 }
 
 /// Encodes bytes as lowercase hex.
@@ -448,21 +341,22 @@ impl Anchor {
     /// Starts a bundle with the certificate and the current floor.
     fn bundle(&self) -> Result<Bundle, Failure> {
         Ok(Bundle {
-            certificate: hex(&self.raw),
+            certificate: self.raw.to_vec(),
             headers: Vec::new(),
-            sequence_number: self.floor()?.to_string(),
-            account: None,
+            sequence_number: self.floor()?,
+            account: None.into(),
             transactions: Vec::new(),
             transactions_proof: None,
             next_cursor: None,
+            ..Default::default()
         })
     }
 }
 
 impl Explorer {
     /// Reads the newest publication target, which bounds every certificate a
-    /// response may use.
-    async fn published(&self) -> Result<Published, Failure> {
+    /// response may use. An empty index has no published snapshot yet.
+    async fn published(&self) -> Result<Option<Published>, Failure> {
         let targets = ReadSession::monotonic(self.targets.clone(), None);
         let latest = targets
             .range_with_mode(
@@ -474,9 +368,9 @@ impl Explorer {
             .await?;
 
         // Target keys are big-endian heights and values are block digests.
-        let (key, digest) = latest
-            .first()
-            .ok_or_else(|| Failure::pending("publication is not ready"))?;
+        let Some((key, digest)) = latest.first() else {
+            return Ok(None);
+        };
         let height = u64::from_be_bytes(
             key.as_ref()
                 .try_into()
@@ -486,11 +380,11 @@ impl Explorer {
             return Err(Failure::invalid("invalid publication height"));
         }
         let digest = Digest::decode(digest.clone())?;
-        Ok(Published {
+        Ok(Some(Published {
             height,
             digest,
             session: targets,
-        })
+        }))
     }
 
     /// Selects a certificate under the newest publication target.
@@ -500,8 +394,11 @@ impl Explorer {
         exact: Option<(u64, Digest)>,
         reverse: bool,
     ) -> Result<Anchor, Failure> {
-        self.anchor_at(&self.published().await?, first, exact, reverse)
-            .await
+        let published = self
+            .published()
+            .await?
+            .ok_or_else(|| Failure::pending("publication is not ready"))?;
+        self.anchor_at(&published, first, exact, reverse).await
     }
 
     /// Selects a finalization certificate between `first` and the publication
@@ -522,6 +419,34 @@ impl Explorer {
             return Err(Failure::pending("requested publication is not ready"));
         }
 
+        self.anchor_between(
+            published,
+            lower,
+            upper,
+            exact.map(|(_, digest)| digest),
+            reverse,
+        )
+        .await?
+        .ok_or_else(|| Failure::pending("finalization certificate is not ready"))
+    }
+
+    /// Selects one certificate within an inclusive published height interval.
+    /// An empty interval or absent certificate leaves a live feed waiting.
+    async fn anchor_between(
+        &self,
+        published: &Published,
+        lower: u64,
+        upper: u64,
+        exact: Option<Digest>,
+        reverse: bool,
+    ) -> Result<Option<Anchor>, Failure> {
+        if lower > upper {
+            return Ok(None);
+        }
+        if upper > published.height {
+            return Err(Failure::invalid("certificate bound exceeds publication"));
+        }
+
         // Scan the Simplex height index for one certificate in the inclusive
         // bound. Appending a zero byte makes the exclusive end key include
         // `upper`.
@@ -537,10 +462,9 @@ impl Explorer {
         let rows = session
             .range_with_mode(&start, &Bytes::from(end), 1, mode)
             .await?;
-        let (key, raw) = rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| Failure::pending("finalization certificate is not ready"))?;
+        let Some((key, raw)) = rows.into_iter().next() else {
+            return Ok(None);
+        };
         let height = keys::finalized_height_from_key(&key)
             .ok_or_else(|| Failure::invalid("invalid certificate key"))?
             .get();
@@ -572,7 +496,7 @@ impl Explorer {
                 .ok_or_else(|| Failure::pending("certificate publication is not ready"))?;
             Digest::decode(bytes)?
         };
-        if marker != *header.seal() || exact.is_some_and(|(_, digest)| digest != *header.seal()) {
+        if marker != *header.seal() || exact.is_some_and(|digest| digest != *header.seal()) {
             return Err(Failure::invalid(
                 "certificate does not match publication or requested digest",
             ));
@@ -583,12 +507,12 @@ impl Explorer {
         let sql = self
             .sql
             .with_read_session(session.with_client(self.sql_store.clone()));
-        Ok(Anchor {
+        Ok(Some(Anchor {
             raw,
             header,
             session,
             sql,
-        })
+        }))
     }
 
     /// Proves the account's latest update inside the certified state range, or
@@ -647,8 +571,9 @@ impl Explorer {
         let encoded = encode_historical_operation_range_proof(&proof);
         bounded_proof(&encoded)?;
         Ok(Some(AccountProof {
-            location: location.to_string(),
-            proof: hex(&encoded),
+            location,
+            proof: encoded.to_vec(),
+            ..Default::default()
         }))
     }
 
@@ -657,7 +582,7 @@ impl Explorer {
         &self,
         anchor: &Anchor,
         request: &AccountRequest,
-    ) -> Result<(Vec<TransactionRow>, Option<String>, Option<String>), Failure> {
+    ) -> Result<(Vec<TransactionRow>, Option<Vec<u8>>, Option<Vec<u8>>), Failure> {
         // SQL rows are untrusted hints. Each must lie within the certified
         // height, match the filter, follow the request cursor, and strictly
         // descend, so a page cannot repeat or reorder rows.
@@ -713,11 +638,12 @@ impl Explorer {
         let rows = hints
             .into_iter()
             .map(|(cursor, digest, location)| TransactionRow {
-                location: location.to_string(),
-                body: hex(&bodies[&digest]),
-                height: cursor.height.to_string(),
+                location,
+                body: bodies[&digest].to_vec(),
+                height: cursor.height,
                 index: cursor.index as u32,
-                role: Some(cursor.role as u8),
+                role: Some((cursor.role as i32).into()),
+                ..Default::default()
             })
             .collect();
         Ok((rows, Some(proof), next))
@@ -729,7 +655,7 @@ impl Explorer {
         &self,
         anchor: &Anchor,
         expected: &[(u64, Digest)],
-    ) -> Result<(String, BTreeMap<Digest, Bytes>), Failure> {
+    ) -> Result<(Vec<u8>, BTreeMap<Digest, Bytes>), Failure> {
         // Collapse duplicate locations, rejecting two digests for one location.
         let mut locations = BTreeMap::new();
         for &(location, digest) in expected {
@@ -759,7 +685,7 @@ impl Explorer {
         &self,
         anchor: &Anchor,
         locations: &[u64],
-    ) -> Result<(String, BTreeMap<u64, Digest>), Failure> {
+    ) -> Result<(Vec<u8>, BTreeMap<u64, Digest>), Failure> {
         // Only appends below the certified tip can hold transactions. The tip
         // itself is the block's commit operation.
         let range = &anchor.header.transactions_range;
@@ -818,7 +744,7 @@ impl Explorer {
 
         let encoded = encode_historical_multi_proof(&proof);
         bounded_proof(&encoded)?;
-        Ok((hex(&encoded), digests))
+        Ok((encoded.to_vec(), digests))
     }
 
     /// Fetches signed bodies for proven transaction digests. Bodies come from
@@ -865,13 +791,13 @@ impl Explorer {
     }
 
     /// Links the certified header down to the parent of the block at `height`.
-    /// Returns the hex parent headers, the block's header, and the block's own
+    /// Returns the encoded parent headers, the block's header, and the block's own
     /// transaction interval [start, end).
     async fn ancestry(
         &self,
         anchor: &Anchor,
         height: u64,
-    ) -> Result<(Vec<String>, Header, u64, u64), Failure> {
+    ) -> Result<(Vec<Vec<u8>>, Header, u64, u64), Failure> {
         // The chain must reach the requested block's parent, or block 1 itself,
         // within the ancestry bound.
         let lowest = height.saturating_sub(1).max(1);
@@ -947,7 +873,7 @@ impl Explorer {
                 if ancestor_height == height {
                     block = Some(ancestor.clone());
                 }
-                headers.push(hex(bytes));
+                headers.push(bytes.to_vec());
                 current = ancestor;
             }
         }
@@ -978,11 +904,10 @@ impl Explorer {
 /// Serves an account's latest proven update and one activity page under a
 /// single certified snapshot.
 async fn account(
-    State(explorer): State<Arc<Explorer>>,
-    Path(account): Path<String>,
-    Query(query): Query<AccountQuery>,
-) -> Result<Response, Failure> {
-    let request = AccountRequest::parse(&account, query)?;
+    explorer: &Explorer,
+    request: proto::GetAccountRequest,
+) -> Result<Bundle, Failure> {
+    let request = AccountRequest::parse(request)?;
 
     // Anchor to the newest certificate under the publication boundary, or to
     // the pinned snapshot.
@@ -998,32 +923,24 @@ async fn account(
                 Ok((Vec::new(), None, None))
             }
         },)?;
-    bundle.account = account;
-    (
-        bundle.transactions,
-        bundle.transactions_proof,
-        bundle.next_cursor,
-    ) = activity;
+    bundle.account = account.into();
+    let (transactions, proof, cursor) = activity;
+    bundle.transactions = transactions;
+    bundle.transactions_proof = proof;
+    bundle.next_cursor = cursor.map(proto::proof_bundle::NextCursor::ActivityCursor);
 
     // Report the floor after every read, since each read can raise it.
-    bundle.sequence_number = anchor.floor()?.to_string();
+    bundle.sequence_number = anchor.floor()?;
     response(bundle)
 }
 
 /// Serves one page of a block's transactions, proven through the lowest
 /// certificate at or above the block.
-async fn block(
-    State(explorer): State<Arc<Explorer>>,
-    Path(height): Path<String>,
-    Query(query): Query<BlockQuery>,
-) -> Result<Response, Failure> {
-    let height = positive(&height)?;
-    let offset = query
-        .offset
-        .as_deref()
-        .map(decimal)
-        .transpose()?
-        .unwrap_or(0);
+async fn block(explorer: &Explorer, request: proto::GetBlockRequest) -> Result<Bundle, Failure> {
+    let proto::GetBlockRequest { height, offset, .. } = request;
+    if height == 0 {
+        return Err(Failure::bad("height must be positive"));
+    }
 
     // Link the lowest covering certificate down to the block's parent, which
     // fixes the block's own transaction interval.
@@ -1050,34 +967,39 @@ async fn block(
         bundle.transactions = digests
             .into_iter()
             .map(|(location, digest)| TransactionRow {
-                location: location.to_string(),
-                body: hex(&bodies[&digest]),
-                height: height.to_string(),
+                location,
+                body: bodies[&digest].to_vec(),
+                height,
                 index: (location - start) as u32,
                 role: None,
+                ..Default::default()
             })
             .collect();
         bundle.transactions_proof = Some(proof);
     }
 
     // Return the next page's offset while transactions remain.
-    bundle.next_cursor = (page_end < count).then(|| page_end.to_string());
+    bundle.next_cursor =
+        (page_end < count).then_some(proto::proof_bundle::NextCursor::BlockOffset(page_end));
 
     // Report the floor after every read, since each read can raise it.
-    bundle.sequence_number = anchor.floor()?.to_string();
+    bundle.sequence_number = anchor.floor()?;
     response(bundle)
 }
 
 /// Serves one transaction with its exact inclusion height and proof.
 async fn transaction(
-    State(explorer): State<Arc<Explorer>>,
-    Path(digest): Path<String>,
-) -> Result<Response, Failure> {
-    let digest = Digest::from(hex_bytes::<32>(&digest)?);
+    explorer: &Explorer,
+    request: proto::GetTransactionRequest,
+) -> Result<Bundle, Failure> {
+    let digest = Digest::from(fixed_bytes::<32>(&request.digest)?);
 
     // Discover the owning height under the published visibility floor, then bind
     // the location to that block's authenticated append interval.
-    let published = explorer.published().await?;
+    let published = explorer
+        .published()
+        .await?
+        .ok_or_else(|| Failure::pending("publication is not ready"))?;
     let sql = explorer
         .sql
         .with_read_session(published.session.with_client(explorer.sql_store.clone()));
@@ -1114,16 +1036,17 @@ async fn transaction(
     let mut bundle = anchor.bundle()?;
     bundle.headers = headers;
     bundle.transactions = vec![TransactionRow {
-        location: location.to_string(),
-        body: hex(&bodies[&digest]),
-        height: height.to_string(),
+        location,
+        body: bodies[&digest].to_vec(),
+        height,
         index,
         role: None,
+        ..Default::default()
     }];
     bundle.transactions_proof = Some(proof);
 
     // Report the floor after every read, since each read can raise it.
-    bundle.sequence_number = anchor.floor()?.to_string();
+    bundle.sequence_number = anchor.floor()?;
     response(bundle)
 }
 

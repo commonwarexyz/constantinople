@@ -195,62 +195,48 @@ to the next batch immediately and still incur ingress verification work.
 
 ### Local Deployment with Indexer + Explorer
 
-Add `--indexer` to spin up the shared `chain-indexer` store, the
-`metadata-indexer` query/stream service, the `qmdb-indexer` query facade, and
-the React explorer dev server alongside the validators:
+Add `--indexer` to start a shared `chain-indexer` Store, one
+`explorer-indexer` HTTP service, and the React explorer alongside the validators.
+The indexer secondary publishes SQL rows, Simplex artifacts, and QMDB data to
+Store. The explorer server reads that Store directly and serves block streams,
+search, combined proof responses, and transaction submission through one
+ConnectRPC service.
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
-  --indexer \
-  --relayer \
-  --output-dir ./local \
-  --spammer \
-  local
+  --validators 4 --indexer --relayer --spammer --output-dir ./local local
 ```
 
-Primaries leave their `indexer:` block unset. The indexer secondary owns the
-full upload path for raw KV, SQL metadata, simplex, and QMDB writes. When both
-`--indexer` and `--relayer` are set, the indexer is `secondary-0` and the
-relayer is `secondary-1`.
+Primaries leave their `indexer:` block unset. When both `--indexer` and
+`--relayer` are set, the publisher is `secondary-0` and the relayer is
+`secondary-1`.
 
-The printed `mprocs` command list grows by four entries:
+The printed `mprocs` command adds three services:
 
-- `cargo run --release -p constantinople-indexer --features chain-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
-  runs the simulator-backed shared store. `--chain-indexer-port` overrides the Store port.
-  The metrics port follows the validator, secondary, and spammer metrics range
-  starting at `--base-metrics-port`. Direct invocations accept `--metrics-port`,
-  and YAML configs accept `metrics_port`. Both default to `9090` when omitted.
-- `cargo run --release -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
-  — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
-- `cargo run --release -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
-  — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
-  overrides the port.
-- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev -- --port 5173 --strictPort`
-  — the [React explorer](../../explorer/README.md), which subscribes to the
-  metadata service, streams new finalized blocks live, and verifies
-  submitted-transaction proofs against `qmdb-indexer` and Simplex finalization
-  certificates in the shared store.
+- `chain-indexer` listens on `8090`. `--chain-indexer-port` overrides its Store
+  port. Its separate metrics port follows the validator, secondary, and spammer
+  metrics range starting at `--base-metrics-port`.
+- `explorer-indexer` listens on `8092`. `--explorer-indexer-port` overrides its
+  HTTP port. The command passes `--store-url` and `--relayer-url`; the latter
+  selects the relayer when enabled, otherwise the first validator's HTTP port.
+  It waits for Store's `/ready` endpoint before starting, using `curl` probes
+  with a one-second timeout and a one-second interval.
+- Vite listens on `5173`, with `VITE_INDEXER_URL` pointing at `explorer-indexer`
+  and `VITE_SIMPLEX_VERIFICATION_MATERIAL` holding the committee verification
+  material. No Store credentials or internal service URLs are sent to the browser.
 
-The generated metadata and QMDB commands require `curl`. They poll Store's
-`/ready` endpoint before starting each adapter. Failed probes are retried after
-one second. Each probe has a one-second timeout.
+The API is `constantinople.explorer.v1.ExplorerService`. Its unary methods are
+`GetAccount`, `GetBlock`, `GetTransaction`, `Search`, and `SubmitTransaction`;
+`WatchBlocks` streams published blocks. Connect requests use paths such as
+`/constantinople.explorer.v1.ExplorerService/GetAccount` on the configured
+origin. The protobuf schema lives in
+[`explorer.proto`](../../crates/indexer/proto/constantinople/explorer/v1/explorer.proto).
+Run `just explorer-generate` to regenerate the browser's typed bindings after
+changing that schema.
 
-Validators do not upload QMDB data to `qmdb-indexer` directly. The indexer
-secondary writes QMDB rows into the shared `chain-indexer` store using reserved
-Store prefixes. `qmdb-indexer` reads those rows from the same store and exposes
-account-state operation-log APIs under `/state` and transaction-hash
-operation-log APIs under `/transactions`.
-
-Validators also write Simplex finalization artifacts into the shared
-`chain-indexer` store through `exoware-simplex`. The explorer reads those
-artifacts through `VITE_STORE_URL`, verifies them with
-`VITE_SIMPLEX_VERIFICATION_MATERIAL`, checks that the certified marshal
-commitment names the decoded block, and only then uses the block's transaction
-root as the trusted root for the QMDB transaction proof.
-
-When `--relayer` is also set, the explorer command receives
-`VITE_MEMPOOL_URL` pointing at the local relayer.
+The browser verifies certificates and QMDB proofs locally. It accesses neither
+raw Store nor SQL/QMDB RPC endpoints. Wallet submissions use the same explorer
+origin and are forwarded by the server to its configured admission endpoint.
 
 End-to-end "spin everything up" with the spammer for live transaction flow:
 
@@ -462,195 +448,153 @@ Primaries omit their `indexer:` block. The indexer secondary owns the full
 upload path, and the shared read services are colocated in the first remote
 region.
 
-The generated bundle now also includes:
+The generated bundle also includes `chain-indexer.yaml`,
+`explorer-indexer.yaml`, and `simplex-verification-material.hex`. Store and the
+explorer server run as separate managed instances in the first remote region.
+The indexer secondary runs the validator executable and publishes to Store.
 
-- `chain-indexer.yaml` — deployer config for the shared store instance.
-- `metadata-indexer.yaml` — deployer config for the metadata query/stream service.
-- `qmdb-indexer.yaml` — deployer config for the QMDB query facade.
-- `simplex-verification-material.hex` — explorer verification material derived from DKG output.
-- three extra deployer instances in `config.yaml`: `chain-indexer`, `metadata-indexer`, and
-  `qmdb-indexer`.
+`chain-indexer` listens on `8090` by default and uses a `c8gb.4xlarge` instance
+with a 500 GiB `io2` volume and 16,000 IOPS. Override its resources with
+`--chain-indexer-instance-type`, `--chain-indexer-storage-size`, and
+`--chain-indexer-storage-iops`. The explorer API listens on `8092`, configurable
+with `--explorer-indexer-port`. Its generated `relayer_url` names the relayer
+secondary when present, otherwise the first validator's HTTP endpoint.
 
-Topology and defaults:
+The deployer opens managed service ports globally because
+`commonware-deployer` has a deployment-wide port list.
 
-- `chain-indexer` is a single shared simulator-backed store instance.
-- `chain-indexer` runs a Constantinople-specific write-heavy RocksDB profile.
-- `metadata-indexer` is a single shared SQL query/stream service layered on that store.
-- `qmdb-indexer` is a single shared QMDB Connect facade layered on that store.
-- Simplex finalization artifacts are stored in `chain-indexer` and read
-  directly by proof-verifying clients through the Store API.
-- all shared indexer services land in the first remote region.
-- `chain-indexer` uses a `c8gb.4xlarge` instance and a 500 GiB `io2` volume with
-  16,000 IOPS by default; override these with `--chain-indexer-instance-type`,
-  `--chain-indexer-storage-size`, and `--chain-indexer-storage-iops`.
-- `chain-indexer` listens on port `8090` by default.
-- `metadata-indexer` listens on port `8091` by default.
-- `qmdb-indexer` listens on port `8092` by default.
-- Full indexer uploads are enabled on only the indexer secondary.
+### Peer HTTP access after creation
 
-Validators commit QMDB rows and Simplex certificates through the shared Store
-URL. The QMDB facade serves account-state operation-log reads under `/state`
-and transaction-hash operation-log reads under `/transactions`. Clients read
-Simplex certificates from the Store.
+With the default empty `--http-cidr` list, or a list limited to operator
+addresses, allow workload-to-workload HTTP access before submitting
+transactions. The deployer's operator-IP rule allows the operator to reach a
+validator; it does not allow the explorer server's public IP to do so. The
+managed explorer sends submissions to the relayer when enabled, otherwise to
+the first validator. The relayer in turn needs HTTP access to every primary
+validator, and a spammer needs HTTP access to the relayer.
 
-The deployer opens shared-service ports globally because `commonware-deployer`'s port list is
-deployment-wide rather than per-instance.
+Hostnames resolve to public IPs from the completed deployment's `hosts.yaml`.
+Arrange narrow source-IP and HTTP-port access through your network policy, or
+choose the existing deployer's broader authorization command described below.
+The generator leaves your `--http-cidr` policy unchanged and prints a reminder
+for managed explorer deployments without public HTTP access. `deploy.sh`
+explicitly supplies `--http-cidr 0.0.0.0/0`, so its HTTP policy already permits
+these hops.
 
-### External Store and Adapters
+**Optional broad peer authorization:** `deployer aws authorize --ip` trusts
+that source IP on **all ports in every deployment security group**, including
+SSH and monitoring. It is not a rule limited to the admission HTTP port. Use
+it only if that workload trust is appropriate; narrow HTTP rules remain an
+alternative.
 
-Pass `--store-url <url>` with `--indexer` to use an external exoware Store instead
-of provisioning the simulator-backed `chain-indexer` host. The owning indexer
-secondary and every locally managed adapter receive this URL. No
-`chain-indexer` instance, binary, config, or port rule is generated.
+After `deployer aws create` completes, this example deliberately authorizes
+the managed explorer's source IP through the existing deployer:
 
-The metadata and QMDB adapters can be replaced independently. Each adapter
-origin requires `--store-url`. The generator checks that dependency,
-but it cannot verify service ownership. The operator must ensure every supplied
-adapter is backed by the same Store deployment as `--store-url`.
+```sh
+TAG=$(yq -r '.tag' deploy/config.yaml)
+HOSTS=$HOME/.commonware_deployer/$TAG/hosts.yaml
+INDEXER_IP=$(yq -r '.hosts[] | select(.name=="explorer-indexer") | .ip' "$HOSTS")
+deployer aws authorize --config deploy/config.yaml --ip "$INDEXER_IP"
+```
+
+When enabled, the relayer and spammer also need their source IPs authorized or
+covered by equivalent narrow HTTP rules. The spammer is named `spammer` in
+`hosts.yaml`; the relayer's host name is the identity of the secondary whose
+generated configuration contains `relayer`. Repeat the optional command with
+each source IP only if you intend to grant the same broad trust. External
+explorer operators must arrange their own admission access.
+
+### External Store and Explorer Service
+
+Pass `--store-url <url>` with `--indexer` to use an external Exoware Store.
+The publisher and managed explorer server receive that URL; no `chain-indexer`
+instance, binary, config, or port rule is generated. Add `--indexer-url <url>`
+to use an existing explorer server backed by that same Store. This suppresses
+its managed instance, binary, config, and port rule. The external server owns
+its transaction admission configuration and must implement all six methods of
+`constantinople.explorer.v1.ExplorerService`. `--indexer-url` supplies the
+service origin; it does not include an RPC method path.
+
+| Remote flags | Managed services |
+| ------------ | ---------------- |
+| none | `chain-indexer`, `explorer-indexer` |
+| `--store-url` | `explorer-indexer` |
+| `--store-url` and `--indexer-url` | none |
+
+`--indexer-url` requires `--store-url`. The generator validates URL syntax;
+operators must ensure the external service reads the correct Store.
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 20 \
-  --indexer \
-  --output-dir ./deploy \
-  remote \
-  --instance-type c8g.2xlarge \
-  --storage-size 75 \
-  --monitoring-instance-type c8g.2xlarge \
-  --monitoring-storage-size 100 \
+  --validators 20 --indexer --output-dir ./deploy remote \
+  --instance-type c8g.2xlarge --storage-size 75 \
+  --monitoring-instance-type c8g.2xlarge --monitoring-storage-size 100 \
   --store-url https://store.example.com \
-  --metadata-indexer-url https://sql.example.com \
-  --qmdb-indexer-url https://qmdb.example.com \
-  --regions us-east-1,us-west-2 \
-  --dashboard ./dashboard.json
+  --indexer-url https://explorer.example.com \
+  --regions us-east-1,us-west-2 --dashboard ./dashboard.json
 ```
 
-`--metadata-indexer-url` and `--qmdb-indexer-url` identify already-running
-explorer origins. They are not written into validator or adapter YAML. Each
-flag suppresses only the matching config file, binary, instance, and port
-rule. An adapter without a remote origin remains local and reads from the
-external Store URL.
-
-| Remote flags | Locally managed services |
-| ------------ | ------------------------ |
-| neither adapter flag | `metadata-indexer`, `qmdb-indexer` |
-| `--metadata-indexer-url` | `qmdb-indexer` |
-| `--qmdb-indexer-url` | `metadata-indexer` |
-| both adapter flags | none |
-
-The validator writer and local adapter readers use independent credentials.
-`--store-api-key` or
-`CONSTANTINOPLE_STORE_API_KEY` is serialized only into the owning indexer
-secondary. It authenticates Simplex, SQL, and QMDB uploads plus writer
-recovery reads. A write-only credential is sufficient when Store reads are
-open. When Store reads require authentication, this credential must have both
-read and write scopes. Supporting separate writer read and write credentials
-is deferred. `--adapter-store-api-key` or
-`CONSTANTINOPLE_ADAPTER_STORE_API_KEY` is serialized only into locally managed
-adapter configs. Both credentials require an explicit external Store URL. Remote adapters receive neither value. An omitted key
-preserves the SDK `EXOWARE_API_KEY` fallback.
-
-The adapter binaries also support environment-only startup through
-`CONSTANTINOPLE_STORE_URL` and `CONSTANTINOPLE_PORT`. Runtime values resolve
-from an explicit CLI value, then deployer YAML, then the environment, then a
-compiled default or missing-value error. A deployer YAML API key takes
-precedence over `EXOWARE_API_KEY`. Overriding the Store URL through the CLI
-drops the YAML credential. The SDK environment fallback still applies.
+The writer credential (`--store-api-key` or `CONSTANTINOPLE_STORE_API_KEY`)
+is serialized only into the publisher secondary. The reader credential
+(`--adapter-store-api-key` or `CONSTANTINOPLE_ADAPTER_STORE_API_KEY`) is
+serialized only into the managed explorer server. Both require an external
+Store URL. External explorer services receive neither credential. An omitted
+key preserves the SDK's `EXOWARE_API_KEY` fallback. The writer needs both read
+and write scopes if Store reads require authentication.
 
 Writers use four HTTP/2 connections per origin and compress requests with Zstd.
 External HTTPS proxies must negotiate h2 through ALPN. Plain HTTP must support
-prior-knowledge h2c. Adapter reads may still use HTTP/1.1.
+prior-knowledge h2c. Explorer Store reads may use HTTP/1.1.
 
 Balanced writer RPCs use the SDK's 30-second deadline as the timeout and retry
 threshold. Failed commits retry the same batch. A Store that consistently takes
 longer will stall publication until requests complete within that deadline.
 
-Each adapter probes Store readiness once before binding. After startup,
-`/health` and `/ready` return static success. These routes indicate completed
-startup and do not track subsequent Store outages.
+The explorer server accepts `--store-url`, `--relayer-url`, `--port`,
+`--host`, `--metrics-port`, and deployer `--hosts`/`--config`. Named hosts in
+both service URLs resolve through the deployer host map. An explicit CLI Store
+URL overrides the YAML URL and drops its associated credential.
 
-`--metrics-port` or YAML `metrics_port` moves `/metrics` to a separate listener.
-Commonware remote bundles set it to 9090 for the monitoring host's Prometheus
-scrapes and omit metrics from the public router. When unset, metrics share the
-service port for deployments that scrape it there. That shared endpoint has the
-service's permissive CORS policy. Health, readiness, metrics, and CORS preflight
-requests are excluded from adapter request counters.
-
-The deployer opens local shared-service ports globally because
-`commonware-deployer` owns one deployment-wide port list. Remote adapter flags
-remove their matching ports from that list.
+The server probes Store readiness before binding. `/health` and `/ready`
+indicate completed startup, not ongoing Store availability. Managed deployment
+sets `metrics_port: 9090` on a separate listener. The browser only needs access
+to the explorer API; Store, SQL, and QMDB access stays on the server.
 
 ### Deployment Script with External Services
 
-The repository deployment script accepts the public Store and adapter
-origins directly. The Rust generator validates these URLs before writing the
-bundle. Credentials can be entered without putting them in shell history.
+The deployment script accepts the same service URLs and builds only managed
+binaries. Store credentials remain in the generated service configuration.
 
 ```sh
-read -rs -p "Store writer API key: " CONSTANTINOPLE_STORE_API_KEY
-export CONSTANTINOPLE_STORE_API_KEY
 ./deploy.sh \
   --store-url https://store.example.com \
-  --sql-url https://sql.example.com \
-  --qmdb-url https://qmdb.example.com
+  --indexer-url https://explorer.example.com
 ```
 
-`--sql-url` and `--qmdb-url` each require `--store-url`, as do credentials.
-The script passes credentials to the generator through its environment.
-`CONSTANTINOPLE_ADAPTER_STORE_API_KEY` supplies the separate local-adapter key.
-Explicit credential flags remain accepted, but their values are visible in the
-invoking process arguments. Prefer environment inputs. Generated YAML contains
-the credentials needed by each service.
-
-Remote adapter origins are exported verbatim to `VITE_SQL_URL` and
-`VITE_QMDB_URL`. A missing adapter origin is constructed from its generated
-host. `VITE_STORE_URL` always points to Store because the explorer reads
-Simplex finalizations directly. Credentials are never exported as `VITE_*`
-values. The static explorer therefore requires tokenless public access to
-Store query, SQL, and QMDB reads. Browser token input is deferred and must be
-implemented before the explorer can use authenticated read origins.
-
-The script builds only locally managed adapter binaries. The managed
-chain-indexer Intel build remains last because both chain-indexer recipes
-write `deploy/chain-indexer`.
+The script exports `VITE_INDEXER_URL` and
+`VITE_SIMPLEX_VERIFICATION_MATERIAL` to the local Vite process. With a managed
+server it resolves the `explorer-indexer` host IP and port `8092`; with
+`--indexer-url` it uses that URL verbatim. The managed Store's Intel binary is
+built last because the architecture recipes share its output path.
 
 ### Local Explorer Against Remote
 
-After the remote deployment has completed, run the explorer locally against the
-remote shared services:
+After deployment, start the explorer locally against the managed API:
 
 ```sh
 TAG=$(yq -r '.tag' deploy/config.yaml)
 HOSTS=$HOME/.commonware_deployer/$TAG/hosts.yaml
-
-CHAIN_IP=$(yq -r '.hosts[] | select(.name=="chain-indexer") | .ip' "$HOSTS")
-SQL_IP=$(yq -r '.hosts[] | select(.name=="metadata-indexer") | .ip' "$HOSTS")
-QMDB_IP=$(yq -r '.hosts[] | select(.name=="qmdb-indexer") | .ip' "$HOSTS")
-
+INDEXER_IP=$(yq -r '.hosts[] | select(.name=="explorer-indexer") | .ip' "$HOSTS")
 SIMPLEX_VERIFICATION_MATERIAL=$(tr -d '[:space:]' < deploy/simplex-verification-material.hex)
 
-VITE_SQL_URL=http://$SQL_IP:8091 \
-VITE_QMDB_URL=http://$QMDB_IP:8092 \
-VITE_STORE_URL=http://$CHAIN_IP:8090 \
+VITE_INDEXER_URL=http://$INDEXER_IP:8092 \
 VITE_SIMPLEX_VERIFICATION_MATERIAL=$SIMPLEX_VERIFICATION_MATERIAL \
 npm --prefix explorer run dev
 ```
 
-The generated local `mprocs` command sets `VITE_MEMPOOL_URL` automatically when
-`--relayer` is enabled. For a local explorer pointed at a remote deployment,
-set it manually if you want local submissions to go through the remote relayer:
-
-```sh
-RELAYER_NAME=$(for f in deploy/*.yaml; do yq -e '.relayer' "$f" >/dev/null 2>&1 && basename "$f" .yaml; done)
-RELAYER_IP=$(yq -r ".hosts[] | select(.name==\"$RELAYER_NAME\") | .ip" "$HOSTS")
-
-VITE_MEMPOOL_URL=http://$RELAYER_IP:8080 \
-VITE_SQL_URL=http://$SQL_IP:8091 \
-VITE_QMDB_URL=http://$QMDB_IP:8092 \
-VITE_STORE_URL=http://$CHAIN_IP:8090 \
-VITE_SIMPLEX_VERIFICATION_MATERIAL=$SIMPLEX_VERIFICATION_MATERIAL \
-npm --prefix explorer run dev
-```
+For an external explorer service, use its URL as `VITE_INDEXER_URL`. Search,
+verified account and transaction pages, block streaming, and wallet submission
+all use this origin.
 
 ## Secondary Validators
 

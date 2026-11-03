@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { VerifiedTransactionBundle } from '../src/proofBundle.ts';
 
 import {
     assignReconciliationOrder,
-    markReconciliationCertificate,
+    assertSubmittedTransactionMatches,
     markReconciliationError,
     markReconciliationFetching,
     markReconciliationWaiting,
@@ -11,7 +12,7 @@ import {
     markSubmissionRejected,
     markTransactionFinalized,
     markValidatorFinalizationObserved,
-    normalizeSubmittedTransaction,
+    restoreSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
     selectReconciliations,
@@ -22,6 +23,47 @@ import {
 const sender = '11'.repeat(32);
 const recipient = '22'.repeat(32);
 const digest = '33'.repeat(32);
+
+function verifiedBundle(): VerifiedTransactionBundle {
+    const root = new Uint8Array(32);
+    return {
+        height: 19n, view: 4n, location: 120n, tip: 140n, proofSizeBytes: 240,
+        blockDigest: root,
+        transaction: { digest, sender, recipient, value: 7n, nonce: 2n, location: 120n, index: 0 },
+        target: {
+            height: 23n, view: 9n, contextView: 8n, timestampMs: 10n, blockDigest: root,
+            stateRoot: root, stateStart: 1n, stateTip: 140n,
+            transactionsRoot: root, transactionsStart: 1n, transactionsTip: 140n, sequenceNumber: 1n,
+        },
+    };
+}
+
+test('stored display fields must match the proved body before finalization is published', () => {
+    const local = reconcilingTransaction();
+    const verified = verifiedBundle();
+    assert.doesNotThrow(() => assertSubmittedTransactionMatches(local, verified.transaction));
+    const changes: Partial<SubmittedTransaction>[] = [
+        { sender: '44'.repeat(32) }, { to: '44'.repeat(32) },
+        { digest: '44'.repeat(32) }, { value: '999' }, { nonce: '999' },
+    ];
+    for (const change of changes) {
+        const restored = restoreSubmittedTransaction({ ...local, ...change, status: 'finalized' })!;
+        assert.throws(() => assertSubmittedTransactionMatches(restored, verified.transaction), /do not match/);
+        const [result] = markTransactionFinalized(verified, 1_600, [restored]);
+        assert.equal(result.status, 'reconciling');
+        assert.notEqual(result.certificate.status, 'verified');
+        assert.notEqual(result.proof.status, 'verified');
+        assert.equal(result.finalizedHeight, null);
+        assert.equal(result.finalizationObservedInMs, null);
+        assert.equal(result.proofObservedInMs, null);
+        assert.equal(result.nonce, restored.nonce);
+        if (restored.digest === verified.transaction.digest) {
+            assert.equal(result.certificate.status, 'error');
+            assert.equal(result.proof.status, 'error');
+            assert.match(result.detail, /do not match/);
+        }
+    }
+});
 
 function reconcilingTransaction(): SubmittedTransaction {
     return {
@@ -43,7 +85,7 @@ function reconcilingTransaction(): SubmittedTransaction {
 }
 
 test('legacy dropped rows return to digest reconciliation', () => {
-    const transaction = normalizeSubmittedTransaction({
+    const transaction = restoreSubmittedTransaction({
         ...reconcilingTransaction(),
         reconciliationVersion: undefined,
         status: 'dropped',
@@ -59,8 +101,8 @@ test('legacy dropped rows return to digest reconciliation', () => {
     assert.equal(shouldReconcileTransaction(transaction!, sender), true);
 });
 
-test('version one finalized rows migrate latency to proof observation only', () => {
-    const transaction = normalizeSubmittedTransaction({
+test('version one finalized rows require fresh verification after restore', () => {
+    const transaction = restoreSubmittedTransaction({
         ...reconcilingTransaction(),
         reconciliationVersion: 1,
         status: 'finalized',
@@ -82,13 +124,16 @@ test('version one finalized rows migrate latency to proof observation only', () 
     });
 
     assert.equal(transaction?.reconciliationVersion, 2);
-    assert.equal(transaction?.status, 'finalized');
+    assert.equal(transaction?.status, 'reconciling');
+    assert.equal(transaction?.finalizedHeight, null);
+    assert.equal(transaction?.certificate.status, 'waiting');
+    assert.equal(transaction?.proof.status, 'waiting');
     assert.equal(transaction?.finalizationObservedInMs, null);
-    assert.equal(transaction?.proofObservedInMs, 500);
+    assert.equal(transaction?.proofObservedInMs, null);
 });
 
 test('legacy filtered rows return to digest reconciliation', () => {
-    const transaction = normalizeSubmittedTransaction({
+    const transaction = restoreSubmittedTransaction({
         ...reconcilingTransaction(),
         reconciliationVersion: undefined,
         status: 'partially_finalized',
@@ -100,23 +145,11 @@ test('legacy filtered rows return to digest reconciliation', () => {
     assert.equal(shouldReconcileTransaction(transaction!, sender), true);
 });
 
-test('dropped response stops reconciliation without latency', () => {
-    const withCertificate = markReconciliationCertificate(
-        digest,
-        19,
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            height: '19',
-            view: '4',
-        },
-        1_400,
-        [reconcilingTransaction()],
-    )[0];
+test('local rejection stops reconciliation without latency', () => {
     const [transaction] = markSubmissionRejected(
         digest,
-        'validator reported transaction dropped before finalization',
-        [withCertificate],
+        'transaction failed local validation before dispatch',
+        [reconcilingTransaction()],
     );
 
     assert.equal(transaction.status, 'rejected');
@@ -126,114 +159,72 @@ test('dropped response stops reconciliation without latency', () => {
     assert.equal(transaction.proof.status, 'unavailable');
     assert.equal(shouldReconcileTransaction(transaction, sender), false);
 
-    const [afterCertificate] = markReconciliationCertificate(
-        digest,
-        19,
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            height: '19',
-            view: '4',
-        },
-        1_500,
-        [transaction],
-    );
-    assert.deepEqual(afterCertificate, transaction);
-
-    const [afterProof] = markTransactionFinalized(
-        digest,
-        19,
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            height: '19',
-            view: '4',
-        },
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            location: '120',
-            tip: '130',
-            proofSizeBytes: 240,
-        },
-        1_600,
-        [transaction],
-    );
+    const [afterProof] = markTransactionFinalized(verifiedBundle(), 1_600, [transaction]);
     assert.deepEqual(afterProof, transaction);
 });
 
-test('each submission phase records its own first observation', () => {
-    const certificate = {
-        status: 'verified',
-        detail: 'verified at height 19',
-        height: '19',
-        view: '4',
-    } as const;
-    const withCertificate = markReconciliationCertificate(
-        digest,
-        19,
-        certificate,
-        1_400,
-        [reconcilingTransaction()],
-    )[0];
-    assert.equal(withCertificate.finalizationObservedInMs, 400);
-    assert.equal(withCertificate.proofObservedInMs, null);
-
-    const repeatedCertificate = markReconciliationCertificate(
-        digest,
-        19,
-        certificate,
-        1_450,
-        [withCertificate],
-    )[0];
-    assert.equal(repeatedCertificate.finalizationObservedInMs, 400);
-
-    const waiting = markTransactionFinalized(
-        digest,
-        19,
-        certificate,
-        { status: 'waiting', detail: 'waiting for QMDB proof' },
-        1_500,
-        [repeatedCertificate],
-    )[0];
-    assert.equal(waiting.status, 'reconciling');
-    assert.equal(waiting.proofObservedInMs, null);
-
-    const finalized = markTransactionFinalized(
-        digest,
-        19,
-        certificate,
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            location: '120',
-            tip: '130',
-            proofSizeBytes: 240,
-        },
-        1_600,
-        [waiting],
-    )[0];
+test('full membership publishes finality, certificate, proof, and observation times together', () => {
+    const finalized = markTransactionFinalized(verifiedBundle(), 1_600, [reconcilingTransaction()])[0];
     assert.equal(finalized.status, 'finalized');
     assert.equal(finalized.finalizedHeight, 19);
-    assert.equal(finalized.finalizationObservedInMs, 400);
+    assert.equal(finalized.finalizationObservedInMs, 600);
     assert.equal(finalized.proofObservedInMs, 600);
-
-    const [afterAdmission] = markSubmissionReconciling(
-        digest,
-        'admitted by a leader',
-        [finalized],
-    );
-    assert.deepEqual(afterAdmission, finalized);
-
-    const [afterRejection] = markSubmissionRejected(
-        digest,
-        'late deterministic response',
-        [finalized],
-    );
-    assert.deepEqual(afterRejection, finalized);
+    assert.deepEqual(finalized.certificate, {
+        status: 'verified', detail: 'verified at height 23', height: '23', view: '9',
+    });
+    assert.deepEqual(finalized.proof, {
+        status: 'verified', detail: 'verified at height 19', location: '120', tip: '140', proofSizeBytes: 240,
+    });
+    assert.deepEqual(markTransactionFinalized(verifiedBundle(), 1_700, [finalized])[0], finalized);
+    assert.deepEqual(markSubmissionReconciling(digest, 'admitted by a leader', [finalized])[0], finalized);
+    assert.deepEqual(markSubmissionRejected(digest, 'late deterministic response', [finalized])[0], finalized);
 });
 
-test('validator finality records height and observations without ending reconciliation', () => {
+test('an owning height outside the stored numeric range cannot publish partial chain state', () => {
+    const local = reconcilingTransaction();
+    const [result] = markTransactionFinalized({ ...verifiedBundle(), height: 1n << 53n }, 1_600, [local]);
+    assert.equal(result.status, 'reconciling');
+    assert.equal(result.certificate.status, 'error');
+    assert.equal(result.proof.status, 'error');
+    assert.equal(result.finalizedHeight, null);
+    assert.equal(result.finalizationObservedInMs, null);
+    assert.equal(result.proofObservedInMs, null);
+    assert.match(result.detail, /height exceeds Number.MAX_SAFE_INTEGER/);
+});
+
+test('wallet observation timing records only previously unobserved milestones', () => {
+    for (const timing of [
+        { finalizationObservedInMs: 0, proofObservedInMs: null },
+        { finalizationObservedInMs: null, proofObservedInMs: 250 },
+    ]) {
+        const [finalized] = markTransactionFinalized(verifiedBundle(), 1_600, [{
+            ...reconcilingTransaction(), ...timing,
+        }]);
+        assert.equal(finalized.finalizationObservedInMs, timing.finalizationObservedInMs ?? 600);
+        assert.equal(finalized.proofObservedInMs, timing.proofObservedInMs ?? 600);
+        assert.equal(finalized.status, 'finalized');
+    }
+});
+
+test('wallet observation timing restores only nonnegative safe integer durations', () => {
+    const cases: [unknown, number | null][] = [
+        [0, 0], [600, 600], [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+        [undefined, null], [null, null], [-1, null], [0.5, null],
+        [Number.MAX_SAFE_INTEGER + 1, null], [NaN, null], [Infinity, null],
+        ['600', null], [true, null], [{}, null], [[], null],
+    ];
+    for (const [duration, expected] of cases) {
+        const restored = restoreSubmittedTransaction({
+            ...reconcilingTransaction(), finalizationObservedInMs: duration, proofObservedInMs: duration,
+        })!;
+        assert.equal(restored.finalizationObservedInMs, expected);
+        assert.equal(restored.proofObservedInMs, expected);
+        assert.equal(restored.nonce, '2');
+        assert.equal(shouldReconcileTransaction(restored, sender), true);
+    }
+});
+
+test('indexer finality report records no authenticated height or observation', () => {
     const [observed] = markValidatorFinalizationObserved(
         digest,
         19,
@@ -242,34 +233,27 @@ test('validator finality records height and observations without ending reconcil
     );
 
     assert.equal(observed.status, 'reconciling');
-    assert.equal(observed.finalizedHeight, 19);
-    assert.equal(observed.finalizationObservedInMs, 250);
+    assert.equal(observed.finalizedHeight, null);
+    assert.equal(observed.finalizationObservedInMs, null);
     assert.equal(observed.proofObservedInMs, null);
     assert.equal(observed.certificate.status, 'waiting');
     assert.equal(observed.proof.status, 'waiting');
 
-    const restored = normalizeSubmittedTransaction(observed);
+    const restored = restoreSubmittedTransaction(observed);
     assert.equal(restored?.status, 'reconciling');
-    assert.equal(restored?.finalizedHeight, 19);
-    assert.equal(restored?.finalizationObservedInMs, 250);
+    assert.equal(restored?.finalizedHeight, null);
+    assert.equal(restored?.finalizationObservedInMs, null);
     assert.equal(restored?.proofObservedInMs, null);
 
-    const [withCertificate] = markReconciliationCertificate(
-        digest,
-        19,
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            height: '19',
-            view: '4',
-        },
-        1_400,
-        [observed],
-    );
-    assert.equal(withCertificate.status, 'reconciling');
-    assert.equal(withCertificate.finalizationObservedInMs, 250);
-    assert.equal(withCertificate.certificate.status, 'verified');
-    assert.equal(withCertificate.proof.status, 'fetching');
+    const [finalized] = markTransactionFinalized(verifiedBundle(), 1_400, [observed]);
+    assert.equal(finalized.status, 'finalized');
+    assert.equal(finalized.finalizedHeight, 19);
+    assert.equal(finalized.finalizationObservedInMs, 400);
+    assert.equal(finalized.certificate.status, 'verified');
+    assert.equal(finalized.proof.status, 'verified');
+
+    const [afterReport] = markValidatorFinalizationObserved(digest, 99, 1_500, [finalized]);
+    assert.deepEqual(afterReport, finalized);
 });
 
 test('only waiting rows owned by the current sender are reconciled', () => {
@@ -380,7 +364,7 @@ test('sleeping retries leave capacity for queued proofs without retrying early',
 
 test('reloaded proof errors retry corrected backend data', () => {
     for (const reconciliationVersion of [1, 2]) {
-        const transaction = normalizeSubmittedTransaction({
+        const transaction = restoreSubmittedTransaction({
             ...reconcilingTransaction(),
             reconciliationVersion,
             certificate: { status: 'error', detail: 'SQL transaction body does not match transaction digest' },
@@ -394,18 +378,70 @@ test('reloaded proof errors retry corrected backend data', () => {
     }
 });
 
-test('proof retries and reload retain a verified certificate', () => {
-    const certificate = {
-        status: 'verified', detail: 'verified at height 7', height: '7', view: '9',
-    } as const;
-    const initial = { ...reconcilingTransaction(), certificate, finalizedHeight: 7 };
+test('finalized in-memory evidence survives retry updates but restore requires new proof', () => {
+    const initial = markTransactionFinalized(verifiedBundle(), 1_600, [reconcilingTransaction()])[0];
     const fetching = markReconciliationFetching(digest, [initial])[0];
     const waiting = markReconciliationWaiting(digest, 'retry scheduled', [fetching])[0];
     const failed = markReconciliationError(digest, 'invalid proof', [waiting])[0];
 
-    for (const tx of [fetching, waiting, failed]) assert.deepEqual(tx.certificate, certificate);
-    const restored = normalizeSubmittedTransaction(failed)!;
-    assert.deepEqual(restored.certificate, certificate);
+    for (const tx of [fetching, waiting, failed]) assert.deepEqual(tx, initial);
+    const restored = restoreSubmittedTransaction(failed)!;
+    assert.equal(restored.certificate.status, 'waiting');
+    assert.equal(restored.finalizedHeight, null);
     assert.equal(restored.proof.status, 'waiting');
     assert.equal(shouldReconcileTransaction(restored, sender), true);
+});
+
+test('stored status and proof claims cannot stop reconciliation or authorize badges', () => {
+    for (const reconciliationVersion of [undefined, 1, 2]) {
+        for (const status of ['finalized', 'rejected', 'dropped', 'partially_finalized', 'reconciling']) {
+            const transaction = restoreSubmittedTransaction({
+                ...reconcilingTransaction(),
+                reconciliationVersion,
+                status,
+                detail: 'finalized at 19',
+                finalizedHeight: 19,
+                finalizationObservedInMs: 250,
+                proofObservedInMs: 300,
+                certificate: { status: 'verified', detail: 'verified', height: '19', view: '4' },
+                proof: { status: 'verified', detail: 'verified', location: '120', tip: '130', proofSizeBytes: 240 },
+            });
+
+            assert.ok(transaction);
+            assert.equal(transaction.status, 'reconciling');
+            assert.equal(transaction.nonce, '2');
+            assert.equal(transaction.finalizedHeight, null);
+            assert.equal(transaction.finalizationObservedInMs, 250);
+            assert.equal(transaction.proofObservedInMs, 300);
+            assert.equal(transaction.certificate.status, 'waiting');
+            assert.equal(transaction.proof.status, 'waiting');
+            assert.notEqual(transaction.detail, 'finalized at 19');
+            assert.equal(shouldReconcileTransaction(transaction, sender), true);
+        }
+    }
+});
+
+test('restore ignores missing or malformed chain claims while retaining valid local fields', () => {
+    const local = {
+        sender, digest, to: recipient, value: '7', nonce: '2', submittedAt: 1_000,
+    };
+    const expected = restoreSubmittedTransaction(local);
+    assert.ok(expected);
+    assert.deepEqual(restoreSubmittedTransaction({
+        ...local,
+        status: 'finalized',
+        certificate: 'invalid',
+        proof: null,
+        finalizedHeight: Number.MAX_SAFE_INTEGER,
+    }), expected);
+
+    for (const invalid of [
+        { nonce: '-1' }, { nonce: '18446744073709551616' }, { nonce: '0'.repeat(1000) },
+        { value: '18446744073709551616' }, { submittedAt: NaN }, { submittedAt: Infinity },
+        { sender: 'invalid' }, { digest: '' },
+    ]) {
+        assert.equal(restoreSubmittedTransaction({ ...local, ...invalid }), null);
+    }
+    assert.equal(restoreSubmittedTransaction({ ...local, nonce: '18446744073709551615' })?.nonce,
+        '18446744073709551615');
 });

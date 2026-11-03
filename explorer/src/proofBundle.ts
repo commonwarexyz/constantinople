@@ -1,10 +1,12 @@
 import { initQmdbWasm, QmdbProofVerifier } from '@exowarexyz/qmdb';
 import { type SimplexCertificateVerifier, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
-import { Code, ConnectError } from '@connectrpc/connect';
+import { createExplorerClient } from './rpc.ts';
+import { ActivityMode, type ProofBundle, type WatchBlocksResponse } from './gen/constantinople/explorer/v1/explorer_pb.ts';
 import { accountKeyFromPublicKey, bytesEqual, fromHex, parseAccountKeyHex, toArrayBuffer, toHex } from './codec.ts';
 import {
     authenticatedHeader, decodeAccountValue, finalizedTargetFromCertificate,
     readU64Be, simplexFinalizationVerifier,
+    MAX_ANCESTRY_HEADERS, MAX_EXECUTION_HEADER_BYTES, MAX_FINALIZATION_CERTIFICATE_BYTES,
     type AccountActivityMode, type AccountTransactionPage, type DecodedBlockHeader,
     type LatestProofTarget, type VerifiedAccountProof, type VerifiedFinalizationTarget,
     type VerifiedTransactionProof,
@@ -12,14 +14,11 @@ import {
 
 const MAX_U64 = (1n << 64n) - 1n;
 
-/** Maximum size in bytes of one combined indexer response body. */
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
-
 /** Maximum decoded size in bytes of one account proof or transaction multiproof. */
 const MAX_PROOF_BYTES = 1024 * 1024;
 
 /** Maximum number of ancestry headers between a covering certificate and the requested block. */
-const MAX_HEADERS = 4096;
+const MAX_HEADERS = MAX_ANCESTRY_HEADERS;
 
 /** Size of the unsigned transaction body whose SHA-256 hash is the transaction digest. */
 const TRANSACTION_BODY_BYTES = 82;
@@ -45,7 +44,7 @@ interface CertificateContext {
 const certificateInitializations = new Map<string, Promise<CertificateContext>>();
 
 interface CommonOptions {
-    readonly qmdbUrl: string;
+    readonly indexerUrl: string;
     readonly simplexVerificationMaterial: string;
     readonly signal?: AbortSignal;
     readonly onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
@@ -93,6 +92,86 @@ interface Envelope {
 
 type CertifiedTarget = LatestProofTarget & Pick<DecodedBlockHeader, 'parentDigest'>;
 
+export interface VerifiedBlock {
+    readonly height: bigint;
+    readonly digest: Uint8Array;
+    readonly txCount: number;
+    readonly timestampMs: bigint;
+    readonly finality: {
+        readonly certifiedHeight: bigint;
+        readonly certificateView: bigint;
+    };
+}
+
+export interface VerifiedBlockBatch {
+    readonly blocks: readonly VerifiedBlock[];
+    readonly target: Omit<LatestProofTarget, 'sequenceNumber'>;
+    readonly sequenceNumberHint: bigint;
+    readonly receivedAt: number;
+}
+
+/** Owns one material-bound stream cursor independently of the certificate memo. */
+export function createBlockBatchVerifier(simplexVerificationMaterial: string, after?: 0n) {
+    if (after !== undefined && after !== 0n) throw new Error('a new block feed can only resume from canonical genesis');
+    const material = simplexVerificationMaterial.trim().toLowerCase();
+    let cursor: { readonly height: bigint; readonly digest: Uint8Array } | undefined;
+    return {
+        get after(): bigint | undefined { return cursor?.height ?? after; },
+        async verify(message: WatchBlocksResponse, signal?: AbortSignal): Promise<VerifiedBlockBatch | null> {
+            signal?.throwIfAborted();
+            if (message.certificate.length === 0 || message.certificate.length > MAX_FINALIZATION_CERTIFICATE_BYTES) {
+                throw new Error('invalid or oversized certificate');
+            }
+            if (message.headers.length > MAX_HEADERS) throw new Error('invalid or oversized headers');
+            for (const header of message.headers) {
+                if (header.length === 0 || header.length > MAX_EXECUTION_HEADER_BYTES) throw new Error('invalid or oversized execution header');
+            }
+            const envelope = {
+                certificate: message.certificate.slice(), headers: message.headers.map((header) => header.slice()),
+                sequenceNumber: u64(message.sequenceNumber, 'Store sequence'),
+            };
+            const target = await certifiedTarget({ simplexVerificationMaterial: material, signal }, envelope);
+            signal?.throwIfAborted();
+            if (cursor && target.height <= cursor.height) {
+                if (target.height === cursor.height && !bytesEqual(target.blockDigest, cursor.digest)) {
+                    throw new Error('block feed conflicts with its accepted head');
+                }
+                return null;
+            }
+
+            const first = cursor ? cursor.height + 1n : after === 0n ? 1n : target.height;
+            const lowest = cursor?.height ?? (first === 1n ? 1n : first - 1n);
+            if (target.height - first + 1n > BigInt(MAX_HEADERS)) throw new Error('block feed gap exceeds header limit');
+            const chain = await authenticatedChain(target, envelope.headers, lowest, signal);
+            if (cursor && !bytesEqual(chain.at(-1)!.digest, cursor.digest)) {
+                throw new Error('block feed ancestry does not match its accepted head');
+            }
+
+            const finality = Object.freeze({ certifiedHeight: target.height, certificateView: target.view });
+            const blocks: VerifiedBlock[] = [];
+            for (let index = chain.length - 1; index >= 0; index--) {
+                const entry = chain[index]!;
+                if (entry.header.height < first) continue;
+                const { start, end } = appendInterval(entry.header, chain[index + 1]?.header);
+                const count = end - start;
+                if (count > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('block transaction count exceeds a safe integer');
+                blocks.push(Object.freeze({
+                    height: entry.header.height, digest: entry.digest.slice(), txCount: Number(count),
+                    timestampMs: entry.header.timestampMs, finality,
+                }));
+            }
+            const { sequenceNumber, parentDigest: _parentDigest, ...authenticated } = target;
+            const batch: VerifiedBlockBatch = {
+                blocks: Object.freeze(blocks), target: authenticated,
+                sequenceNumberHint: sequenceNumber, receivedAt: Date.now(),
+            };
+            signal?.throwIfAborted();
+            cursor = { height: target.height, digest: target.blockDigest.slice() };
+            return batch;
+        },
+    };
+}
+
 interface CanonicalTransaction {
     readonly digest: string;
     readonly sender: string;
@@ -121,6 +200,13 @@ export interface VerifiedBlockBundle {
     readonly nextOffset: bigint | null;
 }
 
+/** A verified body and exact position under a certified transaction root. */
+export interface VerifiedTransactionBundle extends VerifiedTransactionProof {
+    readonly target: LatestProofTarget;
+    readonly transaction: CanonicalTransaction & { readonly index: number };
+    readonly blockDigest: Uint8Array;
+}
+
 /** Starts verifier and QMDB WebAssembly initialization before the first proof arrives. */
 export async function prewarmProofVerification(material: string): Promise<void> {
     await Promise.all([certificateContext(material), initQmdbWasm()]);
@@ -129,19 +215,23 @@ export async function prewarmProofVerification(material: string): Promise<void> 
 /** Fetches and verifies one page of account state and activity. */
 export async function loadAccountBundle(options: AccountBundleOptions): Promise<VerifiedAccountBundle> {
     const request = accountRequest(options);
-    return verifyAccountBundle(request, await loadEnvelope(request, accountPath(request)));
+    return verifyAccountBundle(request, await loadEnvelope(request, () => createExplorerClient(request.indexerUrl).getAccount({
+        account: fromHex(request.account), mode: { all: ActivityMode.ALL, sent: ActivityMode.SENT, received: ActivityMode.RECEIVED }[request.mode],
+        cursor: request.cursor ?? undefined, at: request.at?.height, digest: request.at?.blockDigest,
+        activity: request.includeTransactions,
+    }, { signal: request.signal }), 'account'));
 }
 
 /** Fetches and verifies one page of a block's transactions. */
 export async function loadBlockBundle(options: BlockBundleOptions): Promise<VerifiedBlockBundle> {
     const request = blockRequest(options);
-    return verifyBlockBundle(request, await loadEnvelope(request, `/explorer/blocks/${request.height}?offset=${request.offset}`));
+    return verifyBlockBundle(request, await loadEnvelope(request, () => createExplorerClient(request.indexerUrl).getBlock({ height: request.height, offset: request.offset }, { signal: request.signal }), 'block'));
 }
 
 /** Fetches and verifies one transaction at its exact inclusion height and block index. */
-export async function loadTransactionBundle(options: TransactionBundleOptions): Promise<VerifiedTransactionProof> {
+export async function loadTransactionBundle(options: TransactionBundleOptions): Promise<VerifiedTransactionBundle> {
     const request = transactionRequest(options);
-    return verifyTransactionBundle(request, await loadEnvelope(request, `/explorer/transactions/${request.digest}`));
+    return verifyTransactionBundle(request, await loadEnvelope(request, () => createExplorerClient(request.indexerUrl).getTransaction({ digest: fromHex(request.digest) }, { signal: request.signal }), 'transaction'));
 }
 
 export async function verifyAccountBundle(options: AccountBundleOptions, raw: unknown): Promise<VerifiedAccountBundle> {
@@ -254,7 +344,7 @@ export async function verifyBlockBundle(options: BlockBundleOptions, raw: unknow
     return { target, block: { height: block.height, blockDigest, view: block.view, transactionCount: count }, transactions, nextOffset };
 }
 
-export async function verifyTransactionBundle(options: TransactionBundleOptions, raw: unknown): Promise<VerifiedTransactionProof> {
+export async function verifyTransactionBundle(options: TransactionBundleOptions, raw: unknown): Promise<VerifiedTransactionBundle> {
     // Bind the row to its owning block's append interval to authenticate its height and index.
     const request = transactionRequest(options);
     const envelope = parseEnvelope(raw, 1);
@@ -263,77 +353,69 @@ export async function verifyTransactionBundle(options: TransactionBundleOptions,
     }
     const target = await certifiedTarget(request, envelope);
     const row = envelope.transactions[0]!;
-    const { block, start, end } = await owningBlock(target, envelope, row.height, request.signal);
+    const { block, blockDigest, start, end } = await owningBlock(target, envelope, row.height, request.signal);
     if (row.location < start || row.location >= end || BigInt(row.index) !== row.location - start) {
         throw new Error('transaction is not at its claimed owning-block append position');
     }
 
-    // Report finalization at the owning block, then check that the authenticated body hashes to the
-    // requested digest.
-    request.signal?.throwIfAborted();
-    request.onFinalizationVerified?.({ height: block.height, view: block.view });
     const [transaction] = await verifyTransactions(envelope, target);
     if (transaction!.digest !== request.digest) throw new Error('transaction body does not match requested digest');
     request.signal?.throwIfAborted();
-    return { ...transaction!.proof, height: block.height, view: block.view };
+    request.onFinalizationVerified?.({ height: block.height, view: block.view });
+    const { proof, ...body } = transaction!;
+    return { ...proof, height: block.height, view: block.view, target,
+        transaction: { ...body, index: row.index }, blockDigest };
 }
 
-async function loadEnvelope(options: CommonOptions, path: string): Promise<unknown> {
-    // Start verifier initialization alongside the request. Its outcome is captured immediately so a
-    // failure is not reported as unhandled when transport fails first.
+type BundleKind = 'account' | 'block' | 'transaction';
+
+async function loadEnvelope(options: CommonOptions, load: () => Promise<ProofBundle>, kind: BundleKind): Promise<unknown> {
     options.signal?.throwIfAborted();
-    const ready = prewarmProofVerification(options.simplexVerificationMaterial);
-    const initialization = ready.then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
-
-    // Browser network failures surface as TypeError and are wrapped so retry logic treats them as
-    // transport failures. Gateway errors become retryable Unavailable, and others are terminal.
-    const response = await fetch(`${options.qmdbUrl.replace(/\/+$/, '')}${path}`, { signal: options.signal, cache: 'no-store' })
-        .catch((error: unknown) => { throw error instanceof TypeError ? ConnectError.from(error) : error; });
-    if (!response.ok) {
-        await response.body?.cancel();
-        if (response.status === 502 || response.status === 503 || response.status === 504) throw new ConnectError('aggregate proof unavailable', Code.Unavailable);
-        throw new Error(`aggregate proof request failed (HTTP ${response.status})`);
-    }
-
-    // Enforce the body limit on the declared length and while streaming, and reject invalid UTF-8.
-    const declared = response.headers.get('content-length');
-    if (declared !== null && (!/^[0-9]+$/.test(declared) || Number(declared) > MAX_BODY_BYTES)) {
-        await response.body?.cancel();
-        throw new Error('aggregate response exceeds size limit');
-    }
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('aggregate response body is missing');
-    const decoder = new TextDecoder('utf-8', { fatal: true });
-    let text = '';
-    let size = 0;
-    try {
-        while (true) {
-            options.signal?.throwIfAborted();
-            const chunk = await reader.read()
-                .catch((error: unknown) => { throw error instanceof TypeError ? ConnectError.from(error) : error; });
-            if (chunk.done) break;
-            size += chunk.value.byteLength;
-            if (size > MAX_BODY_BYTES) throw new Error('aggregate response exceeds size limit');
-            text += decoder.decode(chunk.value, { stream: true });
-        }
-        text += decoder.decode();
-    } catch (error) {
-        await reader.cancel().catch(() => undefined);
-        throw error;
-    } finally {
-        reader.releaseLock();
-    }
-
-    // Parse the body, then surface any initialization failure before returning it for verification.
+    const initialization = prewarmProofVerification(options.simplexVerificationMaterial)
+        .then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+    const bundle = await load();
     options.signal?.throwIfAborted();
-    const raw: unknown = JSON.parse(text);
+    const raw = proofBundleInput(bundle, kind);
     const initialized = await initialization;
     if (!initialized.ok) throw initialized.error;
     options.signal?.throwIfAborted();
     return raw;
 }
 
-async function certifiedTarget(options: CommonOptions, envelope: Envelope): Promise<CertifiedTarget> {
+/** Converts bounded protobuf fields to the verifier's canonical inputs without trusting metadata. */
+export function proofBundleInput(bundle: ProofBundle, kind: BundleKind): unknown {
+    const bytes = (value: Uint8Array, label: string, maximum: number) => {
+        if (!(value instanceof Uint8Array) || value.length > maximum) throw new Error(`invalid or oversized ${label}`);
+        return toHex(value);
+    };
+    if (bundle.headers.length > MAX_HEADERS || bundle.transactions.length > 50) throw new Error('oversized proof bundle');
+    const next = bundle.nextCursor;
+    if (next.case !== undefined && next.case !== (kind === 'account' ? 'activityCursor' : kind === 'block' ? 'blockOffset' : undefined)) {
+        throw new Error('proof bundle cursor does not match requested view');
+    }
+    return {
+        certificate: bytes(bundle.certificate, 'certificate', MAX_FINALIZATION_CERTIFICATE_BYTES),
+        headers: bundle.headers.map((header) => bytes(header, 'execution header', MAX_EXECUTION_HEADER_BYTES)),
+        sequenceNumber: u64(bundle.sequenceNumber, 'Store sequence').toString(),
+        account: bundle.account ? {
+            location: u64(bundle.account.location, 'account location').toString(),
+            proof: bytes(bundle.account.proof, 'account proof', MAX_PROOF_BYTES),
+        } : null,
+        transactions: bundle.transactions.map((row) => ({
+            location: u64(row.location, 'transaction location').toString(),
+            body: bytes(row.body, 'signed transaction', MAX_TRANSACTION_BYTES),
+            height: u64(row.height, 'transaction height').toString(), index: row.index, role: row.role,
+        })),
+        transactionsProof: bundle.transactionsProof === undefined ? null : bytes(bundle.transactionsProof, 'transaction multiproof', MAX_PROOF_BYTES),
+        nextCursor: next.case === 'activityCursor' ? bytes(next.value, 'account cursor', 24)
+            : next.case === 'blockOffset' ? u64(next.value, 'block offset').toString() : null,
+    };
+}
+
+async function certifiedTarget(
+    options: Pick<CommonOptions, 'simplexVerificationMaterial' | 'signal'>,
+    envelope: Pick<Envelope, 'certificate' | 'sequenceNumber'>,
+): Promise<CertifiedTarget> {
     options.signal?.throwIfAborted();
     const context = await certificateContext(options.simplexVerificationMaterial);
     options.signal?.throwIfAborted();
@@ -349,9 +431,8 @@ async function certifiedTarget(options: CommonOptions, envelope: Envelope): Prom
         if (!certificate) throw new Error('aggregate finalization certificate is invalid');
         const target = await finalizedTargetFromCertificate(certificate);
 
-        // The header follows the 100-byte commitment and shares the 512-byte ancestry header limit.
-        if (target.height === 0n || certificate.header.length > 100 + 512) throw new Error('invalid certified execution header');
-        verified = { certificate: envelope.certificate, target };
+        if (target.height === 0n) throw new Error('invalid certified execution header');
+        verified = { certificate: envelope.certificate.slice(), target };
     }
 
     // Callers receive copies so they cannot mutate the cached target. The sequence comes from this
@@ -372,33 +453,43 @@ async function certifiedTarget(options: CommonOptions, envelope: Envelope): Prom
  */
 async function owningBlock(target: CertifiedTarget, envelope: Envelope, height: bigint, signal?: AbortSignal) {
     if (height === 0n || height > target.height) throw new Error('invalid owning block height');
-
-    // The ancestry must contain exactly the headers below the target down to the block's parent.
     const lowest = height === 1n ? height : height - 1n;
-    if (BigInt(envelope.headers.length) !== target.height - lowest) throw new Error('aggregate ancestry does not cover the exact owning block and parent');
-    let current: DecodedBlockHeader = { ...target, endOffset: 0 };
-    let digest = target.blockDigest;
-    let block = current;
-    let blockDigest = digest;
-    let parent: DecodedBlockHeader | undefined;
+    const chain = await authenticatedChain(target, envelope.headers, lowest, signal);
+    const index = Number(target.height - height);
+    const { header: block, digest: blockDigest } = chain[index]!;
+    const { start, end } = appendInterval(block, chain[index + 1]?.header);
+    if (end > target.transactionsTip - 1n) throw new Error('owning-block append interval is invalid');
+    return { block, blockDigest, start, end };
+}
 
-    // Each header must hash to its child's parent digest and carry the next lower height.
-    for (const bytes of envelope.headers) {
+/** Authenticates an exact descending chain, including its terminal overlap header. */
+async function authenticatedChain(target: CertifiedTarget, headers: readonly Uint8Array[], lowest: bigint, signal?: AbortSignal) {
+    if (lowest < 1n || lowest > target.height || BigInt(headers.length) !== target.height - lowest) {
+        throw new Error('aggregate ancestry does not cover the exact owning block and parent');
+    }
+    let current: DecodedBlockHeader = { ...target, view: target.contextView, endOffset: 0 };
+    let digest = target.blockDigest;
+    const chain = [{ header: current, digest }];
+    for (const bytes of headers) {
         signal?.throwIfAborted();
         digest = current.parentDigest;
-        current = await authenticatedHeader(bytes, digest, current.height - 1n);
-        if (current.height === height) { block = current; blockDigest = digest; }
-        if (current.height === height - 1n) parent = current;
+        const parent = await authenticatedHeader(bytes, digest, current.height - 1n);
+        if (parent.timestampMs > current.timestampMs) throw new Error('block timestamp precedes its parent');
+        appendInterval(current, parent);
+        current = parent;
+        chain.push({ header: current, digest });
     }
+    signal?.throwIfAborted();
+    return chain;
+}
 
-    // A block's appends run from its parent's tip to before the final operation of its own range.
-    // Block 1 has no uploaded parent, so its appends start one past its certified range start.
-    const start = height === 1n ? block.transactionsStart + 1n : parent!.transactionsTip;
+/** One Commit follows every block's appends; genesis contributes the initial Commit. */
+function appendInterval(block: DecodedBlockHeader, parent?: DecodedBlockHeader) {
+    if (block.height === 1n && block.transactionsStart !== 0n) throw new Error('block one has a noncanonical transaction floor');
+    const start = block.height === 1n ? 1n : parent?.transactionsTip;
     const end = block.transactionsTip - 1n;
-    if (start > end || end > target.transactionsTip - 1n) {
-        throw new Error('owning-block append interval is invalid');
-    }
-    return { block, blockDigest, start, end };
+    if (start === undefined || start > end) throw new Error('owning-block append interval is invalid');
+    return { start, end };
 }
 
 async function verifyAccount(envelope: Envelope, target: LatestProofTarget, account: Uint8Array): Promise<VerifiedAccountProof | null> {
@@ -471,7 +562,7 @@ async function decodeTransaction(row: TransactionRow): Promise<CanonicalTransact
 /** Checks the response shape and every size bound before any cryptographic work. */
 function parseEnvelope(raw: unknown, pageSize: number): Envelope {
     const value = record(raw, 'aggregate response');
-    const headers = array(value.headers, 'headers', MAX_HEADERS).map((entry) => hex(entry, 'execution header', 1, 512));
+    const headers = array(value.headers, 'headers', MAX_HEADERS).map((entry) => hex(entry, 'execution header', 1, MAX_EXECUTION_HEADER_BYTES));
     const transactions = array(value.transactions, 'transactions', pageSize).map((entry) => {
         const row = record(entry, 'transaction row');
         if (!Number.isInteger(row.index) || (row.index as number) < 0 || (row.index as number) > 0xffffffff) throw new Error('invalid transaction index');
@@ -481,7 +572,7 @@ function parseEnvelope(raw: unknown, pageSize: number): Envelope {
     const account = value.account === null ? null : record(value.account, 'account proof');
     if (value.nextCursor !== null && (typeof value.nextCursor !== 'string' || value.nextCursor.length > 48)) throw new Error('invalid next cursor');
     return {
-        certificate: hex(value.certificate, 'certificate', 1, 16 * 1024), headers,
+        certificate: hex(value.certificate, 'certificate', 1, MAX_FINALIZATION_CERTIFICATE_BYTES), headers,
         sequenceNumber: decimal(value.sequenceNumber, 'Store sequence'),
         account: account === null ? null : { location: decimal(account.location, 'account location'), proof: hex(account.proof, 'account proof', 1, MAX_PROOF_BYTES) },
         transactions, transactionsProof: value.transactionsProof === null ? null : hex(value.transactionsProof, 'transaction multiproof', 1, MAX_PROOF_BYTES),
@@ -528,14 +619,6 @@ function blockRequest(options: BlockBundleOptions) {
 
 function transactionRequest(options: TransactionBundleOptions) {
     return { ...options, digest: toHex(parseAccountKeyHex(options.digest)) };
-}
-
-function accountPath(request: ReturnType<typeof accountRequest>): string {
-    const query = new URLSearchParams({ mode: request.mode });
-    if (request.cursor) query.set('cursor', toHex(request.cursor));
-    if (request.at) { query.set('at', request.at.height.toString()); query.set('digest', toHex(request.at.blockDigest)); }
-    if (!request.includeTransactions) query.set('activity', 'false');
-    return `/explorer/accounts/${request.account}?${query}`;
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {

@@ -4,6 +4,7 @@ use super::*;
 mod scan_tests;
 
 use crate::{
+    proto,
     publisher::{
         Publisher, PublisherMetrics,
         certificate::CertificateReporter,
@@ -15,8 +16,10 @@ use crate::{
 };
 use axum::{
     body::{Body, to_bytes},
-    http::{HeaderName, Method, Request},
+    http::{HeaderName, Method, Request, StatusCode},
+    response::Response,
 };
+use buffa::Message;
 use commonware_codec::Encode;
 use commonware_consensus::{
     marshal::coding::types::coding_config_for_participants,
@@ -93,7 +96,7 @@ impl FixtureStore {
     async fn open(context: commonware_runtime::tokio::Context) -> Self {
         let store = ObservedStore::open("explorer-fixture").await.unwrap();
         let client = writer_store_client(&store.url, Some("explorer-fixture")).unwrap();
-        let router = router(&client).unwrap();
+        let router = router(&client, None).unwrap();
         let (publisher, worker) = Publisher::connect(
             context.child("publisher"),
             &store.url,
@@ -440,28 +443,97 @@ async fn publish(
         .expect("fixture certificate must publish");
 }
 
-/// Sends a GET through the router and returns the status and JSON body.
-async fn get(router: &Router, path: &str) -> (StatusCode, Value) {
+/// Sends a protobuf unary request through the public Connect transport.
+async fn post(router: &Router, method: &str, body: Vec<u8>) -> (StatusCode, Bytes) {
     let response = router
         .clone()
-        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/constantinople.explorer.v1.ExplorerService/{method}"
+                ))
+                .header("content-type", "application/proto")
+                .header("connect-protocol-version", "1")
+                .body(Body::from(body))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = response.status();
+    if status.is_success() {
+        assert_eq!(response.headers()["content-type"], "application/proto");
+    }
     let body = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
         .await
         .expect("response must fit within the response limit");
-    (
-        status,
-        serde_json::from_slice(&body).expect("response must be JSON"),
-    )
+    (status, body)
 }
 
-/// Asserts that a GET succeeds and returns its JSON body.
-async fn ok(router: &Router, path: &str) -> Value {
-    let (status, response) = get(router, path).await;
-    assert_eq!(status, StatusCode::OK, "{path} must succeed: {response}");
-    response
+trait ProofRequest: Message {
+    const METHOD: &'static str;
+}
+
+impl ProofRequest for proto::GetAccountRequest {
+    const METHOD: &'static str = "GetAccount";
+}
+
+impl ProofRequest for proto::GetBlockRequest {
+    const METHOD: &'static str = "GetBlock";
+}
+
+impl ProofRequest for proto::GetTransactionRequest {
+    const METHOD: &'static str = "GetTransaction";
+}
+
+/// Decodes the wire response before adapting evidence for shared browser fixtures.
+async fn proof_bundle<Q: ProofRequest>(router: &Router, request: &Q) -> Value {
+    let (status, body) = post(router, Q::METHOD, request.encode_to_vec()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{} must succeed: {body:?}",
+        Q::METHOD
+    );
+    let bundle = proto::ProofBundle::decode_from_slice(&body)
+        .expect("successful proof response must decode as ProofBundle");
+    bundle_json(&bundle)
+}
+
+/// Preserves raw evidence bytes and integer precision in browser fixture JSON.
+fn bundle_json(bundle: &proto::ProofBundle) -> Value {
+    let next_cursor = bundle.next_cursor.as_ref().map(|cursor| match cursor {
+        proto::proof_bundle::NextCursor::ActivityCursor(cursor) => hex(cursor),
+        proto::proof_bundle::NextCursor::BlockOffset(offset) => offset.to_string(),
+    });
+    let transactions = bundle
+        .transactions
+        .iter()
+        .map(|row| {
+            let mut value = json!({
+                "location": row.location.to_string(),
+                "body": hex(&row.body),
+                "height": row.height.to_string(),
+                "index": row.index,
+            });
+            if let Some(role) = row.role {
+                value["role"] = json!(role.to_i32());
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "certificate": hex(&bundle.certificate),
+        "headers": bundle.headers.iter().map(|header| hex(header)).collect::<Vec<_>>(),
+        "sequenceNumber": bundle.sequence_number.to_string(),
+        "account": bundle.account.as_option().map(|account| json!({
+            "location": account.location.to_string(),
+            "proof": hex(&account.proof),
+        })),
+        "transactions": transactions,
+        "transactionsProof": bundle.transactions_proof.as_ref().map(|proof| hex(proof)),
+        "nextCursor": next_cursor,
+    })
 }
 
 /// Decodes the height certified by a bundle's certificate.
@@ -576,17 +648,28 @@ async fn historical_bundles(
     assert!(proof.verify::<Sha256>());
 
     // Both routes prove block 1 through block 3's certificate.
-    let historical_block = ok(&environment.router, "/explorer/blocks/1").await;
+    let historical_block = proof_bundle(
+        &environment.router,
+        &proto::GetBlockRequest {
+            height: 1,
+            ..Default::default()
+        },
+    )
+    .await;
     assert_eq!(certificate_height(&historical_block), 3);
     assert_transactions(&historical_block, block, 0, 3);
-    let digest = hex(block.transactions[0].message_digest().as_ref());
-    let historical_transaction = ok(
+    assert_transaction_proof(&environment.client, &historical_block, certified).await;
+    let historical_transaction = proof_bundle(
         &environment.router,
-        &format!("/explorer/transactions/{digest}"),
+        &proto::GetTransactionRequest {
+            digest: block.transactions[0].message_digest().as_ref().to_vec(),
+            ..Default::default()
+        },
     )
     .await;
     assert_eq!(certificate_height(&historical_transaction), 3);
     assert_transactions(&historical_transaction, block, 0, 1);
+    assert_transaction_proof(&environment.client, &historical_transaction, certified).await;
     environment.close().await;
     (historical_block, historical_transaction)
 }
@@ -596,6 +679,73 @@ fn historical_transactions_below_inactivity_floor_remain_available() {
     commonware_runtime::tokio::Runner::default().start(|context| async move {
         let fixture = fixture().await;
         Box::pin(historical_bundles(context, &fixture)).await;
+    });
+}
+
+#[test]
+fn published_feed_carries_indirect_finality_and_exact_append_intervals() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        let fixture = fixture().await;
+        let environment = FixtureStore::open(context).await;
+        for (index, block) in fixture.blocks[..3].iter().enumerate() {
+            publish(
+                &environment.publisher,
+                &environment.reporter,
+                block,
+                index == 2,
+            )
+            .await;
+        }
+        let client = proto::ExplorerServiceClient::new(
+            connectrpc::client::ServiceTransport::new(environment.router.clone()),
+            connectrpc::client::ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        for (after, lowest) in [(None, 2), (Some(0), 1), (Some(1), 1), (Some(2), 2)] {
+            let mut stream = client
+                .watch_blocks(proto::WatchBlocksRequest {
+                    after,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let batch = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .to_owned_message();
+            let certified =
+                Certificate::decode_cfg(Bytes::from(batch.certificate), &((), ())).unwrap();
+            assert_eq!(certified.header.header().height, 3);
+            assert_eq!(
+                certified.header.header().seal(),
+                fixture.blocks[2].block.seal()
+            );
+            let expected = (lowest..3)
+                .rev()
+                .map(|height| fixture.blocks[height - 1].block.header.encode().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(batch.headers, expected);
+            assert!(batch.sequence_number > 0);
+        }
+
+        // The publisher advances the inactivity floor independently of each
+        // block's append interval. Only adjacent ends determine its count.
+        let headers = fixture.blocks[..3]
+            .iter()
+            .map(|block| &block.block.header)
+            .collect::<Vec<_>>();
+        assert!(headers[2].transactions_range.start() > headers[0].transactions_range.start());
+        assert_eq!(headers[0].transactions_range.end() - 2, 3);
+        assert_eq!(
+            headers[1].transactions_range.end() - headers[0].transactions_range.end() - 1,
+            55
+        );
+        assert_eq!(
+            headers[2].transactions_range.end() - headers[1].transactions_range.end() - 1,
+            0
+        );
+        environment.close().await;
     });
 }
 
@@ -644,7 +794,7 @@ async fn serve_fixture_if_requested(router: Router, fixture: &Fixture) {
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
+                .allow_methods([Method::POST])
                 .allow_headers(Any)
                 .expose_headers([HeaderName::from_static("server-timing")]),
         );
@@ -659,7 +809,7 @@ async fn serve_fixture_if_requested(router: Router, fixture: &Fixture) {
         "recipient": hex(fixture.recipient.as_ref()),
         "latestAccountHeight": "4",
         "latestAccountDigest": hex(fixture.blocks[3].block.seal().as_ref()),
-        "sampleAccountPath": format!("/explorer/accounts/{account}?at=3&digest={snapshot_digest}"),
+        "sampleAccountRequest": {"account": account, "at": "3", "digest": snapshot_digest},
         "blockHeight": "2",
         "transactionDigest": hex(fixture.blocks[1].transactions[54].message_digest().as_ref()),
         "shutdownUrl": format!("{url}/__shutdown"),
@@ -703,24 +853,45 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         publish(publisher, reporter, &fixture.blocks[0], true).await;
         publish(publisher, reporter, &fixture.blocks[1], false).await;
 
+        for (value, kind) in [
+            (fixture.account.as_ref().to_vec(), 0),
+            (fixture.blocks[1].transactions[0].message_digest().as_ref().to_vec(), 1),
+        ] {
+            let request = proto::SearchRequest { value: value.clone(), ..Default::default() };
+            let (status, body) = post(router, "Search", request.encode_to_vec()).await;
+            assert_eq!(status, StatusCode::OK);
+            let response = proto::SearchResponse::decode_from_slice(&body).unwrap();
+            assert_eq!(response.kind.to_i32(), kind);
+            assert_eq!(response.value, value);
+        }
+
         // Block 2 has no covering certificate yet, so it stays unavailable while
         // the account view falls back to block 1's certificate.
-        let (status, _) = get(router, "/explorer/blocks/2").await;
+        let request = proto::GetBlockRequest { height: 2, ..Default::default() };
+        let (status, body) = post(router, "GetBlock", request.encode_to_vec()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let account_path = format!("/explorer/accounts/{}", hex(fixture.account.as_ref()));
-        let lagging_account = ok(router, &account_path).await;
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["code"], "unavailable");
+        let account_request = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            ..Default::default()
+        };
+        let lagging_account = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&lagging_account), 1);
         assert_eq!(lagging_account["transactions"].as_array().unwrap().len(), 3);
 
         // Certifying block 3 lets block 1 prove directly and block 2 prove
         // through block 3's ancestry.
         publish(publisher, reporter, &fixture.blocks[2], true).await;
-        let direct = ok(router, "/explorer/blocks/1").await;
+        let direct = proof_bundle(router, &proto::GetBlockRequest {
+            height: 1, offset: 0, ..Default::default()
+        }).await;
         assert_eq!(certificate_height(&direct), 1);
         assert_eq!(direct["headers"], json!([]));
         assert_transactions(&direct, &fixture.blocks[0], 0, 3);
         assert_transaction_proof(client, &direct, &fixture.blocks[0]).await;
-        let descendant = ok(router, "/explorer/blocks/2").await;
+        let descendant = proof_bundle(router, &proto::GetBlockRequest {
+            height: 2, offset: 0, ..Default::default()
+        }).await;
         assert_eq!(certificate_height(&descendant), 3);
         assert_eq!(
             descendant["headers"],
@@ -735,19 +906,27 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         // Block 2 pages at 50 transactions, returns an empty page at its exact
         // count, and rejects any offset beyond it.
         assert_eq!(descendant["nextCursor"], "50");
-        let last = ok(router, "/explorer/blocks/2?offset=50").await;
+        let last = proof_bundle(router, &proto::GetBlockRequest {
+            height: 2, offset: 50, ..Default::default()
+        }).await;
         assert_transactions(&last, &fixture.blocks[1], 50, 5);
         assert!(last["nextCursor"].is_null());
-        let terminal = ok(router, "/explorer/blocks/2?offset=55").await;
+        let terminal = proof_bundle(router, &proto::GetBlockRequest {
+            height: 2, offset: 55, ..Default::default()
+        }).await;
         assert_transactions(&terminal, &fixture.blocks[1], 55, 0);
-        assert_eq!(
-            get(router, "/explorer/blocks/2?offset=56").await.0,
-            StatusCode::BAD_REQUEST
-        );
+        let invalid_offset = proto::GetBlockRequest {
+            height: 2, offset: 56, ..Default::default()
+        };
+        let (status, body) = post(router, "GetBlock", invalid_offset.encode_to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["code"], "invalid_argument");
 
         // An empty block returns its certificate and parent header without a
         // proof.
-        let empty = ok(router, "/explorer/blocks/3").await;
+        let empty = proof_bundle(router, &proto::GetBlockRequest {
+            height: 3, offset: 0, ..Default::default()
+        }).await;
         assert_eq!(certificate_height(&empty), 3);
         assert_transactions(&empty, &fixture.blocks[2], 0, 0);
         assert_eq!(
@@ -757,7 +936,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
 
         // The account view proves the latest update and returns the newest ten
         // activity rows.
-        let account = ok(router, &account_path).await;
+        let account = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&account), 3);
         assert_eq!(account["account"]["location"], "5");
         assert_eq!(account["transactions"].as_array().unwrap().len(), 10);
@@ -766,45 +945,49 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         assert_transaction_proof(client, &account, &fixture.blocks[2]).await;
 
         // A cursor on the pinned snapshot continues with the next ten rows.
-        let cursor = account["nextCursor"].as_str().unwrap();
-        let pinned = format!(
-            "{account_path}?at=3&digest={}&cursor={cursor}",
-            hex(fixture.blocks[2].block.seal().as_ref())
-        );
-        let next = ok(router, &pinned).await;
+        let pinned = proto::GetAccountRequest {
+            cursor: Some(hex_bytes_dynamic(account["nextCursor"].as_str().unwrap())),
+            at: Some(3),
+            digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            ..account_request.clone()
+        };
+        let next = proof_bundle(router, &pinned).await;
         assert_eq!(next["transactions"][0]["index"], 44);
         assert_eq!(next["transactions"][9]["index"], 35);
 
         // Disabling activity keeps the account proof and returns no rows.
-        let state_only = ok(router, &format!("{account_path}?activity=false")).await;
+        let state_only = proof_bundle(router, &proto::GetAccountRequest {
+            activity: Some(false),
+            ..account_request.clone()
+        }).await;
         assert!(state_only["transactions"].as_array().unwrap().is_empty());
         assert!(state_only["transactionsProof"].is_null());
         assert_eq!(state_only["account"], account["account"]);
 
         // The recipient has no state update, and its received filter returns
         // only receiver rows.
-        let recipient = ok(
-            router,
-            &format!(
-                "/explorer/accounts/{}?mode=received",
-                hex(fixture.recipient.as_ref())
-            ),
-        )
-        .await;
+        let recipient = proof_bundle(router, &proto::GetAccountRequest {
+            account: fixture.recipient.as_ref().to_vec(),
+            mode: 2.into(),
+            ..Default::default()
+        }).await;
         assert!(recipient["account"].is_null());
         assert_eq!(recipient["transactions"][0]["index"], 53);
         assert_eq!(recipient["transactions"][0]["role"], 1);
 
         // A transaction in block 2 proves through block 3's certificate.
         let digest = hex(fixture.blocks[1].transactions[54].message_digest().as_ref());
-        let transaction = ok(router, &format!("/explorer/transactions/{digest}")).await;
+        let transaction = proof_bundle(router, &proto::GetTransactionRequest {
+            digest: fixture.blocks[1].transactions[54].message_digest().as_ref().to_vec(),
+            ..Default::default()
+        }).await;
         assert_eq!(certificate_height(&transaction), 3);
         assert_transactions(&transaction, &fixture.blocks[1], 54, 1);
 
         // After block 4 arrives, the pinned page is unchanged while the latest
         // view moves to block 4 and still reaches earlier blocks.
         publish(publisher, reporter, &fixture.blocks[3], true).await;
-        let after_arrival = ok(router, &pinned).await;
+        let after_arrival = proof_bundle(router, &pinned).await;
         for field in [
             "certificate",
             "headers",
@@ -815,7 +998,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         ] {
             assert_eq!(after_arrival[field], next[field], "pinned field {field} must not change");
         }
-        let account_with_history = ok(router, &account_path).await;
+        let account_with_history = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&account_with_history), 4);
         assert!(account_with_history["transactions"].as_array().unwrap().iter().any(|row| {
             row["location"].as_str().unwrap().parse::<u64>().unwrap()
@@ -824,13 +1007,14 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
 
         // Both routes serve block 4's maximum-size WebAuthn transaction in full.
         let webauthn_digest = hex(fixture.blocks[3].transactions[1].message_digest().as_ref());
-        let webauthn_block = ok(router, "/explorer/blocks/4").await;
+        let webauthn_block = proof_bundle(router, &proto::GetBlockRequest {
+            height: 4, offset: 0, ..Default::default()
+        }).await;
         assert_transactions(&webauthn_block, &fixture.blocks[3], 0, 2);
-        let webauthn_bundle = ok(
-            router,
-            &format!("/explorer/transactions/{webauthn_digest}"),
-        )
-        .await;
+        let webauthn_bundle = proof_bundle(router, &proto::GetTransactionRequest {
+            digest: fixture.blocks[3].transactions[1].message_digest().as_ref().to_vec(),
+            ..Default::default()
+        }).await;
         assert_transactions(&webauthn_bundle, &fixture.blocks[3], 1, 1);
         assert_eq!(
             webauthn_bundle["transactions"][0]["body"]
@@ -886,43 +1070,140 @@ fn signed_transaction_size_limit_matches_the_public_codec() {
     assert!(transaction_body(&body, transaction.message_digest()).is_ok());
     body.push(0);
     let error = transaction_body(&body, transaction.message_digest()).unwrap_err();
-    assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.0, connectrpc::ErrorCode::ResourceExhausted);
 }
 
 #[tokio::test]
 async fn malformed_inputs_are_rejected_before_store_reads() {
-    // Open a router over an empty observed Store.
     let store = ObservedStore::open("explorer-fixture").await.unwrap();
     let client = writer_store_client(&store.url, Some("explorer-fixture")).unwrap();
-    let router = router(&client).unwrap();
+    let router = router(&client, None).unwrap();
+    let valid_account = proto::GetAccountRequest {
+        account: vec![0; 32],
+        ..Default::default()
+    };
+    let mut requests = Vec::new();
 
-    // Each path must fail parsing with 400 before any Store read.
-    let account = "00".repeat(32);
-    let paths = [
-        "/explorer/blocks/0".to_owned(),
-        "/explorer/blocks/-1".to_owned(),
-        "/explorer/blocks/18446744073709551616".to_owned(),
-        "/explorer/blocks/1?offset=-1".to_owned(),
-        "/explorer/blocks/1?offset=18446744073709551616".to_owned(),
-        "/explorer/accounts/00".to_owned(),
-        format!("/explorer/accounts/{}", "gg".repeat(32)),
-        format!("/explorer/accounts/{account}?mode=unknown"),
-        format!("/explorer/accounts/{account}?cursor=00"),
-        format!("/explorer/accounts/{account}?cursor={}", "00".repeat(24)),
-        format!("/explorer/accounts/{account}?at=1"),
-        format!("/explorer/accounts/{account}?digest={account}"),
-        format!("/explorer/accounts/{account}?at=0&digest={account}"),
-        format!("/explorer/accounts/{account}?activity=maybe"),
-        "/explorer/transactions/00".to_owned(),
-        format!("/explorer/transactions/{}", "zz".repeat(32)),
-    ];
-    for path in paths {
-        let (status, response) = get(&router, &path).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{path} must be rejected: {response}"
-        );
+    // Each identity is exactly 32 bytes, including all-zero identities.
+    for length in [0, 1, 31, 33] {
+        requests.push((
+            "GetAccount",
+            proto::GetAccountRequest {
+                account: vec![0; length],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ));
+        requests.push((
+            "GetTransaction",
+            proto::GetTransactionRequest {
+                digest: vec![0; length],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ));
+        requests.push((
+            "Search",
+            proto::SearchRequest {
+                value: vec![0; length],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ));
+    }
+    requests.push((
+        "GetBlock",
+        proto::GetBlockRequest::default().encode_to_vec(),
+    ));
+
+    // Unknown protobuf enum values must not become the default activity mode.
+    for mode in [-1, 3, i32::MAX] {
+        requests.push((
+            "GetAccount",
+            proto::GetAccountRequest {
+                mode: mode.into(),
+                ..valid_account.clone()
+            }
+            .encode_to_vec(),
+        ));
+    }
+
+    // Cursor fields encode a reachable height, index, and account role.
+    for length in [0, 1, 23, 25] {
+        requests.push((
+            "GetAccount",
+            proto::GetAccountRequest {
+                cursor: Some(vec![0; length]),
+                ..valid_account.clone()
+            }
+            .encode_to_vec(),
+        ));
+    }
+    for (height, index, role) in [
+        (0_u64, 0_u64, 0_u64),
+        (1, u64::from(u32::MAX) + 1, 0),
+        (1, 0, 2),
+    ] {
+        let cursor = [
+            height.to_be_bytes(),
+            index.to_be_bytes(),
+            role.to_be_bytes(),
+        ]
+        .concat();
+        requests.push((
+            "GetAccount",
+            proto::GetAccountRequest {
+                cursor: Some(cursor),
+                ..valid_account.clone()
+            }
+            .encode_to_vec(),
+        ));
+    }
+    for (mode, role) in [(1, 1_u64), (2, 0_u64)] {
+        let cursor = [1_u64.to_be_bytes(), 0_u64.to_be_bytes(), role.to_be_bytes()].concat();
+        requests.push((
+            "GetAccount",
+            proto::GetAccountRequest {
+                mode: mode.into(),
+                cursor: Some(cursor),
+                ..valid_account.clone()
+            }
+            .encode_to_vec(),
+        ));
+    }
+
+    // Snapshot pins require both a positive height and a complete digest.
+    for (at, digest) in [
+        (Some(1), None),
+        (None, Some(vec![0; 32])),
+        (Some(0), Some(vec![0; 32])),
+        (Some(1), Some(vec![])),
+        (Some(1), Some(vec![0; 31])),
+        (Some(1), Some(vec![0; 33])),
+    ] {
+        requests.push((
+            "GetAccount",
+            proto::GetAccountRequest {
+                at,
+                digest,
+                ..valid_account.clone()
+            }
+            .encode_to_vec(),
+        ));
+    }
+
+    // Truncated bytes and varints fail in the Connect protobuf decoder.
+    requests.extend([
+        ("GetAccount", vec![0x0a, 0x20, 0x00]),
+        ("GetBlock", vec![0x08, 0x80]),
+        ("GetTransaction", vec![0x0a, 0x20, 0x00]),
+        ("Search", vec![0x0a, 0x20, 0x00]),
+    ]);
+    for (method, bytes) in requests {
+        let (status, body) = post(&router, method, bytes).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {body:?}");
+        let error = serde_json::from_slice::<Value>(&body).expect("Connect error must be JSON");
+        assert_eq!(error["code"], "invalid_argument", "{method}: {error}");
     }
     assert!(store.requests().is_empty());
     store.shutdown().await;
