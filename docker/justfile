@@ -34,24 +34,16 @@ chain-indexer-graviton-binary: build-graviton-image prepare-docker-cache
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:graviton-local
 
-# Build the ARM64 metadata-indexer binary into deploy/
-metadata-indexer-graviton-binary: build-graviton-image prepare-docker-cache
+# Build the ARM64 explorer-indexer binary into deploy/
+explorer-indexer-graviton-binary: build-graviton-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
-    -e BINARY_NAME=metadata-indexer \
-    -e OUTPUT_NAME=metadata-indexer \
-    constantinople-builder:graviton-local
-
-# Build the ARM64 qmdb-indexer binary into deploy/
-qmdb-indexer-graviton-binary: build-graviton-image prepare-docker-cache
-  docker run --rm {{source-mounts}} {{cache-env}} \
-    -e PACKAGE_NAME=constantinople-indexer \
-    -e BINARY_NAME=qmdb-indexer \
-    -e OUTPUT_NAME=qmdb-indexer \
+    -e BINARY_NAME=explorer-indexer \
+    -e OUTPUT_NAME=explorer-indexer \
     constantinople-builder:graviton-local
 
 # Build all ARM64 binaries into deploy/
-graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-indexer-graviton-binary metadata-indexer-graviton-binary qmdb-indexer-graviton-binary
+graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-indexer-graviton-binary explorer-indexer-graviton-binary
 
 # Build the Intel/C8i Docker builder image
 build-intel-image:
@@ -82,24 +74,16 @@ chain-indexer-intel-binary: build-intel-image prepare-docker-cache
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:intel-local
 
-# Build the Intel metadata-indexer binary into deploy/
-metadata-indexer-intel-binary: build-intel-image prepare-docker-cache
+# Build the Intel explorer-indexer binary into deploy/
+explorer-indexer-intel-binary: build-intel-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
-    -e BINARY_NAME=metadata-indexer \
-    -e OUTPUT_NAME=metadata-indexer \
-    constantinople-builder:intel-local
-
-# Build the Intel qmdb-indexer binary into deploy/
-qmdb-indexer-intel-binary: build-intel-image prepare-docker-cache
-  docker run --rm {{source-mounts}} {{cache-env}} \
-    -e PACKAGE_NAME=constantinople-indexer \
-    -e BINARY_NAME=qmdb-indexer \
-    -e OUTPUT_NAME=qmdb-indexer \
+    -e BINARY_NAME=explorer-indexer \
+    -e OUTPUT_NAME=explorer-indexer \
     constantinople-builder:intel-local
 
 # Build all Intel binaries into deploy/
-intel-binaries: validator-intel-binary spammer-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary qmdb-indexer-intel-binary
+intel-binaries: validator-intel-binary spammer-intel-binary chain-indexer-intel-binary explorer-indexer-intel-binary
 
 # Build the AMD/C8a Docker builder image
 build-amd-image:
@@ -130,21 +114,17 @@ chain-indexer-amd-binary: build-amd-image prepare-docker-cache
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:amd-local
 
-# Build the AMD metadata-indexer binary into deploy/
-metadata-indexer-amd-binary: build-amd-image prepare-docker-cache
+# Build the AMD explorer-indexer binary into deploy/
+explorer-indexer-amd-binary: build-amd-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
-    -e BINARY_NAME=metadata-indexer \
-    -e OUTPUT_NAME=metadata-indexer \
-    constantinople-builder:amd-local
-
-# Build the AMD qmdb-indexer binary into deploy/
-qmdb-indexer-amd-binary: build-amd-image prepare-docker-cache
-  docker run --rm {{source-mounts}} {{cache-env}} \
-    -e PACKAGE_NAME=constantinople-indexer \
-    -e BINARY_NAME=qmdb-indexer \
-    -e OUTPUT_NAME=qmdb-indexer \
+    -e BINARY_NAME=explorer-indexer \
+    -e OUTPUT_NAME=explorer-indexer \
     constantinople-builder:amd-local
 
 # Build all AMD binaries into deploy/
-amd-binaries: validator-amd-binary spammer-amd-binary chain-indexer-amd-binary metadata-indexer-amd-binary qmdb-indexer-amd-binary
+amd-binaries: validator-amd-binary spammer-amd-binary chain-indexer-amd-binary explorer-indexer-amd-binary
+
+# Generate the explorer's typed RPC bindings.
+explorer-generate:
+  npm --prefix explorer run generate

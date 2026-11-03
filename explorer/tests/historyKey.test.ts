@@ -4,10 +4,7 @@ import test from 'node:test';
 import { submittedTransactionHistoryKey, type HistoryScope } from '../src/historyKey.ts';
 
 const scope: HistoryScope = {
-    indexerUrl: 'http://127.0.0.1:8091',
-    qmdbUrl: 'http://127.0.0.1:8092',
-    storeUrl: 'http://127.0.0.1:8090',
-    mempoolUrl: 'http://127.0.0.1:8080',
+    indexerUrl: 'http://127.0.0.1:8092',
     simplexVerificationMaterial: 'abc123',
 };
 
@@ -39,9 +36,6 @@ test('submitted transaction history normalizes trailing slashes', () => {
             {
                 ...scope,
                 indexerUrl: `${scope.indexerUrl}/`,
-                qmdbUrl: `${scope.qmdbUrl}/`,
-                storeUrl: `${scope.storeUrl}/`,
-                mempoolUrl: `${scope.mempoolUrl}/`,
             },
             'wallet-a',
         ),

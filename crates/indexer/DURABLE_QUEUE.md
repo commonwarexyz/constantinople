@@ -172,11 +172,16 @@ target's Store floor. There is no separate transaction-proof metadata table.
 account reads select the latest location below the certified state boundary.
 The minimum Store sequence alone cannot select historical account state.
 
-Explorer subscribes to publication targets and yields every covered height in a
-Store frame. A separate SQL stream caches block metadata ahead of publication.
-Display still requires matching publication sequence and digest checks, with
-point queries covering cache misses. Proof inputs can load concurrently, and
-account-page rows share an authenticated target instead of refreshing it per row.
+The explorer server bounds each `WatchBlocks` certificate by the newest
+publication target. A resumed response includes every parent header through
+the caller's last verified height, so reconnecting within a grouped barrier
+retains every remaining height. Clients verify that overlap before accepting
+new rows. The server prefers certificates within the next 64 heights and permits
+a sparse certificate to bridge at most 4096 heights; larger gaps fail explicitly.
+SQL reads share the publication sequence floor and supply only header lookup
+hints. Block counts and timestamps come from authenticated headers. Proof inputs
+can load concurrently, and account-page rows share an authenticated target
+instead of refreshing it per row.
 If a height's certificate is missing, Explorer looks for a certified descendant
 and verifies the parent-header chain back to that height. Header reads are
 batched using untrusted SQL digest hints. Recomputed hashes and consecutive

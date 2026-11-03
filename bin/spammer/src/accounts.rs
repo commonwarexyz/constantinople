@@ -1,12 +1,13 @@
 //! Spammer account generation and seed selection.
 
-use commonware_cryptography::{Signer, ed25519};
+use commonware_cryptography::Signer;
+use commonware_cryptography_curve25519::signing as ed25519;
 use rand::{Rng, RngExt};
 
 /// A spam account with its signing key.
 pub struct SpamAccount {
-    pub private_key: ed25519::PrivateKey,
-    pub public_key: ed25519::PublicKey,
+    pub private_key: ed25519::SigningKey,
+    pub public_key: ed25519::VerifyingKey,
 }
 
 /// Generates `count` deterministic spam accounts from sequential seeds
@@ -14,7 +15,7 @@ pub struct SpamAccount {
 pub fn generate_accounts(count: u32, seed_offset: u64) -> Vec<SpamAccount> {
     (0..count)
         .map(|i| {
-            let private_key = ed25519::PrivateKey::from_seed(seed_offset + u64::from(i));
+            let private_key = ed25519::SigningKey::from_seed(seed_offset + u64::from(i));
             let public_key = private_key.public_key();
             SpamAccount {
                 private_key,
@@ -107,7 +108,7 @@ mod tests {
 
         assert_eq!(
             last_submitter[1].public_key,
-            ed25519::PrivateKey::from_seed(u64::MAX).public_key()
+            ed25519::SigningKey::from_seed(u64::MAX).public_key()
         );
     }
 

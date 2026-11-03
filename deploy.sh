@@ -5,10 +5,9 @@ set -euo pipefail
 usage() {
     echo "usage $0 [options]" >&2
     echo "  --store-url <url>                       default managed chain-indexer" >&2
-    echo "  --sql-url <url>                         default managed metadata-indexer" >&2
-    echo "  --qmdb-url <url>                        default managed qmdb-indexer" >&2
+    echo "  --indexer-url <url>                     default managed explorer-indexer" >&2
     echo "  --store-api-key <key>                   validator Store writer credential" >&2
-    echo "  --adapter-store-api-key <key>           local adapter Store read credential" >&2
+    echo "  --adapter-store-api-key <key>           explorer Store read credential" >&2
     echo "  Credentials may also use CONSTANTINOPLE_STORE_API_KEY and CONSTANTINOPLE_ADAPTER_STORE_API_KEY." >&2
     echo "  --validators <count>                    default 50" >&2
     echo "  --regions <comma-separated-regions>     default us-east-1,us-west-2" >&2
@@ -20,8 +19,7 @@ usage() {
 
 reset_options() {
     STORE_URL=
-    SQL_URL=
-    QMDB_URL=
+    INDEXER_URL=
     STORE_API_KEY=${CONSTANTINOPLE_STORE_API_KEY:-}
     ADAPTER_STORE_API_KEY=${CONSTANTINOPLE_ADAPTER_STORE_API_KEY:-}
     VALIDATORS=50
@@ -36,9 +34,7 @@ reset_options() {
     # Intel NVMe types such as c8id trap on AMD-only instructions.
     REMOTE_ARGS=(--indexer-instance-type c8a.8xlarge)
     BINARY_TARGETS=()
-    EXPLORER_STORE_URL=
-    EXPLORER_SQL_URL=
-    EXPLORER_QMDB_URL=
+    EXPLORER_INDEXER_URL=
 }
 
 parse_options() {
@@ -50,11 +46,8 @@ parse_options() {
             --store-url)
                 target=STORE_URL
                 ;;
-            --sql-url)
-                target=SQL_URL
-                ;;
-            --qmdb-url)
-                target=QMDB_URL
+            --indexer-url)
+                target=INDEXER_URL
                 ;;
             --store-api-key)
                 target=STORE_API_KEY
@@ -101,8 +94,8 @@ prepare_deployment() {
         echo "Store credentials require --store-url" >&2
         return 2
     fi
-    if { [ -n "$SQL_URL" ] || [ -n "$QMDB_URL" ]; } && [ -z "$STORE_URL" ]; then
-        echo "--sql-url and --qmdb-url require --store-url" >&2
+    if [ -n "$INDEXER_URL" ] && [ -z "$STORE_URL" ]; then
+        echo "--indexer-url requires --store-url" >&2
         return 2
     fi
 
@@ -132,7 +125,6 @@ prepare_deployment() {
     fi
 
     if [ -n "$STORE_URL" ]; then
-        EXPLORER_STORE_URL=$STORE_URL
         REMOTE_ARGS+=(--store-url "$STORE_URL")
     else
         REMOTE_ARGS+=(
@@ -143,22 +135,14 @@ prepare_deployment() {
         )
     fi
 
-    if [ -n "$SQL_URL" ]; then
-        EXPLORER_SQL_URL=$SQL_URL
-        REMOTE_ARGS+=(--metadata-indexer-url "$SQL_URL")
-    fi
-
-    if [ -n "$QMDB_URL" ]; then
-        EXPLORER_QMDB_URL=$QMDB_URL
-        REMOTE_ARGS+=(--qmdb-indexer-url "$QMDB_URL")
+    if [ -n "$INDEXER_URL" ]; then
+        EXPLORER_INDEXER_URL=$INDEXER_URL
+        REMOTE_ARGS+=(--indexer-url "$INDEXER_URL")
     fi
 
     BINARY_TARGETS=(validator-amd-binary spammer-amd-binary)
-    if [ -z "$SQL_URL" ]; then
-        BINARY_TARGETS+=(metadata-indexer-amd-binary)
-    fi
-    if [ -z "$QMDB_URL" ]; then
-        BINARY_TARGETS+=(qmdb-indexer-amd-binary)
+    if [ -z "$INDEXER_URL" ]; then
+        BINARY_TARGETS+=(explorer-indexer-amd-binary)
     fi
 }
 
@@ -221,40 +205,15 @@ main() {
     TAG=$(yq -r '.tag' deploy/config.yaml)
     HOSTS=$HOME/.commonware_deployer/$TAG/hosts.yaml
 
-    REQUIRED_IPS=(RELAYER_IP)
-    if [ -z "$SQL_URL" ]; then
-        SQL_IP=$(yq -r '.hosts[] | select(.name=="metadata-indexer") | .ip' "$HOSTS")
-        EXPLORER_SQL_URL=http://$SQL_IP:8091
-        REQUIRED_IPS+=(SQL_IP)
+    if [ -z "$INDEXER_URL" ]; then
+        INDEXER_IP=$(yq -r '.hosts[] | select(.name=="explorer-indexer") | .ip' "$HOSTS")
+        [ -n "$INDEXER_IP" ] || { echo "missing explorer-indexer IP in $HOSTS" >&2; return 1; }
+        EXPLORER_INDEXER_URL=http://$INDEXER_IP:8092
     fi
-
-    if [ -z "$QMDB_URL" ]; then
-        QMDB_IP=$(yq -r '.hosts[] | select(.name=="qmdb-indexer") | .ip' "$HOSTS")
-        EXPLORER_QMDB_URL=http://$QMDB_IP:8092
-        REQUIRED_IPS+=(QMDB_IP)
-    fi
-
-    RELAYER_NAME=$(for f in deploy/*.yaml; do
-        if yq -e '.relayer' "$f" >/dev/null 2>&1; then basename "$f" .yaml; fi
-    done)
-    RELAYER_IP=$(yq -r ".hosts[] | select(.name==\"$RELAYER_NAME\") | .ip" "$HOSTS")
-
-    if [ -z "$STORE_URL" ]; then
-        CHAIN_IP=$(yq -r '.hosts[] | select(.name=="chain-indexer") | .ip' "$HOSTS")
-        EXPLORER_STORE_URL=http://$CHAIN_IP:8090
-        REQUIRED_IPS+=(CHAIN_IP)
-    fi
-
-    for variable in "${REQUIRED_IPS[@]}"; do
-        [ -n "${!variable}" ] || { echo "missing $variable in $HOSTS" >&2; return 1; }
-    done
 
     SIMPLEX_VERIFICATION_MATERIAL=$(tr -d '[:space:]' < deploy/simplex-verification-material.hex)
 
-    VITE_SQL_URL="$EXPLORER_SQL_URL" \
-    VITE_QMDB_URL="$EXPLORER_QMDB_URL" \
-    VITE_STORE_URL="$EXPLORER_STORE_URL" \
-    VITE_MEMPOOL_URL=http://$RELAYER_IP:8080 \
+    VITE_INDEXER_URL="$EXPLORER_INDEXER_URL" \
     VITE_SIMPLEX_VERIFICATION_MATERIAL=$SIMPLEX_VERIFICATION_MATERIAL \
     npm --prefix explorer run dev
 }

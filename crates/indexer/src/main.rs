@@ -12,6 +12,7 @@ use axum::{
     routing::get,
 };
 use clap::{ArgGroup, Parser};
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
 use exoware_simulator::{
     AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack, rocksdb::Options,
 };
@@ -26,14 +27,18 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(10)),
+    reserve: Some(Reserve::pinned(2 << 30)),
+    ..Config::DEFAULT
+});
 
 const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
 const ROCKS_SYNC_BYTES: u64 = 8 * 1024 * 1024;

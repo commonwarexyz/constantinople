@@ -3,7 +3,8 @@
 use crate::{Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
 use commonware_consensus::types::coding::COMMITMENT_SIZE;
-use commonware_cryptography::{ed25519, sha256};
+use commonware_cryptography::sha256;
+use commonware_cryptography_curve25519::signing as ed25519;
 
 /// Maximum encoded block size accepted by consensus, including its header and body framing.
 pub const MAXIMUM_BLOCK_SIZE: usize = 16 * 1024 * 1024;
@@ -32,7 +33,7 @@ pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
 fn maximum_header_size() -> usize {
     // Epoch and the two views use varints. The remaining header counters are fixed width.
     3 * UInt(u64::MAX).encode_size()
-        + ed25519::PublicKey::SIZE
+        + ed25519::VerifyingKey::SIZE
         + COMMITMENT_SIZE
         + 3 * sha256::Digest::SIZE
         + 6 * u64::SIZE
@@ -57,16 +58,16 @@ mod tests {
     use std::num::NonZeroU64;
 
     type Commitment = CodingCommitment<
-        SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>,
+        SealedBlock<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>,
         ReedSolomon<sha256::Sha256>,
         sha256::Sha256,
     >;
 
-    fn maximum_header() -> Header<Commitment, sha256::Digest, ed25519::PublicKey> {
+    fn maximum_header() -> Header<Commitment, sha256::Digest, ed25519::VerifyingKey> {
         Header {
             context: Context {
                 round: Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
-                leader: ed25519::PrivateKey::from_seed(0).public_key(),
+                leader: ed25519::SigningKey::from_seed(0).public_key(),
                 parent: (View::new(u64::MAX), Commitment::default()),
             },
             parent: sha256::Digest::EMPTY,
@@ -80,7 +81,7 @@ mod tests {
     }
 
     fn signature_size_extremes() -> [SignedTransaction<sha256::Sha256>; 2] {
-        let signer = ed25519::PrivateKey::from_seed(1);
+        let signer = ed25519::SigningKey::from_seed(1);
         let key = TransactionPublicKey::ed25519(signer.public_key());
         let transaction = Transaction::new(key.clone(), key, NonZeroU64::MIN, 0);
         let minimum = transaction.seal_and_sign(

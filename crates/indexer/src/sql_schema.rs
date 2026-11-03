@@ -8,7 +8,7 @@ use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::PrefixedStoreClient;
 use exoware_sql::{KvSchema, TableColumnConfig};
 
-/// Name of the SQL table that the explorer subscribes to.
+/// Name of the SQL table carrying finalized block summaries.
 pub const BLOCK_META_TABLE: &str = "block_meta";
 
 /// Name of the SQL table that records one row per finalized transaction.

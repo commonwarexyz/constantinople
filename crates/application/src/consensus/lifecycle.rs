@@ -18,9 +18,7 @@ use commonware_glue::stateful::{
 };
 use commonware_macros::boxed;
 use commonware_parallel::Strategy;
-use commonware_runtime::{
-    BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _,
-};
+use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _};
 use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
@@ -32,7 +30,7 @@ use tracing::{Instrument as _, error, info, info_span, warn};
 
 impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
 where
-    E: BufferPooler + Storage + Metrics + Clock,
+    E: Storage + Metrics + Clock,
     C: Digest,
     H: Hasher,
     P: PublicKey,
@@ -59,13 +57,14 @@ where
         input: &mut I,
     ) -> Option<Proposed<Self, E>>
     where
-        E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
         let parent_digest = parent.digest();
         let parent_height = parent.header.height;
+        let parent_timestamp = parent.header.timestamp;
 
         // Select from the mempool, then execute the selection best effort
         // against the parent's state: anything inapplicable there fails its
@@ -89,22 +88,25 @@ where
         )
         .await;
 
-        // The last parent reference destroys the whole body. Bypass adaptive
-        // scheduling because transaction count cannot predict that ownership
-        // change. A multi-worker Rayon strategy keeps cleanup off this task.
+        // The last parent reference destroys the whole body, and transaction
+        // count cannot predict whether this is it. Rayon runs a spawned job
+        // inline only after an awaited future has measured the hand-off round
+        // trip at its call site, so dropping the future unawaited keeps every
+        // cleanup off this task on a multi-worker pool.
         let drop_span = info_span!("application.propose.drop_parent");
         let drop_work = parent.body.len();
         drop(
             self.strategy
-                .manual()
                 .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
         );
 
+        // Stamp the child no earlier than its parent and commit it to the
+        // executed state and transaction-history roots.
         let header = Header {
             context,
             parent: parent_digest,
             height: parent_height + 1,
-            timestamp: time::timestamp_ms(&runtime),
+            timestamp: time::child_timestamp_ms(&runtime, parent_timestamp),
             state_root: execution.block.state.root(),
             state_range: execution.block.state_sync_range.clone(),
             transactions_root: execution.block.transactions.root(),
@@ -163,11 +165,12 @@ where
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
-        E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        // Reject an oversized block before starting any verification work.
         let encoded_size = block.encode_size();
         if encoded_size > MAXIMUM_BLOCK_SIZE {
             warn!(
@@ -180,11 +183,9 @@ where
             return None;
         }
 
-        // The glue actor retains its own references to the block, so the
-        // header and lazy body are cloned out of the shared reference
-        // (per-transaction refcount bumps) instead of moved.
+        // The worker jobs share the immutable body independently of the block header.
         let header = block.header.clone();
-        let body = Arc::new(block.body.clone());
+        let body = Arc::clone(&block.body);
         drop(block);
 
         // Signature verification needs only the block body, so it starts
@@ -199,6 +200,7 @@ where
             &self.strategy,
         );
 
+        // Wait for the parent, then reject a child stamped before it.
         let parent = parent
             .instrument(info_span!("application.verify.parent"))
             .await?;
@@ -229,17 +231,19 @@ where
 
         let result = futures::try_join!(signatures, execution, wait);
 
-        // The last parent reference destroys the whole body. Bypass adaptive
-        // scheduling because transaction count cannot predict that ownership
-        // change. A multi-worker Rayon strategy keeps cleanup off this task.
+        // The last parent reference destroys the whole body, and transaction
+        // count cannot predict whether this is it. Rayon runs a spawned job
+        // inline only after an awaited future has measured the hand-off round
+        // trip at its call site, so dropping the future unawaited keeps every
+        // cleanup off this task on a multi-worker pool.
         let drop_span = info_span!("application.verify.drop_parent");
         let drop_work = parent.body.len();
         drop(
             self.strategy
-                .manual()
                 .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
         );
 
+        // A failed signature or execution check rejects the block.
         let execution = match result {
             Ok(((), execution, ())) => execution,
             Err(reason) => {
@@ -248,6 +252,8 @@ where
             }
         };
 
+        // The recomputed state and transaction-history commitments must match
+        // the header.
         if !commitments_match(&header, &execution) {
             return None;
         }
@@ -264,7 +270,8 @@ where
         Some(execution.into_merkleized())
     }
 
-    /// Replays a block into speculative batches.
+    /// Replays a finalized block into batches, taking its transaction-history
+    /// floor from its header.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(
@@ -279,13 +286,14 @@ where
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
-        E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        // Decode the body and derive its transfers and digests on the strategy.
         let strategy = self.strategy.clone();
-        let body = block.body.clone();
+        let body = Arc::clone(&block.body);
         let work_size = body.len();
         let height = block.header.height;
         let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
@@ -297,6 +305,8 @@ where
             .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
             .ok()?;
 
+        // Settle the body and append its digests, taking the transaction-history
+        // floor from the start of the header's transaction range.
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body::<E, H, St>(
             state_batch,

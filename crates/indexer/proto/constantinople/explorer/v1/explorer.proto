@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package constantinople.explorer.v1;
+
+service ExplorerService {
+  rpc GetAccount(GetAccountRequest) returns (ProofBundle);
+  rpc GetBlock(GetBlockRequest) returns (ProofBundle);
+  rpc GetTransaction(GetTransactionRequest) returns (ProofBundle);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc WatchBlocks(WatchBlocksRequest) returns (stream WatchBlocksResponse);
+  rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse);
+}
+
+enum ActivityMode {
+  ACTIVITY_MODE_ALL = 0;
+  ACTIVITY_MODE_SENT = 1;
+  ACTIVITY_MODE_RECEIVED = 2;
+}
+
+message GetAccountRequest {
+  bytes account = 1;
+  ActivityMode mode = 2;
+  optional bytes cursor = 3;
+  // A pinned request supplies both at and digest.
+  optional uint64 at = 4;
+  optional bytes digest = 5;
+  // Omitted means true.
+  optional bool activity = 6;
+}
+
+message GetBlockRequest {
+  uint64 height = 1;
+  uint64 offset = 2;
+}
+
+message GetTransactionRequest { bytes digest = 1; }
+
+message ProofBundle {
+  // Finalization certificate anchoring every proof in the bundle.
+  bytes certificate = 1;
+  // Parent headers, newest first, below the certificate down to the requested parent.
+  repeated bytes headers = 2;
+  // Highest Store sequence observed by the reads; this is a visibility floor.
+  uint64 sequence_number = 3;
+  AccountProof account = 4;
+  repeated TransactionRow transactions = 5;
+  optional bytes transactions_proof = 6;
+  oneof next_cursor {
+    bytes activity_cursor = 7;
+    uint64 block_offset = 8;
+  }
+}
+
+message AccountProof {
+  uint64 location = 1;
+  bytes proof = 2;
+}
+
+enum TransactionRole {
+  TRANSACTION_ROLE_SENDER = 0;
+  TRANSACTION_ROLE_RECEIVER = 1;
+}
+
+message TransactionRow {
+  uint64 location = 1;
+  bytes body = 2;
+  // Account activity positions are hints until verified against a block.
+  uint64 height = 3;
+  uint32 index = 4;
+  optional TransactionRole role = 5;
+}
+
+message SearchRequest { bytes value = 1; }
+
+enum SearchKind {
+  SEARCH_KIND_ACCOUNT = 0;
+  SEARCH_KIND_TRANSACTION = 1;
+}
+
+// A navigation hint; the destination's proofs remain authoritative.
+message SearchResponse {
+  SearchKind kind = 1;
+  bytes value = 2;
+}
+
+message WatchBlocksRequest {
+  // Omitted starts at the newest published certificate. Present resumes after a
+  // previously verified height, with that height included as ancestry overlap.
+  optional uint64 after = 1;
+}
+
+message WatchBlocksResponse {
+  reserved 1, 2, 3;
+  reserved "height", "digest", "tx_count";
+  // An unsigned Store visibility observation, not an authenticated chain fact.
+  uint64 sequence_number = 4;
+  bytes certificate = 5;
+  // Exact ancestor headers, newest first, excluding the certified header. A
+  // resumed batch includes a positive previous height as the final header.
+  repeated bytes headers = 6;
+}
+
+message SubmitTransactionRequest { bytes batch = 1; }
+
+message SubmitTransactionResponse {
+  oneof outcome {
+    CompletedSubmission completed = 1;
+    AmbiguousSubmission ambiguous = 2;
+  }
+}
+
+message CompletedSubmission {
+  uint32 http_status = 1;
+  oneof result {
+    Finalized finalized = 2;
+    PartiallyFinalized partially_finalized = 3;
+    Empty dropped = 4;
+    Empty pending = 5;
+    Empty rejected = 6;
+  }
+  bytes body = 7;
+  // Exact upstream value, bounded to 256 bytes.
+  string content_type = 8;
+}
+
+message Finalized { uint64 height = 1; }
+message PartiallyFinalized {
+  uint64 height = 1;
+  uint64 included = 2;
+  uint64 filtered = 3;
+}
+message Empty {}
+
+// No safe conclusion about acceptance can be drawn from this outcome.
+message AmbiguousSubmission {
+  string reason = 1;
+  optional uint32 http_status = 2;
+}

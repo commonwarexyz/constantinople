@@ -8,17 +8,17 @@ mod signed;
 pub use signed::{
     LazySignedTransaction, Signable, Signed, materialize_transaction_chunks,
     preload_transaction_chunks, preload_transaction_slice, verify_transaction_batch,
-    verify_transaction_chunks,
+    verify_transactions,
 };
 
 mod account;
 pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce};
 
 mod auth;
-pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};
+pub use auth::{TransactionPublicKey, TransactionSignature};
 
 mod cache;
-pub use cache::{DecompressedPublicKey, PublicKeyCache};
+pub use cache::PublicKeyCache;
 
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};

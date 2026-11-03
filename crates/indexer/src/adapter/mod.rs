@@ -1,4 +1,4 @@
-//! Shared startup and HTTP serving for Store-backed read adapters.
+//! Startup and HTTP serving for the Store-backed explorer.
 
 use crate::{
     adapter_metrics::{AdapterMetrics, serve_metrics, track_requests},
@@ -65,13 +65,13 @@ fn build_app(routes: Router, metrics: AdapterMetrics, shared_metrics: bool) -> R
 async fn serve(
     profile: Profile,
     settings: Settings,
-    routes: impl FnOnce(&StoreClient) -> Result<Router, BoxError>,
+    routes: impl FnOnce(&StoreClient, Option<&str>) -> Result<Router, BoxError>,
 ) -> Result<(), BoxError> {
     let client = store_client(&settings.store_url, settings.api_key.as_deref())?;
     require_store_ready(&client).await?;
     let metrics = AdapterMetrics::new();
     let app = build_app(
-        routes(&client)?,
+        routes(&client, settings.relayer_url.as_deref())?,
         metrics.clone(),
         settings.metrics_port.is_none(),
     );
@@ -102,7 +102,7 @@ fn init_tracing() {
 /// Parses adapter arguments and serves the supplied routes after Store is ready.
 pub async fn main(
     profile: Profile,
-    routes: impl FnOnce(&StoreClient) -> Result<Router, BoxError>,
+    routes: impl FnOnce(&StoreClient, Option<&str>) -> Result<Router, BoxError>,
 ) -> ExitCode {
     init_tracing();
     let args = Cli::from_arg_matches(&command(profile).get_matches())
@@ -215,8 +215,8 @@ mod tests {
     async fn preflight_responses_can_be_cached() {
         let app = build_app(Router::new(), AdapterMetrics::new(), true);
         for path in [
-            "/transactions/qmdb.v1.OperationLogService/GetOperationRange",
-            "/sql.v1.Service/Query",
+            "/constantinople.explorer.v1.ExplorerService/SubmitTransaction",
+            "/constantinople.explorer.v1.ExplorerService/Search",
         ] {
             let response = app
                 .clone()

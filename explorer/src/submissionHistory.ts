@@ -1,3 +1,5 @@
+import type { VerifiedTransactionBundle } from './proofBundle.ts';
+
 export type SubmittedTransactionStatus = 'reconciling' | 'finalized' | 'rejected';
 
 export type BlockCertificateState =
@@ -42,6 +44,18 @@ export interface SubmittedTransaction {
     readonly proof: TransactionProofState;
 }
 
+// Saved submission fields must match the body authenticated by the digest lookup.
+export function assertSubmittedTransactionMatches(
+    local: SubmittedTransaction,
+    verified: { readonly digest: string; readonly sender: string; readonly recipient: string; readonly value: bigint; readonly nonce: bigint },
+): void {
+    if (local.digest !== verified.digest || local.sender !== verified.sender ||
+        local.to !== verified.recipient || BigInt(local.value) !== verified.value ||
+        BigInt(local.nonce) !== verified.nonce) {
+        throw new Error('saved submission fields do not match the verified transaction');
+    }
+}
+
 export const WAITING_FINALIZATION_CERTIFICATE = {
     status: 'waiting',
     detail: 'queued for finalized metadata',
@@ -82,18 +96,13 @@ export function markSubmissionReconciling(
 export function markValidatorFinalizationObserved(
     digest: string,
     height: number,
-    observedAt: number,
+    _observedAt: number,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateReconciling(digest, current, (tx) => {
-        const observedInMs = Math.max(0, observedAt - tx.submittedAt);
-        return {
-            ...tx,
-            finalizationObservedInMs: tx.finalizationObservedInMs ?? observedInMs,
-            finalizedHeight: height,
-            detail: `validator reported finalized at ${height}`,
-        };
-    });
+    return updateReconciling(digest, current, (tx) => ({
+        ...tx,
+        detail: `reported h${height}`,
+    }));
 }
 
 export function markSubmissionRejected(
@@ -119,26 +128,6 @@ export function markReconciliationFetching(
     return markProofState(digest, current, { status: 'fetching', detail: 'fetching finalized metadata' });
 }
 
-export function markReconciliationCertificate(
-    digest: string,
-    height: number,
-    certificate: BlockCertificateState,
-    observedAt: number,
-    current: SubmittedTransaction[],
-): SubmittedTransaction[] {
-    return updateReconciling(digest, current, (tx) => {
-        if (certificate.status !== 'verified') return tx;
-        return {
-            ...tx,
-            finalizedHeight: height,
-            finalizationObservedInMs:
-                tx.finalizationObservedInMs ?? Math.max(0, observedAt - tx.submittedAt),
-            certificate,
-            proof: { status: 'fetching', detail: 'fetching QMDB proof' },
-        };
-    });
-}
-
 export function markReconciliationWaiting(
     digest: string,
     detail: string,
@@ -156,23 +145,50 @@ export function markReconciliationError(
 }
 
 export function markTransactionFinalized(
-    digest: string,
-    height: number,
-    certificate: BlockCertificateState,
-    proof: TransactionProofState,
-    proofObservedAt: number,
+    verified: VerifiedTransactionBundle,
+    observedAt: number,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateReconciling(digest, current, (tx) => {
-        if (proof.status !== 'verified') return tx;
+    const height = Number(verified.height);
+    return updateReconciling(verified.transaction.digest, current, (tx) => {
+        try {
+            assertSubmittedTransactionMatches(tx, verified.transaction);
+            if (!Number.isSafeInteger(height)) {
+                throw new Error('finalized transaction height exceeds Number.MAX_SAFE_INTEGER');
+            }
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            return {
+                ...tx,
+                detail,
+                finalizedHeight: null,
+                finalizationObservedInMs: null,
+                proofObservedInMs: null,
+                certificate: { status: 'error', detail },
+                proof: { status: 'error', detail },
+            };
+        }
+        const elapsed = Math.max(0, observedAt - tx.submittedAt);
         return {
             ...tx,
             status: 'finalized',
-            detail: `finalized at ${height}`,
-            proofObservedInMs: Math.max(0, proofObservedAt - tx.submittedAt),
+            detail: `finalized h${height}`,
+            finalizationObservedInMs: tx.finalizationObservedInMs ?? elapsed,
+            proofObservedInMs: tx.proofObservedInMs ?? elapsed,
             finalizedHeight: height,
-            certificate,
-            proof,
+            certificate: {
+                status: 'verified',
+                detail: `verified at height ${verified.target.height}`,
+                height: verified.target.height.toString(),
+                view: verified.target.view.toString(),
+            },
+            proof: {
+                status: 'verified',
+                detail: `verified at height ${verified.height}`,
+                location: verified.location.toString(),
+                tip: verified.tip.toString(),
+                proofSizeBytes: verified.proofSizeBytes,
+            },
         };
     });
 }
@@ -234,7 +250,9 @@ export function selectReconciliations(
         .slice(0, available);
 }
 
-export function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | null {
+// Saved rows retain local submission details and observation durations.
+// Chain status requires fresh proof verification.
+export function restoreSubmittedTransaction(value: unknown): SubmittedTransaction | null {
     if (typeof value !== 'object' || value === null) return null;
 
     const transaction = value as Record<string, unknown>;
@@ -246,171 +264,36 @@ export function normalizeSubmittedTransaction(value: unknown): SubmittedTransact
         typeof transaction.to !== 'string' ||
         !isAccountKeyHex(transaction.to) ||
         typeof transaction.value !== 'string' ||
+        !isU64Decimal(transaction.value) ||
         typeof transaction.nonce !== 'string' ||
         !isU64Decimal(transaction.nonce) ||
         typeof transaction.submittedAt !== 'number' ||
-        typeof transaction.status !== 'string' ||
-        typeof transaction.detail !== 'string'
+        !Number.isFinite(transaction.submittedAt) ||
+        transaction.submittedAt < 0
     ) {
         return null;
     }
 
-    if (transaction.reconciliationVersion === 1 || transaction.reconciliationVersion === 2) {
-        return normalizeVersionedTransaction(transaction);
-    }
-    return migrateLegacyTransaction(transaction);
+    return {
+        reconciliationVersion: 2,
+        sender: transaction.sender,
+        digest: transaction.digest,
+        to: transaction.to,
+        value: transaction.value,
+        nonce: transaction.nonce,
+        submittedAt: transaction.submittedAt,
+        status: 'reconciling',
+        detail: 'saved submission',
+        finalizedHeight: null,
+        finalizationObservedInMs: storedDuration(transaction.finalizationObservedInMs),
+        proofObservedInMs: storedDuration(transaction.proofObservedInMs),
+        certificate: WAITING_FINALIZATION_CERTIFICATE,
+        proof: WAITING_FINALIZATION_PROOF,
+    };
 }
 
 export function isAccountKeyHex(value: string): boolean {
     return /^[0-9a-f]{64}$/.test(value);
-}
-
-function normalizeVersionedTransaction(
-    transaction: Record<string, unknown>,
-): SubmittedTransaction | null {
-    if (!isSubmittedTransactionStatus(transaction.status)) return null;
-    const status = transaction.status;
-    if (status === 'rejected') return baseTransaction(transaction, REJECTED_STATE);
-
-    const finalizedHeight = safeOptionalNumber(transaction.finalizedHeight);
-    const currentVersion = transaction.reconciliationVersion === 2;
-    const finalizationObservedInMs = currentVersion
-        ? safeOptionalNumber(transaction.finalizationObservedInMs)
-        : null;
-    const proofObservedInMs = safeOptionalNumber(
-        currentVersion ? transaction.proofObservedInMs : transaction.finalizedInMs,
-    );
-    let certificate = normalizeBlockCertificate(transaction.certificate, finalizedHeight);
-    let proof = normalizeTransactionProof(transaction.proof);
-    if (status === 'finalized' && proof.status !== 'verified') return null;
-
-    // Backend or verifier repairs must allow unresolved rows to retry on reload.
-    if (status === 'reconciling' && proof.status === 'error') {
-        proof = WAITING_FINALIZATION_PROOF;
-        if (certificate.status !== 'verified') certificate = defaultBlockCertificate(finalizedHeight);
-    }
-
-    return baseTransaction(transaction, {
-        status,
-        finalizedHeight,
-        finalizationObservedInMs: finalizedHeight === null ? null : finalizationObservedInMs,
-        proofObservedInMs: status === 'finalized' ? proofObservedInMs : null,
-        certificate,
-        proof,
-    });
-}
-
-function migrateLegacyTransaction(
-    transaction: Record<string, unknown>,
-): SubmittedTransaction {
-    const legacyProof = normalizeTransactionProof(transaction.proof);
-    if (legacyProof.status === 'verified') {
-        return baseTransaction(transaction, {
-            status: 'finalized',
-            finalizedHeight: safeOptionalNumber(transaction.finalizedHeight),
-            finalizationObservedInMs: null,
-            proofObservedInMs: null,
-            certificate: normalizeBlockCertificate(
-                transaction.certificate,
-                safeOptionalNumber(transaction.finalizedHeight),
-            ),
-            proof: legacyProof,
-        });
-    }
-    return baseTransaction(transaction, {
-        status: 'reconciling',
-        finalizedHeight: null,
-        finalizationObservedInMs: null,
-        proofObservedInMs: null,
-        certificate: WAITING_FINALIZATION_CERTIFICATE,
-        proof: WAITING_FINALIZATION_PROOF,
-    });
-}
-
-function baseTransaction(
-    transaction: Record<string, unknown>,
-    state: Pick<
-        SubmittedTransaction,
-        | 'status'
-        | 'finalizedHeight'
-        | 'finalizationObservedInMs'
-        | 'proofObservedInMs'
-        | 'certificate'
-        | 'proof'
-    >,
-): SubmittedTransaction {
-    return {
-        reconciliationVersion: 2,
-        sender: transaction.sender as string,
-        digest: transaction.digest as string,
-        to: transaction.to as string,
-        value: transaction.value as string,
-        nonce: transaction.nonce as string,
-        submittedAt: transaction.submittedAt as number,
-        detail: transaction.detail as string,
-        ...state,
-    };
-}
-
-function normalizeBlockCertificate(
-    value: unknown,
-    finalizedHeight: number | null,
-): BlockCertificateState {
-    if (typeof value !== 'object' || value === null) {
-        return defaultBlockCertificate(finalizedHeight);
-    }
-    const certificate = value as Record<string, unknown>;
-    if (
-        certificate.status === 'verified' &&
-        typeof certificate.detail === 'string' &&
-        typeof certificate.height === 'string' &&
-        typeof certificate.view === 'string'
-    ) {
-        return {
-            status: 'verified',
-            detail: certificate.detail,
-            height: certificate.height,
-            view: certificate.view,
-        };
-    }
-    if (
-        (certificate.status === 'waiting' ||
-            certificate.status === 'error' ||
-            certificate.status === 'unavailable') &&
-        typeof certificate.detail === 'string'
-    ) {
-        return { status: certificate.status, detail: certificate.detail };
-    }
-    return defaultBlockCertificate(finalizedHeight);
-}
-
-function defaultBlockCertificate(finalizedHeight: number | null): BlockCertificateState {
-    if (finalizedHeight === null) return WAITING_FINALIZATION_CERTIFICATE;
-    return { status: 'waiting', detail: 'queued for block certificate' };
-}
-
-function normalizeTransactionProof(value: unknown): TransactionProofState {
-    if (typeof value !== 'object' || value === null) return WAITING_FINALIZATION_PROOF;
-
-    const proof = value as Record<string, unknown>;
-    if (proof.status === 'verified' && typeof proof.detail === 'string') {
-        return {
-            status: 'verified',
-            detail: proof.detail,
-            location: typeof proof.location === 'string' ? proof.location : '',
-            tip: typeof proof.tip === 'string' ? proof.tip : '',
-            proofSizeBytes: typeof proof.proofSizeBytes === 'number' ? proof.proofSizeBytes : 0,
-        };
-    }
-    if (
-        (proof.status === 'waiting' ||
-            proof.status === 'error' ||
-            proof.status === 'unavailable') &&
-        typeof proof.detail === 'string'
-    ) {
-        return { status: proof.status, detail: proof.detail };
-    }
-    return WAITING_FINALIZATION_PROOF;
 }
 
 function markProofState(
@@ -421,7 +304,7 @@ function markProofState(
     return updateReconciling(digest, current, (tx) => ({
         ...tx,
         detail: proof.status === 'error' ? 'finalized proof verification failed' : tx.detail,
-        certificate: tx.certificate.status === 'verified' ? tx.certificate : proof,
+        certificate: proof,
         proof,
     }));
 }
@@ -453,15 +336,11 @@ function compactHistory(current: SubmittedTransaction[]): SubmittedTransaction[]
     return current.filter((tx) => tx.status === 'reconciling' || terminalCount++ < 100);
 }
 
-function isSubmittedTransactionStatus(value: unknown): value is SubmittedTransactionStatus {
-    return value === 'reconciling' || value === 'finalized' || value === 'rejected';
-}
-
 function isU64Decimal(value: string): boolean {
-    if (!/^(0|[1-9]\d*)$/.test(value)) return false;
+    if (!/^(0|[1-9]\d{0,19})$/.test(value)) return false;
     return BigInt(value) <= (1n << 64n) - 1n;
 }
 
-function safeOptionalNumber(value: unknown): number | null {
+function storedDuration(value: unknown): number | null {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
