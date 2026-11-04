@@ -88,9 +88,6 @@ const HISTOGRAM_MAX_COLUMNS = 180;
 const BLOCK_LOG_MAX = 80;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
-const HISTOGRAM_HEIGHT = 18;
-const HISTOGRAM_MAX_ROWS = 200;
-const HISTOGRAM_MIN_ROWS = 1;
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 type Status =
@@ -2229,36 +2226,22 @@ function formatObservedTxPerSecond(
 
 const Histogram = memo(function Histogram({ blocks }: { blocks: VerifiedBlock[] }) {
     const frameRef = useRef<HTMLDivElement>(null);
-    const measureRef = useRef<HTMLSpanElement>(null);
     const [columns, setColumns] = useState(HISTOGRAM_INITIAL_COLUMNS);
-    const [rows, setRows] = useState(HISTOGRAM_HEIGHT);
 
+    // Columns are a fixed pixel width from the stylesheet; the frame decides how many fit.
     useEffect(() => {
         const frame = frameRef.current;
-        const measure = measureRef.current;
-        if (!frame || !measure) return;
+        if (!frame) return;
 
         const recompute = () => {
-            const { width: charWidth, height: charHeight } = measure.getBoundingClientRect();
-            if (charWidth <= 0 || charHeight <= 0) return;
-
-            const availableColumns = Math.floor(frame.clientWidth / charWidth);
+            const columnWidth = parseFloat(getComputedStyle(frame).getPropertyValue('--histogram-column'));
+            if (!(columnWidth > 0)) return;
+            const availableColumns = Math.floor(frame.clientWidth / columnWidth);
             const nextColumns = Math.max(
                 HISTOGRAM_MIN_COLUMNS,
                 Math.min(HISTOGRAM_MAX_COLUMNS, availableColumns),
             );
             setColumns((current) => (current === nextColumns ? current : nextColumns));
-
-            const chart = measure.parentElement;
-            if (!chart) return;
-            const style = getComputedStyle(chart);
-            const contentHeight = chart.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-            const availableRows = Math.floor(contentHeight / charHeight);
-            const nextRows = Math.max(
-                HISTOGRAM_MIN_ROWS,
-                Math.min(HISTOGRAM_MAX_ROWS, availableRows),
-            );
-            setRows((current) => (current === nextRows ? current : nextRows));
         };
 
         recompute();
@@ -2271,26 +2254,19 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: VerifiedBlock[] 
         };
     }, []);
 
-    const { lines, zeroLine, domain } = useMemo(
-        () => buildHistogram(blocks, columns, rows),
-        [blocks, columns, rows],
-    );
+    const { columns: bars, domain } = useMemo(() => buildHistogram(blocks, columns), [blocks, columns]);
 
     return (
         <div className="histogram-frame" ref={frameRef}>
-            <pre className="histogram" aria-label={`recent block transaction counts, zero to ${domain} transactions per block; dots mark empty blocks`}>
-                <span className="histogram__measure" ref={measureRef} aria-hidden="true">
-                    █
-                </span>
-                <span className="histogram__plot">
-                    {lines.map((line, index) => (
-                        <span className="histogram__line" key={index}>
-                            {line}
-                        </span>
-                    ))}
-                    <span className="histogram__zeros">{zeroLine}</span>
-                </span>
-            </pre>
+            <div className="histogram" role="img" aria-label={`recent block transaction counts, zero to ${domain} transactions per block; ticks mark empty blocks`}>
+                {bars.map((bar, index) => bar === null
+                    ? <span className="histogram__column" key={`blank-${index}`} />
+                    : <span
+                        className={bar.txCount === 0 ? 'histogram__column histogram__column--empty' : 'histogram__column'}
+                        key={bar.height.toString()}
+                        style={{ '--bar': bar.fraction } as React.CSSProperties}
+                    />)}
+            </div>
         </div>
     );
 });

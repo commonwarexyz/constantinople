@@ -11,7 +11,7 @@ together.
 | --- | --- | --- |
 | `--font-family-mono` | ui-monospace, SF Mono, Menlo, … | The only typeface. Figures are tabular (`tabular-nums lining-nums`). |
 | `--font-size` | 21px | Root size, so `1rem` below is 21px. |
-| `--line-height` | 1.4 | Body text. Statistics use 1.1 and the histogram 1. |
+| `--line-height` | 1.4 | Body text. Statistics use 1.1. |
 | `--theme-background` | #0e0f10 | Page, popups, grid cells. |
 | `--theme-row-alt` | #131415 | Fields and row hover. |
 | `--theme-border` | #2a2a2a | Every rule, grid gap, and outline. |
@@ -207,8 +207,9 @@ same layout. Hashes and timestamps truncate to fit, and the whole row stays one 
 
 ## Intended exceptions
 
-- **ASCII histogram.** Its glyph grid is sized in pixels (14px; 7px ≤760px; 6px ≤480px) with line
-  height 1. Each observed block occupies one column; new batches append at the right without
-  interpolated sliding. Unobserved history stays blank, actual empty blocks use dim dots, and
-  positive counts use amber. The chart has no visible key. It does not use the text tokens.
+- **Histogram.** A row of fixed-pixel-width columns (`--histogram-column`: 8px; 4px ≤760px;
+  3px ≤480px), one per observed block, drawn as boxes so adjacent bars meet without seams. New
+  batches append at the right without interpolated sliding. Unobserved history stays blank,
+  actual empty blocks are 2px dim baseline ticks, and positive counts use amber bars scaled to
+  the visible peak. The chart has no visible key. It does not use the text tokens.
 - **Block-log time column.** On desktop, an 8px right inset keeps it clear of the scrollbar.
