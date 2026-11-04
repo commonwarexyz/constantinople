@@ -1,6 +1,6 @@
 //! Proposal budgets for the canonical SHA-256 and Ed25519 validator stack.
 
-use crate::{Transaction, TransactionSignature};
+use crate::{StateSyncProof, Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
 use commonware_consensus::types::coding::COMMITMENT_SIZE;
 use commonware_cryptography::sha256;
@@ -20,7 +20,9 @@ pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
     if block_bytes > MAXIMUM_BLOCK_SIZE {
         return None;
     }
-    let body_bytes = block_bytes.checked_sub(maximum_header_size())?;
+    let body_bytes = block_bytes
+        .checked_sub(maximum_header_size())?
+        .checked_sub(StateSyncProof::<sha256::Digest>::max_encode_size())?;
 
     // Counting minimum-size transactions reserves enough two-byte prefixes for any signature mix.
     let minimum_transaction = Transaction::<sha256::Digest>::SIZE + TransactionSignature::MIN_SIZE;
@@ -43,8 +45,8 @@ fn maximum_header_size() -> usize {
 mod tests {
     use super::*;
     use crate::{
-        Block, Header, Sealable, SealedBlock, SignedTransaction, TRANSACTION_NAMESPACE,
-        TransactionPublicKey,
+        Block, Header, Sealable, SealedBlock, SignedTransaction, StateSyncProof,
+        TRANSACTION_NAMESPACE, TransactionPublicKey,
     };
     use commonware_codec::Encode;
     use commonware_coding::ReedSolomon;
@@ -111,11 +113,20 @@ mod tests {
         [minimum, maximum]
     }
 
+    fn maximum_state_sync() -> StateSyncProof<sha256::Digest> {
+        let mut proof = StateSyncProof::initial::<sha256::Sha256>();
+        proof.witness.partial_chunk.as_mut().unwrap().0 = u64::MAX;
+        proof
+    }
+
     #[test]
     fn empty_block_bound_matches_maximum_header_codec() {
-        let block = Block::<_, _, sha256::Sha256>::new(maximum_header(), Vec::new());
+        let block =
+            Block::<_, _, sha256::Sha256>::new(maximum_header(), Vec::new(), maximum_state_sync());
         assert_eq!(
-            maximum_header_size() + 0usize.encode_size(),
+            maximum_header_size()
+                + StateSyncProof::<sha256::Digest>::max_encode_size()
+                + 0usize.encode_size(),
             block.encode().len()
         );
         assert_eq!(max_transaction_bytes(block.encode().len()), Some(0));
@@ -131,7 +142,7 @@ mod tests {
         assert_eq!(maximum_size.encode_size(), 2);
 
         for pattern in [&transactions[..1], &transactions[1..], &transactions[..]] {
-            for block_budget in [307, 512, 8192, 19232, 19381, MAXIMUM_BLOCK_SIZE] {
+            for block_budget in [512, 8192, 19232, 19381, MAXIMUM_BLOCK_SIZE] {
                 let budget = max_transaction_bytes(block_budget).unwrap();
                 let mut filled = 0;
                 let mut body = Vec::new();
@@ -143,7 +154,7 @@ mod tests {
                     filled += size;
                     body.push(transaction.clone());
                 }
-                let block = Block::new(maximum_header(), body);
+                let block = Block::new(maximum_header(), body, maximum_state_sync());
                 assert!(
                     block.encode().len() <= block_budget,
                     "transaction budget {budget} exceeded block budget {block_budget}",

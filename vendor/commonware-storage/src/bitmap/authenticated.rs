@@ -1,0 +1,1361 @@
+//! An authenticated bitmap.
+//!
+//! The authenticated bitmap is an in-memory data structure that does not persist its contents other
+//! than the data corresponding to its "pruned" section, allowing full restoration by "replaying"
+//! all retained elements.
+//!
+//! Authentication is provided by a Merkle tree that is maintained over the bitmap, with each leaf
+//! covering a chunk of N bytes. This Merkle tree isn't balanced, but instead mimics the structure
+//! of an MMR with an equivalent number of leaves. This structure reduces overhead of updating the
+//! most recently added elements, and (more importantly) simplifies aligning the bitmap with an MMR
+//! over elements whose activity state is reflected by the bitmap.
+
+use crate::{
+    Context,
+    merkle::{
+        Family as _,
+        hasher::Hasher,
+        mmr::{
+            self, Error, Location, Position, Proof,
+            mem::{Config, Mmr},
+            verification,
+        },
+        storage::Storage,
+    },
+    metadata::{Config as MConfig, Metadata},
+};
+use ahash::AHashSet;
+use commonware_codec::{Copying, DecodeExt};
+use commonware_cryptography::Digest;
+use commonware_parallel::Strategy;
+use commonware_utils::{
+    bitmap::{BitMap as UtilsBitMap, Prunable as PrunableBitMap},
+    sequence::prefixed_u64::U64,
+};
+use tracing::{debug, error, warn};
+
+/// Returns a root digest incorporating the total bitmap length and the last (unfilled) chunk.
+/// The total length binds the partial chunk to its absolute position.
+pub(crate) fn partial_chunk_root<H: Hasher<mmr::Family>, const N: usize>(
+    hasher: &H,
+    mmr_root: &H::Digest,
+    bit_len: u64,
+    last_chunk_digest: &H::Digest,
+) -> H::Digest {
+    assert!(!bit_len.is_multiple_of(UtilsBitMap::<N>::CHUNK_SIZE_BITS));
+    let bit_len = bit_len.to_be_bytes();
+    hasher.hash(&[
+        mmr_root.as_ref(),
+        bit_len.as_slice(),
+        last_chunk_digest.as_ref(),
+    ])
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// Trait for valid [BitMap] type states.
+pub trait State<D: Digest>: private::Sealed + Sized + Send + Sync {}
+
+/// Merkleized state: the bitmap has been merkleized and the root is cached.
+pub struct Merkleized<D: Digest> {
+    /// The cached root of the bitmap.
+    root: D,
+}
+
+impl<D: Digest> private::Sealed for Merkleized<D> {}
+impl<D: Digest> State<D> for Merkleized<D> {}
+
+/// Unmerkleized state: the bitmap has pending changes not yet merkleized.
+pub struct Unmerkleized {
+    /// Bitmap chunks that have been changed but whose changes are not yet reflected in the
+    /// root digest.
+    ///
+    /// Each dirty chunk is identified by its absolute index, including pruned chunks.
+    ///
+    /// Invariant: Indices are always in the range [pruned_chunks, mmr.leaves()).
+    dirty_chunks: AHashSet<usize>,
+}
+
+impl private::Sealed for Unmerkleized {}
+impl<D: Digest> State<D> for Unmerkleized {}
+
+/// A merkleized bitmap whose root digest has been computed and cached.
+pub type MerkleizedBitMap<E, D, const N: usize, S> = BitMap<E, D, N, Merkleized<D>, S>;
+
+/// An unmerkleized bitmap whose root digest has not been computed.
+pub type UnmerkleizedBitMap<E, D, const N: usize, S> = BitMap<E, D, N, Unmerkleized, S>;
+
+/// A bitmap supporting inclusion proofs through Merkleization.
+///
+/// Merkleization of the bitmap is performed over chunks of N bytes. If the goal is to minimize
+/// proof sizes, choose an N that is equal to the size or double the size of the hasher's digest.
+///
+/// # Type States
+///
+/// The bitmap uses the type-state pattern to enforce at compile-time whether the bitmap has
+/// pending updates that must be merkleized before computing proofs. [MerkleizedBitMap] represents
+/// a bitmap whose root digest has been computed and cached. [UnmerkleizedBitMap] represents a
+/// bitmap with pending updates. An unmerkleized bitmap can be converted into a merkleized bitmap
+/// by calling [UnmerkleizedBitMap::merkleize].
+///
+/// # Warning
+///
+/// Even though we use u64 identifiers for bits, on 32-bit machines, the maximum addressable bit is
+/// limited to (u32::MAX * N * 8).
+pub struct BitMap<E: Context, D: Digest, const N: usize, M: State<D>, S: Strategy> {
+    /// The underlying bitmap.
+    bitmap: PrunableBitMap<N>,
+
+    /// A Merkle tree with each leaf representing an N*8 bit "chunk" of the bitmap.
+    ///
+    /// After calling `merkleize` all chunks are guaranteed to be included in the Merkle tree. The
+    /// last chunk of the bitmap is never part of the tree.
+    ///
+    /// Because leaf elements can be updated when bits in the bitmap are flipped, this tree, while
+    /// based on an MMR structure, is not an MMR but a Merkle tree. The MMR structure results in
+    /// reduced update overhead for elements being appended or updated near the tip compared to a
+    /// more typical balanced Merkle tree.
+    mmr: Mmr<D>,
+
+    /// The strategy used for parallelizing merkleization.
+    strategy: S,
+
+    /// Merkleization-dependent state.
+    state: M,
+
+    /// Metadata for persisting pruned state.
+    metadata: Metadata<E, U64, Vec<u8>>,
+}
+
+/// Prefix used for the metadata key identifying node digests.
+const NODE_PREFIX: u8 = 0;
+
+/// Prefix used for the metadata key identifying the pruned_chunks value.
+const PRUNED_CHUNKS_PREFIX: u8 = 1;
+
+impl<E: Context, D: Digest, const N: usize, M: State<D>, S: Strategy> BitMap<E, D, N, M, S> {
+    /// The size of a chunk in bits.
+    pub const CHUNK_SIZE_BITS: u64 = PrunableBitMap::<N>::CHUNK_SIZE_BITS;
+
+    /// Return the size of the bitmap in bits.
+    #[inline]
+    pub fn size(&self) -> Position {
+        self.mmr.size()
+    }
+
+    /// Return the number of bits currently stored in the bitmap, irrespective of any pruning.
+    #[inline]
+    pub const fn len(&self) -> u64 {
+        self.bitmap.len()
+    }
+
+    /// Returns true if the bitmap is empty.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the number of bits that have been pruned from this bitmap.
+    #[inline]
+    pub const fn pruned_bits(&self) -> u64 {
+        self.bitmap.pruned_bits()
+    }
+
+    /// Returns the number of complete chunks (excludes partial chunk at end, if any).
+    /// The returned index is absolute and includes pruned chunks.
+    #[inline]
+    fn complete_chunks(&self) -> usize {
+        self.bitmap.complete_chunks()
+    }
+
+    /// Return the last chunk of the bitmap and its size in bits. The size can be 0 (meaning the
+    /// last chunk is empty).
+    #[inline]
+    pub fn last_chunk(&self) -> (&[u8; N], u64) {
+        self.bitmap.last_chunk()
+    }
+
+    /// Returns the bitmap chunk containing the specified bit.
+    ///
+    /// # Warning
+    ///
+    /// Panics if the bit doesn't exist or has been pruned.
+    #[inline]
+    pub fn get_chunk_containing(&self, bit: u64) -> &[u8; N] {
+        self.bitmap.get_chunk_containing(bit)
+    }
+
+    /// Get the value of a bit.
+    ///
+    /// # Warning
+    ///
+    /// Panics if the bit doesn't exist or has been pruned.
+    #[inline]
+    pub fn get_bit(&self, bit: u64) -> bool {
+        self.bitmap.get_bit(bit)
+    }
+
+    /// Get the value of a bit from its chunk.
+    /// `bit` is an index into the entire bitmap, not just the chunk.
+    #[inline]
+    pub const fn get_bit_from_chunk(chunk: &[u8; N], bit: u64) -> bool {
+        PrunableBitMap::<N>::get_bit_from_chunk(chunk, bit)
+    }
+
+    /// Verify whether `proof` proves that the `chunk` containing the given bit belongs to the
+    /// bitmap corresponding to `root`.
+    pub fn verify_bit_inclusion(
+        hasher: &impl Hasher<mmr::Family, Digest = D>,
+        proof: &Proof<D>,
+        chunk: &[u8; N],
+        bit: u64,
+        root: &D,
+    ) -> bool {
+        let bit_len = *proof.leaves;
+        if bit >= bit_len {
+            debug!(bit_len, bit, "tried to verify non-existent bit");
+            return false;
+        }
+
+        // Since we support only full bagging, inactive peaks must always be 0.
+        if proof.inactive_peaks != 0 {
+            debug!(
+                inactive_peaks = proof.inactive_peaks,
+                "bitmap proof must have inactive_peaks == 0"
+            );
+            return false;
+        }
+
+        // The chunk index should always be < MAX_LEAVES.
+        let chunked_leaves = Location::new(bit_len / Self::CHUNK_SIZE_BITS);
+        let mut mmr_proof = Proof {
+            leaves: chunked_leaves,
+            inactive_peaks: 0,
+            digests: proof.digests.clone(),
+        };
+
+        let loc = Location::new(bit / Self::CHUNK_SIZE_BITS);
+        if bit_len.is_multiple_of(Self::CHUNK_SIZE_BITS) {
+            return mmr_proof.verify_element_inclusion(hasher, chunk, loc, root);
+        }
+
+        if proof.digests.is_empty() {
+            debug!("proof has no digests");
+            return false;
+        }
+        let last_digest = mmr_proof.digests.pop().unwrap();
+
+        if chunked_leaves == loc {
+            // The proof is over a bit in the partial chunk. In this case the proof's only digest
+            // should be the MMR's root, otherwise it is invalid. Since we've popped off the last
+            // digest already, there should be no remaining digests.
+            if !mmr_proof.digests.is_empty() {
+                debug!(
+                    digests = mmr_proof.digests.len() + 1,
+                    "proof over partial chunk should have exactly 1 digest"
+                );
+                return false;
+            }
+            let last_chunk_digest = hasher.digest(chunk);
+            let reconstructed_root =
+                partial_chunk_root::<_, N>(hasher, &last_digest, bit_len, &last_chunk_digest);
+            return reconstructed_root == *root;
+        };
+
+        // For a proof over a full chunk, `last_digest` contains the partial chunk's digest.
+        let mmr_root = match mmr_proof.reconstruct_root(hasher, &[chunk], loc) {
+            Ok(root) => root,
+            Err(error) => {
+                debug!(error = ?error, "invalid proof input");
+                return false;
+            }
+        };
+
+        let reconstructed_root =
+            partial_chunk_root::<_, N>(hasher, &mmr_root, bit_len, &last_digest);
+
+        reconstructed_root == *root
+    }
+}
+
+impl<E: Context, D: Digest, const N: usize, S: Strategy> MerkleizedBitMap<E, D, N, S> {
+    /// Initialize a bitmap from the metadata in the given partition. If the partition is empty,
+    /// returns an empty bitmap. Otherwise restores the pruned state (the caller must replay
+    /// retained elements to restore its full state).
+    ///
+    /// Returns an error if the bitmap could not be restored, e.g. because of data corruption or
+    /// underlying storage error.
+    pub async fn init(
+        context: E,
+        partition: &str,
+        strategy: S,
+        hasher: &impl Hasher<mmr::Family, Digest = D>,
+    ) -> Result<Self, Error> {
+        let metadata_cfg = MConfig {
+            partition: partition.into(),
+            codec_config: ((0..).into(), ()),
+        };
+        let metadata =
+            Metadata::<_, U64, Vec<u8>>::init(context.child("metadata"), metadata_cfg).await?;
+
+        let key: U64 = U64::new(PRUNED_CHUNKS_PREFIX, 0);
+        let pruned_chunks = match metadata.get(&key) {
+            Some(bytes) => u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                error!("pruned chunks value not a valid u64");
+                Error::DataCorrupted("pruned chunks value not a valid u64")
+            })?),
+            None => {
+                warn!("bitmap metadata does not contain pruned chunks, initializing as empty");
+                0
+            }
+        } as usize;
+        if pruned_chunks == 0 {
+            let mmr = Mmr::new();
+            let cached_root = mmr.root(hasher, 0)?;
+            return Ok(Self {
+                bitmap: PrunableBitMap::new(),
+                mmr,
+                strategy,
+                metadata,
+                state: Merkleized { root: cached_root },
+            });
+        }
+        let pruned_loc = Location::new(pruned_chunks as u64);
+        if !pruned_loc.is_valid() {
+            return Err(Error::DataCorrupted("pruned chunks exceeds MAX_LEAVES"));
+        }
+
+        let mut pinned_nodes = Vec::new();
+        for (index, pos) in mmr::Family::nodes_to_pin(pruned_loc).enumerate() {
+            let Some(bytes) = metadata.get(&U64::new(NODE_PREFIX, index as u64)) else {
+                error!(?pruned_loc, ?pos, "missing pinned node");
+                return Err(Error::MissingNode(pos));
+            };
+            let digest = D::decode(Copying(bytes));
+            let Ok(digest) = digest else {
+                error!(?pruned_loc, ?pos, "could not convert node bytes to digest");
+                return Err(Error::MissingNode(pos));
+            };
+            pinned_nodes.push(digest);
+        }
+
+        let mmr = Mmr::init(Config {
+            nodes: Vec::new(),
+            pruning_boundary: Location::new(pruned_chunks as u64),
+            pinned_nodes,
+        })?;
+
+        let bitmap = PrunableBitMap::new_with_pruned_chunks(pruned_chunks)
+            .expect("pruned_chunks should never overflow");
+        let cached_root = mmr.root(hasher, 0)?;
+        Ok(Self {
+            bitmap,
+            mmr,
+            strategy,
+            metadata,
+            state: Merkleized { root: cached_root },
+        })
+    }
+
+    pub fn get_node(&self, position: Position) -> Option<D> {
+        self.mmr.get_node(position)
+    }
+
+    /// Write the information necessary to restore the bitmap in its fully pruned state at its last
+    /// pruning boundary. Restoring the entire bitmap state is then possible by replaying the
+    /// retained elements.
+    ///
+    /// Consumes the bitmap and returns it only on success: an error (or a dropped future)
+    /// destroys the handle.
+    pub async fn write_pruned(mut self) -> Result<Self, Error> {
+        self.metadata.clear();
+
+        // Write the number of pruned chunks.
+        let key = U64::new(PRUNED_CHUNKS_PREFIX, 0);
+        self.metadata
+            .put(key, self.bitmap.pruned_chunks().to_be_bytes().to_vec());
+
+        // Write the pinned nodes.
+        let pruned_loc = Location::new(self.bitmap.pruned_chunks() as u64);
+        assert!(
+            pruned_loc.is_valid(),
+            "expected valid location from pruned_chunks"
+        );
+        for (i, digest) in mmr::Family::nodes_to_pin(pruned_loc).enumerate() {
+            let digest = self.mmr.get_node_unchecked(digest);
+            let key = U64::new(NODE_PREFIX, i as u64);
+            self.metadata.put(key, digest.to_vec());
+        }
+
+        self.metadata = self.metadata.sync().await.map_err(Error::Metadata)?;
+        Ok(self)
+    }
+
+    /// Destroy the bitmap metadata from disk.
+    pub async fn destroy(self) -> Result<(), Error> {
+        self.metadata.destroy().await.map_err(Error::Metadata)
+    }
+
+    /// Prune all complete chunks before the chunk containing the given bit.
+    ///
+    /// The chunk containing `bit` and all subsequent chunks are retained. All chunks
+    /// before it are pruned from the bitmap and the underlying MMR.
+    ///
+    /// If `bit` equals the bitmap length, this prunes all complete chunks while retaining
+    /// the empty trailing chunk, preparing the bitmap for appending new data.
+    pub fn prune_to_bit(&mut self, bit: u64) -> Result<(), Error> {
+        let chunk = PrunableBitMap::<N>::to_chunk_index(bit);
+        if chunk < self.bitmap.pruned_chunks() {
+            return Ok(());
+        }
+
+        // Prune inner bitmap
+        self.bitmap.prune_to_bit(bit);
+
+        self.mmr.prune(Location::new(chunk as u64))?;
+        Ok(())
+    }
+
+    /// Return the cached root digest against which inclusion proofs can be verified.
+    ///
+    /// # Format
+    ///
+    /// The root digest is simply that of the underlying MMR whenever the bit count falls on a chunk
+    /// boundary. Otherwise, the root is computed as follows in order to capture the bits that are
+    /// not yet part of the MMR:
+    ///
+    /// hash(mmr_root || bit_len.to_be_bytes() || last_chunk_digest)
+    ///
+    /// `bit_len` is the total number of bits, including pruned bits.
+    ///
+    /// The root is computed during merkleization and cached, so this method is cheap to call.
+    pub const fn root(&self) -> D {
+        self.state.root
+    }
+
+    /// Return an inclusion proof for the specified bit, along with the chunk of the bitmap
+    /// containing that bit. The proof can be used to prove any bit in the chunk.
+    ///
+    /// The bitmap proof stores the number of bits in the bitmap within the proof's `leaves` field
+    /// instead of the underlying MMR leaf count, since the MMR does not reflect the number of bits
+    /// in any partial chunk. The underlying MMR leaf count is `proof.leaves` divided by
+    /// [Self::CHUNK_SIZE_BITS].
+    ///
+    /// # Errors
+    ///
+    /// Returns [Error::BitOutOfBounds] if `bit` is out of bounds.
+    pub async fn proof(
+        &self,
+        hasher: &impl Hasher<mmr::Family, Digest = D>,
+        bit: u64,
+    ) -> Result<(Proof<D>, [u8; N]), Error> {
+        if bit >= self.len() {
+            return Err(Error::BitOutOfBounds(bit, self.len()));
+        }
+
+        let chunk = *self.get_chunk_containing(bit);
+        let chunk_loc = Location::from(PrunableBitMap::<N>::to_chunk_index(bit));
+        let (last_chunk, next_bit) = self.bitmap.last_chunk();
+
+        if chunk_loc == self.mmr.leaves() {
+            assert!(next_bit > 0);
+            // Proof is over a bit in the partial chunk. In this case only a single digest is
+            // required in the proof: the mmr's root.
+            return Ok((
+                Proof {
+                    leaves: Location::new(self.len()),
+                    inactive_peaks: 0,
+                    digests: vec![self.mmr.root(hasher, 0)?],
+                },
+                chunk,
+            ));
+        }
+
+        let range = chunk_loc..chunk_loc + 1;
+        let mut proof = verification::range_proof(hasher, &self.mmr, range, 0).await?;
+        proof.leaves = Location::new(self.len());
+        if next_bit == Self::CHUNK_SIZE_BITS {
+            // Bitmap is chunk aligned.
+            return Ok((proof, chunk));
+        }
+
+        // Since the bitmap wasn't chunk aligned, we'll need to include the digest of the last chunk
+        // in the proof to be able to re-derive the root.
+        let last_chunk_digest = hasher.digest(last_chunk);
+        proof.digests.push(last_chunk_digest);
+
+        Ok((proof, chunk))
+    }
+
+    /// Convert this merkleized bitmap into an unmerkleized bitmap without making any changes to it.
+    pub fn into_dirty(self) -> UnmerkleizedBitMap<E, D, N, S> {
+        UnmerkleizedBitMap {
+            bitmap: self.bitmap,
+            mmr: self.mmr,
+            strategy: self.strategy,
+            state: Unmerkleized {
+                dirty_chunks: AHashSet::new(),
+            },
+            metadata: self.metadata,
+        }
+    }
+}
+
+impl<E: Context, D: Digest, const N: usize, S: Strategy> UnmerkleizedBitMap<E, D, N, S> {
+    /// Add a single bit to the end of the bitmap.
+    ///
+    /// # Warning
+    ///
+    /// The update will not affect the root until `merkleize` is called.
+    pub fn push(&mut self, bit: bool) {
+        self.bitmap.push(bit);
+    }
+
+    /// Set the value of the given bit.
+    ///
+    /// # Warning
+    ///
+    /// The update will not impact the root until `merkleize` is called.
+    pub fn set_bit(&mut self, bit: u64, value: bool) {
+        // Apply the change to the inner bitmap
+        self.bitmap.set_bit(bit, value);
+
+        // If the updated chunk is already in the MMR, mark it as dirty.
+        let chunk = PrunableBitMap::<N>::to_chunk_index(bit);
+        if chunk < *self.mmr.leaves() as usize {
+            self.state.dirty_chunks.insert(chunk);
+        }
+    }
+
+    /// Merkleize all updates not yet reflected in the bitmap's root.
+    pub fn merkleize(
+        mut self,
+        hasher: &impl Hasher<mmr::Family, Digest = D>,
+    ) -> Result<MerkleizedBitMap<E, D, N, S>, Error> {
+        // Build a batch backed by the configured strategy.
+        let mut batch = self.mmr.new_batch_with_strategy(self.strategy.clone());
+        let start = *self.mmr.leaves() as usize;
+        let end = self.complete_chunks();
+        for i in start..end {
+            batch = batch.add(hasher, self.bitmap.get_chunk(i));
+        }
+
+        // Pre-hash dirty chunks into digests and update in the batch.
+        let updates: Vec<(Location, &[u8; N])> = self
+            .state
+            .dirty_chunks
+            .iter()
+            .map(|&chunk| {
+                let loc = Location::new(chunk as u64);
+                (loc, self.bitmap.get_chunk(chunk))
+            })
+            .collect();
+        let dirty: Vec<(Location, D)> = self.strategy.map_init_collect_vec(
+            &updates,
+            || hasher.clone(),
+            |h, &(loc, chunk)| {
+                let pos = Position::try_from(loc).unwrap();
+                (loc, h.leaf_digest(pos, chunk.as_ref()))
+            },
+        );
+        batch = batch.update_leaf_batched(&dirty)?;
+
+        // Merkleize and apply.
+        let batch = batch.merkleize(&self.mmr, hasher);
+        self.mmr.apply_batch(&batch)?;
+
+        // Compute the bitmap root.
+        let mmr_root = self.mmr.root(hasher, 0)?;
+        let cached_root = if self.bitmap.is_chunk_aligned() {
+            mmr_root
+        } else {
+            let (last_chunk, _) = self.bitmap.last_chunk();
+            let last_chunk_digest = hasher.digest(last_chunk);
+            partial_chunk_root::<_, N>(hasher, &mmr_root, self.len(), &last_chunk_digest)
+        };
+
+        Ok(MerkleizedBitMap {
+            bitmap: self.bitmap,
+            mmr: self.mmr,
+            strategy: self.strategy,
+            metadata: self.metadata,
+            state: Merkleized { root: cached_root },
+        })
+    }
+}
+
+impl<E: Context, D: Digest, const N: usize, S: Strategy> Storage<mmr::Family>
+    for MerkleizedBitMap<E, D, N, S>
+{
+    type Digest = D;
+
+    fn size(&self) -> Position {
+        self.size()
+    }
+
+    async fn get_node(&self, position: Position) -> Result<Option<D>, Error> {
+        Ok(self.get_node(position))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::merkle::Bagging::{self, BackwardFold, ForwardFold};
+    use commonware_codec::FixedSize;
+    use commonware_cryptography::{Hasher, Sha256, sha256};
+    use commonware_macros::test_traced;
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use mmr::StandardHasher;
+
+    const SHA256_SIZE: usize = sha256::Digest::SIZE;
+
+    type TestContext = deterministic::Context;
+    type TestMerkleizedBitMap<const N: usize> =
+        MerkleizedBitMap<TestContext, sha256::Digest, N, Sequential>;
+
+    impl<E: Context, D: Digest, const N: usize> UnmerkleizedBitMap<E, D, N, Sequential> {
+        // Add a byte's worth of bits to the bitmap.
+        //
+        // # Warning
+        //
+        // - The update will not impact the root until `merkleize` is called.
+        //
+        // - Assumes self.next_bit is currently byte aligned, and panics otherwise.
+        fn push_byte(&mut self, byte: u8) {
+            self.bitmap.push_byte(byte);
+        }
+
+        /// Add a chunk of bits to the bitmap.
+        ///
+        /// # Warning
+        ///
+        /// - The update will not impact the root until `merkleize` is called.
+        ///
+        /// - Panics if self.next_bit is not chunk aligned.
+        fn push_chunk(&mut self, chunk: &[u8; N]) {
+            self.bitmap.push_chunk(chunk);
+        }
+    }
+
+    fn test_chunk<const N: usize>(s: &[u8]) -> [u8; N] {
+        assert_eq!(N % 32, 0);
+        let mut vec: Vec<u8> = Vec::new();
+        for _ in 0..N / 32 {
+            vec.extend(Sha256::hash(&[s]).iter());
+        }
+
+        vec.try_into().unwrap()
+    }
+
+    #[test_traced]
+    fn test_bitmap_verify_empty_proof() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_context| async move {
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let proof = Proof {
+                leaves: Location::new(100),
+                inactive_peaks: 0,
+                digests: Vec::new(),
+            };
+            assert!(
+                !TestMerkleizedBitMap::<SHA256_SIZE>::verify_bit_inclusion(
+                    &hasher,
+                    &proof,
+                    &[0u8; SHA256_SIZE],
+                    0,
+                    &Sha256::fill(0x00),
+                ),
+                "proof without digests shouldn't verify or panic"
+            );
+        });
+    }
+
+    /// Regression: bitmap proofs always have `inactive_peaks == 0`. Mutating only that field
+    /// must invalidate verification so the encoded proof is canonical.
+    #[test_traced]
+    fn test_bitmap_verify_rejects_nonzero_inactive_peaks() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let mut bitmap: TestMerkleizedBitMap<SHA256_SIZE> = TestMerkleizedBitMap::init(
+                context.child("bitmap"),
+                "inactive_peaks_canonical",
+                Sequential,
+                &hasher,
+            )
+            .await
+            .unwrap();
+
+            // Build a multi-chunk bitmap so the proof carries non-trivial digests.
+            let mut dirty = bitmap.into_dirty();
+            for i in 0..(TestMerkleizedBitMap::<SHA256_SIZE>::CHUNK_SIZE_BITS * 4) {
+                dirty.push(i % 3 == 0);
+            }
+            bitmap = dirty.merkleize(&hasher).unwrap();
+            let root = bitmap.root();
+
+            let bit = TestMerkleizedBitMap::<SHA256_SIZE>::CHUNK_SIZE_BITS + 5;
+            let (proof, chunk) = bitmap.proof(&hasher, bit).await.unwrap();
+            assert_eq!(proof.inactive_peaks, 0);
+
+            // Canonical proof verifies.
+            assert!(
+                TestMerkleizedBitMap::<SHA256_SIZE>::verify_bit_inclusion(
+                    &hasher, &proof, &chunk, bit, &root
+                ),
+                "canonical bitmap proof should verify"
+            );
+
+            // Mutating only inactive_peaks must invalidate the proof.
+            let mut tampered = proof;
+            tampered.inactive_peaks = 1;
+            assert!(
+                !TestMerkleizedBitMap::<SHA256_SIZE>::verify_bit_inclusion(
+                    &hasher, &tampered, &chunk, bit, &root
+                ),
+                "bitmap proof with nonzero inactive_peaks must not verify"
+            );
+        });
+    }
+
+    #[test_traced]
+    fn test_bitmap_verify_rejects_relocated_partial_chunk() {
+        for bagging in [ForwardFold, BackwardFold] {
+            // Empty MMR, one peak, and multiple peaks.
+            for full_chunks in [0, 1, 2, 3, 7] {
+                test_bitmap_verify_rejects_relocated_partial_chunk_n::<1>(full_chunks, bagging);
+                test_bitmap_verify_rejects_relocated_partial_chunk_n::<32>(full_chunks, bagging);
+                test_bitmap_verify_rejects_relocated_partial_chunk_n::<64>(full_chunks, bagging);
+            }
+        }
+    }
+
+    fn test_bitmap_verify_rejects_relocated_partial_chunk_n<const N: usize>(
+        full_chunks: u64,
+        bagging: Bagging,
+    ) {
+        let chunk_bits = TestMerkleizedBitMap::<N>::CHUNK_SIZE_BITS;
+        for tail_bits in [1, 2, chunk_bits - 1] {
+            let executor = deterministic::Runner::default();
+            executor.start(|context| async move {
+                let hasher = StandardHasher::<Sha256>::new(bagging);
+                let bitmap: TestMerkleizedBitMap<N> = TestMerkleizedBitMap::init(
+                    context.child("bitmap"),
+                    "test",
+                    Sequential,
+                    &hasher,
+                )
+                .await
+                .unwrap();
+                let mut dirty = bitmap.into_dirty();
+                let tail_start = full_chunks * chunk_bits;
+
+                // Opposite alternating patterns make relocation into any full chunk a false claim.
+                for i in 0..tail_start {
+                    dirty.push(i % 2 != 0);
+                }
+                for i in 0..tail_bits {
+                    dirty.push(i % 2 == 0);
+                }
+                let mut bitmap = dirty.merkleize(&hasher).unwrap();
+                let root = bitmap.root();
+
+                // The tail's absolute position must stay authenticated after pruning all full chunks.
+                for prune_to in [0, tail_start] {
+                    bitmap.prune_to_bit(prune_to).unwrap();
+                    bitmap = bitmap.into_dirty().merkleize(&hasher).unwrap();
+                    assert_eq!(
+                        bitmap.root(), root,
+                        "N={N}, bagging={bagging:?}, full_chunks={full_chunks}, \
+                         tail_bits={tail_bits}, prune_to={prune_to}",
+                    );
+                    let (proof, chunk) = bitmap.proof(&hasher, tail_start).await.unwrap();
+                    assert_eq!(*proof.leaves, tail_start + tail_bits);
+
+                    // Try earlier, original, and future positions, including integer boundaries.
+                    for target_chunk in (0..=full_chunks + 1).chain([
+                        full_chunks + 8,
+                        u64::from(u32::MAX) + 1,
+                        (*mmr::Family::MAX_LEAVES - tail_bits) / chunk_bits,
+                        (u64::MAX - tail_bits) / chunk_bits,
+                    ]) {
+                        let mut relocated = proof.clone();
+                        relocated.leaves = Location::new(target_chunk * chunk_bits + tail_bits);
+                        for offset in 0..=tail_bits {
+                            let bit = target_chunk * chunk_bits + offset;
+                            // A tail bit relocated into a full chunk contradicts the real bit.
+                            if target_chunk < full_chunks && offset < tail_bits {
+                                assert_ne!(
+                                    TestMerkleizedBitMap::<N>::get_bit_from_chunk(&chunk, bit),
+                                    !bit.is_multiple_of(2),
+                                );
+                            }
+                            let valid = TestMerkleizedBitMap::<N>::verify_bit_inclusion(
+                                &hasher, &relocated, &chunk, bit, &root,
+                            );
+                            // Only populated bits at the original tail position may verify.
+                            assert_eq!(
+                                valid,
+                                target_chunk == full_chunks && offset < tail_bits,
+                                "N={N}, bagging={bagging:?}, full_chunks={full_chunks}, tail_bits={tail_bits}, \
+                                 prune_to={prune_to}, target_chunk={target_chunk}, offset={offset}",
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test_traced]
+    fn test_bitmap_verify_rejects_tampered_length() {
+        const CHUNK_BITS: u64 = TestMerkleizedBitMap::<1>::CHUNK_SIZE_BITS;
+        const MAX_BITS: u64 = 8 * CHUNK_BITS + 1;
+
+        for bagging in [ForwardFold, BackwardFold] {
+            deterministic::Runner::default().start(|context| async move {
+                let hasher = StandardHasher::<Sha256>::new(bagging);
+                let mut bitmap: TestMerkleizedBitMap<1> = TestMerkleizedBitMap::init(
+                    context.child("bitmap"),
+                    "test",
+                    Sequential,
+                    &hasher,
+                )
+                .await
+                .unwrap();
+
+                // Grow through every remainder and several MMR peak transitions.
+                for bit_len in 1..=MAX_BITS {
+                    let mut dirty = bitmap.into_dirty();
+                    dirty.push(bit_len % 2 == 0);
+                    bitmap = dirty.merkleize(&hasher).unwrap();
+                    let root = bitmap.root();
+
+                    // Exercise full chunks in aligned and partial bitmaps, and the partial tail.
+                    for bit in (0..bit_len).step_by(CHUNK_BITS as usize) {
+                        let (mut proof, chunk) = bitmap.proof(&hasher, bit).await.unwrap();
+                        // Include lengths whose chunk indices exceed 32-bit usize, the codec's
+                        // maximum leaf count, and the direct API's full u64 input range.
+                        for claimed_len in (0..=MAX_BITS).chain([
+                            (u64::from(u32::MAX) + 1) * CHUNK_BITS,
+                            (u64::from(u32::MAX) + 1) * CHUNK_BITS + 1,
+                            *mmr::Family::MAX_LEAVES,
+                            u64::MAX,
+                        ]) {
+                            proof.leaves = Location::new(claimed_len);
+                            assert_eq!(
+                                TestMerkleizedBitMap::<1>::verify_bit_inclusion(
+                                    &hasher, &proof, &chunk, bit, &root,
+                                ),
+                                claimed_len == bit_len,
+                                "bagging={bagging:?}, bit_len={bit_len}, bit={bit}, claimed_len={claimed_len}",
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test_traced]
+    fn test_bitmap_empty_then_one() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let mut bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            assert_eq!(bitmap.len(), 0);
+            assert_eq!(bitmap.bitmap.pruned_chunks(), 0);
+            bitmap.prune_to_bit(0).unwrap();
+            assert_eq!(bitmap.bitmap.pruned_chunks(), 0);
+
+            // Add a single bit
+            let root = bitmap.root();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push(true);
+            bitmap = dirty.merkleize(&hasher).unwrap();
+            // Root should change
+            let new_root = bitmap.root();
+            assert_ne!(root, new_root);
+            let root = new_root;
+            bitmap.prune_to_bit(1).unwrap();
+            assert_eq!(bitmap.len(), 1);
+            assert_ne!(bitmap.last_chunk().0, &[0u8; SHA256_SIZE]);
+            assert_eq!(bitmap.last_chunk().1, 1);
+            // Pruning should be a no-op since we're not beyond a chunk boundary.
+            assert_eq!(bitmap.bitmap.pruned_chunks(), 0);
+            assert_eq!(root, bitmap.root());
+
+            // Fill up a full chunk
+            let mut dirty = bitmap.into_dirty();
+            for i in 0..(TestMerkleizedBitMap::<SHA256_SIZE>::CHUNK_SIZE_BITS - 1) {
+                dirty.push(i % 2 != 0);
+            }
+            bitmap = dirty.merkleize(&hasher).unwrap();
+            assert_eq!(bitmap.len(), 256);
+            assert_ne!(root, bitmap.root());
+            let root = bitmap.root();
+
+            // Chunk should be provable.
+            let (proof, chunk) = bitmap.proof(&hasher, 0).await.unwrap();
+            assert!(
+                TestMerkleizedBitMap::<SHA256_SIZE>::verify_bit_inclusion(
+                    &hasher, &proof, &chunk, 255, &root
+                ),
+                "failed to prove bit in only chunk"
+            );
+            // bit outside range should not verify
+            assert!(
+                !TestMerkleizedBitMap::<SHA256_SIZE>::verify_bit_inclusion(
+                    &hasher, &proof, &chunk, 256, &root
+                ),
+                "should not be able to prove bit outside of chunk"
+            );
+
+            // Now pruning all bits should matter.
+            bitmap.prune_to_bit(256).unwrap();
+            assert_eq!(bitmap.len(), 256);
+            assert_eq!(bitmap.bitmap.pruned_chunks(), 1);
+            assert_eq!(bitmap.bitmap.pruned_bits(), 256);
+            assert_eq!(root, bitmap.root());
+
+            // Pruning to an earlier point should be a no-op.
+            bitmap.prune_to_bit(10).unwrap();
+            assert_eq!(root, bitmap.root());
+        });
+    }
+
+    #[test_traced]
+    fn test_bitmap_building() {
+        // Build the same bitmap with 2 chunks worth of bits in multiple ways and make sure they are
+        // equivalent based on their roots.
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let test_chunk = test_chunk(b"test");
+            let hasher: StandardHasher<Sha256> = StandardHasher::new(ForwardFold);
+
+            // Add each bit one at a time after the first chunk.
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> = TestMerkleizedBitMap::init(
+                context.child("bitmap").with_attribute("index", 1),
+                "test1",
+                Sequential,
+                &hasher,
+            )
+            .await
+            .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk);
+            for b in test_chunk {
+                for j in 0..8 {
+                    let mask = 1 << j;
+                    let bit = (b & mask) != 0;
+                    dirty.push(bit);
+                }
+            }
+            assert_eq!(dirty.len(), 256 * 2);
+
+            let bitmap = dirty.merkleize(&hasher).unwrap();
+            let root = bitmap.root();
+            let inner_root = bitmap.mmr.root(&hasher, 0).unwrap();
+            assert_eq!(root, inner_root);
+
+            {
+                // Repeat the above MMR build only using push_chunk instead, and make
+                // sure root digests match.
+                let bitmap: TestMerkleizedBitMap<SHA256_SIZE> = TestMerkleizedBitMap::init(
+                    context.child("bitmap").with_attribute("index", 2),
+                    "test2",
+                    Sequential,
+                    &hasher,
+                )
+                .await
+                .unwrap();
+                let mut dirty = bitmap.into_dirty();
+                dirty.push_chunk(&test_chunk);
+                dirty.push_chunk(&test_chunk);
+                let bitmap = dirty.merkleize(&hasher).unwrap();
+                let same_root = bitmap.root();
+                assert_eq!(root, same_root);
+            }
+            {
+                // Repeat build again using push_byte this time.
+                let bitmap: TestMerkleizedBitMap<SHA256_SIZE> = TestMerkleizedBitMap::init(
+                    context.child("bitmap").with_attribute("index", 3),
+                    "test3",
+                    Sequential,
+                    &hasher,
+                )
+                .await
+                .unwrap();
+                let mut dirty = bitmap.into_dirty();
+                dirty.push_chunk(&test_chunk);
+                for b in test_chunk {
+                    dirty.push_byte(b);
+                }
+                let bitmap = dirty.merkleize(&hasher).unwrap();
+                let same_root = bitmap.root();
+                assert_eq!(root, same_root);
+            }
+        });
+    }
+
+    #[test_traced]
+    #[should_panic(expected = "cannot add chunk")]
+    fn test_bitmap_build_chunked_panic() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher: StandardHasher<Sha256> = StandardHasher::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            dirty.push(true);
+            dirty.push_chunk(&test_chunk(b"panic"));
+        });
+    }
+
+    #[test_traced]
+    #[should_panic(expected = "cannot add byte")]
+    fn test_bitmap_build_byte_panic() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher: StandardHasher<Sha256> = StandardHasher::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            dirty.push(true);
+            dirty.push_byte(0x01);
+        });
+    }
+
+    #[test_traced]
+    #[should_panic(expected = "out of bounds")]
+    fn test_bitmap_get_out_of_bounds_bit_panic() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher: StandardHasher<Sha256> = StandardHasher::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            dirty.get_bit(256);
+        });
+    }
+
+    #[test_traced]
+    #[should_panic(expected = "pruned")]
+    fn test_bitmap_get_pruned_bit_panic() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher: StandardHasher<Sha256> = StandardHasher::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            dirty.push_chunk(&test_chunk(b"test2"));
+            let mut bitmap = dirty.merkleize(&hasher).unwrap();
+
+            bitmap.prune_to_bit(256).unwrap();
+            bitmap.get_bit(255);
+        });
+    }
+
+    #[test_traced]
+    fn test_bitmap_root_boundaries() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Build a starting test MMR with two chunks worth of bits.
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            dirty.push_chunk(&test_chunk(b"test2"));
+            let mut bitmap = dirty.merkleize(&hasher).unwrap();
+
+            let root = bitmap.root();
+
+            // Confirm that root changes if we add a 1 bit, even though we won't fill a chunk.
+            let mut dirty = bitmap.into_dirty();
+            dirty.push(true);
+            bitmap = dirty.merkleize(&hasher).unwrap();
+            let new_root = bitmap.root();
+            assert_ne!(root, new_root);
+            assert_eq!(bitmap.mmr.size(), 3); // shouldn't include the trailing bits
+
+            // Add 0 bits to fill up entire chunk.
+            for _ in 0..(SHA256_SIZE * 8 - 1) {
+                let mut dirty = bitmap.into_dirty();
+                dirty.push(false);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                let newer_root = bitmap.root();
+                // root will change when adding 0s within the same chunk
+                assert_ne!(new_root, newer_root);
+            }
+            assert_eq!(bitmap.mmr.size(), 4); // chunk we filled should have been added to mmr
+
+            // Confirm the root changes when we add the next 0 bit since it's part of a new chunk.
+            let mut dirty = bitmap.into_dirty();
+            dirty.push(false);
+            assert_eq!(dirty.len(), 256 * 3 + 1);
+            bitmap = dirty.merkleize(&hasher).unwrap();
+            let newer_root = bitmap.root();
+            assert_ne!(new_root, newer_root);
+
+            // Confirm pruning everything doesn't affect the root.
+            bitmap.prune_to_bit(bitmap.len()).unwrap();
+            assert_eq!(bitmap.bitmap.pruned_chunks(), 3);
+            assert_eq!(bitmap.len(), 256 * 3 + 1);
+            assert_eq!(newer_root, bitmap.root());
+        });
+    }
+
+    #[test_traced]
+    fn test_bitmap_get_set_bits() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Build a test MMR with a few chunks worth of bits.
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            dirty.push_chunk(&test_chunk(b"test2"));
+            dirty.push_chunk(&test_chunk(b"test3"));
+            dirty.push_chunk(&test_chunk(b"test4"));
+            // Add a few extra bits to exercise not being on a chunk or byte boundary.
+            dirty.push_byte(0xF1);
+            dirty.push(true);
+            dirty.push(false);
+            dirty.push(true);
+
+            let mut bitmap = dirty.merkleize(&hasher).unwrap();
+            let root = bitmap.root();
+
+            // Flip each bit and confirm the root changes, then flip it back to confirm it is safely
+            // restored.
+            for bit_pos in (0..bitmap.len()).rev() {
+                let bit = bitmap.get_bit(bit_pos);
+                let mut dirty = bitmap.into_dirty();
+                dirty.set_bit(bit_pos, !bit);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                let new_root = bitmap.root();
+                assert_ne!(root, new_root, "failed at bit {bit_pos}");
+                // flip it back
+                let mut dirty = bitmap.into_dirty();
+                dirty.set_bit(bit_pos, bit);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                let new_root = bitmap.root();
+                assert_eq!(root, new_root);
+            }
+
+            // Repeat the test after pruning.
+            let start_bit = (SHA256_SIZE * 8 * 2) as u64;
+            bitmap.prune_to_bit(start_bit).unwrap();
+            for bit_pos in (start_bit..bitmap.len()).rev() {
+                let bit = bitmap.get_bit(bit_pos);
+                let mut dirty = bitmap.into_dirty();
+                dirty.set_bit(bit_pos, !bit);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                let new_root = bitmap.root();
+                assert_ne!(root, new_root, "failed at bit {bit_pos}");
+                // flip it back
+                let mut dirty = bitmap.into_dirty();
+                dirty.set_bit(bit_pos, bit);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                let new_root = bitmap.root();
+                assert_eq!(root, new_root);
+            }
+        });
+    }
+
+    fn flip_bit<const N: usize>(bit: u64, chunk: &[u8; N]) -> [u8; N] {
+        let byte = PrunableBitMap::<N>::chunk_byte_offset(bit);
+        let mask = PrunableBitMap::<N>::chunk_byte_bitmask(bit);
+        let mut tmp = chunk.to_vec();
+        tmp[byte] ^= mask;
+        tmp.try_into().unwrap()
+    }
+
+    #[test_traced]
+    fn test_bitmap_mmr_proof_verification() {
+        test_bitmap_mmr_proof_verification_n::<32>();
+        test_bitmap_mmr_proof_verification_n::<64>();
+    }
+
+    fn test_bitmap_mmr_proof_verification_n<const N: usize>() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Build a bitmap with 10 chunks worth of bits.
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let bitmap: MerkleizedBitMap<TestContext, sha256::Digest, N, Sequential> =
+                MerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            for i in 0u32..10 {
+                dirty.push_chunk(&test_chunk(format!("test{i}").as_bytes()));
+            }
+            // Add a few extra bits to exercise not being on a chunk or byte boundary.
+            dirty.push_byte(0xA6);
+            dirty.push(true);
+            dirty.push(false);
+            dirty.push(true);
+            dirty.push(true);
+            dirty.push(false);
+
+            let mut bitmap = dirty.merkleize(&hasher).unwrap();
+            let root = bitmap.root();
+
+            // Make sure every bit is provable, even after pruning in intervals of 251 bits (251 is
+            // the largest prime that is less than the size of one 32-byte chunk in bits).
+            for prune_to_bit in (0..bitmap.len()).step_by(251) {
+                assert_eq!(bitmap.root(), root);
+                bitmap.prune_to_bit(prune_to_bit).unwrap();
+                for i in prune_to_bit..bitmap.len() {
+                    let (proof, chunk) = bitmap.proof(&hasher, i).await.unwrap();
+
+                    // Proof should verify for the original chunk containing the bit.
+                    assert!(
+                        MerkleizedBitMap::<TestContext, _, N, Sequential>::verify_bit_inclusion(
+                            &hasher, &proof, &chunk, i, &root
+                        ),
+                        "failed to prove bit {i}",
+                    );
+
+                    // Flip the bit in the chunk and make sure the proof fails.
+                    let corrupted = flip_bit(i, &chunk);
+                    assert!(
+                        !MerkleizedBitMap::<TestContext, _, N, Sequential>::verify_bit_inclusion(
+                            &hasher, &proof, &corrupted, i, &root
+                        ),
+                        "proving bit {i} after flipping should have failed",
+                    );
+                }
+            }
+        })
+    }
+
+    #[test_traced]
+    fn test_bitmap_persistence() {
+        const PARTITION: &str = "bitmap-test";
+        const FULL_CHUNK_COUNT: usize = 100;
+
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            // Initializing from an empty partition should result in an empty bitmap.
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> = TestMerkleizedBitMap::init(
+                context.child("initial"),
+                PARTITION,
+                Sequential,
+                &hasher,
+            )
+            .await
+            .unwrap();
+            assert_eq!(bitmap.len(), 0);
+
+            // Add a non-trivial amount of data.
+            let mut dirty = bitmap.into_dirty();
+            for i in 0..FULL_CHUNK_COUNT {
+                dirty.push_chunk(&test_chunk(format!("test{i}").as_bytes()));
+            }
+            let mut bitmap = dirty.merkleize(&hasher).unwrap();
+            let chunk_aligned_root = bitmap.root();
+
+            // Add a few extra bits beyond the last chunk boundary.
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_byte(0xA6);
+            dirty.push(true);
+            dirty.push(false);
+            dirty.push(true);
+            bitmap = dirty.merkleize(&hasher).unwrap();
+            let root = bitmap.root();
+
+            // prune 10 chunks at a time and make sure replay will restore the bitmap every time.
+            for i in (10..=FULL_CHUNK_COUNT).step_by(10) {
+                bitmap
+                    .prune_to_bit(
+                        (i * TestMerkleizedBitMap::<SHA256_SIZE>::CHUNK_SIZE_BITS as usize) as u64,
+                    )
+                    .unwrap();
+                bitmap.write_pruned().await.unwrap();
+                bitmap = TestMerkleizedBitMap::init(
+                    context.child("restore").with_attribute("index", i),
+                    PARTITION,
+                    Sequential,
+                    &hasher,
+                )
+                .await
+                .unwrap();
+                let _ = bitmap.root();
+
+                // Replay missing chunks.
+                let mut dirty = bitmap.into_dirty();
+                for j in i..FULL_CHUNK_COUNT {
+                    dirty.push_chunk(&test_chunk(format!("test{j}").as_bytes()));
+                }
+                assert_eq!(dirty.bitmap.pruned_chunks(), i);
+                assert_eq!(dirty.len(), FULL_CHUNK_COUNT as u64 * 256);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                assert_eq!(bitmap.root(), chunk_aligned_root);
+
+                // Replay missing partial chunk.
+                let mut dirty = bitmap.into_dirty();
+                dirty.push_byte(0xA6);
+                dirty.push(true);
+                dirty.push(false);
+                dirty.push(true);
+                bitmap = dirty.merkleize(&hasher).unwrap();
+                assert_eq!(bitmap.root(), root);
+            }
+        });
+    }
+
+    #[test_traced]
+    fn test_bitmap_proof_out_of_bounds() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+            let bitmap: TestMerkleizedBitMap<SHA256_SIZE> =
+                TestMerkleizedBitMap::init(context.child("bitmap"), "test", Sequential, &hasher)
+                    .await
+                    .unwrap();
+            let mut dirty = bitmap.into_dirty();
+            dirty.push_chunk(&test_chunk(b"test"));
+            let bitmap = dirty.merkleize(&hasher).unwrap();
+
+            // Proof for bit_offset >= bit_count should fail
+            let result = bitmap.proof(&hasher, 256).await;
+            assert!(matches!(result, Err(Error::BitOutOfBounds(offset, size))
+                    if offset == 256 && size == 256));
+
+            let result = bitmap.proof(&hasher, 1000).await;
+            assert!(matches!(result, Err(Error::BitOutOfBounds(offset, size))
+                    if offset == 1000 && size == 256));
+
+            // Valid proof should work
+            assert!(bitmap.proof(&hasher, 0).await.is_ok());
+            assert!(bitmap.proof(&hasher, 255).await.is_ok());
+        });
+    }
+}

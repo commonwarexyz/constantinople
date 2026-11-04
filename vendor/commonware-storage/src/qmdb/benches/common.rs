@@ -1,0 +1,825 @@
+//! Shared infrastructure for QMDB benchmarks: constants, config builders, type aliases, dispatch
+//! macros, and the common `gen_random_kv` helper.
+
+use commonware_cryptography::{DigestOf, Hasher as _, Sha256};
+use commonware_parallel::Rayon;
+use commonware_runtime::{
+    BLOB_PAGE_SIZE, Strategizer,
+    buffer::paged::{CacheRef, page_size},
+    tokio::Context,
+};
+use commonware_storage::{
+    journal::contiguous::{fixed::Config as FConfig, variable::Config as VConfig},
+    merkle::{self, Family, full::Config as MerkleConfig},
+    qmdb::{
+        any::{
+            FixedConfig as AnyFixedConfig, VariableConfig as AnyVariableConfig,
+            ordered::{
+                fixed::{
+                    Db as OFixed,
+                    partitioned::{Db as OFixPart, p256::Db as OFixP256},
+                },
+                variable::Db as OVariable,
+            },
+            traits::{DbAny, UnmerkleizedBatch},
+            unordered::{
+                fixed::{Db as UFixed, partitioned::Db as UFixPart},
+                variable::Db as UVariable,
+            },
+        },
+        current::{
+            FixedConfig as CurrentFixedConfig, VariableConfig as CurrentVariableConfig,
+            ordered::{fixed::Db as OCFixed, variable::Db as OCVariable},
+            unordered::{fixed::Db as UCFixed, variable::Db as UCVariable},
+        },
+        floor::Proportional,
+        immutable::fixed::{Config as ImmutableFixedConfig, Db as IFixed},
+        keyless::variable::{Config as KeylessConfig, Db as Keyless},
+        store::db::{Config as StoreConfig, Db as Store},
+    },
+    translator::EightCap,
+};
+use commonware_utils::{NZU64, NZUsize, TestRng};
+use rand::{Rng, distr::Distribution};
+use rand_distr::Zipf;
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+
+pub type Digest = DigestOf<Sha256>;
+
+/// Default items per blob for benchmarks. This is small enough that blob boundary crossings can
+/// affect benchmark time. Benchmarks that don't want to measure that cost should override via the
+/// `_with` config generators.
+pub const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(50_000);
+pub const CHUNK_SIZE: usize = 32;
+pub const THREADS: NonZeroUsize = NZUsize!(8);
+pub const PAGE_SIZE: NonZeroU16 = page_size(BLOB_PAGE_SIZE);
+pub const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(512);
+pub const DELETE_FREQUENCY: u32 = 10;
+pub const VARIABLE_VALUE_MAX_LEN: usize = 256;
+pub const WRITE_BUFFER_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
+pub const REPLAY_BUFFER_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
+pub const INIT_CACHE_SIZE: Option<NonZeroUsize> = Some(NZUsize!(1 << 18));
+
+pub type AnyUFixDb<F> = UFixed<F, Context, Digest, Digest, Sha256, EightCap, Rayon>;
+pub type AnyOFixDb<F> = OFixed<F, Context, Digest, Digest, Sha256, EightCap, Rayon>;
+/// Ordered "any" DB with a partitioned snapshot index (256 partitions, P=1). Exercises the
+/// partitioned ordered index's cursor (get_mut/find/update) on apply.
+pub type AnyOFixP256Db<F> = OFixP256<F, Context, Digest, Digest, Sha256, EightCap, Rayon>;
+/// Ordered "any" DB with a partitioned snapshot index (~16.8M partitions, P=3). The inline-SoA config
+/// for very large key sets (P=2 spills past ~33M entries), used by the `init_scale` bench.
+#[allow(dead_code)]
+pub type AnyOFixP3Db<F> = OFixPart<F, Context, Digest, Digest, Sha256, EightCap, 3, Rayon>;
+/// Unordered "any" DB with a partitioned snapshot index (65,536 partitions, P=2), used by the
+/// `init_scale` bench to exercise the unordered index's parallel snapshot build.
+#[allow(dead_code)]
+pub type AnyUFixP64kDb<F> = UFixPart<F, Context, Digest, Digest, Sha256, EightCap, 2, Rayon>;
+pub type CurUFixDb<F> = UCFixed<F, Context, Digest, Digest, Sha256, EightCap, CHUNK_SIZE, Rayon>;
+pub type CurOFixDb<F> = OCFixed<F, Context, Digest, Digest, Sha256, EightCap, CHUNK_SIZE, Rayon>;
+
+// Measures overhead of variable-capable storage when values are fixed-size.
+pub type AnyUVarDigestDb<F> = UVariable<F, Context, Digest, Digest, Sha256, EightCap, Rayon>;
+pub type AnyOVarDigestDb<F> = OVariable<F, Context, Digest, Digest, Sha256, EightCap, Rayon>;
+pub type CurUVarDigestDb<F> =
+    UCVariable<F, Context, Digest, Digest, Sha256, EightCap, CHUNK_SIZE, Rayon>;
+pub type CurOVarDigestDb<F> =
+    OCVariable<F, Context, Digest, Digest, Sha256, EightCap, CHUNK_SIZE, Rayon>;
+
+pub type AnyUVarVecDb<F> = UVariable<F, Context, Digest, Vec<u8>, Sha256, EightCap, Rayon>;
+pub type AnyOVarVecDb<F> = OVariable<F, Context, Digest, Vec<u8>, Sha256, EightCap, Rayon>;
+pub type CurUVarVecDb<F> =
+    UCVariable<F, Context, Digest, Vec<u8>, Sha256, EightCap, CHUNK_SIZE, Rayon>;
+pub type CurOVarVecDb<F> =
+    OCVariable<F, Context, Digest, Vec<u8>, Sha256, EightCap, CHUNK_SIZE, Rayon>;
+
+pub type ImmFixDb<F> = IFixed<F, Context, Digest, Digest, Sha256, EightCap, Rayon>;
+
+pub type KeylessDb<F> = Keyless<F, Context, Vec<u8>, Sha256, Rayon>;
+
+/// Open a keyless benchmark database using the shared benchmark configuration.
+pub async fn open_keyless_db<F: Family>(ctx: Context) -> KeylessDb<F> {
+    let cfg = keyless_cfg(&ctx);
+    KeylessDb::<F>::init(ctx, cfg, None).await.unwrap()
+}
+
+/// Unauthenticated store with variable-size values.
+pub type StoreDb = Store<Context, Digest, Vec<u8>, EightCap>;
+
+/// Open an unauthenticated store benchmark database using the shared benchmark configuration.
+pub async fn open_store_db(ctx: Context) -> StoreDb {
+    let cfg = store_cfg();
+    StoreDb::init(ctx, cfg, None).await.unwrap()
+}
+
+const PARTITION_FIX: &str = "bench-fixed";
+const PARTITION_VAR: &str = "bench-variable";
+const PARTITION_KEYLESS: &str = "bench-keyless";
+const PARTITION_STORE: &str = "bench-store";
+const PARTITION_IMM: &str = "bench-immutable";
+
+fn merkle_cfg(
+    suffix: &str,
+    ctx: &impl Strategizer,
+    page_cache: CacheRef,
+    items_per_blob: NonZeroU64,
+) -> MerkleConfig<Rayon> {
+    MerkleConfig {
+        journal_partition: format!("journal-{suffix}"),
+        metadata_partition: format!("metadata-{suffix}"),
+        items_per_blob,
+        write_buffer: WRITE_BUFFER_SIZE,
+        replay_buffer: REPLAY_BUFFER_SIZE,
+        strategy: ctx.strategy(THREADS),
+        page_cache,
+    }
+}
+
+fn fix_log_cfg(suffix: &str, page_cache: CacheRef, items_per_blob: NonZeroU64) -> FConfig {
+    FConfig {
+        partition: format!("log-journal-{suffix}"),
+        items_per_blob,
+        page_cache,
+        write_buffer: WRITE_BUFFER_SIZE,
+        replay_buffer: REPLAY_BUFFER_SIZE,
+    }
+}
+
+fn var_log_cfg<C>(
+    suffix: &str,
+    page_cache: CacheRef,
+    codec_config: C,
+    items_per_section: NonZeroU64,
+) -> VConfig<C> {
+    VConfig {
+        partition: format!("log-journal-{suffix}"),
+        items_per_section,
+        compression: None,
+        codec_config,
+        page_cache,
+        write_buffer: WRITE_BUFFER_SIZE,
+        replay_buffer: REPLAY_BUFFER_SIZE,
+    }
+}
+
+pub fn any_fix_cfg(ctx: &impl Strategizer) -> AnyFixedConfig<EightCap, Rayon> {
+    any_fix_cfg_with(ctx, ITEMS_PER_BLOB, PAGE_CACHE_SIZE)
+}
+
+pub fn any_fix_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+    page_cache_size: NonZeroUsize,
+) -> AnyFixedConfig<EightCap, Rayon> {
+    any_fix_cfg_full(ctx, items_per_blob, page_cache_size, ())
+}
+
+/// Shared fixed-value config construction, generic over the index's snapshot-build concurrency.
+pub fn any_fix_cfg_full<B>(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+    page_cache_size: NonZeroUsize,
+    init_concurrency: B,
+) -> AnyFixedConfig<EightCap, Rayon, B> {
+    let page_cache = CacheRef::new(PAGE_SIZE, page_cache_size);
+    AnyFixedConfig {
+        merkle_config: merkle_cfg(PARTITION_FIX, ctx, page_cache.clone(), items_per_blob),
+        journal_config: fix_log_cfg(PARTITION_FIX, page_cache, items_per_blob),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency,
+    }
+}
+
+pub fn imm_fix_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> ImmutableFixedConfig<EightCap, Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    ImmutableFixedConfig {
+        merkle_config: merkle_cfg(PARTITION_IMM, ctx, page_cache.clone(), items_per_blob),
+        log: fix_log_cfg(PARTITION_IMM, page_cache, items_per_blob),
+        translator: EightCap,
+        init_buffer: NZUsize!(1 << 21),
+    }
+}
+
+pub fn cur_fix_cfg(ctx: &impl Strategizer) -> CurrentFixedConfig<EightCap, Rayon> {
+    cur_fix_cfg_with(ctx, ITEMS_PER_BLOB)
+}
+
+pub fn cur_fix_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> CurrentFixedConfig<EightCap, Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    CurrentFixedConfig {
+        merkle_config: merkle_cfg(PARTITION_FIX, ctx, page_cache.clone(), items_per_blob),
+        journal_config: fix_log_cfg(PARTITION_FIX, page_cache, items_per_blob),
+        grafted_metadata_partition: format!("grafted-metadata-{PARTITION_FIX}"),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+pub fn any_var_digest_cfg(ctx: &impl Strategizer) -> AnyVariableConfig<EightCap, ((), ()), Rayon> {
+    any_var_digest_cfg_with(ctx, ITEMS_PER_BLOB)
+}
+
+pub fn any_var_digest_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> AnyVariableConfig<EightCap, ((), ()), Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    AnyVariableConfig {
+        merkle_config: merkle_cfg(PARTITION_VAR, ctx, page_cache.clone(), items_per_blob),
+        journal_config: var_log_cfg(PARTITION_VAR, page_cache, ((), ()), items_per_blob),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+pub fn cur_var_digest_cfg(
+    ctx: &impl Strategizer,
+) -> CurrentVariableConfig<EightCap, ((), ()), Rayon> {
+    cur_var_digest_cfg_with(ctx, ITEMS_PER_BLOB)
+}
+
+pub fn cur_var_digest_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> CurrentVariableConfig<EightCap, ((), ()), Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    CurrentVariableConfig {
+        merkle_config: merkle_cfg(PARTITION_VAR, ctx, page_cache.clone(), items_per_blob),
+        journal_config: var_log_cfg(PARTITION_VAR, page_cache, ((), ()), items_per_blob),
+        grafted_metadata_partition: format!("grafted-metadata-{PARTITION_VAR}"),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+/// Codec config for variable-length `Vec<u8>` values.
+type VarVecCfg = ((), (commonware_codec::RangeCfg<usize>, ()));
+
+pub fn any_var_vec_cfg(ctx: &impl Strategizer) -> AnyVariableConfig<EightCap, VarVecCfg, Rayon> {
+    any_var_vec_cfg_with(ctx, ITEMS_PER_BLOB)
+}
+
+pub fn any_var_vec_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> AnyVariableConfig<EightCap, VarVecCfg, Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    AnyVariableConfig {
+        merkle_config: merkle_cfg(PARTITION_VAR, ctx, page_cache.clone(), items_per_blob),
+        journal_config: var_log_cfg(
+            PARTITION_VAR,
+            page_cache,
+            ((), ((0..=10000).into(), ())),
+            items_per_blob,
+        ),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+pub fn cur_var_vec_cfg(
+    ctx: &impl Strategizer,
+) -> CurrentVariableConfig<EightCap, VarVecCfg, Rayon> {
+    cur_var_vec_cfg_with(ctx, ITEMS_PER_BLOB)
+}
+
+pub fn cur_var_vec_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> CurrentVariableConfig<EightCap, VarVecCfg, Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    CurrentVariableConfig {
+        merkle_config: merkle_cfg(PARTITION_VAR, ctx, page_cache.clone(), items_per_blob),
+        journal_config: var_log_cfg(
+            PARTITION_VAR,
+            page_cache,
+            ((), ((0..=10000).into(), ())),
+            items_per_blob,
+        ),
+        grafted_metadata_partition: format!("grafted-metadata-{PARTITION_VAR}"),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+pub fn keyless_cfg(
+    ctx: &impl Strategizer,
+) -> KeylessConfig<(commonware_codec::RangeCfg<usize>, ()), Rayon> {
+    keyless_cfg_with(ctx, ITEMS_PER_BLOB)
+}
+
+pub fn keyless_cfg_with(
+    ctx: &impl Strategizer,
+    items_per_blob: NonZeroU64,
+) -> KeylessConfig<(commonware_codec::RangeCfg<usize>, ()), Rayon> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    KeylessConfig {
+        merkle: merkle_cfg(PARTITION_KEYLESS, ctx, page_cache.clone(), items_per_blob),
+        log: var_log_cfg(
+            PARTITION_KEYLESS,
+            page_cache,
+            ((0..=10000).into(), ()),
+            items_per_blob,
+        ),
+    }
+}
+
+/// Unauthenticated store config for variable-size values, using the shared page cache, journal
+/// layout, and init cache.
+pub fn store_cfg() -> StoreConfig<EightCap, VarVecCfg> {
+    let page_cache = CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE);
+    StoreConfig {
+        log: var_log_cfg(
+            PARTITION_STORE,
+            page_cache,
+            ((), ((0..=10000).into(), ())),
+            ITEMS_PER_BLOB,
+        ),
+        translator: EightCap,
+        init_cache: INIT_CACHE_SIZE,
+        init_buffer: NZUsize!(1 << 21),
+    }
+}
+
+macro_rules! define_db_variants {
+    (
+        enum $enum_name:ident;
+        const $variants_name:ident;
+        dispatch $dispatch_name:ident;
+        timed_dispatch $timed_dispatch_name:ident;
+        entries = [
+            $(
+                {
+                    entry: $entry:ident,
+                    name: $name:literal,
+                    db: $db:ty,
+                    cfg: $cfg:path,
+                }
+            )+
+        ];
+    ) => {
+        #[derive(Debug, Clone, Copy)]
+        enum $enum_name {
+            $($entry),+
+        }
+
+        impl $enum_name {
+            const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$entry => $name),+
+                }
+            }
+        }
+
+        const $variants_name: &[$enum_name] = &[$($enum_name::$entry),+];
+
+        macro_rules! $dispatch_name {
+            ($ctx_expr:expr, $variant_expr:expr, |$db_name:ident| $body:expr) => {
+                match $variant_expr {
+                    $(
+                        $enum_name::$entry => {
+                            let ctx = $ctx_expr;
+                            let cfg = $cfg(&ctx);
+                            #[allow(unused_mut)]
+                            let mut $db_name = <$db>::init(ctx.child("storage"), cfg, None).await.unwrap();
+                            $body
+                        }
+                    )+
+                }
+            };
+        }
+
+        #[allow(unused_macros)]
+        macro_rules! $timed_dispatch_name {
+            ($ctx_expr:expr, $variant_expr:expr, $iters:expr, $cache_size:expr, |$db_name:ident| $body:expr) => {
+                match $variant_expr {
+                    $(
+                        $enum_name::$entry => {
+                            let ctx = $ctx_expr;
+                            let mut cfg = $cfg(&ctx);
+                            cfg.init_cache = $cache_size;
+                            let start = std::time::Instant::now();
+                            for _ in 0..$iters {
+                                #[allow(unused_mut)]
+                                let mut $db_name =
+                                    <$db>::init(ctx.child("storage"), cfg.clone(), None).await.unwrap();
+                                $body
+                            }
+                            start.elapsed()
+                        }
+                    )+
+                }
+            };
+        }
+    };
+}
+
+pub(crate) use define_db_variants;
+
+macro_rules! define_fixed_variants {
+    (
+        enum $enum_name:ident;
+        const $variants_name:ident;
+        dispatch $dispatch_name:ident;
+        timed_dispatch $timed_dispatch_name:ident;
+    ) => {
+        $crate::common::define_db_variants! {
+            enum $enum_name;
+            const $variants_name;
+            dispatch $dispatch_name;
+            timed_dispatch $timed_dispatch_name;
+            entries = [
+                {
+                    entry: AnyUnorderedFixedMmr,
+                    name: "any::unordered::fixed::mmr",
+                    db: $crate::common::AnyUFixDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::any_fix_cfg,
+                }
+                {
+                    entry: AnyUnorderedFixedMmb,
+                    name: "any::unordered::fixed::mmb",
+                    db: $crate::common::AnyUFixDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::any_fix_cfg,
+                }
+                {
+                    entry: AnyOrderedFixedMmr,
+                    name: "any::ordered::fixed::mmr",
+                    db: $crate::common::AnyOFixDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::any_fix_cfg,
+                }
+                {
+                    entry: AnyOrderedFixedMmb,
+                    name: "any::ordered::fixed::mmb",
+                    db: $crate::common::AnyOFixDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::any_fix_cfg,
+                }
+                {
+                    entry: AnyUnorderedVariableMmr,
+                    name: "any::unordered::variable::mmr",
+                    db: $crate::common::AnyUVarDigestDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::any_var_digest_cfg,
+                }
+                {
+                    entry: AnyUnorderedVariableMmb,
+                    name: "any::unordered::variable::mmb",
+                    db: $crate::common::AnyUVarDigestDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::any_var_digest_cfg,
+                }
+                {
+                    entry: AnyOrderedVariableMmr,
+                    name: "any::ordered::variable::mmr",
+                    db: $crate::common::AnyOVarDigestDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::any_var_digest_cfg,
+                }
+                {
+                    entry: AnyOrderedVariableMmb,
+                    name: "any::ordered::variable::mmb",
+                    db: $crate::common::AnyOVarDigestDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::any_var_digest_cfg,
+                }
+                {
+                    entry: CurrentUnorderedFixedMmr,
+                    name: "current::unordered::fixed::mmr",
+                    db: $crate::common::CurUFixDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::cur_fix_cfg,
+                }
+                {
+                    entry: CurrentUnorderedFixedMmb,
+                    name: "current::unordered::fixed::mmb",
+                    db: $crate::common::CurUFixDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::cur_fix_cfg,
+                }
+                {
+                    entry: CurrentOrderedFixedMmr,
+                    name: "current::ordered::fixed::mmr",
+                    db: $crate::common::CurOFixDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::cur_fix_cfg,
+                }
+                {
+                    entry: CurrentOrderedFixedMmb,
+                    name: "current::ordered::fixed::mmb",
+                    db: $crate::common::CurOFixDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::cur_fix_cfg,
+                }
+                {
+                    entry: CurrentUnorderedVariableMmr,
+                    name: "current::unordered::variable::mmr",
+                    db: $crate::common::CurUVarDigestDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::cur_var_digest_cfg,
+                }
+                {
+                    entry: CurrentUnorderedVariableMmb,
+                    name: "current::unordered::variable::mmb",
+                    db: $crate::common::CurUVarDigestDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::cur_var_digest_cfg,
+                }
+                {
+                    entry: CurrentOrderedVariableMmr,
+                    name: "current::ordered::variable::mmr",
+                    db: $crate::common::CurOVarDigestDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::cur_var_digest_cfg,
+                }
+                {
+                    entry: CurrentOrderedVariableMmb,
+                    name: "current::ordered::variable::mmb",
+                    db: $crate::common::CurOVarDigestDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::cur_var_digest_cfg,
+                }
+            ];
+        }
+    };
+}
+
+pub(crate) use define_fixed_variants;
+
+macro_rules! define_vec_variants {
+    (
+        enum $enum_name:ident;
+        const $variants_name:ident;
+        dispatch $dispatch_name:ident;
+        timed_dispatch $timed_dispatch_name:ident;
+    ) => {
+        $crate::common::define_db_variants! {
+            enum $enum_name;
+            const $variants_name;
+            dispatch $dispatch_name;
+            timed_dispatch $timed_dispatch_name;
+            entries = [
+                {
+                    entry: AnyUnorderedMmr,
+                    name: "any::unordered::variable-vec::mmr",
+                    db: $crate::common::AnyUVarVecDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::any_var_vec_cfg,
+                }
+                {
+                    entry: AnyUnorderedMmb,
+                    name: "any::unordered::variable-vec::mmb",
+                    db: $crate::common::AnyUVarVecDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::any_var_vec_cfg,
+                }
+                {
+                    entry: AnyOrderedMmr,
+                    name: "any::ordered::variable-vec::mmr",
+                    db: $crate::common::AnyOVarVecDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::any_var_vec_cfg,
+                }
+                {
+                    entry: AnyOrderedMmb,
+                    name: "any::ordered::variable-vec::mmb",
+                    db: $crate::common::AnyOVarVecDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::any_var_vec_cfg,
+                }
+                {
+                    entry: CurrentUnorderedMmr,
+                    name: "current::unordered::variable-vec::mmr",
+                    db: $crate::common::CurUVarVecDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::cur_var_vec_cfg,
+                }
+                {
+                    entry: CurrentUnorderedMmb,
+                    name: "current::unordered::variable-vec::mmb",
+                    db: $crate::common::CurUVarVecDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::cur_var_vec_cfg,
+                }
+                {
+                    entry: CurrentOrderedMmr,
+                    name: "current::ordered::variable-vec::mmr",
+                    db: $crate::common::CurOVarVecDb<commonware_storage::merkle::mmr::Family>,
+                    cfg: $crate::common::cur_var_vec_cfg,
+                }
+                {
+                    entry: CurrentOrderedMmb,
+                    name: "current::ordered::variable-vec::mmb",
+                    db: $crate::common::CurOVarVecDb<commonware_storage::merkle::mmb::Family>,
+                    cfg: $crate::common::cur_var_vec_cfg,
+                }
+            ];
+        }
+    };
+}
+
+pub(crate) use define_vec_variants;
+
+/// Seed a database with `num_elements` entries, then perform `num_operations` random
+/// updates/deletes. Commits periodically when `commit_frequency` is `Some`.
+///
+/// `seed_batch` caps how many seeds accumulate before each merkleize+apply+commit (bounding peak
+/// memory); `None` seeds in a single batch. `prune_frequency` prunes to the inactivity floor every
+/// `Some(n)` commits to bound on-disk growth; `None` never prunes during generation.
+///
+/// `key_zipf_exponent` selects how update/delete keys are sampled: `None` is uniform; `Some(s)`
+/// draws keys from a Zipf distribution with exponent `s`, so a hot subset is churned far more than
+/// the long tail (a more realistic workload than uniform churn).
+///
+/// `keyspace` sets the index space that updates are drawn from. The seed is always the distinct
+/// keys `0..num_elements`. `None` means updates also draw from `0..num_elements`, so they only
+/// touch seeded keys. `Some(k)` (with `k >= num_elements`) draws updates over all of `0..k`, so
+/// some updates land on unseeded keys and grow the keyspace by inserting them.
+#[allow(clippy::too_many_arguments)]
+pub async fn gen_random_kv<F, M>(
+    mut db: M,
+    num_elements: u64,
+    num_operations: u64,
+    commit_frequency: Option<u32>,
+    seed_batch: Option<u64>,
+    prune_frequency: Option<u32>,
+    key_zipf_exponent: Option<f64>,
+    keyspace: Option<u64>,
+    make_value: impl Fn(&mut TestRng) -> M::Value,
+) -> M
+where
+    F: Family,
+    M: DbAny<F, Key = Digest>,
+{
+    let mut rng = TestRng::new(42);
+
+    // Count commits across both phases so `prune_frequency` can prune to the inactivity floor every
+    // N commits, bounding on-disk growth instead of accumulating the whole (re-appended) log until
+    // the end. Pruning below the floor never affects an `init` replay, which starts at the floor.
+    let mut commits = 0u32;
+
+    // Seed the db with `num_elements` entries. `seed_batch` caps how many seeds accumulate before a
+    // merkleize+apply (bounding the batch). `None` seeds in a single batch. Each apply is followed
+    // by a `commit`, and its `merkle.flush()` writes the in-memory merkle nodes to the journal and
+    // prunes them from memory. Without that, a large build accumulates the whole merkle in RAM.
+    {
+        let mut batch = db.new_batch();
+        let mut pending = 0u64;
+        for i in 0u64..num_elements {
+            let key = Sha256::hash(&[&i.to_be_bytes()]);
+            batch = batch.write(key, Some(make_value(&mut rng)));
+            pending += 1;
+            if seed_batch.is_some_and(|n| pending >= n) {
+                let merkleized = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+                db = db.apply_batch(merkleized).await.unwrap();
+                db = db.commit().await.unwrap();
+                commits += 1;
+                if prune_frequency.is_some_and(|n| commits.is_multiple_of(n)) {
+                    let boundary = db.sync_boundary();
+                    db = db.prune(boundary).await.unwrap();
+                }
+                batch = db.new_batch();
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            let merkleized = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+            db = db.apply_batch(merkleized).await.unwrap();
+            db = db.commit().await.unwrap();
+        }
+    }
+
+    // Perform `num_operations` random updates/deletes, committing periodically. Each apply is
+    // followed by a `commit` so the merkle structure is flushed out of memory (see the seed phase).
+    {
+        // Sample over the full keyspace (which may exceed the seeded set, so some samples hit unseeded
+        // keys and insert them). `Zipf::new` samples a rank in `[1, space]`; map it to a 0-based index.
+        let space = keyspace.unwrap_or(num_elements);
+        let zipf =
+            key_zipf_exponent.map(|s| Zipf::new(space as f64, s).expect("valid zipf parameters"));
+        let mut batch = db.new_batch();
+        for _ in 0u64..num_operations {
+            let idx = match &zipf {
+                Some(z) => ((z.sample(&mut rng) as u64).saturating_sub(1)).min(space - 1),
+                None => rng.next_u64() % space,
+            };
+            let rand_key = Sha256::hash(&[&idx.to_be_bytes()]);
+            if rng.next_u32().is_multiple_of(DELETE_FREQUENCY) {
+                batch = batch.write(rand_key, None);
+                continue;
+            }
+            batch = batch.write(rand_key, Some(make_value(&mut rng)));
+            if let Some(freq) = commit_frequency
+                && rng.next_u32().is_multiple_of(freq)
+            {
+                let merkleized = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+                db = db.apply_batch(merkleized).await.unwrap();
+                db = db.commit().await.unwrap();
+                commits += 1;
+                if prune_frequency.is_some_and(|n| commits.is_multiple_of(n)) {
+                    let boundary = db.sync_boundary();
+                    db = db.prune(boundary).await.unwrap();
+                }
+                batch = db.new_batch();
+            }
+        }
+        let merkleized = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+        db = db.apply_batch(merkleized).await.unwrap();
+        db = db.commit().await.unwrap();
+    }
+
+    db
+}
+
+/// Seed an unauthenticated store with `num_elements` entries in one batch, then perform
+/// `num_operations` random updates/deletes, committing periodically. Draws the same key, value,
+/// and commit sequence as [gen_random_kv] with uniform churn over the seeded keys.
+pub async fn gen_store_random_kv(
+    mut db: StoreDb,
+    num_elements: u64,
+    num_operations: u64,
+    commit_frequency: u32,
+    make_value: impl Fn(&mut TestRng) -> Vec<u8>,
+) -> StoreDb {
+    let mut rng = TestRng::new(42);
+
+    // Seed the db with `num_elements` entries.
+    let mut changes = Vec::with_capacity(num_elements as usize);
+    for i in 0u64..num_elements {
+        let key = Sha256::hash(&[&i.to_be_bytes()]);
+        changes.push((key, Some(make_value(&mut rng))));
+    }
+    db = db
+        .apply_batch(changes.into_iter().collect(), &mut Proportional)
+        .await
+        .unwrap();
+    db = db.commit().await.unwrap();
+
+    // Perform `num_operations` random updates/deletes, committing periodically.
+    let mut changes = Vec::new();
+    for _ in 0u64..num_operations {
+        let rand_key = Sha256::hash(&[&(rng.next_u64() % num_elements).to_be_bytes()]);
+        if rng.next_u32().is_multiple_of(DELETE_FREQUENCY) {
+            changes.push((rand_key, None));
+            continue;
+        }
+        changes.push((rand_key, Some(make_value(&mut rng))));
+        if rng.next_u32().is_multiple_of(commit_frequency) {
+            db = db
+                .apply_batch(
+                    std::mem::take(&mut changes).into_iter().collect(),
+                    &mut Proportional,
+                )
+                .await
+                .unwrap();
+            db = db.commit().await.unwrap();
+        }
+    }
+    let db = db
+        .apply_batch(changes.into_iter().collect(), &mut Proportional)
+        .await
+        .unwrap();
+    db.commit().await.unwrap()
+}
+
+/// Generate a fixed-size digest value.
+pub fn make_fixed_value(rng: &mut TestRng) -> Digest {
+    Sha256::hash(&[&rng.next_u32().to_be_bytes()])
+}
+
+/// Pre-populate the database with `num_keys` unique keys, then commit.
+pub async fn seed_db<F: merkle::Family, C: DbAny<F, Key = Digest, Value = Digest>>(
+    db: C,
+    num_keys: u64,
+) -> C {
+    let mut rng = TestRng::new(42);
+    let mut batch = db.new_batch();
+    for i in 0u64..num_keys {
+        let k = Sha256::hash(&[&i.to_be_bytes()]);
+        batch = batch.write(k, Some(make_fixed_value(&mut rng)));
+    }
+    let merkleized = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+    let db = db.apply_batch(merkleized).await.unwrap();
+    db.commit().await.unwrap()
+}
+
+/// Write `num_updates` random key updates into a batch.
+pub fn write_random_updates<B, Db>(
+    mut batch: B,
+    num_updates: u64,
+    num_keys: u64,
+    rng: &mut TestRng,
+) -> B
+where
+    B: UnmerkleizedBatch<Db, K = Digest, V = Digest>,
+    Db: ?Sized,
+{
+    for _ in 0..num_updates {
+        let idx = rng.next_u64() % num_keys;
+        let k = Sha256::hash(&[&idx.to_be_bytes()]);
+        batch = batch.write(k, Some(make_fixed_value(rng)));
+    }
+    batch
+}
+
+/// Generate a variable-size `Vec<u8>` value (1-256 bytes).
+pub fn make_var_value(rng: &mut TestRng) -> Vec<u8> {
+    let len = (rng.next_u32() as usize) % VARIABLE_VALUE_MAX_LEN + 1;
+    vec![rng.next_u32() as u8; len]
+}

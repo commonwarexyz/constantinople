@@ -1,0 +1,159 @@
+use crate::qmdb::{
+    any::{
+        FixedValue, VariableValue,
+        operation::{
+            Update as UpdateTrait,
+            update::{Parts, sealed::Sealed},
+        },
+        value::{FixedEncoding, ValueEncoding, VariableEncoding},
+    },
+    operation::Key,
+};
+use commonware_codec::{
+    Buf, Encode as _, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt as _, Write,
+};
+use commonware_formatting::hex;
+use commonware_runtime::BufMut;
+use commonware_utils::Array;
+use std::fmt;
+
+#[derive(Clone, PartialEq, Debug, Eq)]
+pub struct Update<K: Key, V: ValueEncoding> {
+    pub key: K,
+    pub value: V::Value,
+    pub next_key: K,
+}
+
+#[cfg(feature = "arbitrary")]
+impl<K: Key, V: ValueEncoding> arbitrary::Arbitrary<'_> for Update<K, V>
+where
+    K: for<'a> arbitrary::Arbitrary<'a>,
+    V::Value: for<'a> arbitrary::Arbitrary<'a>,
+{
+    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(Self {
+            key: u.arbitrary()?,
+            value: u.arbitrary()?,
+            next_key: u.arbitrary()?,
+        })
+    }
+}
+
+impl<K: Key, V: ValueEncoding> Sealed for Update<K, V> {}
+
+impl<K: Key, V: ValueEncoding> UpdateTrait for Update<K, V> {
+    type Key = K;
+    type Value = V::Value;
+    type ValueEncoding = V;
+    type Cached = K;
+
+    fn key(&self) -> &K {
+        &self.key
+    }
+
+    fn into_key(self) -> K {
+        self.key
+    }
+
+    fn value(&self) -> &V::Value {
+        &self.value
+    }
+
+    fn into_value(self) -> V::Value {
+        self.value
+    }
+
+    fn cached<'a>(update: impl FnOnce() -> &'a Self) -> K
+    where
+        Self: 'a,
+    {
+        update().next_key.clone()
+    }
+
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[key:{} next_key:{} value:{}]",
+            hex(&self.key),
+            hex(&self.next_key),
+            hex(&self.value.encode())
+        )
+    }
+}
+
+impl<K: Key, V: ValueEncoding> Parts for Update<K, V> {
+    /// A collision sibling may be the predecessor whose `next_key` a delete rewrites.
+    const SIBLINGS: bool = true;
+
+    fn into_parts(self) -> (K, V::Value, K) {
+        (self.key, self.value, self.next_key)
+    }
+
+    fn from_parts(key: K, value: V::Value, next_key: K) -> Self {
+        Self {
+            key,
+            value,
+            next_key,
+        }
+    }
+}
+
+impl<K: Array, V: FixedValue> FixedSize for Update<K, FixedEncoding<V>> {
+    const SIZE: usize = K::SIZE + V::SIZE + K::SIZE;
+}
+
+impl<K, V> Write for Update<K, V>
+where
+    K: Key,
+    V: ValueEncoding,
+{
+    fn write(&self, buf: &mut impl BufMut) {
+        self.key.write(buf);
+        self.value.write(buf);
+        self.next_key.write(buf);
+    }
+}
+
+impl<K: Array, V: FixedValue> Read for Update<K, FixedEncoding<V>> {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        let key = K::read(buf)?;
+        let value = V::read_cfg(buf, cfg)?;
+        let next_key = K::read(buf)?;
+        Ok(Self {
+            key,
+            value,
+            next_key,
+        })
+    }
+}
+
+impl<K, V> EncodeSize for Update<K, VariableEncoding<V>>
+where
+    K: Key,
+    V: VariableValue,
+{
+    fn encode_size(&self) -> usize {
+        self.key.encode_size() + self.value.encode_size() + self.next_key.encode_size()
+    }
+}
+
+impl<K, V> Read for Update<K, VariableEncoding<V>>
+where
+    K: Key,
+    V: VariableValue,
+{
+    type Cfg = (<K as Read>::Cfg, <V as Read>::Cfg);
+
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        let key = K::read_cfg(buf, &cfg.0)?;
+        let value = V::read_cfg(buf, &cfg.1)?;
+        let next_key = K::read_cfg(buf, &cfg.0)?;
+        Ok(Self {
+            key,
+            value,
+            next_key,
+        })
+    }
+}

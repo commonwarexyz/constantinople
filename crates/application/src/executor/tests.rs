@@ -23,10 +23,11 @@ fn key(index: u8) -> AccountKey {
     AccountKey::from([index; AccountKey::SIZE])
 }
 
-const fn account(balance: u64, base: u64) -> Account {
+const fn account(balance: u64, base: u64, tx_count: u64) -> Account {
     Account {
         balance,
         nonce: Nonce::new(base, 0),
+        tx_count,
     }
 }
 
@@ -125,6 +126,7 @@ fn expected_slot(read: Option<Account>, settled: Account) -> Slot<Account> {
 struct Entry {
     start: Account,
     nonce: Nonce,
+    tx_count: u64,
     debits: u64,
     credits: u64,
 }
@@ -138,6 +140,7 @@ impl Entry {
                 .checked_sub(self.debits)?
                 .checked_add(self.credits)?,
             nonce: self.nonce,
+            tx_count: self.tx_count,
         })
     }
 }
@@ -162,6 +165,7 @@ impl<'a> Model<'a> {
             Entry {
                 start,
                 nonce: start.nonce,
+                tx_count: start.tx_count,
                 debits: 0,
                 credits: 0,
             }
@@ -176,6 +180,7 @@ impl<'a> Model<'a> {
         if !sender.nonce.consume(transfer.nonce) {
             return None;
         }
+        sender.tx_count = sender.tx_count.checked_add(1)?;
         sender.debits = sender.debits.checked_add(transfer.value)?;
 
         // A self-transfer credits the same entry, and any other transfer credits its recipient.
@@ -184,6 +189,7 @@ impl<'a> Model<'a> {
             return Some(vec![(transfer.sender, sender)]);
         }
         let mut recipient = self.entry(&transfer.recipient);
+        recipient.tx_count = recipient.tx_count.checked_add(1)?;
         recipient.credits = recipient.credits.checked_add(transfer.value)?;
         Some(vec![
             (transfer.sender, sender),
@@ -250,7 +256,7 @@ impl<'a> Model<'a> {
 #[test]
 fn executes_run_ahead_nonces() {
     let [sender, recipient] = [key(1), key(2)];
-    let state = State::from([(sender, account(10, 0))]);
+    let state = State::from([(sender, account(10, 0, 0))]);
 
     // Nonces inside the run-ahead window apply in any order.
     let body = [
@@ -264,19 +270,68 @@ fn executes_run_ahead_nonces() {
     assert_eq!(
         settled,
         [
-            (sender, Slot::Put(account(1, 3))),
+            (sender, Slot::Put(account(1, 3, 3))),
             (
                 recipient,
-                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 9, 0))
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 9, 0, 3))
             ),
         ]
     );
 }
 
 #[test]
+fn count_overflow_drops_atomically_across_refills() {
+    let [sender, exhausted, last] = [key(1), key(2), key(3)];
+    let state = State::from([
+        (exhausted, account(100, 0, u64::MAX)),
+        (last, account(100, 0, u64::MAX - 1)),
+    ]);
+    let rounds = vec![
+        vec![
+            transfer(sender, exhausted, 1, 0),
+            transfer(sender, last, 1, 0),
+        ],
+        vec![
+            transfer(sender, last, 1, 1),
+            transfer(sender, sender, 1, 1),
+            transfer(exhausted, sender, 1, 0),
+        ],
+    ];
+    let (accepted, settled) = select(&state, &rounds, 0);
+    assert_eq!(accepted, [vec![false, true], vec![false, true, false]]);
+    assert_eq!(
+        settled,
+        [
+            (sender, Slot::Put(account(99, 2, 2))),
+            (exhausted, Slot::Keep),
+            (last, Slot::Put(account(101, 0, u64::MAX))),
+        ]
+    );
+    assert_eq!(verify(&state, &rounds.concat(), 0, &Sequential), None);
+    let body = survivors(&rounds, &accepted);
+    assert_eq!(
+        written(&verify(&state, &body, 1, &Sequential).unwrap()),
+        written(&settled)
+    );
+}
+
+#[test]
+fn self_transfer_consumes_the_last_count_once() {
+    let sender = key(1);
+    let state = State::from([(sender, account(100, 0, u64::MAX - 1))]);
+    let rounds = vec![vec![
+        transfer(sender, sender, 1, 0),
+        transfer(sender, sender, 1, 1),
+    ]];
+    let (accepted, settled) = select(&state, &rounds, 0);
+    assert_eq!(accepted, [vec![true, false]]);
+    assert_eq!(settled, [(sender, Slot::Put(account(100, 1, u64::MAX)))]);
+}
+
+#[test]
 fn rejects_refused_nonces() {
     let [sender, recipient] = [key(1), key(2)];
-    let state = State::from([(sender, account(10, 1))]);
+    let state = State::from([(sender, account(10, 1, 0))]);
 
     // The sender has consumed nonce 0, and each body presents a nonce its account refuses.
     let far = NONCE_BITMAP_CAPACITY + 5;
@@ -310,20 +365,20 @@ fn rejects_refused_nonces() {
 #[test]
 fn spends_only_block_start_balances() {
     let [payer, middle, sink] = [key(1), key(2), key(3)];
-    let state = State::from([(payer, account(10, 0)), (middle, account(0, 1))]);
+    let state = State::from([(payer, account(10, 0, 0)), (middle, account(0, 1, 0))]);
 
     // Middle's credit cannot fund its spend in the same block.
     let body = [transfer(payer, middle, 10, 0), transfer(middle, sink, 1, 1)];
     assert_eq!(verify(&state, &body, 0, &Sequential), None);
 
     // Credits apply after debits, so a pair of accounts can swap value.
-    let state = State::from([(payer, account(10, 0)), (middle, account(10, 0))]);
+    let state = State::from([(payer, account(10, 0, 0)), (middle, account(10, 0, 0))]);
     let body = [transfer(payer, middle, 4, 0), transfer(middle, payer, 3, 0)];
     assert_eq!(
         verify(&state, &body, 0, &Sequential).expect("swap must settle"),
         [
-            (payer, Slot::Put(account(9, 1))),
-            (middle, Slot::Put(account(11, 1))),
+            (payer, Slot::Put(account(9, 1, 2))),
+            (middle, Slot::Put(account(11, 1, 2))),
         ]
     );
 }
@@ -331,13 +386,13 @@ fn spends_only_block_start_balances() {
 #[test]
 fn self_transfers_debit_and_credit_their_sender() {
     let [sender, recipient] = [key(1), key(2)];
-    let state = State::from([(sender, account(9, 3))]);
+    let state = State::from([(sender, account(9, 3, 0))]);
 
     // Spending the whole balance on a self-transfer leaves it unchanged and consumes the nonce.
     let body = [transfer(sender, sender, 9, 3)];
     assert_eq!(
         verify(&state, &body, 0, &Sequential).expect("self-transfer must settle"),
-        [(sender, Slot::Put(account(9, 4)))]
+        [(sender, Slot::Put(account(9, 4, 1)))]
     );
 
     // The self-transfer's debit and the send's together fit the starting balance.
@@ -348,10 +403,10 @@ fn self_transfers_debit_and_credit_their_sender() {
     assert_eq!(
         verify(&state, &body, 0, &Sequential).expect("body must settle"),
         [
-            (sender, Slot::Put(account(4, 5))),
+            (sender, Slot::Put(account(4, 5, 2))),
             (
                 recipient,
-                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 5, 0))
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 5, 0, 1))
             ),
         ]
     );
@@ -386,10 +441,10 @@ fn self_transfers_debit_and_credit_their_sender() {
     assert_eq!(
         settled,
         [
-            (sender, Slot::Put(account(5, 5))),
+            (sender, Slot::Put(account(5, 5, 2))),
             (
                 recipient,
-                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 4, 0))
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 4, 0, 1))
             ),
         ]
     );
@@ -399,9 +454,9 @@ fn self_transfers_debit_and_credit_their_sender() {
 fn rejects_unaffordable_and_overflowing_sums() {
     let [poor, rich, recipient] = [key(1), key(2), key(3)];
     let state = State::from([
-        (poor, account(5, 0)),
-        (rich, account(u64::MAX, 0)),
-        (recipient, account(u64::MAX - 1, 0)),
+        (poor, account(5, 0, 0)),
+        (rich, account(u64::MAX, 0, 0)),
+        (recipient, account(u64::MAX - 1, 0, 0)),
     ]);
     for body in [
         // A debit past the starting balance.
@@ -433,9 +488,9 @@ fn rejects_unaffordable_and_overflowing_sums() {
     assert_eq!(
         verify(&state, &body, 0, &Sequential).expect("body must settle"),
         [
-            (poor, Slot::Put(account(4, 1))),
-            (rich, Slot::Put(account(u64::MAX, 1))),
-            (recipient, Slot::Put(account(u64::MAX, 0))),
+            (poor, Slot::Put(account(4, 1, 1))),
+            (rich, Slot::Put(account(u64::MAX, 1, 2))),
+            (recipient, Slot::Put(account(u64::MAX, 0, 1))),
         ]
     );
 }
@@ -444,9 +499,9 @@ fn rejects_unaffordable_and_overflowing_sums() {
 fn selection_drops_what_cannot_settle() {
     let [alice, bob, carol, rich] = [key(1), key(2), key(3), key(4)];
     let state = State::from([
-        (alice, account(50, 1)),
-        (bob, account(30, 0)),
-        (rich, account(u64::MAX - 10, 0)),
+        (alice, account(50, 1, 0)),
+        (bob, account(30, 0, 0)),
+        (rich, account(u64::MAX - 10, 0, 0)),
     ]);
     let rounds = vec![
         vec![
@@ -488,9 +543,12 @@ fn selection_drops_what_cannot_settle() {
     assert_eq!(
         settled,
         [
-            (alice, Slot::Put(account(20, 3))),
-            (bob, Slot::Put(account(40, 1))),
-            (carol, Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 20, 1))),
+            (alice, Slot::Put(account(20, 3, 3))),
+            (bob, Slot::Put(account(40, 1, 2))),
+            (
+                carol,
+                Slot::Put(account(DEFAULT_ACCOUNT_BALANCE + 20, 1, 2))
+            ),
             (rich, Slot::Keep),
         ]
     );
@@ -529,6 +587,11 @@ fn random_state(rng: &mut TestRng, keys: &[AccountKey], reachable: bool) -> Stat
         let mut account = Account {
             balance: BALANCES[rng.random_range(0..BALANCES.len())],
             nonce: Nonce::new(BASES[rng.random_range(0..BASES.len())], bitmap),
+            tx_count: if reachable {
+                rng.random_range(1..=100)
+            } else {
+                [0, 1, u64::MAX - 1, u64::MAX][rng.random_range(0..4)]
+            },
         };
 
         // A reachable account that has consumed no nonce holds at least the default balance.
@@ -723,7 +786,7 @@ fn many_keys(count: u32) -> Vec<AccountKey> {
 /// A funded state over `keys` whose accounts have consumed varied nonces.
 fn funded_state(rng: &mut TestRng, keys: &[AccountKey]) -> State {
     keys.iter()
-        .map(|key| (*key, account(1_000_000, rng.random_range(0..3))))
+        .map(|key| (*key, account(1_000_000, rng.random_range(0..3), 0)))
         .collect()
 }
 

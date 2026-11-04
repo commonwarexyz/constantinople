@@ -22,14 +22,15 @@ use commonware_cryptography::{
 use commonware_parallel::Strategy;
 use commonware_runtime::{Handle, Spawner};
 use commonware_storage::{
-    merkle::{Family as _, Location, mmr},
+    merkle::{Family as _, Location, Position, mmr},
     qmdb::{
         any::{
             operation::Operation as AnyOperation,
-            unordered::{Operation as UnorderedOperation, Update as UnorderedUpdate},
+            ordered::{Operation as OrderedOperation, Update as OrderedUpdate},
             value::FixedEncoding,
         },
-        keyless,
+        current, keyless,
+        operation::Floored,
     },
 };
 use commonware_utils::sequence::FixedBytes;
@@ -38,10 +39,10 @@ use constantinople_application::consensus::{
     TransactionHistoryOperation,
 };
 use constantinople_engine::types::{EngineBlock, EngineFinalization};
-use constantinople_primitives::{Account, AccountKey, BlockCfg};
+use constantinople_primitives::{Account, AccountKey, BlockCfg, TransactionHistoryEntry};
 use cpu_time::ThreadTime;
 use exoware_qmdb::{
-    QmdbError,
+    CurrentBoundaryState, QmdbError,
     adapter::upload::{
         AuthenticatedOperationRange, prepare_authenticated_range, stage_authenticated_range,
         stage_watermark,
@@ -66,7 +67,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{Instrument as _, Span, debug, info_span, instrument::WithSubscriber as _, warn};
 
 const QUEUE_MAGIC: u32 = 0x4351_5545;
-const QUEUE_FORMAT_VERSION: u16 = 1;
+const QUEUE_FORMAT_VERSION: u16 = 2;
 const MAX_BUFFERED_UPLOADS: usize = 64;
 
 // Split byte-heavy SQL chunks to reduce encoding, compression, and transfer time.
@@ -81,8 +82,8 @@ const MAX_CONCURRENT_CHUNKS: usize = 64;
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
-type StateOperation = UnorderedOperation<QmdbFamily, AccountKey, StateEncoding>;
-type TransactionEncoding<H> = FixedEncoding<<H as Hasher>::Digest>;
+type StateOperation = OrderedOperation<QmdbFamily, AccountKey, StateEncoding>;
+type TransactionEncoding<H> = FixedEncoding<TransactionHistoryEntry<<H as Hasher>::Digest>>;
 type TransactionOperation<H> = keyless::Operation<QmdbFamily, TransactionEncoding<H>>;
 
 /// Completion signals for a queued finalized-block upload.
@@ -254,7 +255,56 @@ impl<D: Digest> Read for QueuedAuthenticatedRange<D> {
     }
 }
 
-/// Self-contained durable queue payload.
+/// Bitmap and grafted-tree changes at one finalized state boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurrentStateDelta<D: Digest> {
+    pruned_chunks: u64,
+    chunks: Vec<(u64, [u8; 32])>,
+    grafted_nodes: Vec<(Position<QmdbFamily>, D)>,
+}
+
+impl<D: Digest> From<current::batch::Boundary<QmdbFamily, D, 32>> for CurrentStateDelta<D> {
+    fn from(boundary: current::batch::Boundary<QmdbFamily, D, 32>) -> Self {
+        Self {
+            pruned_chunks: boundary.pruned_chunks,
+            chunks: boundary.chunks,
+            grafted_nodes: boundary.grafted_nodes,
+        }
+    }
+}
+
+impl<D: Digest> EncodeSize for CurrentStateDelta<D> {
+    fn encode_size(&self) -> usize {
+        self.pruned_chunks.encode_size()
+            + self.chunks.encode_size()
+            + self.grafted_nodes.encode_size()
+    }
+}
+
+impl<D: Digest> Write for CurrentStateDelta<D> {
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        self.pruned_chunks.write(buf);
+        self.chunks.write(buf);
+        self.grafted_nodes.write(buf);
+    }
+}
+
+impl<D: Digest> Read for CurrentStateDelta<D> {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        Ok(Self {
+            pruned_chunks: u64::read(buf)?,
+            chunks: Vec::<(u64, [u8; 32])>::read_cfg(buf, &(RangeCfg::from(0..), ((), ())))?,
+            grafted_nodes: Vec::<(Position<QmdbFamily>, D)>::read_cfg(
+                buf,
+                &(RangeCfg::from(0..), ((), ())),
+            )?,
+        })
+    }
+}
+
+/// Durable queue payload for one finalized block and its publication delta.
 ///
 /// The default form holds decoded operation bytes. [CapturedFinalizedUpload]
 /// holds typed operations. Both forms encode to identical bytes.
@@ -268,6 +318,7 @@ where
     finalization: Option<EngineFinalization<P, V, H>>,
     finalized_ts_micros: i64,
     state: QueuedAuthenticatedRange<H::Digest, S>,
+    state_delta: CurrentStateDelta<H::Digest>,
     transactions: QueuedAuthenticatedRange<H::Digest, T>,
 }
 
@@ -294,9 +345,12 @@ where
         finalized_ts_micros: i64,
         artifacts: FinalizedArtifacts<H>,
     ) -> Result<Self, PublishError> {
-        if artifacts.state.root != block.header.state_root {
+        if artifacts.state.root != block.state_sync.ops_root
+            || artifacts.state_boundary.root != block.header.state_root
+            || artifacts.state_boundary.witness != block.state_sync.witness
+        {
             return Err(PublishError::InvalidQueuedUpload {
-                reason: "state artifact root does not match the finalized header",
+                reason: "state artifact boundary does not match the finalized block",
             });
         }
         if artifacts.transactions.root != block.header.transactions_root {
@@ -305,12 +359,14 @@ where
             });
         }
         let state = QueuedAuthenticatedRange::from_finalized_range(artifacts.state);
+        let state_delta = CurrentStateDelta::from(artifacts.state_boundary);
         let transactions = QueuedAuthenticatedRange::from_finalized_range(artifacts.transactions);
         let upload = Self {
             block: block.clone(),
             finalization,
             finalized_ts_micros,
             state,
+            state_delta,
             transactions,
         };
         upload
@@ -350,6 +406,9 @@ where
     }
 
     fn validate(&self) -> Result<(), &'static str> {
+        if !self.block.verify_state_root() {
+            return Err("state synchronization witness does not match the finalized header");
+        }
         if self
             .finalization
             .as_ref()
@@ -410,6 +469,7 @@ where
             + self.finalization.encode_size()
             + self.finalized_ts_micros.encode_size()
             + self.state.encode_size()
+            + self.state_delta.encode_size()
             + self.transactions.encode_size()
     }
 }
@@ -430,6 +490,7 @@ where
         self.finalization.write(buf);
         self.finalized_ts_micros.write(buf);
         self.state.write(buf);
+        self.state_delta.write(buf);
         self.transactions.write(buf);
     }
 }
@@ -455,6 +516,7 @@ where
             finalization: Option::<EngineFinalization<P, V, Sha256>>::read(buf)?,
             finalized_ts_micros: i64::read(buf)?,
             state: QueuedAuthenticatedRange::read_cfg(buf, &cfg.state)?,
+            state_delta: CurrentStateDelta::read(buf)?,
             transactions: QueuedAuthenticatedRange::read_cfg(buf, &cfg.transactions)?,
         };
         upload
@@ -552,6 +614,7 @@ where
     block: EngineBlock<H, P>,
     finalized_ts_micros: i64,
     state: QueuedAuthenticatedRange<H::Digest>,
+    state_delta: CurrentStateDelta<H::Digest>,
     transactions: QueuedAuthenticatedRange<H::Digest>,
     omit_pinned_nodes: bool,
 }
@@ -701,6 +764,7 @@ where
                 block,
                 finalized_ts_micros,
                 state,
+                state_delta,
                 transactions,
                 ..
             } = upload;
@@ -719,6 +783,7 @@ where
                         block,
                         finalized_ts_micros,
                         state,
+                        state_delta,
                         transactions,
                         omit_pinned_nodes,
                     },
@@ -1048,18 +1113,40 @@ where
     S: Strategy,
 {
     let expansion_started = Instant::now();
+    if !upload.block.verify_state_root() {
+        return Err(PublishError::InvalidQueuedUpload {
+            reason: "state synchronization witness does not match the finalized header",
+        });
+    }
+    let state_floor = upload
+        .state
+        .operations
+        .last()
+        .and_then(|encoded| StateOperation::decode(Copying(encoded.as_slice())).ok())
+        .and_then(|operation| operation.has_floor())
+        .ok_or(PublishError::InvalidQueuedUpload {
+            reason: "state operation range does not end at a valid commit floor",
+        })?;
     let state_span = info_span!(
         "indexer.qmdb.prepare.state",
         operations = upload.state.operations.len()
     );
-    let state = state_span.in_scope(|| {
-        prepare_authenticated_range::<QmdbFamily, H, StateOperation, S>(
-            &as_authenticated_range(&upload.state, upload.block.header.state_range.start()),
-            &upload.block.header.state_root,
-            &(),
-            &strategy,
-        )
-    })?;
+    let state = state_span
+        .in_scope(|| {
+            prepare_authenticated_range::<QmdbFamily, H, StateOperation, S>(
+                &as_authenticated_range(&upload.state, state_floor.as_u64()),
+                &upload.block.state_sync.ops_root,
+                &(),
+                &strategy,
+            )
+        })?
+        .with_current_boundary::<H, 32>(&CurrentBoundaryState {
+            root: upload.block.header.state_root,
+            pruned_chunks: upload.state_delta.pruned_chunks,
+            ops_root_witness: upload.block.state_sync.witness.clone(),
+            chunks: upload.state_delta.chunks,
+            grafted_nodes: upload.state_delta.grafted_nodes,
+        })?;
     let transactions_span = info_span!(
         "indexer.qmdb.prepare.transactions",
         operations = upload.transactions.operations.len()
@@ -1157,19 +1244,19 @@ where
     let _entered = span.enter();
     let appended = transaction_appends::<H>(transactions)?;
     let mut rows = encode_block_rows(block, finalized_ts_micros, transactions.start, &appended)?;
-    rows.extend(account_rows(state)?);
+    rows.extend(account_rows(state, block.header.height)?);
     span.record("rows", rows.len());
     Ok(rows)
 }
 
-/// Digests appended by a finalized transaction-history batch.
+/// Entries appended by a finalized transaction-history batch.
 ///
-/// Each batch appends one digest per block transaction and then commits once.
+/// Each batch appends one entry per block transaction and then commits once.
 /// Transaction locations are derived from that layout, so any other shape is
 /// rejected instead of shifting rows onto the wrong operations.
 fn transaction_appends<H>(
     range: &QueuedAuthenticatedRange<H::Digest>,
-) -> Result<Vec<H::Digest>, PublishError>
+) -> Result<Vec<TransactionHistoryEntry<H::Digest>>, PublishError>
 where
     H: Hasher,
     H::Digest: Codec,
@@ -1183,7 +1270,7 @@ where
         .iter()
         .map(
             |encoded| match TransactionOperation::<H>::decode(Copying(encoded.as_slice())) {
-                Ok(keyless::Operation::Append(digest)) => Ok(digest),
+                Ok(keyless::Operation::Append(entry)) => Ok(entry),
                 Ok(keyless::Operation::Commit(..)) => Err(PublishError::InvalidQueuedUpload {
                     reason: "transaction operations commit before the final operation",
                 }),
@@ -1197,6 +1284,7 @@ where
 
 fn account_rows<D: Digest>(
     range: &QueuedAuthenticatedRange<D>,
+    write_height: u64,
 ) -> Result<Vec<super::SqlRow>, PublishError> {
     let span = info_span!(
         "indexer.qmdb.prepare.account_rows",
@@ -1211,7 +1299,12 @@ fn account_rows<D: Digest>(
                 reason: "state operation bytes do not decode",
             }
         })?;
-        let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
+        let AnyOperation::Update(OrderedUpdate {
+            key,
+            value: account,
+            ..
+        }) = operation
+        else {
             continue;
         };
         rows.push(encode_account_meta_row(AccountMetaRow {
@@ -1223,6 +1316,8 @@ fn account_rows<D: Digest>(
             nonce_base: account_u64(&account, 8),
             nonce_bitmap: account_u64(&account, 16),
             qmdb_location: location,
+            tx_count: account_u64(&account, 24),
+            write_height,
         }));
     }
     span.record("rows", rows.len());
@@ -1388,13 +1483,23 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{
         Metrics as _, Runner as _, Supervisor as _,
+        buffer::paged::CacheRef,
+        deterministic,
         telemetry::metrics::{has_metric_value, metric_samples},
     };
-    use commonware_storage::merkle::mem::Mem;
-    use commonware_utils::{NZU16, non_empty_range};
+    use commonware_storage::{
+        journal::contiguous::fixed::Config as JournalConfig,
+        merkle::mem::Mem,
+        qmdb::{
+            current::{batch::Boundary, ordered::fixed::Db},
+            floor::Proportional,
+        },
+        translator::TwoCap,
+    };
+    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
     use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
-    use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
-    use exoware_qmdb::adapter::{Keyless, Unordered};
+    use constantinople_primitives::{Block, Header, Sealable, SignedTransaction, StateSyncProof};
+    use exoware_qmdb::adapter::{Keyless, Ordered};
     use rand::{SeedableRng, rngs::StdRng};
     use std::{pin::pin, sync::Mutex as StdMutex};
     use tracing::{
@@ -1498,19 +1603,16 @@ mod tests {
 
     #[test]
     fn queue_codec_round_trips_exact_inputs() {
-        let state_operations = [
-            StateOperation::CommitFloor(None, Location::new(0)),
-            StateOperation::CommitFloor(None, Location::new(1)),
-        ];
+        let native_state = empty_states(1).remove(0);
         let transaction_operations = [
             TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
             TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
         ];
-        let state = queued_range(&encode_operations(&state_operations), 1, 2);
+        let state = native_state.clone();
         let transactions = queued_range(&encode_operations(&transaction_operations), 1, 2);
         let upload = queued_upload(1, state, transactions);
         let encoded = upload.encode();
-        assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 1]);
+        assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 2]);
         let decoded = QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
@@ -1526,6 +1628,16 @@ mod tests {
         assert_eq!(decoded.state_end(), upload.state_end());
         assert_eq!(decoded.transactions.start, upload.transactions.start);
         assert_eq!(decoded.transaction_end(), upload.transaction_end());
+        assert_eq!(
+            decoded.state_delta.pruned_chunks,
+            upload.state_delta.pruned_chunks
+        );
+        assert_eq!(decoded.state_delta.chunks, upload.state_delta.chunks);
+        assert_eq!(
+            decoded.state_delta.grafted_nodes,
+            upload.state_delta.grafted_nodes
+        );
+        assert!(decoded.block.verify_state_root());
 
         for index in 0..6 {
             let mut unsupported = encoded.to_vec();
@@ -1542,17 +1654,14 @@ mod tests {
 
     #[test]
     fn uncertified_upload_round_trips() {
-        let state_operations = [
-            StateOperation::CommitFloor(None, Location::new(0)),
-            StateOperation::CommitFloor(None, Location::new(1)),
-        ];
+        let native_state = empty_states(1).remove(0);
         let transaction_operations = [
             TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
             TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
         ];
         let mut upload = queued_upload(
             1,
-            queued_range(&encode_operations(&state_operations), 1, 2),
+            native_state.clone(),
             queued_range(&encode_operations(&transaction_operations), 1, 2),
         );
         upload.finalization = None;
@@ -1583,13 +1692,7 @@ mod tests {
 
     #[test]
     fn queue_range_round_trips_more_than_one_million_operations() {
-        let operations = vec![
-            StateOperation::Update(UnorderedUpdate(
-                AccountKey::try_from(&[7u8; 32][..]).unwrap(),
-                AccountValue::try_from(Account::default().encode().as_ref()).unwrap(),
-            ));
-            1_000_001
-        ];
+        let operations = vec![StateOperation::CommitFloor(None, Location::new(0)); 1_000_001];
         let range = queued_range(&encode_operations(&operations), 0, operations.len() as u64);
         let encoded = range.encode();
         let decoded = QueuedAuthenticatedRange::<Sha256Digest>::decode_cfg(
@@ -1608,22 +1711,25 @@ mod tests {
 
     #[test]
     fn captured_upload_encodes_like_its_decoded_form() {
-        let state_operations = vec![
-            CapturedStateOperation::CommitFloor(None, Location::new(0)),
-            CapturedStateOperation::CommitFloor(None, Location::new(1)),
-        ];
+        let state = empty_states(1).remove(0);
         let transaction_operations = vec![
             TransactionHistoryOperation::<Sha256>::Commit(None, Location::new(0)),
             TransactionHistoryOperation::<Sha256>::Commit(None, Location::new(1)),
         ];
-        let state_bytes = encode_operations(&state_operations);
+        let state_bytes = state.range.operations.clone();
         let transaction_bytes = encode_operations(&transaction_operations);
-        let state = queued_range(&state_bytes, 1, 2);
         let transactions = queued_range(&transaction_bytes, 1, 2);
         let block = test_block(1, &state, &transactions);
         let finalization = test_finalization(&block);
         let artifacts = FinalizedArtifacts {
-            state: captured_range(&state, block.header.state_root, state_operations),
+            state: FinalizedRange {
+                start: Location::new(state.range.start),
+                end: Location::new(state.range.end),
+                root: state.ops_root,
+                pinned_nodes: state.range.pinned_nodes.clone(),
+                operations: state.operations.clone(),
+            },
+            state_boundary: state.boundary.clone(),
             transactions: captured_range(
                 &transactions,
                 block.header.transactions_root,
@@ -1649,7 +1755,7 @@ mod tests {
                 &QueuedFinalizedUploadCfg::default(),
             )
             .expect("captured payload must decode");
-        assert_eq!(round_trip.state.operations, state_bytes[1..2]);
+        assert_eq!(round_trip.state.operations, state_bytes);
         assert_eq!(round_trip.transactions.operations, transaction_bytes[1..2]);
     }
 
@@ -1679,19 +1785,12 @@ mod tests {
             )
             .await
             .expect("publisher connects");
-            let state = encode_operations(&[
-                StateOperation::CommitFloor(None, Location::new(0)),
-                StateOperation::CommitFloor(None, Location::new(1)),
-            ]);
+            let native_state = empty_states(1).remove(0);
             let transactions = encode_operations(&[
                 TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
                 TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
             ]);
-            let upload = queued_upload(
-                1,
-                queued_range(&state, 1, 2),
-                queued_range(&transactions, 1, 2),
-            );
+            let upload = queued_upload(1, native_state.clone(), queued_range(&transactions, 1, 2));
             let block = upload.block().clone();
             let finalization = upload.finalization().cloned();
             publisher
@@ -1755,11 +1854,7 @@ mod tests {
             )
             .await
             .expect("connect publisher");
-            let state_operations = encode_operations(
-                &(0..=3)
-                    .map(|height| StateOperation::CommitFloor(None, Location::new(height)))
-                    .collect::<Vec<_>>(),
-            );
+            let states = empty_states(3);
             let transaction_operations = encode_operations(
                 &(0..=3)
                     .map(|height| {
@@ -1770,7 +1865,7 @@ mod tests {
             let upload = |height| {
                 queued_upload(
                     height,
-                    queued_range(&state_operations, height, height + 1),
+                    states[height as usize - 1].clone(),
                     queued_range(&transaction_operations, height, height + 1),
                 )
             };
@@ -1953,11 +2048,7 @@ mod tests {
             )
             .await
             .expect("connect publisher");
-            let state_operations = encode_operations(
-                &(0..=4)
-                    .map(|height| StateOperation::CommitFloor(None, Location::new(height)))
-                    .collect::<Vec<_>>(),
-            );
+            let states = empty_states(4);
             let transaction_operations = encode_operations(
                 &(0..=4)
                     .map(|height| {
@@ -1975,7 +2066,7 @@ mod tests {
             let upload = |height| {
                 let mut upload = queued_upload(
                     height,
-                    queued_range(&state_operations, height, height + 1),
+                    states[height as usize - 1].clone(),
                     queued_range(&transaction_operations, height, height + 1),
                 );
                 upload.finalized_ts_micros = finalized_ts_micros;
@@ -2117,11 +2208,7 @@ mod tests {
                     )
                     .await
                     .expect("connect publisher");
-                    let state_operations = encode_operations(
-                        &(0..=3)
-                            .map(|height| StateOperation::CommitFloor(None, Location::new(height)))
-                            .collect::<Vec<_>>(),
-                    );
+                    let states = empty_states(3);
                     let transaction_operations = encode_operations(
                         &(0..=3)
                             .map(|height| {
@@ -2132,7 +2219,7 @@ mod tests {
                     let upload = |height| {
                         queued_upload(
                             height,
-                            queued_range(&state_operations, height, height + 1),
+                            states[height as usize - 1].clone(),
                             queued_range(&transaction_operations, height, height + 1),
                         )
                     };
@@ -2321,14 +2408,7 @@ mod tests {
             let second_digest = Sha256Digest::from([2; Sha256Digest::SIZE]);
             let (first_tx, first_rx) = oneshot::channel();
             let (second_tx, second_rx) = oneshot::channel();
-            let state_operations = encode_operations(&[
-                StateOperation::CommitFloor(None, Location::new(0)),
-                StateOperation::CommitFloor(None, Location::new(1)),
-                StateOperation::Delete(
-                    AccountKey::try_from(&[7u8; 32][..]).expect("account key has fixed width"),
-                ),
-                StateOperation::CommitFloor(None, Location::new(2)),
-            ]);
+            let states = empty_states(2);
             let transaction_operations = encode_operations(&[
                 TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
                 TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
@@ -2350,8 +2430,9 @@ mod tests {
             ]);
             let second_data = persisted_test_upload(
                 &clients,
+                &metrics,
                 2,
-                queued_range(&state_operations, 2, 4),
+                states[1].clone(),
                 queued_range(&transaction_operations, 2, 3),
             )
             .await;
@@ -2368,8 +2449,9 @@ mod tests {
 
             let first_data = persisted_test_upload(
                 &clients,
+                &metrics,
                 1,
-                queued_range(&state_operations, 1, 2),
+                states[0].clone(),
                 queued_range(&transaction_operations, 1, 2),
             )
             .await;
@@ -2440,11 +2522,7 @@ mod tests {
             let store = StoreClient::new("http://localhost:1");
             let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
             let metrics = super::super::PublisherMetrics::new(&context);
-            let state_operations = encode_operations(
-                &(0..=16)
-                    .map(|location| StateOperation::CommitFloor(None, Location::new(location)))
-                    .collect::<Vec<_>>(),
-            );
+            let states = empty_states(16);
             let transaction_operations = encode_operations(
                 &(0..=16)
                     .map(|location| {
@@ -2454,9 +2532,10 @@ mod tests {
             );
 
             for start in 1..=16 {
-                let state = queued_range(&state_operations, start, start + 1);
+                let state = states[start as usize - 1].clone();
                 let transactions = queued_range(&transaction_operations, start, start + 1);
-                let expected_removed = state.pinned_nodes.len() + transactions.pinned_nodes.len();
+                let expected_removed =
+                    state.range.pinned_nodes.len() + transactions.pinned_nodes.len();
                 let prepare = |omit_pinned_nodes| {
                     prepare_data_batch(
                         state_qmdb_client(&store).unwrap(),
@@ -2466,7 +2545,8 @@ mod tests {
                         UploadData {
                             block: test_block(start, &state, &transactions),
                             finalized_ts_micros: 1,
-                            state: state.clone(),
+                            state: state.range.clone(),
+                            state_delta: CurrentStateDelta::from(state.boundary.clone()),
                             transactions: transactions.clone(),
                             omit_pinned_nodes,
                         },
@@ -2486,7 +2566,7 @@ mod tests {
                 }
                 for (key, value) in full.iter().filter(|(key, _)| !trimmed.contains_key(*key)) {
                     let pins = match key[0] {
-                        crate::namespaces::STATE_QMDB_PREFIX_VALUE => &state.pinned_nodes,
+                        crate::namespaces::STATE_QMDB_PREFIX_VALUE => &state.range.pinned_nodes,
                         crate::namespaces::TRANSACTIONS_QMDB_PREFIX_VALUE => {
                             &transactions.pinned_nodes
                         }
@@ -2517,11 +2597,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let state_operations = encode_operations(
-                &(0..=10)
-                    .map(|location| StateOperation::CommitFloor(None, Location::new(location)))
-                    .collect::<Vec<_>>(),
-            );
+            let states = empty_states(10);
             let transaction_operations = encode_operations(
                 &(0..=10)
                     .map(|location| {
@@ -2533,7 +2609,7 @@ mod tests {
                 let start = height + 6;
                 queued_upload(
                     height,
-                    queued_range(&state_operations, start, start + 1),
+                    states[start as usize - 1].clone(),
                     queued_range(&transaction_operations, start, start + 1),
                 )
             };
@@ -2554,19 +2630,20 @@ mod tests {
             second.published().await.unwrap();
             third.published().await.unwrap();
 
-            let state = Unordered::<
+            let state = Ordered::<
                 QmdbFamily,
                 Sha256,
                 AccountKey,
                 AccountValue,
                 STATE_PROOF_CHUNK_SIZE,
                 StateEncoding,
-            >::new(state_qmdb_client(&physical).unwrap(), ());
-            let transactions =
-                Keyless::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
-                    transactions_qmdb_client(&physical).unwrap(),
-                    (),
-                );
+            >::new(state_qmdb_client(&physical).unwrap(), (), ());
+            let transactions = Keyless::<
+                QmdbFamily,
+                Sha256,
+                TransactionHistoryEntry<Sha256Digest>,
+                TransactionEncoding<Sha256>,
+            >::new(transactions_qmdb_client(&physical).unwrap(), ());
             let expected = upload(3);
             let state_proof = Box::pin(state.operation_range_checkpoint(
                 Location::new(9),
@@ -2588,6 +2665,7 @@ mod tests {
                 state_proof.canonical_root::<Sha256>(),
                 expected.block.header.state_root
             );
+            assert_eq!(state_proof.ops_root, expected.block.state_sync.ops_root);
             assert_eq!(
                 transaction_proof.canonical_root::<Sha256>(),
                 expected.block.header.transactions_root
@@ -2625,6 +2703,15 @@ mod tests {
             .await
             .unwrap();
             assert!(proof.verify::<Sha256>());
+            let current = Box::pin(state.current_operation_range(
+                Location::new(10),
+                Location::new(10),
+                1,
+                None,
+            ))
+            .await
+            .expect("current proof survives publisher restart");
+            assert_eq!(current.root, upload(4).block.header.state_root);
             drop(restarted);
             restarted_worker.await.expect("publisher drains");
             store.shutdown().await;
@@ -2632,23 +2719,20 @@ mod tests {
     }
 
     #[test]
-    fn data_preparation_uses_header_inactivity_floors() {
+    fn data_preparation_uses_distinct_state_and_transaction_floors() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let store = StoreClient::new("http://localhost:1");
             let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
             let metrics = super::super::PublisherMetrics::new(&context);
-
-            for (end, state_floor, transaction_floor) in [(8, 0, 6), (11, 7, 9), (15, 8, 12)] {
-                let state_operations = encode_operations(
-                    &(0..end)
-                        .map(|location| {
-                            StateOperation::CommitFloor(
-                                None,
-                                Location::new(location.min(state_floor)),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                );
+            let states = empty_states(260);
+            for (end, transaction_floor) in [(8, 6), (257, 250), (261, 258)] {
+                let state = states[end as usize - 2].clone();
+                if end == 261 {
+                    assert_ne!(
+                        queued_range_root(&state.range, state.sync_start),
+                        state.ops_root
+                    );
+                }
                 let transaction_operations = encode_operations(
                     &(0..end)
                         .map(|location| {
@@ -2659,28 +2743,17 @@ mod tests {
                         })
                         .collect::<Vec<_>>(),
                 );
-                let state = queued_range(&state_operations, end - 1, end);
                 let transactions = queued_range(&transaction_operations, end - 1, end);
-
-                // Build the expected roots from the complete histories, independently of the pins.
-                let mut header = test_block(1, &state, &transactions).header.clone();
-                header.state_root =
-                    queued_range_root(&queued_range(&state_operations, 0, end), state_floor);
-                header.transactions_root = queued_range_root(
-                    &queued_range(&transaction_operations, 0, end),
-                    transaction_floor,
-                );
-                header.state_range = non_empty_range!(state_floor, end);
-                header.transactions_range = non_empty_range!(transaction_floor, end);
-                let block = EngineBlock::from(
-                    Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
-                        .seal(&mut Sha256::default()),
-                );
+                let mut block = (*test_block(1, &state, &transactions)).clone().into_inner();
+                block.header.transactions_root =
+                    queued_range_root(&transactions, transaction_floor);
+                block.header.transactions_range = non_empty_range!(transaction_floor, end);
                 let upload = QueuedFinalizedUpload::<Sha256, ed25519::VerifyingKey, MinSig> {
-                    block,
+                    block: block.seal(&mut Sha256::default()).into(),
                     finalization: None,
                     finalized_ts_micros: 1,
-                    state,
+                    state: state.range,
+                    state_delta: CurrentStateDelta::from(state.boundary),
                     transactions,
                 };
                 let decoded =
@@ -2688,7 +2761,8 @@ mod tests {
                         upload.encode(),
                         &QueuedFinalizedUploadCfg::default(),
                     )
-                    .expect("queue entry preserves distinct floors and operation starts");
+                    .expect("queue preserves native current boundary");
+                assert!(decoded.block.header.state_range.start() <= decoded.state.start);
                 let (_, state_end, transaction_end) = prepare_data_batch(
                     state_qmdb_client(&store).unwrap(),
                     transactions_qmdb_client(&store).unwrap(),
@@ -2698,12 +2772,13 @@ mod tests {
                         block: decoded.block,
                         finalized_ts_micros: decoded.finalized_ts_micros,
                         state: decoded.state,
+                        state_delta: decoded.state_delta,
                         transactions: decoded.transactions,
                         omit_pinned_nodes: false,
                     },
                     &metrics,
                 )
-                .expect("header floors authenticate the captured suffixes");
+                .expect("raw commit floors authenticate captured suffixes");
                 assert_eq!(state_end.as_u64(), end - 1);
                 assert_eq!(transaction_end.as_u64(), end - 1);
             }
@@ -2716,23 +2791,62 @@ mod tests {
             let store = StoreClient::new("http://localhost:1");
             let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
             let metrics = super::super::PublisherMetrics::new(&context);
-            let state_operations = encode_operations(&[
-                StateOperation::CommitFloor(None, Location::new(0)),
-                StateOperation::CommitFloor(None, Location::new(1)),
-            ]);
+            let key = AccountKey::from([7; AccountKey::SIZE]);
+            let native_state =
+                state_fixtures(vec![vec![(key, Some(Account::default()))]]).remove(0);
+            let signer = ed25519::SigningKey::from_seed(7);
+            let public_key =
+                constantinople_primitives::TransactionPublicKey::ed25519(signer.public_key());
+            let transaction = constantinople_primitives::Transaction::new(
+                public_key.clone(),
+                public_key,
+                std::num::NonZeroU64::MIN,
+                0,
+            )
+            .seal_and_sign(&signer, b"metadata-proof-test", &mut Sha256::default());
             let transaction_operations = encode_operations(&[
                 TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
+                TransactionOperation::<Sha256>::Append(TransactionHistoryEntry {
+                    digest: *transaction.message_digest(),
+                    sender_index: 0,
+                    recipient_index: 0,
+                }),
                 TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
             ]);
+            let transactions = queued_range(&transaction_operations, 1, 3);
+            let template = test_block(1, &native_state, &transactions);
+            let block: EngineBlock<Sha256, ed25519::VerifyingKey> = Block::new(
+                template.header.clone(),
+                vec![transaction],
+                template.state_sync.clone(),
+            )
+            .seal(&mut Sha256::default())
+            .into();
+            prepare_data_batch(
+                state_qmdb_client(&store).unwrap(),
+                transactions_qmdb_client(&store).unwrap(),
+                schema.clone(),
+                Sequential,
+                UploadData {
+                    block: block.clone(),
+                    finalized_ts_micros: 1,
+                    state: native_state.range.clone(),
+                    state_delta: CurrentStateDelta::from(native_state.boundary.clone()),
+                    transactions: transactions.clone(),
+                    omit_pinned_nodes: false,
+                },
+                &metrics,
+            )
+            .expect("valid native current preparation");
 
             for corrupt_state in [true, false] {
-                let mut state = queued_range(&state_operations, 1, 2);
-                let mut transactions = queued_range(&transaction_operations, 1, 2);
-                let block = test_block(1, &state, &transactions);
+                let mut state = native_state.clone();
+                let mut transactions = queued_range(&transaction_operations, 1, 3);
+                let block = block.clone();
 
                 // Invalid bytes must fail authentication before metadata tries to decode them.
                 let range = if corrupt_state {
-                    &mut state
+                    &mut state.range
                 } else {
                     &mut transactions
                 };
@@ -2746,7 +2860,8 @@ mod tests {
                     UploadData {
                         block,
                         finalized_ts_micros: 1,
-                        state,
+                        state: state.range,
+                        state_delta: CurrentStateDelta::from(state.boundary),
                         transactions,
                         omit_pinned_nodes: false,
                     },
@@ -2763,6 +2878,70 @@ mod tests {
     }
 
     #[test]
+    fn account_metadata_preserves_counts_and_records_floor_copy_height() {
+        use crate::sql_schema::ACCOUNT_META_TABLE;
+        use constantinople_primitives::Nonce;
+        use exoware_sql::CellValue;
+
+        let key =
+            AccountKey::from_public_key(&constantinople_primitives::TransactionPublicKey::ed25519(
+                ed25519::SigningKey::from_seed(7).public_key(),
+            ));
+        let account = Account {
+            balance: 91,
+            nonce: Nonce {
+                base: 13,
+                bitmap: 17,
+            },
+            tx_count: 29,
+        };
+        let states = state_fixtures(vec![vec![(key, Some(account))], Vec::new()]);
+        let transactions = encode_operations(&[
+            TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
+            TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
+            TransactionOperation::<Sha256>::Commit(None, Location::new(2)),
+        ]);
+        for (index, state) in states.iter().enumerate() {
+            let height = 11 + index as u64;
+            let tx_start = 1 + index as u64;
+            let transactions = queued_range(&transactions, tx_start, tx_start + 1);
+            let last_write = state
+                .operations
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(offset, op)| {
+                    matches!(op, AnyOperation::Update(update) if update.key == key)
+                        .then_some(state.range.start + offset as u64)
+                })
+                .expect("native floor walk emits account update");
+            let block = test_block(height, &state, &transactions);
+            let rows = encode_metadata_rows(&block, 1_000, &state.range, &transactions)
+                .expect("account rows");
+            let account_rows: Vec<_> = rows
+                .iter()
+                .filter(|row| row.table == ACCOUNT_META_TABLE)
+                .collect();
+            let row = account_rows.last().expect("account update metadata");
+            assert!(
+                matches!(row.values.first(), Some(CellValue::FixedBinary(value)) if value.as_slice() == key.as_ref())
+            );
+            for (position, expected) in [
+                (1, 91),
+                (2, 13),
+                (3, 17),
+                (4, last_write),
+                (5, 29),
+                (6, height),
+            ] {
+                assert!(
+                    matches!(row.values.get(position), Some(CellValue::UInt64(value)) if *value == expected)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn data_preparation_requires_appends_then_one_commit() {
         use constantinople_primitives::{Transaction, TransactionPublicKey};
         use std::num::NonZeroU64;
@@ -2771,10 +2950,7 @@ mod tests {
             let store = StoreClient::new("http://localhost:1");
             let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
             let metrics = super::super::PublisherMetrics::new(&context);
-            let state_operations = encode_operations(&[
-                StateOperation::CommitFloor(None, Location::new(0)),
-                StateOperation::CommitFloor(None, Location::new(1)),
-            ]);
+            let native_state = empty_states(1).remove(0);
             let signer = ed25519::SigningKey::from_seed(7);
             let key = TransactionPublicKey::ed25519(signer.public_key());
             let transaction =
@@ -2785,17 +2961,27 @@ mod tests {
                         &mut Sha256::default(),
                     );
             let digest = *transaction.message_digest();
-            let append = || TransactionOperation::<Sha256>::Append(digest);
+            let append = || {
+                TransactionOperation::<Sha256>::Append(TransactionHistoryEntry {
+                    digest,
+                    sender_index: 0,
+                    recipient_index: 0,
+                })
+            };
             let commit = || TransactionOperation::<Sha256>::Commit(None, Location::new(0));
 
             // Authentication owns the trailing commit, so metadata never sees a range without one.
             let history = vec![commit(), append()];
-            let state = queued_range(&state_operations, 1, 2);
+            let state = native_state.clone();
             let transactions = queued_range(&encode_operations(&history), 1, 2);
-            let header = test_block(1, &state, &transactions).header.clone();
-            let block = Block::new(header, vec![transaction.clone()])
-                .seal(&mut Sha256::default())
-                .into();
+            let template = test_block(1, &state, &transactions);
+            let block = Block::new(
+                template.header.clone(),
+                vec![transaction.clone()],
+                template.state_sync.clone(),
+            )
+            .seal(&mut Sha256::default())
+            .into();
             let error = prepare_data_batch(
                 state_qmdb_client(&store).unwrap(),
                 transactions_qmdb_client(&store).unwrap(),
@@ -2804,7 +2990,8 @@ mod tests {
                 UploadData {
                     block,
                     finalized_ts_micros: 1,
-                    state,
+                    state: state.range,
+                    state_delta: CurrentStateDelta::from(state.boundary),
                     transactions,
                     omit_pinned_nodes: false,
                 },
@@ -2838,15 +3025,17 @@ mod tests {
                 let mut history = vec![commit()];
                 history.extend(operations);
                 let end = u64::try_from(history.len()).expect("history length fits u64");
-                let state = queued_range(&state_operations, 1, 2);
+                let state = native_state.clone();
                 let transactions = queued_range(&encode_operations(&history), 1, end);
-                let header = test_block(1, &state, &transactions).header.clone();
+                let template = test_block(1, &state, &transactions);
                 let body = if has_transaction {
                     vec![transaction.clone()]
                 } else {
                     Vec::new()
                 };
-                let block = Block::new(header, body).seal(&mut Sha256::default()).into();
+                let block = Block::new(template.header.clone(), body, template.state_sync.clone())
+                    .seal(&mut Sha256::default())
+                    .into();
 
                 let result = prepare_data_batch(
                     state_qmdb_client(&store).unwrap(),
@@ -2856,7 +3045,8 @@ mod tests {
                     UploadData {
                         block,
                         finalized_ts_micros: 1,
-                        state,
+                        state: state.range,
+                        state_delta: CurrentStateDelta::from(state.boundary),
                         transactions,
                         omit_pinned_nodes: false,
                     },
@@ -2887,7 +3077,7 @@ mod tests {
             let limit = proposal_mib * 1024 * 1024;
             let mut body = Vec::new();
             let mut body_bytes = 0;
-            let mut state_ops = vec![StateOperation::CommitFloor(None, Location::new(0))];
+            let mut state_writes = Vec::new();
             let mut transaction_ops = vec![TransactionOperation::<Sha256>::Commit(
                 None,
                 Location::new(0),
@@ -2915,36 +3105,38 @@ mod tests {
                 for (key, balance, nonce) in [(&sender_key, 99, 1), (&receiver_key, 101, 0)] {
                     let account = Account {
                         balance,
+                        tx_count: 1,
                         nonce: Nonce {
                             base: nonce,
                             bitmap: 0,
                         },
                     };
-                    state_ops.push(StateOperation::Update(UnorderedUpdate(
-                        AccountKey::from_public_key(key),
-                        AccountValue::try_from(account.encode().as_ref())
-                            .expect("fixed account value"),
-                    )));
+                    state_writes.push((AccountKey::from_public_key(key), Some(account)));
                 }
                 transaction_ops.push(TransactionOperation::<Sha256>::Append(
-                    *transaction.message_digest(),
+                    TransactionHistoryEntry {
+                        digest: *transaction.message_digest(),
+                        sender_index: 0,
+                        recipient_index: 0,
+                    },
                 ));
                 body.push(transaction);
             }
-            state_ops.push(StateOperation::CommitFloor(None, Location::new(1)));
             transaction_ops.push(TransactionOperation::<Sha256>::Commit(
                 None,
                 Location::new(1),
             ));
-            let state = queued_range(&encode_operations(&state_ops), 1, state_ops.len() as u64);
+            let state = state_fixtures(vec![state_writes]).remove(0);
             let transactions = queued_range(
                 &encode_operations(&transaction_ops),
                 1,
                 transaction_ops.len() as u64,
             );
-            drop((state_ops, transaction_ops));
-            let header = test_block(1, &state, &transactions).header.clone();
-            let block = Block::new(header, body).seal(&mut Sha256::default()).into();
+            drop(transaction_ops);
+            let template = test_block(1, &state, &transactions);
+            let block = Block::new(template.header.clone(), body, template.state_sync.clone())
+                .seal(&mut Sha256::default())
+                .into();
             let (server, url) = exoware_simulator::open_temp().await.expect("open Store");
             let physical = writer_store_client(&url, None).expect("Store client");
             let schema = Arc::new(build_meta_schema(sql_meta_client(&physical).unwrap()).unwrap());
@@ -2956,7 +3148,8 @@ mod tests {
                 UploadData {
                     block,
                     finalized_ts_micros: 1,
-                    state,
+                    state: state.range,
+                    state_delta: CurrentStateDelta::from(state.boundary),
                     transactions,
                     omit_pinned_nodes: false,
                 },
@@ -3024,52 +3217,53 @@ mod tests {
             };
             let first_transaction = transaction(0);
             let second_transaction = transaction(1);
-            let account = |balance| {
-                AccountValue::try_from(
-                    Account {
-                        balance,
-                        nonce: Nonce::default(),
-                    }
-                    .encode()
-                    .as_ref(),
-                )
-                .expect("fixed account value")
+            let account = |balance, tx_count| Account {
+                balance,
+                tx_count,
+                nonce: Nonce::default(),
             };
             let account_key = AccountKey::from_public_key(&key);
-            let state_operations = [
-                StateOperation::CommitFloor(None, Location::new(0)),
-                StateOperation::Update(UnorderedUpdate(account_key, account(10))),
-                StateOperation::CommitFloor(None, Location::new(1)),
-                StateOperation::Update(UnorderedUpdate(account_key, account(9))),
-                StateOperation::CommitFloor(None, Location::new(1)),
-            ];
+            let mut states = state_fixtures(vec![
+                vec![(account_key, Some(account(10, 1)))],
+                vec![(account_key, Some(account(9, 2)))],
+            ]);
+            let second_state = states.pop().unwrap();
+            let first_state = states.pop().unwrap();
             let transaction_operations = [
                 TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
-                TransactionOperation::<Sha256>::Append(*first_transaction.message_digest()),
+                TransactionOperation::<Sha256>::Append(TransactionHistoryEntry {
+                    digest: *first_transaction.message_digest(),
+                    sender_index: 0,
+                    recipient_index: 0,
+                }),
                 TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
-                TransactionOperation::<Sha256>::Append(*second_transaction.message_digest()),
+                TransactionOperation::<Sha256>::Append(TransactionHistoryEntry {
+                    digest: *second_transaction.message_digest(),
+                    sender_index: 1,
+                    recipient_index: 1,
+                }),
                 TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
             ];
-            let state_encoded = encode_operations(&state_operations);
             let transaction_encoded = encode_operations(&transaction_operations);
-            let first_state = queued_range(&state_encoded, 1, 3);
             let first_transactions = queued_range(&transaction_encoded, 1, 3);
-            let second_state = queued_range(&state_encoded, 3, 5);
             let second_transactions = queued_range(&transaction_encoded, 3, 5);
-            let first_header = test_block(1, &first_state, &first_transactions)
-                .header
-                .clone();
-            let first_block: EngineBlock<Sha256, ed25519::VerifyingKey> =
-                Block::new(first_header, vec![first_transaction])
-                    .seal(&mut Sha256::default())
-                    .into();
-            let second_header = test_block(2, &second_state, &second_transactions)
-                .header
-                .clone();
-            let second_block: EngineBlock<Sha256, ed25519::VerifyingKey> =
-                Block::new(second_header, vec![second_transaction])
-                    .seal(&mut Sha256::default())
-                    .into();
+            let first_template = test_block(1, &first_state, &first_transactions);
+            let first_block: EngineBlock<Sha256, ed25519::VerifyingKey> = Block::new(
+                first_template.header.clone(),
+                vec![first_transaction],
+                first_template.state_sync.clone(),
+            )
+            .seal(&mut Sha256::default())
+            .into();
+            let second_template = test_block(2, &second_state, &second_transactions);
+            let second_block: EngineBlock<Sha256, ed25519::VerifyingKey> = Block::new(
+                second_template.header.clone(),
+                vec![second_transaction],
+                second_template.state_sync.clone(),
+            )
+            .seal(&mut Sha256::default())
+            .into();
+            let state_ranges = [first_state.range.clone(), second_state.range.clone()];
             let first_digest = *first_block.seal();
             let second_digest = *second_block.seal();
             let first = queued_upload_from(
@@ -3100,25 +3294,26 @@ mod tests {
 
             assert_eq!(target(&target_client, 1).await, Some(first_digest));
             assert_eq!(target(&target_client, 2).await, Some(second_digest));
-            let state = Unordered::<
+            let state = Ordered::<
                 QmdbFamily,
                 Sha256,
                 AccountKey,
                 AccountValue,
                 STATE_PROOF_CHUNK_SIZE,
                 StateEncoding,
-            >::new(state_client, ());
-            let transactions =
-                Keyless::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
-                    transaction_client,
-                    (),
-                );
+            >::new(state_client, (), ());
+            let transactions = Keyless::<
+                QmdbFamily,
+                Sha256,
+                TransactionHistoryEntry<Sha256Digest>,
+                TransactionEncoding<Sha256>,
+            >::new(transaction_client, ());
             assert_eq!(
                 state
                     .latest_published_watermark()
                     .await
                     .expect("read state watermark"),
-                Some(Location::new(4))
+                Some(Location::new(second_block.header.state_range.end() - 1))
             );
             assert_eq!(
                 transactions
@@ -3128,12 +3323,19 @@ mod tests {
                 Some(Location::new(4))
             );
 
-            for (block, start) in [(&first_block, 1), (&second_block, 3)] {
+            for ((block, tx_start), state_range) in [(&first_block, 1), (&second_block, 3)]
+                .into_iter()
+                .zip(&state_ranges)
+            {
                 let state_tip = Location::new(block.header.state_range.end() - 1);
                 let transaction_tip = Location::new(block.header.transactions_range.end() - 1);
                 assert_eq!(
                     state.root_at(state_tip).await.expect("state root"),
                     block.header.state_root,
+                );
+                assert_eq!(
+                    state.ops_root_at(state_tip).await.expect("state ops root"),
+                    block.state_sync.ops_root,
                 );
                 assert_eq!(
                     transactions
@@ -3142,7 +3344,7 @@ mod tests {
                         .expect("transaction root"),
                     block.header.transactions_root,
                 );
-                for location in start..block.header.state_range.end() {
+                for location in state_range.start..state_range.end {
                     let proof = Box::pin(state.operation_range(
                         state_tip,
                         Location::new(location),
@@ -3153,13 +3355,23 @@ mod tests {
                     .expect("state operation proof");
                     assert_eq!(proof.root, block.header.state_root);
                     assert_eq!(proof.start_location, Location::new(location));
-                    let index = usize::try_from(location).expect("location fits usize");
+                    let index =
+                        usize::try_from(location - state_range.start).expect("offset fits usize");
                     assert_eq!(
                         encode_operations(&proof.operations),
-                        state_encoded[index..index + 1],
+                        state_range.operations[index..index + 1]
                     );
+                    let current = Box::pin(state.current_operation_range(
+                        state_tip,
+                        Location::new(location),
+                        1,
+                        None,
+                    ))
+                    .await
+                    .expect("current state operation proof");
+                    assert_eq!(current.root, block.header.state_root);
                 }
-                for location in start..block.header.transactions_range.end() {
+                for location in tx_start..block.header.transactions_range.end() {
                     let proof = Box::pin(transactions.operation_range(
                         transaction_tip,
                         Location::new(location),
@@ -3193,10 +3405,48 @@ mod tests {
                     ))
                     .await
                     .expect("transaction append proof");
+                    let entry = TransactionHistoryEntry {
+                        digest,
+                        sender_index: block.header.height - 1,
+                        recipient_index: block.header.height - 1,
+                    };
                     assert_eq!(
                         proof.operations,
-                        vec![TransactionOperation::<Sha256>::Append(digest)],
+                        vec![TransactionOperation::<Sha256>::Append(entry)]
                     );
+                    let mut checkpoint = Box::pin(transactions.operation_range_checkpoint(
+                        transaction_tip,
+                        Location::new(append_start + offset),
+                        1,
+                        None,
+                    ))
+                    .await
+                    .expect("transaction append checkpoint");
+                    assert_eq!(
+                        checkpoint.canonical_root::<Sha256>(),
+                        block.header.transactions_root
+                    );
+                    assert!(checkpoint.verify::<Sha256>());
+                    for altered in [
+                        TransactionHistoryEntry {
+                            digest: Sha256Digest::EMPTY,
+                            ..entry
+                        },
+                        TransactionHistoryEntry {
+                            sender_index: entry.sender_index + 1,
+                            ..entry
+                        },
+                        TransactionHistoryEntry {
+                            recipient_index: entry.recipient_index + 1,
+                            ..entry
+                        },
+                    ] {
+                        checkpoint.encoded_operations[0] =
+                            TransactionOperation::<Sha256>::Append(altered)
+                                .encode()
+                                .to_vec();
+                        assert!(!checkpoint.verify::<Sha256>());
+                    }
                 }
             }
 
@@ -3219,37 +3469,27 @@ mod tests {
 
     async fn persisted_test_upload(
         clients: &WorkerClients,
+        metrics: &super::super::PublisherMetrics,
         height: u64,
-        state: QueuedAuthenticatedRange<Sha256Digest>,
+        state: StateFixture,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
     ) -> PersistedUpload {
-        let state_root = queued_range_root(&state, state.start);
-        let transactions_root = queued_range_root(&transactions, transactions.start);
-        let state = prepare_authenticated_range::<QmdbFamily, Sha256, StateOperation, Sequential>(
-            &as_authenticated_range(&state, state.start),
-            &state_root,
-            &(),
-            &Sequential,
-        )
-        .expect("prepare state range");
-        let transactions = prepare_authenticated_range::<
-            QmdbFamily,
-            Sha256,
-            TransactionOperation<Sha256>,
+        let (batch, state_end, transaction_end) = prepare_data_batch(
+            clients.state.clone(),
+            clients.transactions.clone(),
+            clients.sql_schema.clone(),
             Sequential,
-        >(
-            &as_authenticated_range(&transactions, transactions.start),
-            &transactions_root,
-            &(),
-            &Sequential,
+            UploadData {
+                block: test_block(height, &state, &transactions),
+                finalized_ts_micros: height as i64,
+                state: state.range,
+                state_delta: CurrentStateDelta::from(state.boundary),
+                transactions,
+                omit_pinned_nodes: false,
+            },
+            metrics,
         )
-        .expect("prepare transaction range");
-        let mut batch = StoreWriteBatch::new();
-        let state_end = state.latest_location();
-        let transaction_end = transactions.latest_location();
-        stage_authenticated_range(&clients.state, state, &mut batch).expect("stage state range");
-        stage_authenticated_range(&clients.transactions, transactions, &mut batch)
-            .expect("stage transaction range");
+        .expect("prepare native test data");
         batch
             .commit(&clients.store)
             .await
@@ -3261,6 +3501,83 @@ mod tests {
             persisted_at: Instant::now(),
             publication_wait_span: Span::none(),
         }
+    }
+
+    #[derive(Clone)]
+    struct StateFixture {
+        range: QueuedAuthenticatedRange<Sha256Digest>,
+        boundary: Boundary<QmdbFamily, Sha256Digest, 32>,
+        ops_root: Sha256Digest,
+        sync_start: u64,
+        operations: Arc<Vec<CapturedStateOperation>>,
+    }
+
+    fn empty_states(count: usize) -> Vec<StateFixture> {
+        state_fixtures(vec![Vec::new(); count])
+    }
+
+    fn state_fixtures(writes: Vec<Vec<(AccountKey, Option<Account>)>>) -> Vec<StateFixture> {
+        deterministic::Runner::default().start(|context| async move {
+            let page_cache = CacheRef::new(NZU16!(88), NZUsize!(8));
+            let mut db =
+                Db::<QmdbFamily, _, AccountKey, Account, Sha256, TwoCap, 32, Sequential>::init(
+                    context,
+                    commonware_storage::qmdb::current::Config {
+                        merkle_config: commonware_storage::merkle::full::Config {
+                            journal_partition: "publisher-fixture-merkle".into(),
+                            metadata_partition: "publisher-fixture-merkle-meta".into(),
+                            items_per_blob: NZU64!(1024),
+                            write_buffer: NZUsize!(4096),
+                            replay_buffer: NZUsize!(4096),
+                            strategy: Sequential,
+                            page_cache: page_cache.clone(),
+                        },
+                        journal_config: JournalConfig {
+                            partition: "publisher-fixture-operations".into(),
+                            items_per_blob: NZU64!(1024),
+                            page_cache,
+                            write_buffer: NZUsize!(4096),
+                            replay_buffer: NZUsize!(4096),
+                        },
+                        grafted_metadata_partition: "publisher-fixture-grafted-meta".into(),
+                        translator: TwoCap,
+                        init_cache: None,
+                        init_buffer: NZUsize!(4096),
+                        init_concurrency: (),
+                    },
+                    None,
+                )
+                .await
+                .expect("initialize native current fixture");
+            let mut states = Vec::with_capacity(writes.len());
+            for writes in writes {
+                let mut batch = db.new_batch();
+                for (key, value) in writes {
+                    batch = batch.write(key, value);
+                }
+                let batch = batch
+                    .merkleize(&db, None, &mut Proportional)
+                    .await
+                    .expect("merkleize native current fixture");
+                let (start, operations) = batch.operations();
+                let range = QueuedAuthenticatedRange {
+                    start: start.as_u64(),
+                    end: batch.bounds().tip.size.as_u64(),
+                    pinned_nodes: batch.ops_pinned_nodes(&db).expect("native fixture pins"),
+                    operations: encode_operations(&operations),
+                };
+                states.push(StateFixture {
+                    range,
+                    boundary: batch.boundary(),
+                    ops_root: batch.ops_root(),
+                    sync_start: batch.sync_boundary().as_u64(),
+                    operations,
+                });
+                db = db.apply_batch(batch).await.expect("apply native fixture");
+            }
+            db.destroy().await.expect("destroy native fixture");
+            states
+        })
     }
 
     fn encode_operations<T: Encode>(operations: &[T]) -> Vec<Vec<u8>> {
@@ -3300,7 +3617,7 @@ mod tests {
 
     fn queued_upload(
         height: u64,
-        state: QueuedAuthenticatedRange<Sha256Digest>,
+        state: StateFixture,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
     ) -> QueuedFinalizedUpload<Sha256, ed25519::VerifyingKey, MinSig> {
         let block = test_block(height, &state, &transactions);
@@ -3311,14 +3628,15 @@ mod tests {
     fn queued_upload_from(
         block: EngineBlock<Sha256, ed25519::VerifyingKey>,
         finalization: TestFinalization,
-        state: QueuedAuthenticatedRange<Sha256Digest>,
+        state: StateFixture,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
     ) -> QueuedFinalizedUpload<Sha256, ed25519::VerifyingKey, MinSig> {
         let upload = QueuedFinalizedUpload {
             finalized_ts_micros: i64::try_from(block.header.height).expect("height fits timestamp"),
             block,
             finalization: Some(finalization),
-            state,
+            state: state.range,
+            state_delta: CurrentStateDelta::from(state.boundary),
             transactions,
         };
         upload.validate().expect("test upload validates");
@@ -3327,10 +3645,10 @@ mod tests {
 
     fn test_block(
         height: u64,
-        state: &QueuedAuthenticatedRange<Sha256Digest>,
+        state: &StateFixture,
         transactions: &QueuedAuthenticatedRange<Sha256Digest>,
     ) -> EngineBlock<Sha256, ed25519::VerifyingKey> {
-        let state_root = queued_range_root(state, state.start);
+        let state_root = state.boundary.root;
         let transactions_root = queued_range_root(transactions, transactions.start);
         let leader = ed25519::SigningKey::from_seed(height).public_key();
         let header = Header {
@@ -3343,13 +3661,20 @@ mod tests {
             height,
             timestamp: height,
             state_root,
-            state_range: non_empty_range!(state.start, state.end),
+            state_range: non_empty_range!(state.sync_start, state.range.end),
             transactions_root,
             transactions_range: non_empty_range!(transactions.start, transactions.end),
         };
         EngineBlock::from(
-            Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
-                .seal(&mut Sha256::default()),
+            Block::new(
+                header,
+                Vec::<SignedTransaction<Sha256>>::new(),
+                StateSyncProof {
+                    ops_root: state.ops_root,
+                    witness: state.boundary.witness.clone(),
+                },
+            )
+            .seal(&mut Sha256::default()),
         )
     }
 

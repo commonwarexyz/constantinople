@@ -13,7 +13,7 @@ export function normalizeSearchQuery(value: string): string {
 }
 
 /** Returns a navigation hint. Destination pages authenticate their own evidence. */
-export async function searchIndexer(endpoint: string, query: string, signal: AbortSignal): Promise<SearchMatch | null> {
+export async function searchIndexer(endpoint: string, query: string, signal: AbortSignal): Promise<SearchMatch> {
     signal.throwIfAborted();
     const value = normalizeSearchQuery(query);
     try {
@@ -24,7 +24,8 @@ export async function searchIndexer(endpoint: string, query: string, signal: Abo
         }
         return { kind: match.kind === SearchKind.ACCOUNT ? 'account' : 'transaction', value };
     } catch (error) {
-        if (error instanceof ConnectError && error.code === Code.NotFound) return null;
+        signal.throwIfAborted();
+        if (error instanceof ConnectError && error.code === Code.NotFound) return { kind: 'account', value };
         throw error;
     }
 }

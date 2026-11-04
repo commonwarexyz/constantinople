@@ -58,6 +58,7 @@ fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTr
             Account {
                 balance: 1_000_000,
                 nonce,
+                tx_count: 0,
             },
         );
         transfers.push(PreparedTransfer {

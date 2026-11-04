@@ -40,8 +40,7 @@ export function SearchForm({ ref, endpoint, onOpenAccount, onOpenTransaction }: 
             const normalized = normalizeSearchQuery(query);
             const match = await searchIndexer(endpoint, normalized, controller.signal);
             if (controller.signal.aborted) return;
-            if (!match) setMessage('no indexed match');
-            else if (match.kind === 'account') onOpenAccount(match.value);
+            if (match.kind === 'account') onOpenAccount(match.value);
             else onOpenTransaction(match.value);
         } catch (error) {
             if (!controller.signal.aborted) setMessage(errorMessage(error));

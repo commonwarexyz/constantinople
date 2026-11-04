@@ -7,7 +7,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
+use constantinople_primitives::{Block, Header, Sealable, SealedBlock, StateSyncProof};
 
 /// Creates the genesis block.
 pub fn genesis_block<C, P, H>(
@@ -46,6 +46,10 @@ where
     P: PublicKey,
     H: Hasher,
 {
+    let state_sync = StateSyncProof::initial::<H>();
+    assert_eq!(state_target.root, state_sync.ops_root);
+    assert_eq!(*state_target.range.start(), 0);
+    assert_eq!(*state_target.range.end(), 1);
     let header = Header {
         context: Context {
             round: Round::zero(),
@@ -55,11 +59,11 @@ where
         parent: H::Digest::EMPTY,
         height: 0,
         timestamp,
-        state_root: state_target.root,
+        state_root: state_sync.root::<H>(),
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transactions_target.root,
         transactions_range: non_empty_range!(0, *transactions_target.size),
     };
 
-    Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
+    Block::<C, P, H>::new(header, Vec::new(), state_sync).seal(hasher)
 }

@@ -1,0 +1,33 @@
+[package]
+name = "constantinople-account-proof"
+description = "Verify Constantinople current account inclusion and exclusion proofs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[features]
+wasm = ["dep:js-sys", "dep:wasm-bindgen"]
+
+[dependencies]
+constantinople-primitives.workspace = true
+commonware-codec.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-storage.workspace = true
+thiserror.workspace = true
+js-sys = { version = "=0.3.103", optional = true }
+wasm-bindgen = { version = "=0.2.126", optional = true }
+
+[dev-dependencies]
+commonware-parallel.workspace = true
+commonware-runtime.workspace = true
+commonware-utils.workspace = true

@@ -1,0 +1,297 @@
+//! Benchmarks for QMDB database generation (write-heavy workloads).
+//!
+//! Measures the time to seed a database and perform random updates/deletes across all keyed
+//! variants (fixed-value, variable-value), the unauthenticated store, and the keyless variant.
+
+use crate::common::{
+    Digest, define_fixed_variants, define_vec_variants, gen_random_kv, gen_store_random_kv,
+    make_fixed_value, make_var_value, open_keyless_db, open_store_db,
+};
+use commonware_macros::boxed;
+use commonware_runtime::{
+    Supervisor as _,
+    benchmarks::{context, tokio},
+    tokio::{Config, Context},
+};
+use commonware_storage::{
+    merkle::{Family, mmb, mmr},
+    qmdb::any::traits::DbAny,
+};
+use commonware_utils::TestRng;
+use criterion::{Criterion, criterion_group};
+use rand::Rng;
+use std::time::{Duration, Instant};
+
+const NUM_ELEMENTS: u64 = 1_000;
+const NUM_OPERATIONS: u64 = 10_000;
+const COMMITS_PER_ITERATION: u64 = 100;
+const CASES: [(u64, u64); 1] = [(NUM_ELEMENTS, NUM_OPERATIONS)];
+
+cfg_if::cfg_if! {
+    if #[cfg(not(full_bench))] {
+        const STORE_CASES: [(u64, u64); 1] = [(NUM_ELEMENTS, NUM_OPERATIONS)];
+    } else {
+        /// The full run also measures the store at the init bench's population size, where the
+        /// log outgrows the page cache.
+        const STORE_CASES: [(u64, u64); 2] = [
+            (NUM_ELEMENTS, NUM_OPERATIONS),
+            (NUM_ELEMENTS * 100, NUM_OPERATIONS * 100),
+        ];
+    }
+}
+
+/// Benchmark a populated database: generate data, prune, sync. Returns elapsed time (excluding
+/// destroy).
+#[boxed]
+async fn bench_db<F: Family, C: DbAny<F, Key = Digest>>(
+    db: C,
+    elements: u64,
+    operations: u64,
+    commit_frequency: u32,
+    make_value: impl Fn(&mut TestRng) -> C::Value,
+) -> Duration {
+    let start = Instant::now();
+    let db = gen_random_kv::<F, _>(
+        db,
+        elements,
+        operations,
+        Some(commit_frequency),
+        None, // seed_batch
+        None, // prune_frequency
+        None, // key_zipf_exponent (uniform churn)
+        None, // keyspace (all keys seeded)
+        make_value,
+    )
+    .await;
+    let boundary = db.sync_boundary();
+    let db = db.prune(boundary).await.unwrap();
+    let db = db.sync().await.unwrap();
+    let elapsed = start.elapsed();
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+define_fixed_variants! {
+    enum FixedVariant;
+    const FIXED_VARIANTS;
+    dispatch dispatch_fixed;
+    timed_dispatch dispatch_fixed_timed_init;
+}
+
+fn bench_fixed_value_generate(c: &mut Criterion) {
+    let runner = tokio::Runner::new(Config::default());
+    for (elements, operations) in CASES {
+        for &variant in FIXED_VARIANTS {
+            c.bench_function(
+                &format!(
+                    "{}/variant={} elements={elements} operations={operations}",
+                    module_path!(),
+                    variant.name(),
+                ),
+                |b| {
+                    b.to_async(&runner).iter_custom(|iters| async move {
+                        let ctx = context::get::<Context>();
+                        let commit_freq = (operations / COMMITS_PER_ITERATION) as u32;
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            total += dispatch_fixed!(ctx.child("storage"), variant, |db| {
+                                bench_db(db, elements, operations, commit_freq, make_fixed_value)
+                                    .await
+                            });
+                        }
+                        total
+                    });
+                },
+            );
+        }
+    }
+}
+
+define_vec_variants! {
+    enum VarVariant;
+    const VEC_VARIANTS;
+    dispatch dispatch_var;
+    timed_dispatch dispatch_var_timed_init;
+}
+
+fn bench_var_value_generate(c: &mut Criterion) {
+    let runner = tokio::Runner::new(Config::default());
+    for (elements, operations) in CASES {
+        for &variant in VEC_VARIANTS {
+            c.bench_function(
+                &format!(
+                    "{}/variant={} elements={elements} operations={operations}",
+                    module_path!(),
+                    variant.name(),
+                ),
+                |b| {
+                    b.to_async(&runner).iter_custom(|iters| async move {
+                        let ctx = context::get::<Context>();
+                        let commit_freq = (operations / COMMITS_PER_ITERATION) as u32;
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            total += dispatch_var!(ctx.child("storage"), variant, |db| {
+                                bench_db(db, elements, operations, commit_freq, make_var_value)
+                                    .await
+                            });
+                        }
+                        total
+                    });
+                },
+            );
+        }
+    }
+}
+
+/// Benchmark seeding and churning an unauthenticated store, then pruning and syncing it, for each
+/// of [`STORE_CASES`].
+fn bench_store_generate(c: &mut Criterion) {
+    let runner = tokio::Runner::new(Config::default());
+    for (elements, operations) in STORE_CASES {
+        c.bench_function(
+            &format!(
+                "{}/variant=store::variable elements={elements} operations={operations}",
+                module_path!(),
+            ),
+            |b| {
+                b.to_async(&runner).iter_custom(|iters| async move {
+                    let ctx = context::get::<Context>();
+                    let commit_freq = (operations / COMMITS_PER_ITERATION) as u32;
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let db = open_store_db(ctx.child("storage")).await;
+                        let start = Instant::now();
+                        let db = gen_store_random_kv(
+                            db,
+                            elements,
+                            operations,
+                            commit_freq,
+                            make_var_value,
+                        )
+                        .await;
+                        let floor = db.inactivity_floor_loc();
+                        let db = db.prune(floor).await.unwrap();
+                        let db = db.sync().await.unwrap();
+                        total += start.elapsed();
+                        db.destroy().await.unwrap();
+                    }
+                    total
+                });
+            },
+        );
+    }
+}
+
+const KEYLESS_OPS: u64 = 10_000;
+const KEYLESS_COMMIT_FREQ: u32 = 25;
+
+macro_rules! keyless_variants {
+    (
+        $(
+            $entry:ident {
+                name: $name:literal,
+                init: |$ctx:ident| $init:expr,
+            }
+        )+
+    ) => {
+        #[derive(Debug, Clone, Copy)]
+        enum KeylessVariant {
+            $($entry),+
+        }
+
+        impl KeylessVariant {
+            const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$entry => $name),+
+                }
+            }
+        }
+
+        const KEYLESS_VARIANTS: &[KeylessVariant] = &[$(KeylessVariant::$entry),+];
+
+        macro_rules! dispatch_keyless {
+            ($ctx_expr:expr, $variant_expr:expr, |$db_name:ident| $body:expr) => {
+                match $variant_expr {
+                    $(
+                        KeylessVariant::$entry => {
+                            let $ctx = $ctx_expr;
+                            let mut $db_name = $init.await;
+                            $body
+                        }
+                    )+
+                }
+            };
+        }
+    };
+}
+
+keyless_variants! {
+    Mmr {
+        name: "keyless::mmr",
+        init: |ctx| open_keyless_db::<mmr::Family>(ctx.child("storage")),
+    }
+    Mmb {
+        name: "keyless::mmb",
+        init: |ctx| open_keyless_db::<mmb::Family>(ctx.child("storage")),
+    }
+}
+
+fn bench_keyless_generate(c: &mut Criterion) {
+    let runner = tokio::Runner::new(Config::default());
+    for operations in [KEYLESS_OPS, KEYLESS_OPS * 2] {
+        for &variant in KEYLESS_VARIANTS {
+            c.bench_function(
+                &format!(
+                    "{}/variant={} operations={operations}",
+                    module_path!(),
+                    variant.name(),
+                ),
+                |b| {
+                    b.to_async(&runner).iter_custom(|iters| async move {
+                        let ctx = context::get::<Context>();
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let start = Instant::now();
+                            dispatch_keyless!(ctx.child("storage"), variant, |db| {
+                                let mut rng = TestRng::new(42);
+                                let mut batch = db.new_batch();
+                                for _ in 0u64..operations {
+                                    let v = make_var_value(&mut rng);
+                                    batch = batch.append(v);
+                                    if rng.next_u32().is_multiple_of(KEYLESS_COMMIT_FREQ) {
+                                        let merkleized = batch
+                                            .merkleize(&db, None, db.inactivity_floor_loc())
+                                            .await
+                                            .unwrap();
+                                        db = db.apply_batch(merkleized).await.unwrap();
+                                        batch = db.new_batch();
+                                    }
+                                }
+                                let merkleized = batch
+                                    .merkleize(&db, None, db.inactivity_floor_loc())
+                                    .await
+                                    .unwrap();
+                                let db = db.apply_batch(merkleized).await.unwrap();
+                                let db = db.sync().await.unwrap();
+
+                                total += start.elapsed();
+                                db.destroy().await.unwrap();
+                            });
+                        }
+                        total
+                    });
+                },
+            );
+        }
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets =
+        bench_fixed_value_generate,
+        bench_var_value_generate,
+        bench_store_generate,
+        bench_keyless_generate
+}

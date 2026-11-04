@@ -19,7 +19,7 @@ const key = submittedTransactionHistoryKey({ indexerUrl: 'http://indexer', simpl
 const legacy = (committee = material, wallet = account) => `constantinople.submitted-transactions.v3:http%3A%2F%2Fsql:http%3A%2F%2Fqmdb:http%3A%2F%2Fstore:http%3A%2F%2Frelayer:${committee}:${wallet}`;
 const pending: SubmittedTransaction = {
     reconciliationVersion: 2, sender: account, digest: 'cc'.repeat(32), to: 'dd'.repeat(32),
-    value: '1', nonce: '0', submittedAt: 1, finalizationObservedInMs: null,
+    value: '1', nonce: '0', submittedAt: 1, reportedInMs: null, reportedHeight: null, finalizationObservedInMs: null,
     proofObservedInMs: null, status: 'reconciling', detail: 'delivery uncertain',
     finalizedHeight: null, certificate: WAITING_FINALIZATION_CERTIFICATE, proof: WAITING_FINALIZATION_PROOF,
 };

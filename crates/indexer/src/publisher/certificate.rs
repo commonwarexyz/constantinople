@@ -582,7 +582,8 @@ mod tests {
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_engine::ThresholdScheme;
     use constantinople_primitives::{
-        Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+        Block, Header, Sealable, StateSyncProof, TRANSACTION_NAMESPACE, Transaction,
+        TransactionPublicKey,
     };
     use exoware_simplex::SimplexReader;
     use rand::{SeedableRng, rngs::StdRng};
@@ -934,6 +935,7 @@ mod tests {
             0,
         )
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let state_sync = StateSyncProof::initial::<Sha256>();
         let header = Header {
             context: SimplexContext {
                 round: Round::zero(),
@@ -943,12 +945,12 @@ mod tests {
             parent: Sha256Digest::EMPTY,
             height,
             timestamp: 0,
-            state_root: Sha256Digest::EMPTY,
-            state_range: non_empty_range!(0, 2),
+            state_root: state_sync.root::<Sha256>(),
+            state_range: non_empty_range!(0, 1),
             transactions_root: Sha256Digest::EMPTY,
             transactions_range: non_empty_range!(0, 2),
         };
-        let block = Block::new(header, vec![transaction]).seal(&mut Sha256::default());
+        let block = Block::new(header, vec![transaction], state_sync).seal(&mut Sha256::default());
         EngineBlock::from(block)
     }
 

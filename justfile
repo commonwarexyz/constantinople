@@ -58,3 +58,12 @@ explorer-build:
 # Install Explorer dependencies.
 explorer-install *args='':
   npm --prefix explorer install $@
+
+# Test the native fixed-account proof verifier.
+account-proof-test *args='':
+  cargo test -p constantinople-account-proof $@
+
+# Build the browser verifier into a caller-owned output directory.
+account-proof-wasm out target:
+  RUSTFLAGS='' CARGO_ENCODED_RUSTFLAGS='' CARGO_TARGET_DIR="$2" cargo build --release --locked -p constantinople-account-proof --target wasm32-unknown-unknown --features wasm
+  wasm-bindgen "$2/wasm32-unknown-unknown/release/constantinople_account_proof.wasm" --target web --out-name constantinople_account_proof --out-dir "$1"

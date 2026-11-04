@@ -130,85 +130,46 @@ impl Query for CountingStore {
     }
 }
 
-/// Decodes the activity position of every returned row.
-fn cursors(batches: &[RecordBatch]) -> Vec<Cursor> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            (0..batch.num_rows()).map(|row| Cursor {
-                height: uint(batch, 0, row).unwrap(),
-                index: uint(batch, 1, row).unwrap(),
-                role: uint(batch, 2, row).unwrap(),
-            })
-        })
-        .collect()
-}
-
-/// Asserts that seeking from `cursor` returns the same page as one disjunctive
-/// cursor predicate while reading at most one page plus one row. With `deep`,
-/// the disjunctive query must scan the prefix the seek skips.
-async fn compare_page(
+/// Asserts that the authenticated interval reads only its own rows.
+async fn assert_page(
     sql: &SqlContext,
     reads: &Reads,
     account: [u8; 32],
-    cursor: Cursor,
+    end: u64,
     expected: &[(u64, u64, u64)],
-    deep: bool,
 ) {
-    // Run the single-predicate reference query and record its reads.
     let request = AccountRequest {
         key: AccountKey::from(account),
-        mode: None,
-        cursor: Some(cursor),
+        cursor: Some(Cursor(end)),
         snapshot: None,
+        account_location: None,
         activity: true,
     };
-    let old_query = format!(
-        "SELECT height, index, role, tx_digest, qmdb_location FROM tx_activity WHERE account = X'{}' AND height <= 4096 AND (height < {} OR (height = {} AND index < {}) OR (height = {} AND index = {} AND role < {})) ORDER BY height DESC, index DESC, role DESC LIMIT 11",
-        hex(&account),
-        cursor.height,
-        cursor.height,
-        cursor.index,
-        cursor.height,
-        cursor.index,
-        cursor.role
-    );
-    let old = query_rows(sql, &old_query, 11).await.unwrap();
-    let old_reads = reads.finish().await;
-
-    // Run the cursor seek and record its reads.
-    let new = activity_rows(sql, &request, 4096).await.unwrap();
-    let new_reads = reads.finish().await;
-
-    // Both queries must return the expected page. The seek must stay within the
-    // page budget, and a deep reference query must scan the skipped prefix.
-    let tuples = |batches: &[RecordBatch]| {
-        cursors(batches)
-            .into_iter()
-            .map(|cursor| (cursor.height, cursor.index, cursor.role))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(tuples(&old), expected);
-    assert_eq!(tuples(&new), expected);
+    let batches = activity_rows(sql, &request, end.saturating_sub(10), end, 4096)
+        .await
+        .unwrap();
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row| {
+                (
+                    uint(batch, 0, row).unwrap(),
+                    uint(batch, 1, row).unwrap(),
+                    uint(batch, 2, row).unwrap(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    let (range, point) = reads.finish().await;
     assert!(
-        new_reads.0 + new_reads.1 <= 11,
-        "cursor seeks must read at most the remaining page budget: {new_reads:?}"
-    );
-    if deep {
-        assert!(
-            old_reads.0 >= 2048,
-            "the residual cursor must exercise the discarded prefix: {old_reads:?}"
-        );
-    }
-    eprintln!(
-        "activity cursor ({},{},{}) old range/point={old_reads:?}, seek range/point={new_reads:?}",
-        cursor.height, cursor.index, cursor.role
+        range + point <= expected.len(),
+        "account intervals must read only their page: range={range}, point={point}"
     );
 }
 
 #[tokio::test]
 async fn activity_cursor_seeks_read_only_the_remaining_page() {
-    // Serve a RocksDB Store whose query service counts returned rows.
     let store = Arc::new(RocksStore::open_owned(tempfile::tempdir().unwrap(), None).unwrap());
     let reads = Arc::new(Reads::default());
     let query = Arc::new(CountingStore {
@@ -224,8 +185,6 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    // Register the metadata schema over that Store.
     let client = writer_store_client(&url, None).unwrap();
     let client = sql_meta_client(&client).unwrap();
     let schema = build_meta_schema(client.clone()).unwrap();
@@ -233,12 +192,11 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
     let mut writer = schema.batch_writer();
     schema.register_all(&sql).unwrap();
 
-    // Write one account with 4096 rows at one height, one with a row at each of
-    // 4096 heights, and one whose page spans two heights. Writes must not count
-    // as query reads.
-    let mut insert = |account, height, index| {
+    // Account indices form one ordered key range across block boundaries.
+    let mut insert = |account, account_index, height, index| {
         let row = encode_tx_activity_row(TxActivityRow {
             account,
+            account_index,
             role: TxActivityRole::Sender,
             height,
             index,
@@ -251,93 +209,61 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
         writer.insert(row.table, row.values).unwrap();
     };
     for index in 0..4096 {
-        insert([1; 32], 1000, index);
-        insert([2; 32], u64::from(index) + 1, 0);
+        insert([1; 32], u64::from(index), 1000, index);
+        insert([2; 32], u64::from(index), u64::from(index) + 1, 0);
     }
-    for index in 0..21 {
-        insert([3; 32], 1, index);
-    }
-    for index in 0..3 {
-        insert([3; 32], 2, index);
+    for index in 0..24 {
+        let (height, block_index) = if index < 21 {
+            (1, index)
+        } else {
+            (2, index - 21)
+        };
+        insert([3; 32], u64::from(index), height, block_index);
     }
     writer.flush().await.unwrap();
     assert_eq!(reads.finish().await, (0, 0));
 
-    // A deep cursor within one height seeks past the newer indices.
-    compare_page(
+    assert_page(
         &sql,
         &reads,
         [1; 32],
-        Cursor {
-            height: 1000,
-            index: 32,
-            role: 1,
-        },
-        &(22..=32)
+        33,
+        &(23..33)
             .rev()
-            .map(|index| (1000, index, 0))
+            .map(|index| (index, 1000, index))
             .collect::<Vec<_>>(),
-        true,
     )
     .await;
-
-    // A deep cursor across heights seeks past the newer heights.
-    compare_page(
+    assert_page(
         &sql,
         &reads,
         [2; 32],
-        Cursor {
-            height: 32,
-            index: 0,
-            role: 1,
-        },
-        &(22..=32)
+        32,
+        &(22..32)
             .rev()
-            .map(|height| (height, 0, 0))
+            .map(|index| (index, index + 1, 0))
             .collect::<Vec<_>>(),
-        true,
     )
     .await;
-
-    // A page that spans two heights composes the cursor's suffix ranges.
-    let composed = [(2, 2, 0), (2, 1, 0), (2, 0, 0)]
-        .into_iter()
-        .chain((13..=20).rev().map(|index| (1, index, 0)))
-        .collect::<Vec<_>>();
-    compare_page(
+    assert_page(
         &sql,
         &reads,
         [3; 32],
-        Cursor {
-            height: 2,
-            index: 2,
-            role: 1,
-        },
-        &composed,
-        false,
+        24,
+        &(14..24)
+            .rev()
+            .map(|index| {
+                if index < 21 {
+                    (index, 1, index)
+                } else {
+                    (index, 2, index - 21)
+                }
+            })
+            .collect::<Vec<_>>(),
     )
     .await;
-
-    // The first possible position leaves no suffix range, so it returns no rows
-    // without reading the Store.
-    let request = AccountRequest {
-        key: AccountKey::from([3; 32]),
-        mode: None,
-        cursor: Some(Cursor {
-            height: 1,
-            index: 0,
-            role: 0,
-        }),
-        snapshot: None,
-        activity: true,
-    };
-    assert!(
-        activity_rows(&sql, &request, 4096)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(reads.finish().await, (0, 0));
+    assert_page(&sql, &reads, [3; 32], 3, &[(2, 1, 2), (1, 1, 1), (0, 1, 0)]).await;
+    assert_page(&sql, &reads, [3; 32], 0, &[]).await;
 
     server.abort();
     let _ = server.await;

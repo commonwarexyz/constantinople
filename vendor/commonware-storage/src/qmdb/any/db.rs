@@ -1,0 +1,710 @@
+//! A shared, generic implementation of the _Any_ QMDB.
+//!
+//! The impl blocks in this file define shared functionality across all Any QMDB variants.
+
+use super::operation::{Operation, update::Update};
+use crate::{
+    Context,
+    index::Unordered as UnorderedIndex,
+    journal::{
+        authenticated,
+        contiguous::{Contiguous, Mutable},
+    },
+    merkle::{Family, Location, Proof},
+    qmdb::{Error, bitmap::Shared, chain::Commitment, metrics::Metrics},
+};
+use commonware_codec::{Codec, CodecShared};
+use commonware_cryptography::Hasher;
+use commonware_macros::boxed;
+use commonware_parallel::Strategy;
+use commonware_runtime::{Handle, Spawner};
+use commonware_utils::bitmap;
+use core::{
+    future::Future,
+    num::{NonZeroU64, NonZeroUsize},
+};
+use std::sync::Arc;
+
+/// One shard's output from the fused [`Db::get_many_map`] path: mapped results for the shard's
+/// keys plus `(global key index, position)` pairs for page-cache misses.
+type ShardReads<T> = (Vec<Option<T>>, Vec<(usize, u64)>);
+
+/// Whether two `(key index, position)` candidates share a position.
+const fn same_position(a: &(usize, u64), b: &(usize, u64)) -> bool {
+    a.1 == b.1
+}
+
+/// Type alias for the authenticated journal used by [Db].
+pub(crate) type AuthenticatedLog<F, E, C, H, S> = authenticated::Journal<F, E, C, H, S>;
+
+/// An "Any" QMDB implementation generic over ordered/unordered keys and variable/fixed values.
+/// Consider using one of the following specialized variants instead, which may be more ergonomic:
+/// - [crate::qmdb::any::ordered::fixed::Db]
+/// - [crate::qmdb::any::ordered::variable::Db]
+/// - [crate::qmdb::any::unordered::fixed::Db]
+/// - [crate::qmdb::any::unordered::variable::Db]
+///
+/// `N` is the bitmap chunk size in bytes; defaults to `BITMAP_CHUNK_BYTES`. `current::Db`
+/// overrides `N` to match its grafted-tree configuration.
+pub struct Db<
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: CodecShared>,
+    I: UnorderedIndex<Value = Location<F>>,
+    H: Hasher,
+    U: Send + Sync,
+    const N: usize,
+    S: Strategy,
+> {
+    /// A (pruned) log of all operations in order of their application. The index of each
+    /// operation in the log is called its _location_, which is a stable identifier.
+    ///
+    /// # Invariants
+    ///
+    /// - The log is never pruned beyond the inactivity floor.
+    /// - There is always at least one commit operation in the log.
+    pub(crate) log: AuthenticatedLog<F, E, C, H, S>,
+
+    /// Cached operations root for this database.
+    pub(crate) root: H::Digest,
+
+    /// A location before which all operations are "inactive" (that is, operations before this point
+    /// are over keys that have been updated by some operation at or after this point).
+    pub(crate) inactivity_floor_loc: Location<F>,
+
+    /// A snapshot of all currently active operations in the form of a map from each key to the
+    /// location in the log containing its most recent update.
+    ///
+    /// # Invariant
+    ///
+    /// - Only references `Operation::Update`s.
+    pub(crate) snapshot: I,
+
+    /// The number of active keys in the snapshot.
+    pub(crate) active_keys: usize,
+
+    /// Activity bitmap over the applied operations. Rebuilt from the journal on init and never
+    /// persisted. The floor walk draws its candidates below the database's size from its set
+    /// bits. When wrapped by `current::Db`, it also supplies grafted-tree leaves and proofs.
+    ///
+    /// # Invariants
+    ///
+    /// - `bitmap.len() == log.size()`.
+    /// - For every unpruned location `i`, `bitmap[i] == 1` if and only if `snapshot` maps a
+    ///   key to `i` or `i` is the last commit.
+    pub(crate) bitmap: Arc<Shared<N>>,
+
+    /// Metrics for this database.
+    pub(crate) metrics: Metrics<E>,
+
+    /// Marker for the update type parameter.
+    pub(crate) _update: core::marker::PhantomData<U>,
+}
+
+impl<F, E, C, I, H, U, const N: usize, S> std::fmt::Debug for Db<F, E, C, I, H, U, N, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item = Operation<F, U>>,
+    I: UnorderedIndex<Value = Location<F>>,
+    H: Hasher,
+    U: Update,
+    S: Strategy,
+    Operation<F, U>: Codec,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db")
+            .field("bounds", &self.bounds())
+            .field("inactivity_floor_loc", &self.inactivity_floor_loc)
+            .finish_non_exhaustive()
+    }
+}
+
+// Shared read-only functionality.
+impl<F, E, C, I, H, U, const N: usize, S> Db<F, E, C, I, H, U, N, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item = Operation<F, U>>,
+    I: UnorderedIndex<Value = Location<F>>,
+    H: Hasher,
+    U: Update,
+    S: Strategy,
+    Operation<F, U>: Codec,
+{
+    /// Return the inactivity floor location. This is the location before which all operations are
+    /// known to be inactive. Operations before this point can be safely pruned.
+    #[cfg(any(test, feature = "test-traits"))]
+    pub(crate) const fn inactivity_floor_loc(&self) -> Location<F> {
+        self.inactivity_floor_loc
+    }
+
+    /// Return the most recent location from which this database can safely be synced, and the
+    /// upper bound on [`Self::prune`]'s `loc`. For `any`, this equals the inactivity floor.
+    pub const fn sync_boundary(&self) -> Location<F> {
+        self.inactivity_floor_loc
+    }
+
+    /// Whether the snapshot currently has no active keys.
+    pub const fn is_empty(&self) -> bool {
+        self.active_keys == 0
+    }
+
+    /// Get the metadata associated with the last commit.
+    pub async fn get_metadata(&self) -> Result<Option<U::Value>, crate::qmdb::Error<F>> {
+        // The log always ends with a commit operation.
+        match self.log.read(*self.log.size() - 1).await? {
+            Operation::CommitFloor(metadata, _) => Ok(metadata),
+            _ => unreachable!("last commit is not a CommitFloor operation"),
+        }
+    }
+
+    /// Return the canonical QMDB operations root.
+    pub const fn root(&self) -> H::Digest {
+        self.root
+    }
+
+    /// The [`Commitment`] for the database's current state.
+    pub(crate) fn commitment(&self) -> Commitment<F, H::Digest> {
+        Commitment::new(self.log.size(), self.root)
+    }
+
+    /// Return the inactive_peaks count for the given leaf count and inactivity floor.
+    pub(crate) fn inactive_peaks(
+        &self,
+        leaves: Location<F>,
+        inactivity_floor: Location<F>,
+    ) -> usize {
+        F::inactive_peaks(leaves, inactivity_floor)
+    }
+
+    /// Return a reference to the merkleization strategy.
+    pub const fn strategy(&self) -> &S {
+        self.log.strategy()
+    }
+
+    /// Get the value of `key` in the db, or None if it has no value.
+    // Explicit Send avoids the borrowed-iterator inference limitation (rust-lang/rust#100013).
+    #[allow(clippy::manual_async_fn)]
+    pub fn get(
+        &self,
+        key: &U::Key,
+    ) -> impl Future<Output = Result<Option<U::Value>, crate::qmdb::Error<F>>> + Send {
+        async move {
+            let _timer = self.metrics.get_timer();
+            self.metrics.get_calls.inc();
+            self.metrics.lookups_requested.inc();
+
+            // Translated keys can collide, so read candidates until the full key matches.
+            let mut result = None;
+            for loc in self.snapshot.get(key).copied() {
+                let op = self.log.read(*loc).await?;
+                let Operation::Update(data) = op else {
+                    panic!("location does not reference update operation. loc={loc}");
+                };
+                if data.key() == key {
+                    result = Some(data.into_value());
+                    break;
+                }
+            }
+
+            Ok(result)
+        }
+    }
+
+    /// Batch read multiple keys.
+    ///
+    /// Returns results in the same order as the input keys.
+    pub async fn get_many(
+        &self,
+        keys: &[&U::Key],
+    ) -> Result<Vec<Option<U::Value>>, crate::qmdb::Error<F>> {
+        self.get_many_map(keys, |data, _| data.into_value()).await
+    }
+
+    /// Like [`Self::get_many`] but maps each matched update through `map`, which takes the
+    /// update by value along with the committed location it was read from. A key repeated in
+    /// `keys` receives a clone of its update in every slot but the last.
+    pub(crate) async fn get_many_map<T: Send>(
+        &self,
+        keys: &[&U::Key],
+        map: impl Fn(U, Location<F>) -> T + Send + Sync,
+    ) -> Result<Vec<Option<T>>, crate::qmdb::Error<F>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _timer = self.metrics.get_many_timer();
+        self.metrics.get_many_calls.inc();
+        self.metrics.lookups_requested.inc_by(keys.len() as u64);
+
+        // One fused pass resolves everything the page cache can serve: probe the index, sort
+        // candidate locations, read cached operations, and match them back to keys, collecting
+        // misses. The strategy policy decides per batch size whether the pass runs on the
+        // calling thread or sharded across the pool.
+        let strategy = self.strategy();
+        let (mut results, mut misses) =
+            strategy.run_batches(keys.len(), NonZeroUsize::MIN, 1, |batches| {
+                let mut shards = batches
+                    .map_collect_vec(
+                        |ranges| ranges,
+                        |range| self.resolve_cached(&keys[range.clone()], &map, range.start),
+                    )
+                    .into_iter();
+
+                // The first shard's vectors are kept and the rest appended, so a whole-input
+                // run moves nothing and a split run reserves the results buffer once.
+                let (mut results, mut misses) = shards
+                    .next()
+                    .expect("run_batches must supply a batch for nonempty keys");
+                results.reserve(keys.len() - results.len());
+                for (shard_results, shard_misses) in shards {
+                    results.extend(shard_results);
+                    misses.extend(shard_misses);
+                }
+                (results, misses)
+            });
+        if misses.is_empty() {
+            return Ok(results);
+        }
+
+        // Fallback: read each distinct missed position once with one batched read, which also
+        // validates the missed positions: every candidate position is decoded by exactly one of
+        // the two passes, so corruption detection does not depend on cache state.
+        misses.sort_unstable_by_key(|&(_, pos)| pos);
+        let positions = Self::dedup_positions(&misses);
+        let ops = self.log.read_many(&positions).await?;
+        assert_eq!(
+            ops.len(),
+            positions.len(),
+            "read_many returns one operation per position"
+        );
+        Self::match_read_ops(
+            keys,
+            &misses,
+            ops.into_iter().map(Some),
+            &map,
+            &mut results,
+            |_, pos| unreachable!("read_many returns one operation per position, pos={pos}"),
+        );
+        Ok(results)
+    }
+
+    /// Probe the index for `keys`, serve page-cache hits synchronously, and match them back to
+    /// keys. Returns per-key results plus `(base + key index, position)` pairs for positions
+    /// the cache could not serve. A miss is recorded even when its key already resolved so the
+    /// fallback read still validates the position.
+    fn resolve_cached<T: Send>(
+        &self,
+        keys: &[&U::Key],
+        map: &(impl Fn(U, Location<F>) -> T + Send + Sync),
+        base: usize,
+    ) -> ShardReads<T> {
+        // Probe the in-memory index. Each key may map to multiple locations due to hash
+        // collisions.
+        let mut candidates: Vec<(usize, u64)> = Vec::with_capacity(keys.len());
+        self.snapshot
+            .get_many(keys, |key_idx, &loc| candidates.push((key_idx, *loc)));
+
+        // Sort by position and deduplicate for the batched cache read.
+        candidates.sort_unstable_by_key(|&(_, pos)| pos);
+        let positions = Self::dedup_positions(&candidates);
+
+        let served = self.log.try_read_many_sync(&positions);
+        assert_eq!(
+            served.len(),
+            positions.len(),
+            "try_read_many_sync returns one slot per position"
+        );
+        let mut results: Vec<Option<T>> = (0..keys.len()).map(|_| None).collect();
+        let mut misses: Vec<(usize, u64)> = Vec::new();
+        Self::match_read_ops(
+            keys,
+            &candidates,
+            served.into_iter(),
+            map,
+            &mut results,
+            |key_idx, pos| misses.push((base + key_idx, pos)),
+        );
+        (results, misses)
+    }
+
+    /// Collapse position-sorted `(key index, position)` candidates into deduplicated positions.
+    fn dedup_positions(candidates: &[(usize, u64)]) -> Vec<u64> {
+        let mut positions = Vec::with_capacity(candidates.len());
+        positions.extend(candidates.chunk_by(same_position).map(|group| group[0].1));
+        positions
+    }
+
+    /// Match the operations read for the deduplicated positions of position-sorted
+    /// `(key index, position)` candidates back to those candidates, filling each unresolved key
+    /// slot whose operation carries its exact key. `ops` yields one slot per deduplicated
+    /// position, in order: the operation read there, or `None` when the page cache could not
+    /// serve it, which is reported to `on_miss` with each candidate's key index and position.
+    fn match_read_ops<T>(
+        keys: &[&U::Key],
+        candidates: &[(usize, u64)],
+        ops: impl Iterator<Item = Option<Operation<F, U>>>,
+        map: &impl Fn(U, Location<F>) -> T,
+        results: &mut [Option<T>],
+        mut on_miss: impl FnMut(usize, u64),
+    ) {
+        for (group, op) in candidates.chunk_by(same_position).zip(ops) {
+            let pos = group[0].1;
+            let Some(op) = op else {
+                for &(key_idx, _) in group {
+                    on_miss(key_idx, pos);
+                }
+                continue;
+            };
+            let Operation::Update(data) = op else {
+                panic!("location does not reference update operation. loc={pos}");
+            };
+
+            // The candidates sharing this position match the update only for repeated input
+            // keys. Defer each match so every slot but the last takes a clone and the last
+            // takes the update itself.
+            let loc = Location::new(pos);
+            let mut pending = None;
+            for &(key_idx, _) in group {
+                if results[key_idx].is_some() || data.key() != keys[key_idx] {
+                    continue;
+                }
+                if let Some(prev) = pending.replace(key_idx) {
+                    results[prev] = Some(map(data.clone(), loc));
+                }
+            }
+            if let Some(last) = pending {
+                results[last] = Some(map(data, loc));
+            }
+        }
+    }
+
+    /// Return the retained operation range `[start, end)`.
+    ///
+    /// Proof generation also requires the necessary Merkle nodes to be retained.
+    pub fn bounds(&self) -> std::ops::Range<Location<F>> {
+        let bounds = self.log.bounds();
+        Location::new(bounds.start)..Location::new(bounds.end)
+    }
+
+    /// Update state gauges from the current database state.
+    pub(crate) fn update_metrics(&self) {
+        let bounds = self.log.bounds();
+        self.metrics.update(
+            bounds.end,
+            bounds.start,
+            *self.inactivity_floor_loc,
+            bounds.end - 1,
+        );
+    }
+
+    /// Return the pinned Merkle nodes for a lower operation boundary of `loc`.
+    pub async fn pinned_nodes_at(
+        &self,
+        loc: Location<F>,
+    ) -> Result<Vec<H::Digest>, crate::qmdb::Error<F>> {
+        self.log
+            .merkle
+            .pinned_nodes_at(loc)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+// Functionality requiring a mutable journal.
+impl<F, E, C, I, H, U, const N: usize, S> Db<F, E, C, I, H, U, N, S>
+where
+    F: Family,
+    E: Context,
+    C: Mutable<Item = Operation<F, U>>,
+    I: UnorderedIndex<Value = Location<F>>,
+    H: Hasher,
+    U: Update,
+    S: Strategy,
+    Operation<F, U>: Codec,
+{
+    /// Prune the bitmap to `prune_loc`, rounded down to a chunk boundary. Skips the
+    /// inactivity-floor check.
+    pub(crate) fn prune_bitmap(&mut self, prune_loc: Location<F>) {
+        self.bitmap.write().prune_to_bit(*prune_loc);
+    }
+
+    /// Prune the operations log to `prune_loc`. Does not touch the bitmap.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [crate::qmdb::Error::PruneBeyondMinRequired] if `prune_loc` > inactivity floor.
+    /// - Returns [`crate::merkle::Error::LocationOverflow`] if `prune_loc` > [`crate::merkle::Family::MAX_LEAVES`].
+    #[boxed]
+    pub(crate) async fn prune_log(mut self, prune_loc: Location<F>) -> Result<Self, Error<F>> {
+        if prune_loc > self.inactivity_floor_loc {
+            return Err(crate::qmdb::Error::PruneBeyondMinRequired(
+                prune_loc,
+                self.inactivity_floor_loc,
+            ));
+        }
+
+        (self.log, _) = self.log.prune(prune_loc).await?;
+        Ok(self)
+    }
+
+    /// Prune historical operations prior to `prune_loc`. This does not affect the db's root or
+    /// snapshot.
+    ///
+    /// The retained start in [`Self::bounds`] can remain below `prune_loc`.
+    ///
+    /// `prune` requires no prior commit. After a crash, the database remains recoverable;
+    /// uncommitted operations are not guaranteed to survive.
+    #[tracing::instrument(
+        name = "qmdb.any.db.prune",
+        level = "info",
+        skip_all,
+        fields(
+            requested_loc = *prune_loc,
+            inactivity_floor = *self.inactivity_floor_loc,
+        ),
+    )]
+    #[boxed]
+    pub async fn prune(self, prune_loc: Location<F>) -> Result<Self, crate::qmdb::Error<F>> {
+        let _timer = self.metrics.prune_timer();
+        self.metrics.prune_calls.inc();
+        let mut db = self.prune_log(prune_loc).await?;
+        db.prune_bitmap(prune_loc);
+        db.update_metrics();
+        Ok(db)
+    }
+
+    /// Returns a historical proof for `historical_size` operations, anchored at `start_loc`
+    /// and bounded by `max_ops`.
+    ///
+    /// # Contract
+    ///
+    /// `historical_size` must be a commit-boundary size: the operation at `historical_size - 1`
+    /// must itself be a commit op declaring the governing inactivity floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::qmdb::Error::HistoricalFloorPruned`] if `historical_size - 1` is retained
+    /// but is not a commit op, either because the caller passed a non-commit-boundary size or
+    /// because pruning removed the commit that would have governed it.
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(
+        name = "qmdb.any.db.historical_proof",
+        level = "info",
+        skip_all,
+        fields(
+            historical_size = *historical_size,
+            start_loc = *start_loc,
+            max_ops = max_ops.get(),
+        ),
+    )]
+    pub async fn historical_proof(
+        &self,
+        historical_size: Location<F>,
+        start_loc: Location<F>,
+        max_ops: NonZeroU64,
+    ) -> Result<(Proof<F, H::Digest>, Vec<Operation<F, U>>), crate::qmdb::Error<F>> {
+        if historical_size > self.log.size() {
+            return Err(crate::qmdb::Error::Merkle(
+                crate::merkle::Error::RangeOutOfBounds(historical_size),
+            ));
+        }
+
+        let inactivity_floor =
+            crate::qmdb::find_inactivity_floor_at::<F, _>(&self.log, historical_size).await?;
+        let inactive_peaks = self.inactive_peaks(historical_size, inactivity_floor);
+        self.log
+            .historical_proof(historical_size, start_loc, max_ops, inactive_peaks)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn proof(
+        &self,
+        loc: Location<F>,
+        max_ops: NonZeroU64,
+    ) -> Result<(Proof<F, H::Digest>, Vec<Operation<F, U>>), crate::qmdb::Error<F>> {
+        self.historical_proof(self.log.size(), loc, max_ops).await
+    }
+
+    /// Returns a [Db] initialized from `log`. `shared_bitmap = None` allocates a fresh bitmap;
+    /// `Some(b)` adopts a pre-allocated bitmap (used by `current::Db`, which sizes pruned chunks
+    /// from grafted metadata). `init_concurrency` is the index's snapshot-build concurrency
+    /// (see [crate::qmdb::SnapshotBuild::Concurrency]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the last operation is not a commit floor operation. Empty logs are handled
+    /// upstream by [`crate::qmdb::any::init_with_bitmap`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn init_from_log(
+        context: E,
+        mut index: I,
+        log: AuthenticatedLog<F, E, C, H, S>,
+        shared_bitmap: Option<Arc<Shared<N>>>,
+        init_concurrency: <I as crate::qmdb::SnapshotBuild<F>>::Concurrency,
+        init_buffer: NonZeroUsize,
+        cache_size: Option<NonZeroUsize>,
+        metrics: Metrics<E>,
+    ) -> Result<Self, crate::qmdb::Error<F>>
+    where
+        E: Spawner,
+        I: crate::qmdb::SnapshotBuild<F>,
+        C: 'static,
+    {
+        // Share the log so the snapshot build can hand each parallel worker its own reader. Sole
+        // ownership is recovered (`Arc::into_inner`) once the build has dropped every worker clone.
+        let log = Arc::new(log);
+        let (inactivity_floor_loc, active_keys, bitmap) = {
+            let bounds = log.bounds();
+            if bounds.end == 0 {
+                return Err(Error::HistoricalFloorPruned(Location::new(bounds.end)));
+            }
+            let inactivity_floor_loc =
+                crate::qmdb::find_inactivity_floor_at::<F, _>(&*log, Location::new(bounds.end))
+                    .await?;
+
+            // Build the snapshot, collecting each replayed location's activity status.
+            let (active_keys, activity) = index
+                .build_snapshot(
+                    context,
+                    inactivity_floor_loc,
+                    &log,
+                    init_concurrency,
+                    init_buffer,
+                    cache_size,
+                )
+                .await?;
+
+            // Seed the bitmap so its pruned prefix matches the retained log boundary. Bits in
+            // [pruned_bits, bounds.start) correspond to pruned operations and remain 0.
+            let bitmap = shared_bitmap.unwrap_or_else(|| {
+                let pruned_chunks =
+                    (bounds.start / bitmap::Prunable::<N>::CHUNK_SIZE_BITS) as usize;
+                let bm = bitmap::Prunable::<N>::new_with_pruned_chunks(pruned_chunks)
+                    .expect("pruned chunk count fits in u64 bits");
+                Arc::new(Shared::new(bm))
+            });
+
+            // Extend the bitmap up to the inactivity floor (zero-fill), then append the replayed
+            // suffix, all under a single lock acquisition.
+            {
+                let mut guard = bitmap.write();
+                // A caller-supplied bitmap must be pruned to a chunk boundary at or below the
+                // inactivity floor. Anything past it would make `extend_to` silently leave gaps.
+                assert!(
+                    guard.pruned_bits() <= *inactivity_floor_loc,
+                    "shared_bitmap pruned_bits {} exceeds inactivity_floor_loc {}",
+                    guard.pruned_bits(),
+                    *inactivity_floor_loc,
+                );
+                guard.extend_to(*inactivity_floor_loc);
+                guard.extend_from_bitmap(&activity);
+            }
+
+            (inactivity_floor_loc, active_keys, bitmap)
+        };
+
+        // The build has returned, so every worker clone of the log is dropped. Reclaim it.
+        let log = Arc::into_inner(log).expect("snapshot build retained a log reference");
+
+        // The bitmap must have exactly one bit per retained log location.
+        if bitmap::Readable::<N>::len(bitmap.as_ref()) != log.size() {
+            return Err(crate::qmdb::Error::DataCorrupted(
+                "bitmap length diverged from log size during init",
+            ));
+        }
+
+        let inactive_peaks = F::inactive_peaks(log.merkle.leaves(), inactivity_floor_loc);
+        let root = log.root(inactive_peaks)?;
+
+        let db = Self {
+            log,
+            root,
+            inactivity_floor_loc,
+            snapshot: index,
+            active_keys,
+            bitmap,
+            metrics,
+            _update: core::marker::PhantomData,
+        };
+        db.update_metrics();
+        Ok(db)
+    }
+
+    /// Sync all database state to disk.
+    #[tracing::instrument(
+        name = "qmdb.any.db.sync",
+        level = "info",
+        skip_all,
+        fields(
+            db_size = *self.log.size(),
+            inactivity_floor = *self.inactivity_floor_loc,
+            active_keys = self.active_keys as u64,
+        ),
+    )]
+    #[boxed]
+    pub async fn sync(mut self) -> Result<Self, crate::qmdb::Error<F>> {
+        let _timer = self.metrics.sync_timer();
+        self.metrics.sync_calls.inc();
+        self.log = self.log.sync().await?;
+        Ok(self)
+    }
+
+    /// Begin durably persisting the journal state published by prior [`Db::apply_batch`] calls.
+    ///
+    /// Awaiting the returned [Handle] provides the same durability guarantee as [Self::commit].
+    /// Also makes a best-effort attempt to bound the recovery needed on startup. Use
+    /// [Self::sync] to guarantee none is needed. A new sync waits for the prior sync before
+    /// starting. Failures of the deferred durability work surface on the returned handle. A
+    /// failed data sync also fails the next durability operation. A failed recovery-watermark
+    /// sync is not observed by [Self::commit], and a failed merkle-node sync may not be. Both
+    /// resurface on the next [Self::sync].
+    #[tracing::instrument(
+        name = "qmdb.any.db.start_sync",
+        level = "info",
+        skip_all,
+        fields(
+            db_size = *self.log.size(),
+            inactivity_floor = *self.inactivity_floor_loc,
+            active_keys = self.active_keys as u64,
+        ),
+    )]
+    #[boxed]
+    pub async fn start_sync(mut self) -> Result<(Self, Handle<()>), crate::qmdb::Error<F>> {
+        self.metrics.start_sync_calls.inc();
+        let (log, handle) = self.log.start_sync().await?;
+        self.log = log;
+        Ok((self, handle))
+    }
+
+    /// Durably commit the journal state published by prior [`Db::apply_batch`]
+    /// calls.
+    #[tracing::instrument(
+        name = "qmdb.any.db.commit",
+        level = "info",
+        skip_all,
+        fields(
+            db_size = *self.log.size(),
+            inactivity_floor = *self.inactivity_floor_loc,
+            active_keys = self.active_keys as u64,
+        ),
+    )]
+    #[boxed]
+    pub async fn commit(mut self) -> Result<Self, crate::qmdb::Error<F>> {
+        let _timer = self.metrics.commit_timer();
+        self.metrics.commit_calls.inc();
+        self.log = self.log.commit().await?;
+        Ok(self)
+    }
+
+    /// Destroy the db, removing all data from disk.
+    #[boxed]
+    pub async fn destroy(self) -> Result<(), crate::qmdb::Error<F>> {
+        // Destructure before the await boundary to avoid stack growth from
+        // retaining the entire `self` in the future.
+        let Self { log, .. } = self;
+        log.destroy().await.map_err(Into::into)
+    }
+}

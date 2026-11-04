@@ -1,0 +1,142 @@
+use crate::{append_fixed_random_data, get_fixed_journal};
+use commonware_runtime::{
+    Runner as _, Supervisor as _,
+    benchmarks::{context, tokio},
+    tokio::{Config, Context, Runner},
+};
+use commonware_storage::journal::contiguous::{Contiguous as _, fixed::Journal};
+use commonware_utils::{NZU64, futures::try_join_all, sequence::FixedBytes, test_rng};
+use criterion::{Criterion, criterion_group};
+use rand::RngExt as _;
+use std::{
+    hint::black_box,
+    num::NonZeroU64,
+    time::{Duration, Instant},
+};
+
+/// Partition name to use in the journal config.
+const PARTITION: &str = "test-partition";
+
+/// Value of items_per_blob to use in the journal config.
+const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(10_000);
+
+/// Number of items to write to the journal we will be reading from.
+const ITEMS_TO_WRITE: u64 = 5_000_000;
+
+/// Size of each journal item in bytes.
+const ITEM_SIZE: usize = 32;
+
+/// Read `items_to_read` random items from the given `journal`, awaiting each
+/// result before continuing.
+async fn bench_run_serial(
+    journal: Journal<Context, FixedBytes<ITEM_SIZE>>,
+    items_to_read: usize,
+) -> Journal<Context, FixedBytes<ITEM_SIZE>> {
+    let (journal, reader) = journal.snapshot().await.unwrap();
+    let mut rng = test_rng();
+    for _ in 0..items_to_read {
+        let pos = rng.random_range(0..ITEMS_TO_WRITE);
+        black_box(reader.read(pos).await.expect("failed to read data"));
+    }
+    journal
+}
+
+/// Concurrently read (via try_join_all) `items_to_read` random items from the given `journal`.
+async fn bench_run_concurrent(
+    journal: Journal<Context, FixedBytes<ITEM_SIZE>>,
+    items_to_read: usize,
+) -> Journal<Context, FixedBytes<ITEM_SIZE>> {
+    let (journal, reader) = journal.snapshot().await.unwrap();
+    let mut rng = test_rng();
+    let mut futures = Vec::with_capacity(items_to_read);
+    for _ in 0..items_to_read {
+        let pos = rng.random_range(0..ITEMS_TO_WRITE);
+        futures.push(reader.read(pos));
+    }
+    try_join_all(futures).await.expect("failed to read data");
+    journal
+}
+
+/// Batch-read `items_to_read` random items via `read_many`.
+async fn bench_run_read_many(
+    journal: Journal<Context, FixedBytes<ITEM_SIZE>>,
+    items_to_read: usize,
+) -> Journal<Context, FixedBytes<ITEM_SIZE>> {
+    let (journal, reader) = journal.snapshot().await.unwrap();
+    let mut rng = test_rng();
+    let mut positions: Vec<u64> = (0..items_to_read)
+        .map(|_| rng.random_range(0..ITEMS_TO_WRITE))
+        .collect();
+    positions.sort_unstable();
+    positions.dedup();
+    black_box(
+        reader
+            .read_many(&positions)
+            .await
+            .expect("failed to read data"),
+    );
+    journal
+}
+
+fn bench_fixed_read_random(c: &mut Criterion) {
+    let cfg = Config::default();
+    let mut initialized = false;
+    let runner = tokio::Runner::new(cfg.clone());
+    for mode in ["serial", "concurrent", "read_many"] {
+        for items_to_read in [100, 1_000, 10_000, 100_000] {
+            c.bench_function(
+                &format!(
+                    "{}/mode={} items={} size={}",
+                    module_path!(),
+                    mode,
+                    items_to_read,
+                    ITEM_SIZE
+                ),
+                |b| {
+                    // Setup: populate journal (once, on first sample).
+                    if !initialized {
+                        Runner::new(cfg.clone()).start(|ctx| async move {
+                            let j = get_fixed_journal(ctx, PARTITION, ITEMS_PER_BLOB).await;
+                            append_fixed_random_data::<_, ITEM_SIZE>(j, ITEMS_TO_WRITE).await;
+                        });
+                        initialized = true;
+                    }
+
+                    // Benchmark: measure read time.
+                    b.to_async(&runner).iter_custom(|iters| async move {
+                        let ctx = context::get::<commonware_runtime::tokio::Context>();
+                        let mut j =
+                            get_fixed_journal(ctx.child("storage"), PARTITION, ITEMS_PER_BLOB)
+                                .await;
+                        let mut duration = Duration::ZERO;
+                        for _ in 0..iters {
+                            let start = Instant::now();
+                            j = match mode {
+                                "serial" => bench_run_serial(j, items_to_read).await,
+                                "concurrent" => bench_run_concurrent(j, items_to_read).await,
+                                "read_many" => bench_run_read_many(j, items_to_read).await,
+                                _ => unreachable!(),
+                            };
+                            duration += start.elapsed();
+                        }
+                        duration
+                    });
+                },
+            );
+        }
+    }
+
+    // Cleanup: destroy journal.
+    if initialized {
+        Runner::new(cfg).start(|context| async move {
+            let j = get_fixed_journal::<ITEM_SIZE>(context, PARTITION, ITEMS_PER_BLOB).await;
+            j.destroy().await.unwrap();
+        });
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = bench_fixed_read_random
+}

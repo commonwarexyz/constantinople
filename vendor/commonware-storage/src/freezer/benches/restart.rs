@@ -1,0 +1,55 @@
+use super::utils::{append_random, init};
+use commonware_runtime::{
+    Runner, Supervisor as _,
+    benchmarks::{context, tokio},
+    tokio::Config,
+};
+use criterion::{Criterion, criterion_group};
+use std::time::{Duration, Instant};
+
+#[cfg(not(full_bench))]
+const ITEMS: [u64; 1] = [10_000];
+#[cfg(full_bench)]
+const ITEMS: [u64; 4] = [10_000, 50_000, 100_000, 500_000];
+
+fn bench_restart(c: &mut Criterion) {
+    let cfg = Config::default();
+    for items in ITEMS {
+        // Populate the freezer with random keys
+        let builder = commonware_runtime::tokio::Runner::new(cfg.clone());
+        let checkpoint = builder.start(|ctx| async move {
+            let store = init(ctx, None).await;
+            let (store, _) = append_random(store, items).await;
+            store.close().await.unwrap()
+        });
+
+        // Run the benchmarks
+        let runner = tokio::Runner::new(cfg.clone());
+        let label = format!("{}/items={}", module_path!(), items);
+        c.bench_function(&label, |b| {
+            b.to_async(&runner).iter_custom(|iters| async move {
+                let ctx = context::get::<commonware_runtime::tokio::Context>();
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let start = Instant::now();
+                    let _store = init(ctx.child("storage"), Some(checkpoint)).await;
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
+
+        // Tear down
+        let cleaner = commonware_runtime::tokio::Runner::new(cfg.clone());
+        cleaner.start(|ctx| async move {
+            let store = init(ctx, None).await;
+            store.destroy().await.unwrap();
+        });
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = bench_restart
+}

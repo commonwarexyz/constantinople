@@ -31,6 +31,8 @@ pub(crate) struct TxMetaRow {
     pub qmdb_location: u64,
     pub body: Bytes,
     pub height: u64,
+    pub sender_index: u64,
+    pub recipient_index: u64,
 }
 
 /// Transaction activity role stored in `tx_activity`.
@@ -60,6 +62,7 @@ pub(crate) struct TxActivityRow {
     pub value: u64,
     pub nonce: u64,
     pub qmdb_location: u64,
+    pub account_index: u64,
 }
 
 /// One `account_meta` row per account-state QMDB operation.
@@ -69,6 +72,8 @@ pub(crate) struct AccountMetaRow {
     pub nonce_base: u64,
     pub nonce_bitmap: u64,
     pub qmdb_location: u64,
+    pub tx_count: u64,
+    pub write_height: u64,
 }
 
 /// Encode the SQL rows for a finalized block.
@@ -105,6 +110,8 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
             CellValue::UInt64(tx.qmdb_location),
             CellValue::Binary(tx.body.to_vec()),
             CellValue::UInt64(tx.height),
+            CellValue::UInt64(tx.sender_index),
+            CellValue::UInt64(tx.recipient_index),
         ],
     }
 }
@@ -123,6 +130,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
             CellValue::UInt64(tx.qmdb_location),
+            CellValue::UInt64(tx.account_index),
         ],
     }
 }
@@ -137,6 +145,8 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
             CellValue::UInt64(account.nonce_base),
             CellValue::UInt64(account.nonce_bitmap),
             CellValue::UInt64(account.qmdb_location),
+            CellValue::UInt64(account.tx_count),
+            CellValue::UInt64(account.write_height),
         ],
     }
 }

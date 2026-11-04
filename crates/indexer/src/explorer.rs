@@ -18,7 +18,7 @@ use crate::{
 use axum::Router;
 use buffa::Message;
 use bytes::Bytes;
-use commonware_codec::{Decode, DecodeExt, FixedSize};
+use commonware_codec::{Decode, DecodeExt, Encode, FixedSize};
 use commonware_consensus::types::Height;
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
@@ -28,7 +28,8 @@ use commonware_cryptography_curve25519::signing::VerifyingKey;
 use commonware_storage::{
     merkle::{Location, mmr},
     qmdb::{
-        any::{unordered, value::FixedEncoding},
+        any::{ordered, value::FixedEncoding},
+        current::ordered::proof::constant::ExclusionProof,
         keyless,
     },
 };
@@ -39,7 +40,8 @@ use constantinople_engine::{
     types::{EngineCommitment, EngineHeader},
 };
 use constantinople_primitives::{
-    Account, AccountKey, SignedTransaction, Transaction, TransactionSignature,
+    Account, AccountKey, SignedTransaction, Transaction, TransactionHistoryEntry,
+    TransactionSignature,
 };
 use datafusion::arrow::{
     array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array},
@@ -47,8 +49,8 @@ use datafusion::arrow::{
 };
 use exoware_qmdb::{
     QmdbError,
-    adapter::{Keyless, Unordered},
-    proof::{encode_historical_multi_proof, encode_historical_operation_range_proof},
+    adapter::{Keyless, Ordered},
+    proof::{RawKeyLookupProof, encode_operation_multi_proof},
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, RangeMode, ReadSession, StoreClient};
 use exoware_simplex::{Finalized, keys};
@@ -94,7 +96,7 @@ type Certificate = Finalized<
     EngineCommitment<Sha256, VerifyingKey>,
 >;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
-type StateLog = Unordered<
+type StateLog = Ordered<
     mmr::Family,
     Sha256,
     AccountKey,
@@ -102,9 +104,10 @@ type StateLog = Unordered<
     STATE_PROOF_CHUNK_SIZE,
     FixedEncoding<AccountValue>,
 >;
-type TransactionLog = Keyless<mmr::Family, Sha256, Digest, FixedEncoding<Digest>>;
-type StateOperation = unordered::Operation<mmr::Family, AccountKey, FixedEncoding<AccountValue>>;
-type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<Digest>>;
+type HistoryEntry = TransactionHistoryEntry<Digest>;
+type TransactionLog = Keyless<mmr::Family, Sha256, HistoryEntry, FixedEncoding<HistoryEntry>>;
+type StateOperation = ordered::Operation<mmr::Family, AccountKey, FixedEncoding<AccountValue>>;
+type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<HistoryEntry>>;
 
 /// Store clients shared by every explorer route.
 struct Explorer {
@@ -142,7 +145,7 @@ impl Explorer {
             simplex: simplex_client(client)?,
             sql_store,
             sql,
-            state: StateLog::new(state_qmdb_client(client)?, ()),
+            state: StateLog::new(state_qmdb_client(client)?, (), ()),
             transactions: TransactionLog::new(transactions_qmdb_client(client)?, ()),
         })
     }
@@ -211,62 +214,33 @@ fn response(bundle: Bundle) -> Result<Bundle, Failure> {
 
 /// Validated account request.
 struct AccountRequest {
-    /// Account whose state and activity are read.
     key: AccountKey,
-    /// Role filter (0 sent, 1 received), or `None` for all activity.
-    mode: Option<u8>,
-    /// Last row of the previous page, which this page excludes.
+    /// Exclusive history index at the top of this page.
     cursor: Option<Cursor>,
-    /// Height and digest that pin the certified snapshot across pages.
+    /// Height and digest of the certificate shared by every page.
     snapshot: Option<(u64, Digest)>,
-    /// Whether to return an activity page.
+    /// Exact account update shared by every page.
+    account_location: Option<u64>,
     activity: bool,
 }
 
-/// Position in an account's activity, encoded as 24 big-endian bytes.
-///
-/// Pages run newest first in the derived (height, index, role) order.
+/// Exclusive account-history index encoded as eight big-endian bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Cursor {
-    height: u64,
-    index: u64,
-    role: u64,
-}
+struct Cursor(u64);
 
 impl Cursor {
     fn parse(value: &[u8]) -> Result<Self, Failure> {
-        let bytes = fixed_bytes::<24>(value)?;
-        let cursor = Self {
-            height: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
-            index: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-            role: u64::from_be_bytes(bytes[16..].try_into().unwrap()),
-        };
-
-        // Reject positions that no activity row can occupy.
-        if cursor.height == 0 || cursor.index > u64::from(u32::MAX) || cursor.role > 1 {
-            return Err(Failure::bad("invalid activity cursor"));
-        }
-        Ok(cursor)
+        Ok(Self(u64::from_be_bytes(fixed_bytes::<8>(value)?)))
     }
 
     fn encode(self) -> Vec<u8> {
-        let mut bytes = [0; 24];
-        bytes[..8].copy_from_slice(&self.height.to_be_bytes());
-        bytes[8..16].copy_from_slice(&self.index.to_be_bytes());
-        bytes[16..].copy_from_slice(&self.role.to_be_bytes());
-        bytes.to_vec()
+        self.0.to_be_bytes().to_vec()
     }
 }
 
 impl AccountRequest {
     fn parse(query: proto::GetAccountRequest) -> Result<Self, Failure> {
         let key = AccountKey::from(fixed_bytes::<32>(&query.account)?);
-        let mode = match query.mode.as_known() {
-            Some(proto::ActivityMode::All) => None,
-            Some(proto::ActivityMode::Sent) => Some(0),
-            Some(proto::ActivityMode::Received) => Some(1),
-            None => return Err(Failure::bad("unknown activity mode")),
-        };
         let snapshot = match (query.at, query.digest) {
             (None, None) => None,
             (Some(height), Some(digest)) if height != 0 => {
@@ -275,18 +249,35 @@ impl AccountRequest {
             _ => return Err(Failure::bad("positive at and digest must appear together")),
         };
         let cursor = query.cursor.as_deref().map(Cursor::parse).transpose()?;
-        if cursor.is_some_and(|cursor| mode.is_some_and(|role| cursor.role != u64::from(role))) {
-            return Err(Failure::bad("cursor role does not match mode"));
+        if (cursor.is_some() && query.account_location.is_none())
+            || ((cursor.is_some() || query.account_location.is_some()) && snapshot.is_none())
+        {
+            return Err(Failure::bad(
+                "account pages require a pinned snapshot and account location",
+            ));
         }
-        let activity = query.activity.unwrap_or(true);
         Ok(Self {
             key,
-            mode,
             cursor,
             snapshot,
-            activity,
+            account_location: query.account_location,
+            activity: query.activity.unwrap_or(true),
         })
     }
+}
+
+/// Account update and the block interval that contains it.
+struct AccountEvidence {
+    proof: AccountProof,
+    value: Account,
+    headers: Vec<Vec<u8>>,
+    transaction_end: u64,
+}
+
+/// A current account value with its history boundary, or authenticated absence.
+enum AccountLookup {
+    Present(AccountEvidence),
+    Absent(AccountProof),
 }
 
 /// Checks a fixed-width application identity or cursor before reading Store.
@@ -515,137 +506,237 @@ impl Explorer {
         }))
     }
 
-    /// Proves the account's latest update inside the certified state range, or
-    /// returns `None` when SQL holds no such update.
+    /// Proves the account's value or absence at the certified state boundary.
     async fn account_proof(
         &self,
         anchor: &Anchor,
-        key: &AccountKey,
-    ) -> Result<Option<AccountProof>, Failure> {
-        // SQL supplies only a candidate location, which the proof below must
-        // bind to the certified state root.
+        request: &AccountRequest,
+    ) -> Result<AccountLookup, Failure> {
         let start = anchor.header.state_range.start();
         let end = anchor.header.state_range.end();
-        let query = format!(
-            "SELECT qmdb_location FROM account_meta WHERE account = X'{}' AND qmdb_location >= {start} AND qmdb_location < {end} ORDER BY qmdb_location DESC LIMIT 1",
-            hex(key.as_ref())
-        );
-        let batches = query_rows(&anchor.sql, &query, 1).await?;
-        let Some(batch) = batches.first() else {
-            return Ok(None);
-        };
-        let location = uint(batch, 0, 0)?;
-        if location < start || location >= end {
-            return Err(Failure::invalid(
-                "account location is outside certified range",
-            ));
-        }
-
-        // Prove that location at the certified tip, reading QMDB at or above
-        // the request floor.
-        let proof = Box::pin(self.state.operation_range_checkpoint(
-            Location::new(end - 1),
-            Location::new(location),
-            1,
+        let tip = end
+            .checked_sub(1)
+            .ok_or_else(|| Failure::invalid("certified state range is empty"))?;
+        let mut lookups = Box::pin(self.state.get_many_raw(
+            Location::new(tip),
+            &[request.key],
             Some(anchor.floor()?),
         ))
         .await?;
-
-        // The proof must reproduce the certified root and contain exactly one
-        // operation, an update of the requested account.
-        if proof.canonical_root::<Sha256>() != anchor.header.state_root
-            || proof.encoded_operations.len() != 1
-        {
+        if lookups.len() != 1 {
             return Err(Failure::invalid(
-                "account proof does not match certified root",
+                "account lookup returned an invalid result count",
             ));
         }
-        let operation =
-            StateOperation::decode_cfg(Bytes::copy_from_slice(&proof.encoded_operations[0]), &())?;
-        if !matches!(operation, StateOperation::Update(update) if update.0 == *key) {
-            return Err(Failure::invalid(
-                "account proof does not contain requested update",
-            ));
-        }
-
-        let encoded = encode_historical_operation_range_proof(&proof);
+        let (location, value, encoded, encoded_operation) = match lookups.pop().unwrap() {
+            RawKeyLookupProof::Hit(raw) => {
+                if raw.watermark.as_u64() != tip
+                    || raw.root != anchor.header.state_root
+                    || raw.proof.range_proof.proof.leaves.as_u64() != end
+                {
+                    return Err(Failure::invalid(
+                        "account proof does not match certified root",
+                    ));
+                }
+                let StateOperation::Update(update) = &raw.operation else {
+                    return Err(Failure::invalid("account proof does not contain an update"));
+                };
+                if update.key != request.key {
+                    return Err(Failure::invalid("account proof names a different key"));
+                }
+                let location = raw.proof.loc.as_u64();
+                if request
+                    .account_location
+                    .is_some_and(|pinned| pinned != location)
+                {
+                    return Err(Failure::pending("pinned account update is not available"));
+                }
+                let value = Account::decode(Bytes::copy_from_slice(update.value.as_ref()))?;
+                (
+                    location,
+                    value,
+                    raw.proof.encode().to_vec(),
+                    raw.operation.encode().to_vec(),
+                )
+            }
+            RawKeyLookupProof::Miss(raw) => {
+                let operation_proof = match &raw.proof {
+                    ExclusionProof::KeyValue(proof, _) | ExclusionProof::Commit(proof, _) => proof,
+                };
+                if raw.watermark.as_u64() != tip
+                    || raw.root != anchor.header.state_root
+                    || raw.requested_key != request.key
+                    || operation_proof.range_proof.proof.leaves.as_u64() != end
+                {
+                    return Err(Failure::invalid(
+                        "account exclusion does not match certified snapshot",
+                    ));
+                }
+                if request.account_location.is_some() {
+                    return Err(Failure::pending("pinned account update is not available"));
+                }
+                let encoded = raw.proof.encode().to_vec();
+                bounded_proof(&encoded)?;
+                return Ok(AccountLookup::Absent(AccountProof {
+                    location: 0,
+                    proof: encoded,
+                    write_height: 0,
+                    claim: Some(proto::account_proof::Claim::Exclusion(true)),
+                    ..Default::default()
+                }));
+            }
+        };
         bounded_proof(&encoded)?;
-        Ok(Some(AccountProof {
-            location,
-            proof: encoded.to_vec(),
-            ..Default::default()
+
+        // The authenticated update fixes the metadata row used for its write-height provenance.
+        let query = format!(
+            "SELECT qmdb_location, tx_count, write_height FROM account_meta WHERE account = X'{}' AND qmdb_location = {location} LIMIT 1",
+            hex(request.key.as_ref())
+        );
+        let batches = query_rows(&anchor.sql, &query, 1).await?;
+        let Some(batch) = batches.first() else {
+            return Err(Failure::pending("account update metadata is not available"));
+        };
+        let metadata_location = uint(batch, 0, 0)?;
+        let count = uint(batch, 1, 0)?;
+        let write_height = uint(batch, 2, 0)?;
+        if metadata_location != location
+            || location < start
+            || location >= end
+            || write_height == 0
+            || write_height > anchor.header.height
+        {
+            return Err(Failure::invalid("account metadata is outside the snapshot"));
+        }
+
+        if value.tx_count != count {
+            return Err(Failure::invalid("account proof disagrees with metadata"));
+        }
+
+        // The parent's end separates this block's state appends from older
+        // updates. Floor copies are included and carry their unchanged value.
+        let (headers, writer, _, transaction_end) = self.ancestry(anchor, write_height).await?;
+        let state_start = if write_height == 1 {
+            1
+        } else {
+            let parent = Header::decode(Bytes::copy_from_slice(
+                headers
+                    .last()
+                    .ok_or_else(|| Failure::invalid("account parent is missing"))?,
+            ))?;
+            parent.state_range.end()
+        };
+        if location < state_start || location >= writer.state_range.end() - 1 {
+            return Err(Failure::invalid(
+                "account update is outside its inclusion block",
+            ));
+        }
+        Ok(AccountLookup::Present(AccountEvidence {
+            proof: AccountProof {
+                location,
+                proof: encoded,
+                write_height,
+                claim: Some(proto::account_proof::Claim::EncodedOperation(
+                    encoded_operation,
+                )),
+                ..Default::default()
+            },
+            value,
+            headers,
+            transaction_end,
         }))
     }
 
-    /// Returns one activity page with its multi-proof and the next cursor.
+    /// Proves the complete contiguous page below the account's exclusive end.
     async fn activity(
         &self,
         anchor: &Anchor,
         request: &AccountRequest,
+        account: &AccountEvidence,
     ) -> Result<(Vec<TransactionRow>, Option<Vec<u8>>, Option<Vec<u8>>), Failure> {
-        // SQL rows are untrusted hints. Each must lie within the certified
-        // height, match the filter, follow the request cursor, and strictly
-        // descend, so a page cannot repeat or reorder rows.
-        let height = anchor.header.height;
-        let batches = activity_rows(&anchor.sql, request, height).await?;
-        let mut hints = Vec::new();
-        for batch in &batches {
-            for row in 0..batch.num_rows() {
-                let cursor = Cursor {
-                    height: uint(batch, 0, row)?,
-                    index: uint(batch, 1, row)?,
-                    role: uint(batch, 2, row)?,
-                };
-                let digest = digest_at(batch, 3, row)?;
-                let location = uint(batch, 4, row)?;
-                if cursor.height == 0
-                    || cursor.height > height
-                    || cursor.index > u64::from(u32::MAX)
-                    || cursor.role > 1
-                    || request
-                        .mode
-                        .is_some_and(|role| u64::from(role) != cursor.role)
-                    || request.cursor.is_some_and(|bound| cursor >= bound)
-                    || hints
-                        .last()
-                        .is_some_and(|(previous, _, _)| *previous <= cursor)
-                {
-                    return Err(Failure::invalid("activity row violates page bounds"));
-                }
-                hints.push((cursor, digest, location));
-            }
+        let end = request
+            .cursor
+            .map_or(account.value.tx_count, |cursor| cursor.0);
+        if end > account.value.tx_count {
+            return Err(Failure::bad("cursor exceeds the proven account count"));
         }
-
-        // The extra row only signals another page. The next cursor is the
-        // last returned row, which the following page excludes.
-        let next = if hints.len() > ACCOUNT_PAGE {
-            hints[ACCOUNT_PAGE - 1].0.encode().into()
-        } else {
-            None
-        };
-        hints.truncate(ACCOUNT_PAGE);
-        if hints.is_empty() {
+        let lower = end.saturating_sub(ACCOUNT_PAGE as u64);
+        let expected_count = (end - lower) as usize;
+        let next = (lower > 0).then(|| Cursor(lower).encode());
+        if expected_count == 0 {
             return Ok((Vec::new(), None, next));
         }
-
-        // The proof binds each location to its digest. Heights and indices
-        // remain hints because no proof covers them.
+        let batches =
+            activity_rows(&anchor.sql, request, lower, end, account.proof.write_height).await?;
+        let mut hints = Vec::with_capacity(expected_count);
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let index = uint(batch, 0, row)?;
+                let height = uint(batch, 1, row)?;
+                let block_index = uint(batch, 2, row)?;
+                let role = uint(batch, 3, row)?;
+                let digest = digest_at(batch, 4, row)?;
+                let location = uint(batch, 5, row)?;
+                if index != end - 1 - hints.len() as u64
+                    || height == 0
+                    || height > account.proof.write_height
+                    || block_index > u64::from(u32::MAX)
+                    || role > 1
+                    || location >= account.transaction_end
+                {
+                    return Err(Failure::invalid(
+                        "activity row violates account page bounds",
+                    ));
+                }
+                hints.push((index, height, block_index, role, digest, location));
+            }
+        }
+        if hints.len() != expected_count {
+            return Err(Failure::invalid("account history page is incomplete"));
+        }
         let expected = hints
             .iter()
-            .map(|(_, digest, location)| (*location, *digest))
+            .map(|(_, _, _, _, digest, location)| (*location, *digest))
             .collect::<Vec<_>>();
-        let (proof, bodies) = self.transaction_evidence(anchor, &expected).await?;
-        let rows = hints
-            .into_iter()
-            .map(|(cursor, digest, location)| TransactionRow {
+        let (proof, entries, bodies) = self.transaction_evidence(anchor, &expected).await?;
+        let mut seen = BTreeSet::new();
+        let mut rows = Vec::with_capacity(expected_count);
+        for (index, height, block_index, role, digest, location) in hints {
+            if !seen.insert(location) {
+                return Err(Failure::invalid("duplicate account transaction"));
+            }
+            let entry = entries[&location];
+            let body = &bodies[&digest];
+            let transaction = SignedTransaction::<Sha256>::decode(body.clone())?;
+            let value = transaction.value();
+            let sender = AccountKey::from_public_key(
+                value
+                    .sender()
+                    .ok_or_else(|| Failure::invalid("invalid transaction sender"))?,
+            );
+            let recipient = value.to;
+            if (sender == recipient && entry.sender_index != entry.recipient_index)
+                || (role == 0 && (sender != request.key || entry.sender_index != index))
+                || (role == 1
+                    && (recipient != request.key
+                        || sender == recipient
+                        || entry.recipient_index != index))
+            {
+                return Err(Failure::invalid(
+                    "transaction does not occupy the requested account index",
+                ));
+            }
+            rows.push(TransactionRow {
                 location,
-                body: bodies[&digest].to_vec(),
-                height: cursor.height,
-                index: cursor.index as u32,
-                role: Some((cursor.role as i32).into()),
+                body: body.to_vec(),
+                height,
+                index: block_index as u32,
+                role: Some((role as i32).into()),
+                sender_index: entry.sender_index,
+                recipient_index: entry.recipient_index,
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
         Ok((rows, Some(proof), next))
     }
 
@@ -655,7 +746,14 @@ impl Explorer {
         &self,
         anchor: &Anchor,
         expected: &[(u64, Digest)],
-    ) -> Result<(Vec<u8>, BTreeMap<Digest, Bytes>), Failure> {
+    ) -> Result<
+        (
+            Vec<u8>,
+            BTreeMap<u64, HistoryEntry>,
+            BTreeMap<Digest, Bytes>,
+        ),
+        Failure,
+    > {
         // Collapse duplicate locations, rejecting two digests for one location.
         let mut locations = BTreeMap::new();
         for &(location, digest) in expected {
@@ -670,22 +768,30 @@ impl Explorer {
         let (encoded, digests) = self
             .transaction_proof(anchor, &locations.keys().copied().collect::<Vec<_>>())
             .await?;
-        if locations != digests {
+        if locations.len() != digests.len()
+            || locations.iter().any(|(location, digest)| {
+                digests
+                    .get(location)
+                    .is_none_or(|entry| entry.digest != *digest)
+            })
+        {
             return Err(Failure::invalid(
                 "transaction proof disagrees with metadata",
             ));
         }
-        let bodies = self.bodies(anchor, digests.values().copied()).await?;
-        Ok((encoded, bodies))
+        let bodies = self
+            .bodies(anchor, digests.values().map(|entry| entry.digest))
+            .await?;
+        Ok((encoded, digests, bodies))
     }
 
     /// Proves ascending `locations` against the certified transactions root and
-    /// returns the encoded proof with each proven digest.
+    /// returns the encoded proof with each complete history entry.
     async fn transaction_proof(
         &self,
         anchor: &Anchor,
         locations: &[u64],
-    ) -> Result<(Vec<u8>, BTreeMap<u64, Digest>), Failure> {
+    ) -> Result<(Vec<u8>, BTreeMap<u64, HistoryEntry>), Failure> {
         // Only appends below the certified tip can hold transactions. The tip
         // itself is the block's commit operation.
         let range = &anchor.header.transactions_range;
@@ -725,24 +831,23 @@ impl Explorer {
             ));
         }
 
-        // Each proven operation must be an append, whose value is the
-        // transaction digest.
+        // Each append binds a digest and both participant indices.
         let mut digests = BTreeMap::new();
         for ((location, bytes), expected) in proof.operations.iter().zip(locations) {
             if location.as_u64() != *expected {
                 return Err(Failure::invalid("transaction proof location mismatch"));
             }
-            let TransactionOperation::Append(digest) =
+            let TransactionOperation::Append(entry) =
                 TransactionOperation::decode_cfg(Bytes::copy_from_slice(bytes), &())?
             else {
                 return Err(Failure::invalid(
                     "requested transaction location is not an append",
                 ));
             };
-            digests.insert(*expected, digest);
+            digests.insert(*expected, entry);
         }
 
-        let encoded = encode_historical_multi_proof(&proof);
+        let encoded = encode_operation_multi_proof(&proof);
         bounded_proof(&encoded)?;
         Ok((encoded.to_vec(), digests))
     }
@@ -901,8 +1006,7 @@ impl Explorer {
     }
 }
 
-/// Serves an account's latest proven update and one activity page under a
-/// single certified snapshot.
+/// Serves an account value and history page, or verified absence, at one certified snapshot.
 async fn account(
     explorer: &Explorer,
     request: proto::GetAccountRequest,
@@ -914,20 +1018,20 @@ async fn account(
     let anchor = explorer.anchor(1, request.snapshot, true).await?;
     let mut bundle = anchor.bundle()?;
 
-    // Prove the account update and the activity page against the same anchor.
-    let (account, activity) =
-        tokio::try_join!(explorer.account_proof(&anchor, &request.key), async {
+    match explorer.account_proof(&anchor, &request).await? {
+        AccountLookup::Present(account) => {
             if request.activity {
-                explorer.activity(&anchor, &request).await
-            } else {
-                Ok((Vec::new(), None, None))
+                let (transactions, proof, cursor) =
+                    explorer.activity(&anchor, &request, &account).await?;
+                bundle.transactions = transactions;
+                bundle.transactions_proof = proof;
+                bundle.next_cursor = cursor.map(proto::proof_bundle::NextCursor::ActivityCursor);
             }
-        },)?;
-    bundle.account = account.into();
-    let (transactions, proof, cursor) = activity;
-    bundle.transactions = transactions;
-    bundle.transactions_proof = proof;
-    bundle.next_cursor = cursor.map(proto::proof_bundle::NextCursor::ActivityCursor);
+            bundle.headers = account.headers;
+            bundle.account = Some(account.proof).into();
+        }
+        AccountLookup::Absent(proof) => bundle.account = Some(proof).into(),
+    }
 
     // Report the floor after every read, since each read can raise it.
     bundle.sequence_number = anchor.floor()?;
@@ -963,12 +1067,16 @@ async fn block(explorer: &Explorer, request: proto::GetBlockRequest) -> Result<B
     if offset < page_end {
         let locations = (start + offset..start + page_end).collect::<Vec<_>>();
         let (proof, digests) = explorer.transaction_proof(&anchor, &locations).await?;
-        let bodies = explorer.bodies(&anchor, digests.values().copied()).await?;
+        let bodies = explorer
+            .bodies(&anchor, digests.values().map(|entry| entry.digest))
+            .await?;
         bundle.transactions = digests
             .into_iter()
-            .map(|(location, digest)| TransactionRow {
+            .map(|(location, entry)| TransactionRow {
                 location,
-                body: bodies[&digest].to_vec(),
+                body: bodies[&entry.digest].to_vec(),
+                sender_index: entry.sender_index,
+                recipient_index: entry.recipient_index,
                 height,
                 index: (location - start) as u32,
                 role: None,
@@ -1030,7 +1138,7 @@ async fn transaction(
         .map_err(|_| Failure::limit("transaction index exceeds supported range"))?;
 
     // The proof must authenticate exactly this digest at the hinted location.
-    let (proof, bodies) = explorer
+    let (proof, entries, bodies) = explorer
         .transaction_evidence(&anchor, &[(location, digest)])
         .await?;
     let mut bundle = anchor.bundle()?;
@@ -1041,6 +1149,8 @@ async fn transaction(
         height,
         index,
         role: None,
+        sender_index: entries[&location].sender_index,
+        recipient_index: entries[&location].recipient_index,
         ..Default::default()
     }];
     bundle.transactions_proof = Some(proof);
@@ -1074,63 +1184,20 @@ fn transaction_body(bytes: &[u8], digest: &Digest) -> Result<Bytes, Failure> {
     Ok(bytes)
 }
 
-/// Reads at most one row beyond an activity page, newest first, after the
-/// request cursor and at or below the certified `height`.
+/// Reads exactly the requested account-index interval, newest first.
 async fn activity_rows(
     sql: &SqlContext,
     request: &AccountRequest,
+    lower: u64,
+    end: u64,
     height: u64,
 ) -> Result<Vec<RecordBatch>, Failure> {
-    // A cursor above the certified height belongs to a later snapshot.
-    if request.cursor.is_some_and(|cursor| cursor.height > height) {
-        return Err(Failure::bad("cursor exceeds certified height"));
-    }
-
-    // Sent and received filters apply the role as a row predicate.
-    let mut predicate = format!("account = X'{}'", hex(request.key.as_ref()));
-    if let Some(role) = request.mode {
-        predicate.push_str(&format!(" AND role = {role}"));
-    }
-
-    // Each cursor suffix is a separate key range, so the Store can seek past
-    // earlier pages. The ranges are disjoint and ordered newest first.
-    let mut ranges = Vec::with_capacity(3);
-    if let Some(cursor) = request.cursor {
-        if cursor.role == 1 && request.mode.is_none() {
-            ranges.push(format!(
-                "height = {} AND index = {} AND role = 0",
-                cursor.height, cursor.index
-            ));
-        }
-        if cursor.index > 0 {
-            ranges.push(format!(
-                "height = {} AND index < {}",
-                cursor.height, cursor.index
-            ));
-        }
-        if cursor.height > 1 {
-            ranges.push(format!("height < {}", cursor.height));
-        }
-    } else {
-        ranges.push(format!("height <= {height}"));
-    }
-
-    // Query the ranges in order, carrying the remaining budget so the total
-    // stays within one page plus one row.
-    let mut remaining = ACCOUNT_PAGE + 1;
-    let mut batches = Vec::new();
-    for range in ranges {
-        let query = format!(
-            "SELECT height, index, role, tx_digest, qmdb_location FROM tx_activity WHERE {predicate} AND {range} ORDER BY height DESC, index DESC, role DESC LIMIT {remaining}"
-        );
-        let next = query_rows(sql, &query, remaining).await?;
-        remaining -= next.iter().map(RecordBatch::num_rows).sum::<usize>();
-        batches.extend(next);
-        if remaining == 0 {
-            break;
-        }
-    }
-    Ok(batches)
+    let count = (end - lower) as usize;
+    let query = format!(
+        "SELECT account_index, height, index, role, tx_digest, qmdb_location FROM tx_activity WHERE account = X'{}' AND account_index >= {lower} AND account_index < {end} AND height <= {height} ORDER BY account_index DESC LIMIT {count}",
+        hex(request.key.as_ref())
+    );
+    query_rows(sql, &query, count).await
 }
 
 /// Runs a SQL query, rejecting results with more than `max` rows and dropping

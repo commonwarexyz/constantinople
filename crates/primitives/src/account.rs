@@ -177,13 +177,21 @@ impl Read for Nonce {
 /// An account, as represented in the state of the chain.
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-#[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
+#[display(
+    "Account {{ balance: {}, nonce: {}, tx_count: {} }}",
+    balance,
+    nonce,
+    tx_count
+)]
 pub struct Account {
     /// The balance of the account, which is the amount of tokens that the
     /// account holds.
     pub balance: u64,
     /// Consumed and run-ahead transaction nonce state.
     pub nonce: Nonce,
+    /// Number of accepted transactions involving this account in either role.
+    /// A transaction sent to the same account counts once.
+    pub tx_count: u64,
 }
 
 impl Default for Account {
@@ -191,18 +199,20 @@ impl Default for Account {
         Self {
             balance: DEFAULT_ACCOUNT_BALANCE,
             nonce: Nonce::default(),
+            tx_count: 0,
         }
     }
 }
 
 impl FixedSize for Account {
-    const SIZE: usize = u64::SIZE + Nonce::SIZE;
+    const SIZE: usize = u64::SIZE + Nonce::SIZE + u64::SIZE;
 }
 
 impl Write for Account {
     fn write(&self, buf: &mut impl BufMut) {
         self.balance.write(buf);
         self.nonce.write(buf);
+        self.tx_count.write(buf);
     }
 }
 
@@ -213,6 +223,7 @@ impl Read for Account {
         Ok(Self {
             balance: u64::read(buf)?,
             nonce: Nonce::read(buf)?,
+            tx_count: u64::read(buf)?,
         })
     }
 }
@@ -305,11 +316,14 @@ mod tests {
         let account = Account {
             balance: 42,
             nonce: Nonce::new(7, 3),
+            tx_count: 11,
         };
 
         let mut buf = Vec::with_capacity(Account::SIZE);
         account.write(&mut buf);
         assert_eq!(buf.len(), Account::SIZE);
+        assert_eq!(Account::SIZE, 32);
+        assert_eq!(&buf[24..], &11u64.to_be_bytes());
 
         let decoded = Account::decode(buf).expect("decoding should succeed");
         assert_eq!(decoded, account);
@@ -322,6 +336,7 @@ mod tests {
             Account {
                 balance: DEFAULT_ACCOUNT_BALANCE,
                 nonce: Nonce::default(),
+                tx_count: 0,
             }
         );
     }

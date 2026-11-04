@@ -1,0 +1,321 @@
+//! Shared synchronization logic for [crate::qmdb::current] databases.
+//!
+//! Contains the implementation of [crate::qmdb::sync::Database] for
+//! [Db](crate::qmdb::current::db::Db), covering every variant (ordered/unordered,
+//! fixed/variable, any snapshot index).
+//!
+//! The canonical root of a `current` database combines the ops root, grafted root, and optional
+//! pending and partial chunk digests into a single hash (see the [Root structure](super) section in
+//! the module documentation). The sync engine operates on the **ops root**, not the canonical root:
+//! it downloads operations and verifies each batch against the ops root using ops-tree range proofs
+//! (identical to `any` sync). Callers that verify current ops proofs directly should use
+//! [crate::qmdb::verify_proof]. [crate::qmdb::current::proof::OpsRootWitness] can be used by
+//! callers that need to authenticate the synced ops root against a trusted canonical root; the sync
+//! engine does not perform this check itself.
+//!
+//! After all operations are synced, the bitmap and grafted tree are reconstructed deterministically
+//! from the operations. The canonical root is then computed from the ops root, the reconstructed
+//! grafted root, and any pending or partial chunk digests.
+//!
+//! The [Database]`::`[root()](crate::qmdb::sync::Database::root) implementation returns the **ops
+//! root** (not the canonical root) because that is what the sync engine verifies against.
+//!
+//! For pruned databases (`range.start > 0`), grafted pinned nodes for the pruned region are read
+//! directly from the ops tree after it is built. This works because of the zero-chunk identity: for
+//! all-zero bitmap chunks (which all pruned chunks are), the grafted leaf equals the ops subtree
+//! root, making the grafted tree structurally identical to the ops tree at and above the grafting
+//! height.
+
+use crate::{
+    Context,
+    index::{Factory as IndexFactory, Unordered as UnorderedIndex},
+    journal::{authenticated, contiguous::Mutable},
+    merkle::{
+        Graftable, Location,
+        full::{self, Merkle},
+    },
+    qmdb::{
+        self,
+        any::{
+            db::Db as AnyDb,
+            operation::{Operation, update::Update},
+        },
+        bitmap::Shared,
+        current::{db, grafting},
+        metrics::Metrics as AnyMetrics,
+        sync::{Database, DatabaseConfig as Config, Request, source},
+    },
+    translator::Translator,
+};
+use commonware_codec::Codec;
+use commonware_cryptography::{DigestOf, Hasher};
+use commonware_parallel::Strategy;
+use commonware_runtime::Spawner;
+use commonware_utils::{bitmap::Prunable as BitMap, range::NonEmptyRange};
+use core::num::NonZeroUsize;
+use std::{num::NonZeroU64, sync::Arc};
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+impl<T: Translator, J: Clone, S: Strategy, B> Config for super::Config<T, J, S, B> {
+    type JournalConfig = J;
+
+    fn journal_config(&self) -> Self::JournalConfig {
+        self.journal_config.clone()
+    }
+}
+
+/// Shared helper to build a `current::db::Db` from sync components.
+///
+/// This follows the same pattern as `any/sync/mod.rs::build_db` but additionally:
+/// * Builds the activity bitmap by replaying the operations log.
+/// * Extracts grafted pinned nodes from the ops tree (zero-chunk identity).
+/// * Builds the grafted tree from the bitmap and ops tree.
+/// * Computes and caches the canonical root.
+#[allow(clippy::too_many_arguments)]
+async fn build_db<F, E, U, I, H, J, const N: usize, S>(
+    context: E,
+    merkle_config: full::Config<S>,
+    log: J,
+    translator: I::Translator,
+    pinned_nodes: Option<Vec<H::Digest>>,
+    range: NonEmptyRange<Location<F>>,
+    apply_batch_size: NonZeroU64,
+    init_concurrency: <I as crate::qmdb::SnapshotBuild<F>>::Concurrency,
+    init_buffer: NonZeroUsize,
+    cache_size: Option<NonZeroUsize>,
+    metadata_partition: String,
+    strategy: S,
+) -> Result<db::Db<F, E, J, I, H, U, N, S>, qmdb::Error<F>>
+where
+    F: Graftable,
+    E: Context + Spawner,
+    U: Update,
+    I: IndexFactory + crate::qmdb::SnapshotBuild<F>,
+    H: Hasher,
+    J: Mutable<Item = Operation<F, U>> + 'static,
+    S: Strategy,
+    Operation<F, U>: Codec,
+{
+    // Build authenticated log.
+    let merkle = Merkle::<F, _, _, S>::init_sync(
+        context.child("merkle"),
+        full::SyncConfig {
+            config: merkle_config,
+            range: range.clone(),
+            pinned_nodes,
+        },
+    )
+    .await?;
+    let index = I::new(context.child("index"), translator);
+    let log = authenticated::Journal::<F, _, _, _, S>::from_components(
+        merkle,
+        log,
+        qmdb::hasher::<H>(),
+        apply_batch_size,
+    )
+    .await?;
+
+    // Initialize bitmap with pruned chunks.
+    //
+    // Floor division is intentional: chunks entirely below range.start are pruned.
+    // If range.start is not chunk-aligned, the partial leading chunk is reconstructed by
+    // init_from_log, which pads the gap between `pruned_chunks * CHUNK_SIZE_BITS` and the
+    // journal's inactivity floor with inactive (false) bits.
+    let pruned_chunks = (*range.start() / BitMap::<N>::CHUNK_SIZE_BITS) as usize;
+    let bitmap = BitMap::<N>::new_with_pruned_chunks(pruned_chunks)
+        .map_err(|_| qmdb::Error::<F>::DataCorrupted("pruned chunks overflow"))?;
+    let bitmap = Arc::new(Shared::<N>::new(bitmap));
+
+    // Build any::Db, handing it the pre-allocated bitmap. `init_from_log` populates the bitmap
+    // during replay.
+    let snapshot_context = context.child("any_snapshot");
+    let any_metrics = AnyMetrics::new(context.child("any"));
+    let any: AnyDb<F, E, J, I, H, U, N, S> = AnyDb::init_from_log(
+        snapshot_context,
+        index,
+        log,
+        Some(bitmap),
+        init_concurrency,
+        init_buffer,
+        cache_size,
+        any_metrics,
+    )
+    .await?;
+
+    // Fetch grafted pinned nodes from the ops tree. For each position the grafted family
+    // needs at its pruning boundary, source the digest from the ops tree via the zero-chunk
+    // identity: when the covered chunks are all zero (which pruned chunks always are), the
+    // ops-family digest at the mapped position equals the grafted digest.
+    //
+    // Requires `range.start <=` target's [`Db::sync_boundary`](db::Db::sync_boundary): that
+    // bound guarantees every required ops-tree node is born at `range.end`.
+    let grafted_pinned_nodes = {
+        let grafted_boundary = Location::<F>::new(pruned_chunks as u64);
+        let grafting_height = grafting::height::<N>();
+        let mut pinned_nodes = Vec::new();
+        for grafted_pos in F::nodes_to_pin(grafted_boundary) {
+            let ops_pos = grafting::grafted_to_ops_pos::<F>(grafted_pos, grafting_height);
+            let digest = any
+                .log
+                .merkle
+                .get_node(ops_pos)
+                .await?
+                .ok_or(qmdb::Error::<F>::DataCorrupted("missing ops pinned node"))?;
+            pinned_nodes.push(digest);
+        }
+        pinned_nodes
+    };
+
+    // Rebuild the grafted tree, graft roots, and canonical root from the synced `any` state.
+    // The canonical root is deterministic because the engine authenticates the ops and the
+    // bitmap is derived from them.
+    let (grafted_tree, graft_roots, ops_root_witness) = db::rebuild_grafted_tree::<F, H, S, N>(
+        any.bitmap.as_ref(),
+        &grafted_pinned_nodes,
+        &any.log.merkle,
+        any.inactivity_floor_loc,
+        &strategy,
+    )
+    .await?;
+
+    // Initialize metadata store and construct the Db.
+    let (metadata, _, _) =
+        db::init_metadata::<F, E, DigestOf<H>>(context.child("metadata"), &metadata_partition)
+            .await?;
+
+    let root = ops_root_witness.root::<H>(&any.root());
+    let metrics = db::Metrics::new(context);
+    let current_db = db::Db {
+        any,
+        grafted_tree: Arc::new(grafted_tree),
+        graft_roots,
+        metadata,
+        strategy,
+        root,
+        ops_root_witness,
+        metrics,
+        #[cfg(test)]
+        halt_before_prune_log: false,
+    };
+    current_db.update_metrics();
+
+    // Persist metadata so the db can be reopened with init_fixed/init_variable.
+    let current_db = current_db.sync_metadata().await?;
+
+    Ok(current_db)
+}
+
+impl<F, E, C, I, H, U, const N: usize, S> Database for db::Db<F, E, C, I, H, U, N, S>
+where
+    F: Graftable,
+    E: Context + Spawner,
+    C: Mutable<Item = Operation<F, U>>
+        + crate::qmdb::sync::Journal<F, Context = E, Op = Operation<F, U>>
+        + 'static,
+    I: IndexFactory + crate::qmdb::SnapshotBuild<F> + UnorderedIndex<Value = Location<F>>,
+    H: Hasher,
+    U: Update,
+    S: Strategy,
+    Operation<F, U>: Codec,
+{
+    type Family = F;
+    type Context = E;
+    type Op = Operation<F, U>;
+    type Journal = C;
+    type Hasher = H;
+    type Config = super::Config<
+        I::Translator,
+        <C as crate::qmdb::sync::Journal<F>>::Config,
+        S,
+        <I as crate::qmdb::SnapshotBuild<F>>::Concurrency,
+    >;
+    type Digest = H::Digest;
+
+    async fn from_sync_result(
+        context: Self::Context,
+        config: Self::Config,
+        log: Self::Journal,
+        pinned_nodes: Option<Vec<Self::Digest>>,
+        range: NonEmptyRange<Location<F>>,
+        apply_batch_size: NonZeroU64,
+    ) -> Result<Self, qmdb::Error<F>> {
+        let strategy = config.merkle_config.strategy.clone();
+        build_db::<F, _, U, _, H, _, N, _>(
+            context,
+            config.merkle_config,
+            log,
+            config.translator,
+            pinned_nodes,
+            range,
+            apply_batch_size,
+            config.init_concurrency,
+            config.init_buffer,
+            config.init_cache,
+            config.grafted_metadata_partition,
+            strategy,
+        )
+        .await
+    }
+
+    async fn persist_sync_result(self) -> Result<Self, qmdb::Error<F>> {
+        Ok(self)
+    }
+
+    async fn local_pinned_nodes(
+        context: Self::Context,
+        config: &Self::Config,
+        target: &qmdb::sync::Target<Self::Family, Self::Digest>,
+        journal: &Self::Journal,
+    ) -> Result<Option<Vec<Self::Digest>>, qmdb::Error<F>> {
+        if target.range.start() == Location::new(0)
+            || !qmdb::sync::journal_covers_range(journal.bounds(), &target.range)
+        {
+            return Ok(None);
+        }
+
+        // The inactivity floor is carried by the last commit operation rather than
+        // being the target range's start.
+        let inactivity_floor =
+            qmdb::find_inactivity_floor_at::<F, _>(journal, target.range.end()).await?;
+
+        qmdb::sync::local_pinned_nodes::<F, _, H, S>(
+            context,
+            config.merkle_config.clone(),
+            target,
+            inactivity_floor,
+        )
+        .await
+    }
+
+    /// Returns the ops root (not the canonical root), since the sync engine verifies
+    /// batches against the ops tree.
+    fn root(&self) -> Self::Digest {
+        self.any.root()
+    }
+}
+
+/// A `current` database serves proofs from the `any` database it wraps. The sync engine
+/// operates on the ops root, which is `any`'s root.
+impl<F, E, C, I, H, U, const N: usize, S> crate::qmdb::sync::Source
+    for db::Db<F, E, C, I, H, U, N, S>
+where
+    F: Graftable,
+    E: Context,
+    C: Mutable<Item = Operation<F, U>>,
+    I: UnorderedIndex<Value = Location<F>>,
+    H: Hasher,
+    U: Update,
+    S: Strategy,
+    Operation<F, U>: Codec,
+{
+    type Family = F;
+    type Digest = H::Digest;
+    type Op = Operation<F, U>;
+    type Error = qmdb::Error<F>;
+
+    async fn serve(&self, request: Request<F>) -> source::Result<Self> {
+        self.any.serve(request).await
+    }
+}

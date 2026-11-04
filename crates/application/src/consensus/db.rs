@@ -3,41 +3,40 @@
 use commonware_cryptography::Hasher;
 use commonware_glue::stateful::db::{
     DatabaseSet, Reader, Shared, Unmerkleized,
-    any::{AnyStaged, AnyUnmerkleized},
+    current::{CurrentStaged, CurrentUnmerkleized},
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
-    index::unordered::Index as UnorderedIndex,
+    index::ordered::Index as OrderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
     mmr,
     qmdb::{
         any::{
-            batch::Slot,
-            operation::Operation as AnyOperation,
-            unordered::{Update as UnorderedUpdate, fixed},
+            batch::Slot, operation::Operation as AnyOperation, ordered::Update as OrderedUpdate,
             value::FixedEncoding,
         },
+        current::ordered::fixed,
         keyless::fixed as keyless_fixed,
         sync::{CompactTarget, Target as AnyTarget},
     },
     translator::EightCap,
 };
-use constantinople_primitives::{Account, AccountKey};
+use constantinople_primitives::{Account, AccountKey, TransactionHistoryEntry};
 use std::future::Future;
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
-    Shared<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>;
+    Shared<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, 32, S>>;
 
 pub type TransactionHistoryDb<E, H, S> =
-    keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
+    keyless_fixed::CompactDb<mmr::Family, E, TransactionHistoryEntry<<H as Hasher>::Digest>, H, S>;
 
 pub type TransactionHistoryOperation<H> =
-    keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
+    keyless_fixed::Operation<mmr::Family, TransactionHistoryEntry<<H as Hasher>::Digest>>;
 
 pub type StateOperation =
-    AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>;
+    AnyOperation<mmr::Family, OrderedUpdate<AccountKey, FixedEncoding<Account>>>;
 
 pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
@@ -49,30 +48,32 @@ pub type TransactionDatabase<E, H, S> = Shared<TransactionHistoryDb<E, H, S>>;
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
 
 pub type DatabaseReaders<E, H, T, S> = (
-    Reader<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>,
+    Reader<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, 32, S>>,
     Reader<TransactionHistoryDb<E, H, S>>,
 );
 
 /// Unmerkleized application state batch, staged by the executor before writes.
-pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
+pub type StateBatch<E, H, T, S> = CurrentUnmerkleized<
     mmr::Family,
     E,
     FixedJournal<E, StateOperation>,
-    UnorderedIndex<T, mmr::Location>,
+    OrderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    OrderedUpdate<AccountKey, FixedEncoding<Account>>,
+    32,
     S,
 >;
 
 /// Staged application state batch: touched keys are read and their resolved
 /// locations retained, so indexed updates skip key re-resolution at merkleize.
-pub type StateStaged<E, H, T, S> = AnyStaged<
+pub type StateStaged<E, H, T, S> = CurrentStaged<
     mmr::Family,
     E,
     FixedJournal<E, StateOperation>,
-    UnorderedIndex<T, mmr::Location>,
+    OrderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    OrderedUpdate<AccountKey, FixedEncoding<Account>>,
+    32,
     S,
 >;
 
@@ -96,18 +97,18 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
     TransactionMerkleized<E, H, S>,
 );
 
-pub(super) fn apply_transaction_digests<E, H, S>(
+pub(super) fn apply_transaction_entries<E, H, S>(
     batch: TransactionBatch<E, H, S>,
-    digests: &[H::Digest],
+    entries: &[TransactionHistoryEntry<H::Digest>],
 ) -> TransactionBatch<E, H, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    digests
+    entries
         .iter()
-        .fold(batch, |batch, digest| batch.append(*digest))
+        .fold(batch, |batch, entry| batch.append(*entry))
 }
 
 /// Merkleizes the staged state batch, with one slot per staged read, and the
@@ -155,7 +156,7 @@ mod tests {
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedJournalConfig,
         merkle::full::Config as MmrConfig,
-        qmdb::any::{FixedConfig, batch::Slot},
+        qmdb::{any::batch::Slot, current::FixedConfig},
         translator::EightCap,
     };
     use commonware_utils::{NZU16, NZU64, NZUsize};
@@ -187,6 +188,7 @@ mod tests {
             init_cache: Some(NZUsize!(1024)),
             init_buffer: NZUsize!(1 << 21),
             init_concurrency: (),
+            grafted_metadata_partition: "state-order-test-grafted-metadata".into(),
         }
     }
 
@@ -198,6 +200,7 @@ mod tests {
         Account {
             balance,
             nonce: Nonce::default(),
+            tx_count: 0,
         }
     }
 
