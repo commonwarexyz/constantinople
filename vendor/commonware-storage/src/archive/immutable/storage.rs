@@ -1,0 +1,452 @@
+use crate::{
+    Context,
+    archive::{Error, Identifier, immutable::Config},
+    freezer::{self, Checkpoint, Cursor, Freezer},
+    metadata::{self, Metadata},
+    ordinal::{self, Ordinal},
+};
+use commonware_codec::{Buf, CodecShared, EncodeSize, FixedSize, Read, ReadExt, Write};
+use commonware_runtime::{
+    BufMut,
+    telemetry::metrics::{Counter, MetricsExt as _},
+};
+use commonware_utils::{Array, bitmap::BitMap, sequence::prefixed_u64::U64};
+use futures::{TryFutureExt as _, try_join};
+use std::collections::BTreeMap;
+use tracing::{debug, warn};
+
+/// Prefix for [Freezer] records.
+const FREEZER_PREFIX: u8 = 0;
+
+/// Prefix for [Ordinal] records.
+const ORDINAL_PREFIX: u8 = 1;
+
+/// Item stored in [Metadata] to ensure [Freezer] and [Ordinal] remain consistent.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+enum Record {
+    Freezer(Checkpoint),
+    Ordinal(Option<BitMap>),
+}
+
+impl Record {
+    /// Get the [Freezer] [Checkpoint] from the [Record].
+    fn freezer(&self) -> &Checkpoint {
+        match self {
+            Self::Freezer(checkpoint) => checkpoint,
+            _ => panic!("incorrect record"),
+        }
+    }
+
+    /// Get the [Ordinal] [BitMap] from the [Record].
+    fn ordinal(&self) -> &Option<BitMap> {
+        match self {
+            Self::Ordinal(indices) => indices,
+            _ => panic!("incorrect record"),
+        }
+    }
+}
+
+impl Write for Record {
+    fn write(&self, buf: &mut impl BufMut) {
+        match self {
+            Self::Freezer(checkpoint) => {
+                buf.put_u8(0);
+                checkpoint.write(buf);
+            }
+            Self::Ordinal(indices) => {
+                buf.put_u8(1);
+                indices.write(buf);
+            }
+        }
+    }
+}
+
+impl Read for Record {
+    type Cfg = ();
+    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
+        let tag = u8::read(buf)?;
+        match tag {
+            0 => Ok(Self::Freezer(Checkpoint::read(buf)?)),
+            1 => Ok(Self::Ordinal(Option::<BitMap>::read_cfg(
+                buf,
+                &(..=usize::MAX as u64).into(),
+            )?)),
+            _ => Err(commonware_codec::Error::InvalidEnum(tag)),
+        }
+    }
+}
+
+impl EncodeSize for Record {
+    fn encode_size(&self) -> usize {
+        1 + match self {
+            Self::Freezer(_) => Checkpoint::SIZE,
+            Self::Ordinal(indices) => indices.encode_size(),
+        }
+    }
+}
+
+/// The archive's state, boxed so the public [Archive] handle stays pointer-sized.
+struct Inner<E: Context, K: Array, V: CodecShared> {
+    /// Number of items per section.
+    items_per_section: u64,
+
+    /// Metadata for the archive.
+    metadata: Metadata<E, U64, Record>,
+
+    /// Freezer for the archive.
+    freezer: Freezer<E, K, V>,
+
+    /// Ordinal for the archive.
+    ordinal: Ordinal<E, Cursor>,
+
+    // Metrics
+    gets: Counter,
+    has: Counter,
+    syncs: Counter,
+}
+
+impl<E: Context, K: Array, V: CodecShared> Inner<E, K, V> {
+    /// See [Archive::init].
+    async fn init(context: E, cfg: Config<V::Cfg>) -> Result<Self, Error> {
+        // Initialize metadata
+        let metadata = Metadata::<E, U64, Record>::init(
+            context.child("metadata"),
+            metadata::Config {
+                partition: cfg.metadata_partition,
+                codec_config: (),
+            },
+        )
+        .await?;
+
+        // Metadata is the commit record for lower-layer storage. If no checkpoint was committed,
+        // Freezer::init treats existing freezer blobs as uncommitted and starts empty.
+        let freezer_key = U64::new(FREEZER_PREFIX, 0);
+        let checkpoint = metadata.get(&freezer_key).map(|freezer| *freezer.freezer());
+
+        // Initialize table
+        //
+        // TODO (#1227): Use sharded metadata to provide consistency
+        let freezer = Freezer::init(
+            context.child("freezer"),
+            freezer::Config {
+                key_partition: cfg.freezer_key_partition,
+                key_write_buffer: cfg.freezer_key_write_buffer,
+                key_page_cache: cfg.freezer_key_page_cache,
+                value_partition: cfg.freezer_value_partition,
+                value_compression: cfg.freezer_value_compression,
+                value_write_buffer: cfg.freezer_value_write_buffer,
+                value_target_size: cfg.freezer_value_target_size,
+                table_partition: cfg.freezer_table_partition,
+                table_initial_size: cfg.freezer_table_initial_size,
+                table_resize_frequency: cfg.freezer_table_resize_frequency,
+                table_resize_chunk_size: cfg.freezer_table_resize_chunk_size,
+                table_replay_buffer: cfg.replay_buffer,
+                codec_config: cfg.codec_config,
+            },
+            checkpoint,
+        )
+        .await?;
+
+        // Collect committed ordinal sections. Ordinal::init removes stored sections that are not
+        // present in this map, so an empty map represents a committed empty ordinal.
+        let sections = metadata
+            .keys()
+            .filter(|k| k.prefix() == ORDINAL_PREFIX)
+            .collect::<Vec<_>>();
+        let mut section_bits = BTreeMap::new();
+        for section in sections {
+            // Get record
+            let bits = metadata.get(section).unwrap().ordinal();
+
+            // A partial section's bitmap spans the whole section, so its length must match the
+            // configured section size. Sections are addressed by that size, so a mismatch would
+            // serve records at the wrong indices.
+            if let Some(bits) = bits
+                && bits.len() != cfg.items_per_section.get()
+            {
+                warn!(
+                    section = section.value(),
+                    bitmap_len = bits.len(),
+                    items_per_section = cfg.items_per_section.get(),
+                    "committed section does not match items_per_section"
+                );
+                return Err(Error::RecordCorrupted);
+            }
+
+            // Get section
+            let section = section.value();
+            section_bits.insert(section, bits);
+        }
+
+        // Initialize ordinal
+        //
+        // TODO (#1227): Use sharded metadata to provide consistency
+        let ordinal = Ordinal::init(
+            context.child("ordinal"),
+            ordinal::Config {
+                partition: cfg.ordinal_partition,
+                items_per_blob: cfg.items_per_section,
+                write_buffer: cfg.ordinal_write_buffer,
+                replay_buffer: cfg.replay_buffer,
+            },
+            Some(section_bits),
+        )
+        .await?;
+
+        // Initialize metrics
+        let gets = context.counter("gets", "Number of gets performed");
+        let has = context.counter("has", "Number of has performed");
+        let syncs = context.counter("syncs", "Number of syncs called");
+
+        Ok(Self {
+            items_per_section: cfg.items_per_section.get(),
+            metadata,
+            freezer,
+            ordinal,
+            gets,
+            has,
+            syncs,
+        })
+    }
+
+    /// Get the value for the given index.
+    async fn get_index(&self, index: u64) -> Result<Option<V>, Error> {
+        // Get ordinal
+        let Some(cursor) = self.ordinal.get(index).await? else {
+            return Ok(None);
+        };
+
+        // Get journal entry
+        let result = self
+            .freezer
+            .get(freezer::Identifier::Cursor(cursor))
+            .await?;
+
+        // Get value
+        Ok(result)
+    }
+
+    /// Get the value for the given key.
+    async fn get_key(&self, key: &K) -> Result<Option<V>, Error> {
+        // Get table entry
+        let result = self.freezer.get(freezer::Identifier::Key(key)).await?;
+
+        // Get value
+        Ok(result)
+    }
+
+    /// Initialize the section.
+    fn initialize_section(&mut self, section: u64) {
+        // Create active bit vector
+        let bits = BitMap::zeroes(self.items_per_section);
+
+        // Store record
+        let key = U64::new(ORDINAL_PREFIX, section);
+        self.metadata.put(key, Record::Ordinal(Some(bits)));
+        debug!(section, "initialized section");
+    }
+
+    /// See [crate::archive::Archive::put].
+    async fn put(mut self: Box<Self>, index: u64, key: K, data: &V) -> Result<Box<Self>, Error> {
+        // Ignore duplicates
+        if self.ordinal.has(index) {
+            return Ok(self);
+        }
+
+        // Initialize section if it doesn't exist
+        let section = index / self.items_per_section;
+        let ordinal_key = U64::new(ORDINAL_PREFIX, section);
+        if self.metadata.get(&ordinal_key).is_none() {
+            self.initialize_section(section);
+        }
+        let record = self.metadata.get_mut(&ordinal_key).unwrap();
+
+        // Update active bits
+        let done = if let Record::Ordinal(Some(bits)) = record {
+            bits.set(index % self.items_per_section, true);
+            bits.count_ones() == self.items_per_section
+        } else {
+            false
+        };
+        if done {
+            *record = Record::Ordinal(None);
+        }
+
+        // Put in table
+        let cursor;
+        (self.freezer, cursor) = self.freezer.put(key, data).await?;
+
+        // Put section and offset in ordinal
+        self.ordinal = self.ordinal.put(index, cursor).await?;
+
+        Ok(self)
+    }
+
+    /// See [crate::archive::Archive::get].
+    async fn get(&self, identifier: Identifier<'_, K>) -> Result<Option<V>, Error> {
+        self.gets.inc();
+
+        match identifier {
+            Identifier::Index(index) => self.get_index(index).await,
+            Identifier::Key(key) => self.get_key(key).await,
+        }
+    }
+
+    /// See [crate::archive::Archive::has].
+    async fn has(&self, identifier: Identifier<'_, K>) -> Result<bool, Error> {
+        self.has.inc();
+
+        match identifier {
+            Identifier::Index(index) => Ok(self.ordinal.has(index)),
+            Identifier::Key(key) => Ok(self.freezer.has(key).await?),
+        }
+    }
+
+    /// See [crate::archive::Archive::sync].
+    async fn sync(mut self: Box<Self>) -> Result<Box<Self>, Error> {
+        self.syncs.inc();
+
+        // Sync journal and ordinal
+        let ((freezer, checkpoint), ordinal) = try_join!(
+            self.freezer.sync().map_err(Error::from),
+            self.ordinal.sync().map_err(Error::from)
+        )?;
+        self.freezer = freezer;
+        self.ordinal = ordinal;
+
+        // Publish the freezer checkpoint with a single metadata sync after the
+        // freezer and ordinal state are durable.
+        let freezer_key = U64::new(FREEZER_PREFIX, 0);
+        self.metadata = self
+            .metadata
+            .put_sync(freezer_key, Record::Freezer(checkpoint))
+            .await?;
+
+        Ok(self)
+    }
+
+    /// See [crate::archive::Archive::next_gap].
+    fn next_gap(&self, index: u64) -> (Option<u64>, Option<u64>) {
+        self.ordinal.next_gap(index)
+    }
+
+    /// See [crate::archive::Archive::missing_items].
+    fn missing_items(&self, index: u64, max: usize) -> Vec<u64> {
+        self.ordinal.missing_items(index, max)
+    }
+
+    /// See [crate::archive::Archive::ranges].
+    fn ranges(&self) -> impl Iterator<Item = (u64, u64)> {
+        self.ordinal.ranges()
+    }
+
+    /// See [crate::archive::Archive::ranges_from].
+    fn ranges_from(&self, from: u64) -> impl Iterator<Item = (u64, u64)> {
+        self.ordinal.ranges_from(from)
+    }
+
+    /// See [crate::archive::Archive::first_index].
+    fn first_index(&self) -> Option<u64> {
+        self.ordinal.first_index()
+    }
+
+    /// See [crate::archive::Archive::last_index].
+    fn last_index(&self) -> Option<u64> {
+        self.ordinal.last_index()
+    }
+
+    /// See [crate::archive::Archive::destroy].
+    async fn destroy(self) -> Result<(), Error> {
+        // Remove the commit record first: whatever an interrupted destroy leaves behind is then
+        // uncommitted relative to any surviving commit record, and the next init discards it.
+        self.metadata.destroy().await?;
+
+        // The stores it named now hold only uncommitted data, so they can be removed in any order.
+        self.ordinal.destroy().await?;
+        self.freezer.destroy().await?;
+        Ok(())
+    }
+}
+
+/// An immutable key-value store for ordered data with a minimal memory footprint.
+///
+/// Mutating functions consume the archive and return it only on success: an error (or a
+/// dropped future) destroys the handle.
+pub struct Archive<E: Context, K: Array, V: CodecShared>(Box<Inner<E, K, V>>);
+
+impl<E: Context, K: Array, V: CodecShared> std::fmt::Debug for Archive<E, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Archive")
+            .field("first_index", &self.0.first_index())
+            .field("last_index", &self.0.last_index())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Context, K: Array, V: CodecShared> Archive<E, K, V> {
+    /// Initialize a new [Archive] with the given [Config].
+    pub async fn init(context: E, cfg: Config<V::Cfg>) -> Result<Self, Error> {
+        Ok(Self(Box::new(Inner::init(context, cfg).await?)))
+    }
+}
+
+impl<E: Context, K: Array, V: CodecShared> crate::archive::Archive for Archive<E, K, V> {
+    type Key = K;
+    type Value = V;
+
+    async fn put(mut self, index: u64, key: K, data: &V) -> Result<Self, Error> {
+        self.0 = self.0.put(index, key, data).await?;
+        Ok(self)
+    }
+
+    async fn get(&self, identifier: Identifier<'_, K>) -> Result<Option<V>, Error> {
+        self.0.get(identifier).await
+    }
+
+    async fn has(&self, identifier: Identifier<'_, K>) -> Result<bool, Error> {
+        self.0.has(identifier).await
+    }
+
+    async fn sync(mut self) -> Result<Self, Error> {
+        self.0 = self.0.sync().await?;
+        Ok(self)
+    }
+
+    fn next_gap(&self, index: u64) -> (Option<u64>, Option<u64>) {
+        self.0.next_gap(index)
+    }
+
+    fn missing_items(&self, index: u64, max: usize) -> Vec<u64> {
+        self.0.missing_items(index, max)
+    }
+
+    fn ranges(&self) -> impl Iterator<Item = (u64, u64)> {
+        self.0.ranges()
+    }
+
+    fn ranges_from(&self, from: u64) -> impl Iterator<Item = (u64, u64)> {
+        self.0.ranges_from(from)
+    }
+
+    fn first_index(&self) -> Option<u64> {
+        self.0.first_index()
+    }
+
+    fn last_index(&self) -> Option<u64> {
+        self.0.last_index()
+    }
+
+    async fn destroy(self) -> Result<(), Error> {
+        self.0.destroy().await
+    }
+}
+
+#[cfg(all(test, feature = "arbitrary"))]
+mod conformance {
+    use super::*;
+    use commonware_codec::conformance::CodecConformance;
+
+    commonware_conformance::conformance_tests! {
+        CodecConformance<Record>
+    }
+}

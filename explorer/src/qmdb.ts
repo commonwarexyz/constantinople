@@ -7,7 +7,7 @@ const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const ACCOUNT_VALUE_BYTES = 24;
+const ACCOUNT_VALUE_BYTES = 32;
 const U64_BYTES = 8;
 const MAX_BLOCK_TIMESTAMP_MS = 7_258_118_400_000n;
 
@@ -46,16 +46,15 @@ export interface LatestProofTarget extends FinalizedTransactionTarget {
     readonly sequenceNumber: bigint;
 }
 
-export type AccountActivityMode = 'all' | 'sent' | 'received';
-
 export interface AccountTransactionRow {
     readonly digest: string;
     readonly direction: 'sent' | 'received';
     readonly counterparty: string;
     readonly value: bigint;
     readonly nonce: bigint;
-    readonly height: bigint;
-    readonly blockIndex: number;
+    readonly accountIndex: bigint;
+    readonly senderIndex: bigint;
+    readonly recipientIndex: bigint;
     readonly location: bigint;
 }
 
@@ -68,9 +67,22 @@ export interface VerifiedAccountProof {
     readonly balance: bigint;
     readonly nonce: bigint;
     readonly nonceBitmap: bigint;
+    readonly txCount: bigint;
+    readonly writeHeight: bigint;
+    readonly timestampMs: bigint;
     readonly location: bigint;
     readonly tip: bigint;
     readonly proofSizeBytes: number;
+}
+
+export interface VerifiedAccountExclusion {
+    readonly accountKey: string;
+    readonly timestampMs: bigint;
+    readonly proofSizeBytes: number;
+    /** Location of the operation whose key span excludes the account. */
+    readonly location: bigint;
+    /** Hex keys of the adjacent active accounts bracketing this one; null for an empty database. */
+    readonly span: { readonly lower: string; readonly upper: string } | null;
 }
 
 // The parent digest authenticates ancestor headers and exact transaction bounds.
@@ -261,7 +273,7 @@ function readVarint(bytes: Uint8Array, offset: number): { value: bigint; offset:
 
 export function decodeAccountValue(
     value: Uint8Array,
-): Pick<VerifiedAccountProof, 'balance' | 'nonce' | 'nonceBitmap'> {
+): Pick<VerifiedAccountProof, 'balance' | 'nonce' | 'nonceBitmap' | 'txCount'> {
     if (value.length !== ACCOUNT_VALUE_BYTES) {
         throw new Error('malformed account proof value');
     }
@@ -269,6 +281,7 @@ export function decodeAccountValue(
         balance: readU64Be(value, 0),
         nonce: readU64Be(value, 8),
         nonceBitmap: readU64Be(value, 16),
+        txCount: readU64Be(value, 24),
     };
 }
 

@@ -1,0 +1,1610 @@
+//! Core sync engine components that are shared across sync clients.
+use crate::{
+    merkle::{Family, Location},
+    qmdb::{
+        self,
+        sync::{
+            Database, Error as SyncError, Journal, Metrics, SourceFor, Target,
+            database::Config as _,
+            error::EngineError,
+            requests::{Id as RequestId, Requests},
+            source::{Request, Response, Source},
+        },
+    },
+};
+use commonware_codec::Encode;
+use commonware_cryptography::{Digest, Hasher};
+use commonware_macros::{boxed, select};
+use commonware_runtime::Supervisor as _;
+use commonware_utils::channel::{mpsc, ring};
+use futures::future::{Aborted, Either, pending};
+use mpsc::error::TryRecvError;
+use std::{
+    collections::BTreeMap,
+    fmt::Debug,
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
+
+/// Type alias for sync engine errors
+type Error<DB, S> =
+    qmdb::sync::Error<<DB as Database>::Family, <S as Source>::Error, <DB as Database>::Digest>;
+
+/// Whether sync should continue or complete
+#[derive(Debug)]
+pub(crate) enum NextStep<C, D> {
+    /// Sync should continue with the updated client
+    Continue(C),
+    /// Sync is complete with the final database
+    Complete(D),
+}
+
+/// Events that can occur during synchronization
+#[derive(Debug)]
+enum Event<F: Family, Op, D: Digest, E> {
+    /// A target update was received
+    TargetUpdate(Target<F, D>),
+    /// A batch of operations was received, or its request was aborted by a target update
+    BatchReceived(Result<IndexedFetchResult<F, Op, D, E>, Aborted>),
+    /// The target update channel was closed
+    UpdateChannelClosed,
+    /// A finish signal was received
+    FinishRequested,
+    /// The finish signal channel was closed
+    FinishChannelClosed,
+}
+
+/// Result from a fetch operation, tagged with its request ID.
+#[derive(Debug)]
+pub(super) struct IndexedFetchResult<F: Family, Op, D: Digest, E> {
+    /// Unique ID assigned when the request was scheduled.
+    pub id: RequestId,
+    /// The result of the fetch operation.
+    pub result: Result<Option<Response<F, Op, D>>, E>,
+}
+
+/// Verifies one response against the exact request and trusted root that scheduled it.
+fn verify_response<F, Op, H>(
+    request: Request<F>,
+    root: &H::Digest,
+    response: &Response<F, Op, H::Digest>,
+) -> bool
+where
+    F: Family,
+    Op: Encode,
+    H: Hasher,
+{
+    if response.proof().leaves != request.size() {
+        return false;
+    }
+
+    let hasher = qmdb::hasher::<H>();
+    match (&request, response) {
+        (
+            Request::Operations { start, max_ops, .. },
+            Response::Operations { proof, operations },
+        ) => {
+            let operations_len = operations.len() as u64;
+            if operations_len == 0 || operations_len > max_ops.get() {
+                false
+            } else {
+                let elements = operations.iter().map(Encode::encode).collect::<Vec<_>>();
+                proof.verify_range_inclusion(&hasher, &elements, *start, root)
+            }
+        }
+        (
+            Request::Boundary { start, .. },
+            Response::Boundary {
+                proof,
+                op,
+                pinned_nodes,
+            },
+        ) => {
+            proof.verify_proof_and_pinned_nodes(&hasher, &[op.encode()], *start, pinned_nodes, root)
+        }
+        _ => false,
+    }
+}
+
+/// Wait for the next synchronization event.
+/// Returns `None` when there are no outstanding requests and no channels to wait on.
+async fn wait_for_event<F: Family, Op: Send, D: Digest, E: Send>(
+    update_rx: &mut Option<ring::Receiver<Target<F, D>>>,
+    finish_rx: &mut Option<mpsc::Receiver<()>>,
+    outstanding_requests: &mut Requests<F, Op, D, E>,
+) -> Option<Event<F, Op, D, E>> {
+    if outstanding_requests.len() == 0 && update_rx.is_none() && finish_rx.is_none() {
+        return None;
+    }
+
+    let target_update_fut = update_rx.as_mut().map_or_else(
+        || Either::Right(pending()),
+        |update_rx| Either::Left(update_rx.recv()),
+    );
+    let finish_fut = finish_rx.as_mut().map_or_else(
+        || Either::Right(pending()),
+        |finish_rx| Either::Left(finish_rx.recv()),
+    );
+    let batch_result_fut = outstanding_requests.next_completed();
+
+    select! {
+        finish = finish_fut => finish.map_or_else(
+            || Some(Event::FinishChannelClosed),
+            |_| Some(Event::FinishRequested)
+        ),
+        target = target_update_fut => target.map_or_else(
+            || Some(Event::UpdateChannelClosed),
+            |target| Some(Event::TargetUpdate(target))
+        ),
+        result = batch_result_fut => Some(Event::BatchReceived(result)),
+    }
+}
+
+/// Configuration for creating a new Engine
+pub struct Config<DB, S>
+where
+    DB: Database,
+{
+    /// Runtime context for creating database components
+    pub context: DB::Context,
+    /// Source of operations and proofs
+    pub source: S,
+    /// Trusted sync target (root digest and operation bounds).
+    ///
+    /// The engine only verifies source data against this commitment and does not select or
+    /// authenticate the target.
+    pub target: Target<DB::Family, DB::Digest>,
+    /// Maximum number of outstanding requests. The boundary request for the pinned nodes counts
+    /// toward it.
+    ///
+    /// Requests cover the next unfetched gaps anywhere in the sync range, so operations fetched
+    /// ahead of an unanswered request wait in memory until it is answered. The buffered amount
+    /// grows with the fetch rate and the time a request stays unanswered, which the source's
+    /// timeout and retry policy bounds.
+    pub max_outstanding_requests: NonZeroUsize,
+    /// Maximum operations to fetch per batch
+    pub fetch_batch_size: NonZeroU64,
+    /// Number of operations to apply in a single batch
+    pub apply_batch_size: NonZeroU64,
+    /// Database-specific configuration
+    pub db_config: DB::Config,
+    /// Channel for receiving sync target updates.
+    ///
+    /// The caller selects targets before sending updates and sends valid targets of the same
+    /// database in advancing order; an update may be superseded by a newer one before the engine
+    /// reads it. The engine adopts only strictly advancing targets and discards the rest.
+    pub update_rx: Option<ring::Receiver<Target<DB::Family, DB::Digest>>>,
+    /// Channel that requests sync completion once the current target is reached.
+    ///
+    /// When `None`, sync completes as soon as the target is reached.
+    pub finish_rx: Option<mpsc::Receiver<()>>,
+    /// Channel used to notify an observer once the current target is reached.
+    ///
+    /// The engine reports each reached target at most once, in the order reached, and never
+    /// waits for the observer, so an observer that falls behind skips intermediate reports.
+    pub reached_target_tx: Option<ring::Sender<Target<DB::Family, DB::Digest>>>,
+}
+/// A shared sync engine that manages the core synchronization state and operations.
+pub(crate) struct Engine<DB, S>
+where
+    DB: Database,
+    S: SourceFor<DB>,
+{
+    /// Tracks outstanding fetch requests and their futures
+    outstanding_requests: Requests<DB::Family, DB::Op, DB::Digest, S::Error>,
+
+    /// Operations that have been fetched but not yet applied to the log.
+    ///
+    /// # Invariant
+    ///
+    /// The vectors in the map are non-empty.
+    fetched_operations: BTreeMap<Location<DB::Family>, Vec<DB::Op>>,
+
+    /// Pinned merkle nodes at `target.range.start()`, used for database construction.
+    pinned_nodes: Option<Vec<DB::Digest>>,
+
+    /// The current sync target (root digest and operation bounds)
+    target: Target<DB::Family, DB::Digest>,
+
+    /// Maximum number of parallel outstanding requests
+    max_outstanding_requests: NonZeroUsize,
+
+    /// Maximum operations to fetch in a single batch
+    fetch_batch_size: NonZeroU64,
+
+    /// Number of operations to apply in a single batch
+    apply_batch_size: NonZeroU64,
+
+    /// Journal that operations are applied to during sync
+    journal: DB::Journal,
+
+    /// Source of operations and proofs, shared with in-flight requests
+    source: Arc<S>,
+
+    /// Runtime context for database operations
+    context: DB::Context,
+
+    /// Configuration for building the final database
+    config: DB::Config,
+
+    /// Optional receiver for target updates during sync
+    update_rx: Option<ring::Receiver<Target<DB::Family, DB::Digest>>>,
+
+    /// Whether the caller has asked the sync to finish at the current target.
+    finish_requested: bool,
+
+    /// Channel that requests sync completion once the current target is reached.
+    ///
+    /// When `None`, sync completes as soon as the target is reached.
+    finish_rx: Option<mpsc::Receiver<()>>,
+
+    /// Channel used to notify an observer once the current target is reached.
+    reached_target_tx: Option<ring::Sender<Target<DB::Family, DB::Digest>>>,
+
+    /// Progress gauges updated after target updates and batch application.
+    metrics: Metrics,
+
+    /// Tracks whether the current target has already been reported as reached.
+    reached_current_target_reported: bool,
+}
+
+#[cfg(test)]
+impl<DB, S> Engine<DB, S>
+where
+    DB: Database,
+    S: SourceFor<DB>,
+{
+    pub(crate) fn journal(&self) -> &DB::Journal {
+        &self.journal
+    }
+}
+
+impl<DB, S> Engine<DB, S>
+where
+    DB: Database,
+    S: SourceFor<DB>,
+{
+    pub async fn new(config: Config<DB, S>) -> Result<Self, Error<DB, S>> {
+        if !config.target.range.end().is_valid() {
+            return Err(SyncError::Engine(EngineError::InvalidTarget {
+                lower_bound_pos: config.target.range.start(),
+                upper_bound_pos: config.target.range.end(),
+            }));
+        }
+
+        // Recover the operation prefix that can resume this target.
+        let journal = <DB::Journal as Journal<DB::Family>>::new(
+            config.context.child("journal"),
+            config.db_config.journal_config(),
+            config.target.range.clone(),
+        )
+        .await?;
+        let journal_size = journal.size();
+
+        // The sync journal is the source of truth for resume. If it already
+        // reaches the target, try to recover the target's pinned nodes from local
+        // Merkle state before asking peers for them. Partial journals resume without
+        // probing completed database state.
+        let pinned_nodes = if journal_size == *config.target.range.end() {
+            DB::local_pinned_nodes(
+                config.context.child("local_pinned_nodes"),
+                &config.db_config,
+                &config.target,
+                &journal,
+            )
+            .await?
+        } else {
+            None
+        };
+
+        let sync_context = config.context.child("sync");
+        let metrics = Metrics::new(&sync_context);
+        let mut engine = Self {
+            outstanding_requests: Requests::new(),
+            fetched_operations: BTreeMap::new(),
+            pinned_nodes,
+            target: config.target.clone(),
+            max_outstanding_requests: config.max_outstanding_requests,
+            fetch_batch_size: config.fetch_batch_size,
+            apply_batch_size: config.apply_batch_size,
+            journal,
+            source: Arc::new(config.source),
+            context: config.context,
+            config: config.db_config,
+            update_rx: config.update_rx,
+            finish_requested: false,
+            finish_rx: config.finish_rx,
+            reached_target_tx: config.reached_target_tx,
+            reached_current_target_reported: false,
+            metrics,
+        };
+        engine.schedule_requests();
+        engine.record_progress();
+        Ok(engine)
+    }
+
+    /// Track `request` and spawn its fetch against the shared source.
+    fn spawn_fetch(&mut self, request: Request<DB::Family>) {
+        let source = Arc::clone(&self.source);
+        let root = self.target.root;
+        self.outstanding_requests
+            .insert(request, move |id| async move {
+                let result: Result<_, S::Error> = async {
+                    let (mut response, mut feedback) = source.serve(request).await?;
+                    loop {
+                        if verify_response::<DB::Family, DB::Op, DB::Hasher>(
+                            request, &root, &response,
+                        ) {
+                            if let Some(feedback) = feedback {
+                                feedback.accept();
+                            }
+                            return Ok(Some(response));
+                        }
+
+                        let Some(current) = feedback else {
+                            return Ok(None);
+                        };
+                        let Some((next_response, next_feedback)) = current.reject().await else {
+                            return Ok(None);
+                        };
+                        response = next_response;
+                        feedback = Some(next_feedback);
+                    }
+                }
+                .await;
+                IndexedFetchResult { id, result }
+            });
+    }
+
+    /// Schedule new fetch requests for operations in the sync range that we haven't yet fetched.
+    fn schedule_requests(&mut self) {
+        let target_size = self.target.range.end();
+
+        // Schedule a boundary request at the lower sync bound if pinned nodes are still
+        // needed and one isn't already in flight. The pinned nodes it returns are what let
+        // us rebuild the pruned prefix.
+        if !self.pinned_nodes_ready()
+            && !self
+                .outstanding_requests
+                .contains(&self.target.range.start())
+        {
+            let request = Request::Boundary {
+                size: target_size,
+                start: self.target.range.start(),
+            };
+            self.spawn_fetch(request);
+        }
+
+        // Calculate the maximum number of requests to make
+        let num_requests = self
+            .max_outstanding_requests
+            .get()
+            .saturating_sub(self.outstanding_requests.len());
+
+        let log_size = self.journal.size();
+
+        for _ in 0..num_requests {
+            // Find the next gap in the sync range that needs to be fetched.
+            let Some(gap_range) = crate::qmdb::sync::gaps::find_next(
+                Location::new(log_size)..self.target.range.end(),
+                self.fetched_operations.iter().map(|(&start, operations)| {
+                    start..start.checked_add(operations.len() as u64).unwrap()
+                }),
+                self.outstanding_requests.ranges(),
+            ) else {
+                break; // No more gaps to fill
+            };
+
+            // Calculate batch size for this gap
+            let gap_size = *gap_range.end.checked_sub(*gap_range.start).unwrap();
+            let gap_size: NonZeroU64 = gap_size.try_into().unwrap();
+            let batch_size = self.fetch_batch_size.min(gap_size);
+
+            // Schedule the request
+            let request = Request::Operations {
+                size: target_size,
+                start: gap_range.start,
+                max_ops: batch_size,
+            };
+            self.spawn_fetch(request);
+        }
+    }
+
+    /// Reset sync state for a target update.
+    ///
+    /// Keeps fetched operations. Keeps pinned nodes only while the lower bound is unchanged.
+    /// Keeps outstanding requests, whatever target size they were issued for, except those at or
+    /// below a moved lower bound. Each request verifies against the root it was issued with.
+    pub async fn reset_for_target_update(
+        mut self,
+        new_target: Target<DB::Family, DB::Digest>,
+    ) -> Result<Self, Error<DB, S>> {
+        let start_moved = self.target.range.start() != new_target.range.start();
+        self.journal = self.journal.resize(new_target.range.start()).await?;
+        if start_moved {
+            self.pinned_nodes = None;
+
+            // A source may prune up to the new lower bound, so a request below a moved bound
+            // may never be answered. Requests are also tracked by start location, so one kept at the
+            // new bound would block the boundary request there.
+            let new_start = new_target.range.start();
+            self.outstanding_requests
+                .retain(|request| request.start() > new_start);
+        }
+
+        self.target = new_target;
+        self.reached_current_target_reported = false;
+        Ok(self)
+    }
+
+    /// Drain a pending explicit-finish signal without blocking.
+    ///
+    /// If a finish signal is present, the finish channel is dropped and the engine
+    /// may complete as soon as it is at a target. If the finish channel is
+    /// disconnected before a finish request is observed, this returns
+    /// [`EngineError::FinishChannelClosed`].
+    fn drain_finish_requests(&mut self) -> Result<(), Error<DB, S>> {
+        let Some(finish_rx) = self.finish_rx.as_mut() else {
+            return Ok(());
+        };
+        match finish_rx.try_recv() {
+            Ok(()) => {
+                self.finish_rx = None;
+                self.finish_requested = true;
+                Ok(())
+            }
+            Err(TryRecvError::Empty) => Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                Err(SyncError::Engine(EngineError::FinishChannelClosed))
+            }
+        }
+    }
+
+    /// Notify an observer that the current target has been reached. The notification is sent
+    /// at most once per target, guarded by `reached_current_target_reported`.
+    ///
+    /// The send never waits. If the observer has dropped its receiver, the engine stops reporting
+    /// and keeps syncing.
+    fn report_reached_target(&mut self) {
+        if self.reached_current_target_reported {
+            return;
+        }
+        if let Some(sender) = self.reached_target_tx.as_ref()
+            && !sender.send_lossy(self.target.clone())
+        {
+            self.reached_target_tx = None;
+        }
+        self.reached_current_target_reported = true;
+    }
+
+    /// Record a progress snapshot in metrics.
+    fn record_progress(&mut self) {
+        self.metrics.record_target(*self.target.range.end());
+        self.metrics.record_synced(self.journal.size());
+    }
+
+    /// Store a batch of fetched operations. If the input list is empty, this is a no-op.
+    ///
+    /// Each start has at most one outstanding request, and gaps skip stored batches, so a batch
+    /// never replaces another.
+    pub(crate) fn store_operations(
+        &mut self,
+        start_loc: Location<DB::Family>,
+        operations: Vec<DB::Op>,
+    ) {
+        if operations.is_empty() {
+            return;
+        }
+        self.fetched_operations.insert(start_loc, operations);
+    }
+
+    /// Apply fetched operations to the journal if we have them.
+    ///
+    /// This method finds operations that are contiguous with the current journal tip
+    /// and applies them in order. It removes stale batches and handles partial
+    /// application of batches when needed.
+    pub(crate) async fn apply_operations(mut self) -> Result<Self, Error<DB, S>> {
+        let mut next_loc = self.journal.size();
+
+        // Remove any batches of operations with stale data.
+        // That is, those whose last operation is before `next_loc`.
+        self.fetched_operations.retain(|&start_loc, operations| {
+            assert!(!operations.is_empty());
+            let end_loc = start_loc.checked_add(operations.len() as u64 - 1).unwrap();
+            end_loc >= next_loc
+        });
+
+        loop {
+            // See if we have the next operation to apply (i.e. at the journal tip).
+            // Find the index of the range that contains the next location.
+            let range_start_loc =
+                self.fetched_operations
+                    .iter()
+                    .find_map(|(range_start, range_ops)| {
+                        assert!(!range_ops.is_empty());
+                        let range_end =
+                            range_start.checked_add(range_ops.len() as u64 - 1).unwrap();
+                        if *range_start <= next_loc && next_loc <= range_end {
+                            Some(*range_start)
+                        } else {
+                            None
+                        }
+                    });
+
+            let Some(range_start_loc) = range_start_loc else {
+                // We don't have the next operation to apply (i.e. at the journal tip)
+                break;
+            };
+
+            // Remove the batch of operations that contains the next operation to apply.
+            let mut operations = self.fetched_operations.remove(&range_start_loc).unwrap();
+            assert!(!operations.is_empty());
+            // Skip operations that are before the next location. The containment check when
+            // selecting the range (`next_loc <= range_end`) guarantees at least one operation
+            // at or after it, so the batch is never empty.
+            operations.drain(..(next_loc - *range_start_loc) as usize);
+            next_loc += operations.len() as u64;
+            self.journal = self.journal.append(operations).await?;
+        }
+
+        Ok(self)
+    }
+
+    /// Check if sync is complete based on the current journal size and target
+    fn is_at_target(&self) -> Result<bool, Error<DB, S>> {
+        let journal_size = self.journal.size();
+        let target_journal_size = self.target.range.end();
+
+        // Check if we've completed sync
+        if journal_size >= target_journal_size {
+            if journal_size > target_journal_size {
+                // This shouldn't happen in normal operation - indicates a bug
+                return Err(SyncError::Engine(EngineError::InvalidState));
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Returns whether this target needs pinned nodes to reconstruct pruned state.
+    fn needs_pinned_nodes(&self) -> bool {
+        self.target.range.start() > Location::new(0)
+    }
+
+    /// Returns whether pinned nodes are present or not needed by this target.
+    fn pinned_nodes_ready(&self) -> bool {
+        !self.needs_pinned_nodes() || self.pinned_nodes.is_some()
+    }
+
+    /// Returns whether the journal and pinned nodes are both ready for completion.
+    fn is_ready_to_complete(&self) -> Result<bool, Error<DB, S>> {
+        Ok(self.is_at_target()? && self.pinned_nodes_ready())
+    }
+
+    /// Handle the result of a fetch operation.
+    fn handle_fetch_result(
+        &mut self,
+        fetch_result: IndexedFetchResult<DB::Family, DB::Op, DB::Digest, S::Error>,
+    ) -> Result<(), Error<DB, S>> {
+        // A target update can retire a request before its completed result is handled.
+        let Some(request) = self.outstanding_requests.remove(fetch_result.id) else {
+            return Ok(());
+        };
+
+        let response = fetch_result
+            .result
+            .map_err(SyncError::Source)?
+            .ok_or(SyncError::Engine(EngineError::InvalidResponse))?;
+
+        let start_loc = request.start();
+        match response {
+            Response::Operations { operations, .. } => {
+                self.store_operations(start_loc, operations);
+            }
+            Response::Boundary {
+                op, pinned_nodes, ..
+            } => {
+                // A tracked boundary request is at the current lower bound. A fetched batch
+                // there already holds its operation.
+                self.pinned_nodes = Some(pinned_nodes);
+                self.fetched_operations
+                    .entry(start_loc)
+                    .or_insert_with(|| vec![op]);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a sync event and return the next engine state.
+    async fn handle_event(
+        mut self,
+        event: Event<DB::Family, DB::Op, DB::Digest, S::Error>,
+    ) -> Result<NextStep<Self, DB>, Error<DB, S>> {
+        match event {
+            Event::TargetUpdate(new_target) => {
+                // A non-advancing update is discarded.
+                if !new_target.advances(&self.target) {
+                    return Ok(NextStep::Continue(self));
+                }
+                // A same-root update that advances is impossible for an append-only log and
+                // indicates a caller bug.
+                if new_target.root == self.target.root {
+                    return Err(SyncError::Engine(EngineError::SyncTargetRootUnchanged));
+                }
+
+                let mut updated_self = self.reset_for_target_update(new_target).await?;
+                updated_self.record_progress();
+                updated_self.schedule_requests();
+                Ok(NextStep::Continue(updated_self))
+            }
+            Event::UpdateChannelClosed => {
+                self.update_rx = None;
+                Ok(NextStep::Continue(self))
+            }
+            Event::FinishRequested => {
+                self.finish_rx = None;
+                self.finish_requested = true;
+                Ok(NextStep::Continue(self))
+            }
+            Event::FinishChannelClosed => Err(SyncError::Engine(EngineError::FinishChannelClosed)),
+            Event::BatchReceived(fetch_result) => {
+                // An aborted request carries no result, but still wakes the loop to reschedule.
+                if let Ok(fetch_result) = fetch_result {
+                    self.handle_fetch_result(fetch_result)?;
+                }
+                self.schedule_requests();
+                let mut engine = self.apply_operations().await?;
+                engine.record_progress();
+                Ok(NextStep::Continue(engine))
+            }
+        }
+    }
+
+    /// Execute one step of the synchronization process.
+    ///
+    /// This is the main coordination method that:
+    /// 1. Checks if sync is complete
+    /// 2. Waits for the next synchronization event
+    /// 3. Handles different event types (target updates, fetch results)
+    /// 4. Coordinates request scheduling and operation application
+    ///
+    /// Returns `NextStep::Complete(database)` when sync is finished, or
+    /// `NextStep::Continue(self)` when more work remains.
+    #[boxed]
+    pub(crate) async fn step(mut self) -> Result<NextStep<Self, DB>, Error<DB, S>> {
+        self.drain_finish_requests()?;
+
+        // Check if sync is complete
+        if self.is_ready_to_complete()? {
+            // Report the reached target before a queued update can replace it.
+            self.report_reached_target();
+
+            // Take a queued target update before completing at the old target, unless the
+            // caller already asked to finish. Updates that do not advance the target are
+            // discarded.
+            if !self.finish_requested {
+                while let Some(update_rx) = self.update_rx.as_mut() {
+                    match update_rx.try_recv() {
+                        Ok(new_target) => {
+                            if new_target.advances(&self.target) {
+                                return self.handle_event(Event::TargetUpdate(new_target)).await;
+                            }
+                        }
+                        Err(ring::TryRecvError::Empty) => break,
+                        Err(ring::TryRecvError::Disconnected) => {
+                            self.update_rx = None;
+                        }
+                    }
+                }
+            }
+
+            if self.finish_rx.is_some() {
+                let event = wait_for_event(
+                    &mut self.update_rx,
+                    &mut self.finish_rx,
+                    &mut self.outstanding_requests,
+                )
+                .await
+                .ok_or(SyncError::Engine(EngineError::SyncStalled))?;
+                return self.handle_event(event).await;
+            }
+
+            return Ok(NextStep::Complete(self.complete().await?));
+        }
+
+        // Wait for the next synchronization event
+        let event = wait_for_event(
+            &mut self.update_rx,
+            &mut self.finish_rx,
+            &mut self.outstanding_requests,
+        )
+        .await
+        .ok_or(SyncError::Engine(EngineError::SyncStalled))?;
+        self.handle_event(event).await
+    }
+
+    /// Build the final database from the completed sync and verify its root against the
+    /// target.
+    async fn complete(mut self) -> Result<DB, Error<DB, S>> {
+        self.journal = self.journal.sync().await?;
+
+        let database = DB::from_sync_result(
+            self.context,
+            self.config,
+            self.journal,
+            self.pinned_nodes,
+            self.target.range.clone(),
+            self.apply_batch_size,
+        )
+        .await?;
+
+        let got_root = database.root();
+        let expected_root = self.target.root;
+        if got_root != expected_root {
+            return Err(SyncError::Engine(EngineError::RootMismatch {
+                expected: expected_root,
+                actual: got_root,
+            }));
+        }
+
+        Ok(database.persist_sync_result().await?)
+    }
+
+    /// Run sync to completion, returning the final database when done.
+    ///
+    /// This method repeatedly calls `step()` until sync is complete. The `step()` method
+    /// handles building the final database and verifying the root digest.
+    pub async fn sync(mut self) -> Result<DB, Error<DB, S>> {
+        // Run sync loop until completion
+        loop {
+            match self.step().await? {
+                NextStep::Continue(new_engine) => self = new_engine,
+                NextStep::Complete(database) => return Ok(database),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::{
+        merkle::{Proof, mmr::Family as MmrFamily},
+        qmdb::sync::{
+            harness::{DbOf, OpOf, SyncTestHarness},
+            source::{self, tests::FailSource},
+        },
+    };
+    use commonware_cryptography::{Sha256, sha256};
+    use commonware_runtime::{Runner as _, deterministic};
+    use commonware_utils::{NZU64, NZUsize, non_empty_range};
+    use std::{
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Clone)]
+    struct TestConfig {
+        journal_size: u64,
+        pinned_node_probes: Arc<AtomicUsize>,
+    }
+
+    impl crate::qmdb::sync::DatabaseConfig for TestConfig {
+        type JournalConfig = u64;
+
+        fn journal_config(&self) -> Self::JournalConfig {
+            self.journal_size
+        }
+    }
+
+    struct TestJournal {
+        size: u64,
+    }
+
+    impl Journal<MmrFamily> for TestJournal {
+        type Config = u64;
+        type Context = deterministic::Context;
+        type Error = crate::journal::Error;
+        type Op = i32;
+
+        async fn new(
+            _context: Self::Context,
+            size: Self::Config,
+            _range: commonware_utils::range::NonEmptyRange<Location<MmrFamily>>,
+        ) -> Result<Self, Self::Error> {
+            Ok(Self { size })
+        }
+
+        async fn resize(mut self, start: Location<MmrFamily>) -> Result<Self, Self::Error> {
+            self.size = *start;
+            Ok(self)
+        }
+
+        async fn sync(self) -> Result<Self, Self::Error> {
+            Ok(self)
+        }
+
+        fn size(&self) -> u64 {
+            self.size
+        }
+
+        async fn append(mut self, ops: Vec<Self::Op>) -> Result<Self, Self::Error> {
+            self.size += ops.len() as u64;
+            Ok(self)
+        }
+    }
+
+    struct TestDb;
+
+    impl Database for TestDb {
+        type Config = TestConfig;
+        type Context = deterministic::Context;
+        type Digest = sha256::Digest;
+        type Family = MmrFamily;
+        type Hasher = Sha256;
+        type Journal = TestJournal;
+        type Op = i32;
+
+        async fn from_sync_result(
+            _context: Self::Context,
+            _config: Self::Config,
+            _journal: Self::Journal,
+            _pinned_nodes: Option<Vec<Self::Digest>>,
+            _range: commonware_utils::range::NonEmptyRange<Location<Self::Family>>,
+            _apply_batch_size: NonZeroU64,
+        ) -> Result<Self, qmdb::Error<Self::Family>> {
+            Ok(Self)
+        }
+
+        async fn persist_sync_result(self) -> Result<Self, qmdb::Error<Self::Family>> {
+            Ok(self)
+        }
+
+        async fn local_pinned_nodes(
+            _context: Self::Context,
+            config: &Self::Config,
+            _target: &Target<Self::Family, Self::Digest>,
+            _journal: &Self::Journal,
+        ) -> Result<Option<Vec<Self::Digest>>, qmdb::Error<Self::Family>> {
+            config.pinned_node_probes.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(vec![]))
+        }
+
+        fn root(&self) -> Self::Digest {
+            sha256::Digest::from([0u8; 32])
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestSource;
+
+    impl Source for TestSource {
+        type Digest = sha256::Digest;
+        type Error = Infallible;
+        type Family = MmrFamily;
+        type Op = i32;
+
+        async fn serve(&self, _request: Request<MmrFamily>) -> source::Result<Self> {
+            Ok((
+                Response::Operations {
+                    proof: Proof {
+                        leaves: Location::new(0),
+                        inactive_peaks: 0,
+                        digests: vec![],
+                    },
+                    operations: vec![],
+                },
+                None,
+            ))
+        }
+    }
+
+    fn test_engine_config(
+        context: deterministic::Context,
+        journal_size: u64,
+        pinned_node_probes: Arc<AtomicUsize>,
+    ) -> Config<TestDb, TestSource> {
+        Config {
+            context,
+            source: TestSource,
+            target: Target {
+                root: sha256::Digest::from([1u8; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(10)),
+            },
+            max_outstanding_requests: NZUsize!(1),
+            fetch_batch_size: NZU64!(1),
+            apply_batch_size: NZU64!(1),
+            db_config: TestConfig {
+                journal_size,
+                pinned_node_probes,
+            },
+            update_rx: None,
+            finish_rx: None,
+            reached_target_tx: None,
+        }
+    }
+
+    async fn retention_engine<H: SyncTestHarness>(
+        context: deterministic::Context,
+    ) -> Engine<DbOf<H>, FailSource<H::Family, OpOf<H>, sha256::Digest>>
+    where
+        OpOf<H>: 'static,
+    {
+        // Source requests stay unpolled; completed fetch results are injected directly.
+        let config = Config {
+            db_config: H::config("retention"),
+            context,
+            source: FailSource::new(),
+            target: Target {
+                root: sha256::Digest::from([1u8; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(10)),
+            },
+            max_outstanding_requests: NZUsize!(1),
+            fetch_batch_size: NZU64!(1),
+            apply_batch_size: NZU64!(1),
+            update_rx: None,
+            finish_rx: None,
+            reached_target_tx: None,
+        };
+        Engine::new(config).await.unwrap()
+    }
+
+    fn insert_pending_request<DB, S>(
+        engine: &mut Engine<DB, S>,
+        request: Request<DB::Family>,
+    ) -> RequestId
+    where
+        DB: Database,
+        S: SourceFor<DB>,
+        DB::Op: 'static,
+    {
+        engine
+            .outstanding_requests
+            .insert(request, |_| std::future::pending())
+    }
+
+    fn late_fetch_result<F: Family, Op>(
+        id: RequestId,
+        operation: Op,
+    ) -> IndexedFetchResult<F, Op, sha256::Digest, qmdb::Error<F>> {
+        IndexedFetchResult {
+            id,
+            result: Ok(Some(Response::Operations {
+                proof: Proof {
+                    leaves: Location::new(10),
+                    inactive_peaks: 0,
+                    digests: vec![],
+                },
+                operations: vec![operation],
+            })),
+        }
+    }
+
+    /// A boundary response keeps a fetched batch that starts at the lower bound.
+    pub(crate) fn test_boundary_response_keeps_fetched_batch_at_lower_bound<H: SyncTestHarness>()
+    where
+        OpOf<H>: Clone + PartialEq + Debug + 'static,
+    {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = retention_engine::<H>(context).await;
+            let operations = H::create_ops(3);
+            engine
+                .fetched_operations
+                .insert(Location::new(6), operations.clone());
+
+            // Move the lower bound to the start of the fetched batch.
+            let next = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(6), Location::new(12)),
+            };
+            let mut engine = engine.reset_for_target_update(next).await.unwrap();
+            assert!(engine.pinned_nodes.is_none());
+
+            // The boundary response sets pinned nodes without replacing the batch.
+            let id = insert_pending_request(
+                &mut engine,
+                Request::Boundary {
+                    size: Location::new(12),
+                    start: Location::new(6),
+                },
+            );
+            let pinned = vec![sha256::Digest::from([7; 32])];
+            engine
+                .handle_fetch_result(IndexedFetchResult {
+                    id,
+                    result: Ok(Some(Response::Boundary {
+                        proof: Proof {
+                            leaves: Location::new(12),
+                            inactive_peaks: 0,
+                            digests: vec![],
+                        },
+                        op: operations[0].clone(),
+                        pinned_nodes: pinned.clone(),
+                    })),
+                })
+                .unwrap();
+            assert_eq!(engine.pinned_nodes, Some(pinned));
+            assert_eq!(
+                engine.fetched_operations.get(&Location::new(6)),
+                Some(&operations)
+            );
+
+            // Applying moves the journal past the whole batch.
+            let engine = engine.apply_operations().await.unwrap();
+            assert_eq!(engine.journal.size(), 9);
+        });
+    }
+
+    /// Moving the lower bound past an operation request cancels it with the old boundary and
+    /// drops its queued result.
+    pub(crate) fn test_target_update_drops_queued_result_of_cancelled_request<H: SyncTestHarness>()
+    where
+        OpOf<H>: 'static,
+    {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = retention_engine::<H>(context).await;
+
+            // Track the boundary request and an operation request below the next lower bound.
+            assert!(engine.outstanding_requests.contains(&Location::new(5)));
+            let request = Request::Operations {
+                size: Location::new(10),
+                start: Location::new(6),
+                max_ops: NZU64!(1),
+            };
+            let old_id = insert_pending_request(&mut engine, request);
+            let queued_result = late_fetch_result(old_id, H::create_ops(1).pop().unwrap());
+            assert_eq!(engine.outstanding_requests.len(), 2);
+
+            // Moving the lower bound beyond both starts cancels both requests.
+            let new_target = Target {
+                root: sha256::Digest::from([2u8; 32]),
+                range: non_empty_range!(Location::new(7), Location::new(12)),
+            };
+            let mut engine = engine.reset_for_target_update(new_target).await.unwrap();
+            assert_eq!(engine.outstanding_requests.len(), 0);
+            assert!(engine.outstanding_requests.remove(old_id).is_none());
+
+            // The queued result of the cancelled request is ignored.
+            engine.handle_fetch_result(queued_result).unwrap();
+            assert!(engine.fetched_operations.is_empty());
+            assert!(engine.pinned_nodes.is_none());
+            assert!(matches!(
+                engine.outstanding_requests.next_completed().await,
+                Err(Aborted)
+            ));
+            assert!(matches!(
+                engine.outstanding_requests.next_completed().await,
+                Err(Aborted)
+            ));
+            assert_eq!(engine.outstanding_requests.len(), 0);
+        });
+    }
+
+    /// An operation request at an old size survives any number of target updates while its
+    /// start is beyond the lower bound, and its late response is stored. The boundary request
+    /// survives updates that keep the lower bound.
+    pub(crate) fn test_target_updates_keep_old_size_request_beyond_floor<H: SyncTestHarness>()
+    where
+        OpOf<H>: Clone + PartialEq + Debug + 'static,
+    {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = retention_engine::<H>(context).await;
+
+            // Track a pending boundary request and an operation request at the first target
+            // size.
+            assert!(engine.outstanding_requests.contains(&Location::new(5)));
+            insert_pending_request(
+                &mut engine,
+                Request::Boundary {
+                    size: Location::new(10),
+                    start: Location::new(5),
+                },
+            );
+            let request = Request::Operations {
+                size: Location::new(10),
+                start: Location::new(8),
+                max_ops: NZU64!(1),
+            };
+            let id = insert_pending_request(&mut engine, request);
+            assert_eq!(engine.outstanding_requests.len(), 2);
+
+            // Updates with an unchanged lower bound keep both requests.
+            let mut root = 2u8;
+            for end in 11..21 {
+                let next = Target {
+                    root: sha256::Digest::from([root; 32]),
+                    range: non_empty_range!(Location::new(5), Location::new(end)),
+                };
+                root += 1;
+                engine = engine.reset_for_target_update(next).await.unwrap();
+                assert!(engine.outstanding_requests.contains(&Location::new(5)));
+                assert!(engine.outstanding_requests.contains(&Location::new(8)));
+                assert_eq!(engine.outstanding_requests.len(), 2);
+            }
+
+            // Updates that move the lower bound below the request start cancel the boundary
+            // and keep the operation request.
+            for (start, end) in [(6, 22), (7, 24)] {
+                let next = Target {
+                    root: sha256::Digest::from([root; 32]),
+                    range: non_empty_range!(Location::new(start), Location::new(end)),
+                };
+                root += 1;
+                engine = engine.reset_for_target_update(next).await.unwrap();
+                assert!(engine.outstanding_requests.contains(&Location::new(8)));
+                assert_eq!(engine.outstanding_requests.len(), 1);
+            }
+
+            // The late response at the first target size is stored at its start.
+            let operation = H::create_ops(1).pop().unwrap();
+            engine
+                .handle_fetch_result(late_fetch_result(id, operation.clone()))
+                .unwrap();
+            assert_eq!(engine.outstanding_requests.len(), 0);
+            assert_eq!(
+                engine.fetched_operations.get(&Location::new(8)),
+                Some(&vec![operation])
+            );
+        });
+    }
+
+    /// Moving the lower bound cancels an operation request whose range ends at the new bound and
+    /// keeps one beyond it.
+    pub(crate) fn test_target_update_floor_move_cancels_operations_below_bound<H: SyncTestHarness>()
+    where
+        OpOf<H>: 'static,
+    {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = retention_engine::<H>(context).await;
+
+            // Track operation requests below and beyond the next lower bound.
+            let below = Request::Operations {
+                size: Location::new(10),
+                start: Location::new(6),
+                max_ops: NZU64!(2),
+            };
+            insert_pending_request(&mut engine, below);
+            let beyond = Request::Operations {
+                size: Location::new(10),
+                start: Location::new(9),
+                max_ops: NZU64!(1),
+            };
+            insert_pending_request(&mut engine, beyond);
+            assert_eq!(engine.outstanding_requests.len(), 3);
+
+            // Moving the lower bound to the end of the first request cancels it and the old
+            // boundary. The request beyond the bound survives.
+            let next = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(8), Location::new(14)),
+            };
+            let engine = engine.reset_for_target_update(next).await.unwrap();
+            assert!(!engine.outstanding_requests.contains(&Location::new(5)));
+            assert!(!engine.outstanding_requests.contains(&Location::new(6)));
+            assert!(engine.outstanding_requests.contains(&Location::new(9)));
+            assert_eq!(engine.outstanding_requests.len(), 1);
+        });
+    }
+
+    /// Moving the lower bound to the start of an operation request cancels it and the old
+    /// boundary request, and scheduling issues the boundary request at the new lower bound.
+    pub(crate) fn test_moved_floor_schedules_boundary_without_waiting_for_old_operation<
+        H: SyncTestHarness,
+    >()
+    where
+        OpOf<H>: 'static,
+    {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = retention_engine::<H>(context).await;
+
+            // Track the boundary request and an operation request at the next lower bound.
+            let operation_id = insert_pending_request(
+                &mut engine,
+                Request::Operations {
+                    size: Location::new(10),
+                    start: Location::new(6),
+                    max_ops: NZU64!(1),
+                },
+            );
+            assert!(engine.outstanding_requests.contains(&Location::new(5)));
+
+            // Move the lower bound to the start of the operation request.
+            let next = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(6), Location::new(12)),
+            };
+            let mut engine = engine.reset_for_target_update(next).await.unwrap();
+            engine.schedule_requests();
+
+            // Both requests are cancelled and the boundary request at the new lower bound is
+            // the only one outstanding.
+            assert!(engine.outstanding_requests.remove(operation_id).is_none());
+            assert!(!engine.outstanding_requests.contains(&Location::new(5)));
+            assert!(engine.outstanding_requests.contains(&Location::new(6)));
+            assert_eq!(engine.outstanding_requests.len(), 1);
+        });
+    }
+
+    /// Target updates keep fetched operations and keep pinned nodes only while the lower bound is
+    /// unchanged. Once the lower bound moves, applying drops batches below it and trims a batch
+    /// that straddles it.
+    #[test]
+    fn target_updates_keep_operations_and_reset_pins_only_when_floor_moves() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = Engine::new(test_engine_config(
+                context,
+                5,
+                Arc::new(AtomicUsize::new(0)),
+            ))
+            .await
+            .unwrap();
+
+            // Hold pinned nodes and two batches fetched ahead of the journal tip.
+            let fetched = BTreeMap::from([
+                (Location::new(6), vec![1, 2]),
+                (Location::new(8), vec![3, 4]),
+            ]);
+            engine.fetched_operations = fetched.clone();
+            let pinned = vec![sha256::Digest::from([7; 32])];
+            engine.pinned_nodes = Some(pinned.clone());
+
+            // An update with an unchanged lower bound keeps operations and pinned nodes.
+            let next = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            let engine = engine.reset_for_target_update(next).await.unwrap();
+            assert_eq!(engine.fetched_operations, fetched);
+            assert_eq!(engine.pinned_nodes, Some(pinned));
+
+            // An update that moves the lower bound keeps operations and clears pinned nodes.
+            let next = Target {
+                root: sha256::Digest::from([3; 32]),
+                range: non_empty_range!(Location::new(9), Location::new(14)),
+            };
+            let engine = engine.reset_for_target_update(next).await.unwrap();
+            assert_eq!(engine.fetched_operations, fetched);
+            assert!(engine.pinned_nodes.is_none());
+
+            // Applying drops the batch below the new lower bound and appends the operation of
+            // the straddling batch at it.
+            let engine = engine.apply_operations().await.unwrap();
+            assert_eq!(engine.journal.size(), 10);
+            assert!(engine.fetched_operations.is_empty());
+        });
+    }
+
+    #[test]
+    fn new_probes_local_pinned_nodes_when_journal_reaches_target() {
+        deterministic::Runner::default().start(|context| async move {
+            let pinned_node_probes = Arc::new(AtomicUsize::new(0));
+            Engine::new(test_engine_config(context, 10, pinned_node_probes.clone()))
+                .await
+                .unwrap();
+
+            assert_eq!(pinned_node_probes.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn new_skips_local_pinned_nodes_when_journal_is_partial() {
+        deterministic::Runner::default().start(|context| async move {
+            let pinned_node_probes = Arc::new(AtomicUsize::new(0));
+            Engine::new(test_engine_config(context, 7, pinned_node_probes.clone()))
+                .await
+                .unwrap();
+
+            assert_eq!(pinned_node_probes.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn new_schedules_operations_after_boundary_request() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut config = test_engine_config(context, 5, Arc::new(AtomicUsize::new(0)));
+            config.max_outstanding_requests = NZUsize!(2);
+            config.fetch_batch_size = NZU64!(5);
+
+            let engine = Engine::new(config).await.unwrap();
+            let requests = &engine.outstanding_requests;
+
+            assert_eq!(requests.len(), 2);
+            assert!(requests.contains(&Location::new(5)));
+            assert!(requests.contains(&Location::new(6)));
+        });
+    }
+
+    #[test]
+    fn step_takes_queued_update_before_completing() {
+        deterministic::Runner::default().start(|context| async move {
+            let (update_tx, update_rx) = ring::channel(NZUsize!(2));
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.update_rx = Some(update_rx);
+            // Queue a stale update and an advancing one. The stale one is discarded and
+            // the advancing one retargets the engine instead of completing.
+            let stale = Target {
+                root: sha256::Digest::from([2u8; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(10)),
+            };
+            let advancing = Target {
+                root: sha256::Digest::from([3u8; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            assert!(update_tx.send_lossy(stale));
+            assert!(update_tx.send_lossy(advancing.clone()));
+
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
+                panic!("engine should retarget instead of completing");
+            };
+            assert_eq!(engine.target, advancing);
+        });
+    }
+
+    #[test]
+    fn step_completes_at_current_target_after_finish() {
+        deterministic::Runner::default().start(|context| async move {
+            let (update_tx, update_rx) = ring::channel(NZUsize!(1));
+            let (finish_tx, finish_rx) = mpsc::channel(1);
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            // TestDb's root, so completion's final check passes.
+            config.target.root = sha256::Digest::from([0u8; 32]);
+            config.update_rx = Some(update_rx);
+            config.finish_rx = Some(finish_rx);
+            let advancing = Target {
+                root: sha256::Digest::from([3u8; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            assert!(update_tx.send_lossy(advancing));
+            finish_tx.send(()).await.unwrap();
+
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Complete(_) = engine.step().await.unwrap() else {
+                panic!("a requested finish must win over a queued update");
+            };
+        });
+    }
+
+    /// A no-op fetch result for testing request tracking.
+    fn dummy_result(id: RequestId) -> IndexedFetchResult<MmrFamily, i32, sha256::Digest, ()> {
+        IndexedFetchResult {
+            id,
+            result: Ok(Some(Response::Operations {
+                proof: Proof {
+                    leaves: Location::new(0),
+                    inactive_peaks: 0,
+                    digests: vec![],
+                },
+                operations: vec![],
+            })),
+        }
+    }
+
+    /// Helper to add a request at a given location.
+    fn add(requests: &mut Requests<MmrFamily, i32, sha256::Digest, ()>, loc: u64) -> RequestId {
+        requests.insert(
+            Request::Operations {
+                size: Location::new(loc),
+                start: Location::new(loc),
+                max_ops: NZU64!(1),
+            },
+            |id| std::future::ready(dummy_result(id)),
+        )
+    }
+
+    #[test]
+    fn test_add_and_remove() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+        assert_eq!(requests.len(), 0);
+
+        let id = add(&mut requests, 10);
+        assert_eq!(requests.len(), 1);
+        assert!(requests.contains(&Location::new(10)));
+
+        assert!(requests.remove(id).is_some());
+        assert!(!requests.contains(&Location::new(10)));
+        assert!(requests.remove(id).is_none());
+    }
+
+    #[test]
+    fn test_retain_matching() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+
+        add(&mut requests, 5);
+        add(&mut requests, 10);
+        add(&mut requests, 15);
+        add(&mut requests, 20);
+        assert_eq!(requests.len(), 4);
+
+        requests.retain(|request| request.start() >= Location::new(10));
+        assert_eq!(requests.len(), 3);
+        assert!(!requests.contains(&Location::new(5)));
+        assert!(requests.contains(&Location::new(10)));
+        assert!(requests.contains(&Location::new(15)));
+        assert!(requests.contains(&Location::new(20)));
+    }
+
+    #[test]
+    fn test_retain_none() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+
+        add(&mut requests, 5);
+        add(&mut requests, 10);
+        assert_eq!(requests.len(), 2);
+
+        requests.retain(|_| false);
+        assert_eq!(requests.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_empty() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+        requests.retain(|_| true);
+        assert_eq!(requests.len(), 0);
+    }
+
+    #[test]
+    fn test_retain_all() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+
+        add(&mut requests, 10);
+        add(&mut requests, 20);
+        assert_eq!(requests.len(), 2);
+
+        requests.retain(|_| true);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.contains(&Location::new(10)));
+        assert!(requests.contains(&Location::new(20)));
+    }
+
+    #[test]
+    fn test_superseded_request() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+
+        // Old request at location 10
+        let old_id = add(&mut requests, 10);
+        assert_eq!(requests.len(), 1);
+
+        // New request supersedes at same location
+        let new_id = add(&mut requests, 10);
+        assert_eq!(requests.len(), 1);
+
+        // Old ID is no longer tracked (superseded by insert)
+        assert!(requests.remove(old_id).is_none());
+
+        // New ID is still tracked and by_location is intact
+        assert!(requests.contains(&Location::new(10)));
+        assert!(requests.remove(new_id).is_some());
+        assert!(!requests.contains(&Location::new(10)));
+    }
+
+    #[test]
+    fn test_stale_completion_after_retain() {
+        let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+
+        let old_id = add(&mut requests, 5);
+        let queued_result = dummy_result(old_id);
+        add(&mut requests, 15);
+        requests.retain(|request| request.start() >= Location::new(10));
+
+        // The queued completion no longer resolves to a tracked request.
+        assert!(requests.remove(queued_result.id).is_none());
+
+        // New request at the same location gets a different ID
+        let new_id = add(&mut requests, 5);
+        assert_ne!(old_id, new_id);
+        assert!(requests.remove(new_id).is_some());
+    }
+
+    #[test]
+    fn test_retain_aborts_future() {
+        deterministic::Runner::default().start(|_context| async move {
+            let mut requests: Requests<MmrFamily, i32, sha256::Digest, ()> = Requests::new();
+            requests.insert(
+                Request::Operations {
+                    size: Location::new(5),
+                    start: Location::new(5),
+                    max_ops: NZU64!(1),
+                },
+                |_| std::future::pending(),
+            );
+            requests.retain(|_| false);
+            assert!(matches!(requests.next_completed().await, Err(Aborted)));
+        });
+    }
+
+    #[test]
+    fn reports_reached_target_before_queued_update() {
+        deterministic::Runner::default().start(|context| async move {
+            let (update_tx, update_rx) = ring::channel(NZUsize!(1));
+            let (_finish_tx, finish_rx) = mpsc::channel(1);
+            let (reached_tx, mut reached_rx) = ring::channel(NZUsize!(1));
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.update_rx = Some(update_rx);
+            config.finish_rx = Some(finish_rx);
+            config.reached_target_tx = Some(reached_tx);
+            let original = config.target.clone();
+
+            // Queue an advancing target before the engine starts.
+            let next = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            assert!(update_tx.send_lossy(next.clone()));
+
+            // The journal already reaches the original target, so the first step reports it
+            // before adopting the queued update.
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
+                panic!("the coordinator has not requested completion");
+            };
+            assert_eq!(
+                reached_rx.try_recv().ok(),
+                Some(original),
+                "a queued update hid a reached target from the coordinator"
+            );
+            assert_eq!(engine.target, next);
+        });
+    }
+
+    #[test]
+    fn reports_never_wait_for_the_observer() {
+        deterministic::Runner::default().start(|context| async move {
+            let (finish_tx, finish_rx) = mpsc::channel(1);
+            let (reached_tx, mut reached_rx) = ring::channel(NZUsize!(1));
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.finish_rx = Some(finish_rx);
+
+            // Use TestDb's root so completion's final check passes.
+            config.target.root = sha256::Digest::from([0; 32]);
+            let original = config.target.clone();
+
+            // Fill the progress channel with a stale report that the observer never reads.
+            let stale = Target {
+                root: sha256::Digest::from([9; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(8)),
+            };
+            assert!(reached_tx.send_lossy(stale));
+            config.reached_target_tx = Some(reached_tx);
+
+            // The step reports and completes without waiting, and its report replaces the stale
+            // one.
+            finish_tx.send(()).await.unwrap();
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Complete(_) = engine.step().await.unwrap() else {
+                panic!("a requested finish completes at the reached target");
+            };
+            assert_eq!(reached_rx.try_recv(), Ok(original));
+        });
+    }
+
+    #[test]
+    fn step_adopts_newest_target_after_overflow() {
+        deterministic::Runner::default().start(|context| async move {
+            let (update_tx, update_rx) = ring::channel(NZUsize!(1));
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.update_rx = Some(update_rx);
+
+            // Send three advancing targets into a one-slot channel, which keeps only the newest.
+            let targets = [12u64, 14, 16].map(|end| Target {
+                root: sha256::Digest::from([end as u8; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(end)),
+            });
+            for target in targets.iter().cloned() {
+                assert!(update_tx.send_lossy(target));
+            }
+
+            // The journal already reaches the original target, so the step adopts the newest one.
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
+                panic!("engine should retarget instead of completing");
+            };
+            assert_eq!(engine.target, targets[2]);
+        });
+    }
+}

@@ -26,9 +26,9 @@ pub const BLOCK_META_HEIGHT: &str = "height";
 pub const BLOCK_META_DIGEST: &str = "digest";
 /// `block_meta`: number of transactions contained in the block.
 pub const BLOCK_META_TX_COUNT: &str = "tx_count";
-/// `block_meta`: root of the transaction-hash QMDB operation log at this block.
+/// `block_meta`: root of the transaction-history QMDB operation log at this block.
 pub const BLOCK_META_TRANSACTIONS_ROOT: &str = "transactions_root";
-/// `block_meta`: latest transaction-hash QMDB operation location at this block.
+/// `block_meta`: latest transaction-history QMDB operation location at this block.
 pub const BLOCK_META_TRANSACTIONS_TIP: &str = "transactions_tip";
 /// `block_meta`: simplex consensus view that finalized the block.
 pub const BLOCK_META_VIEW: &str = "view";
@@ -39,12 +39,17 @@ pub const BLOCK_META_FINALIZED_TS: &str = "finalized_ts";
 
 /// `tx_meta`: 32-byte transaction digest, fixed-size binary.
 pub const TX_META_DIGEST: &str = "tx_digest";
-/// `tx_meta`: transaction-hash QMDB operation location for this digest.
+/// `tx_meta`: transaction-history QMDB operation location for this digest.
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
 /// `tx_meta`: encoded signed transaction bytes.
 pub const TX_META_BODY: &str = "body";
 /// `tx_meta`: finalized block height containing this transaction.
 pub const TX_META_HEIGHT: &str = "height";
+
+/// `tx_meta`: authenticated sender account-history index.
+pub const TX_META_SENDER_INDEX: &str = "sender_index";
+/// `tx_meta`: authenticated recipient account-history index.
+pub const TX_META_RECIPIENT_INDEX: &str = "recipient_index";
 
 // ---------- tx_activity columns ----------
 
@@ -64,8 +69,11 @@ pub const TX_ACTIVITY_COUNTERPARTY: &str = "counterparty";
 pub const TX_ACTIVITY_VALUE: &str = "value";
 /// `tx_activity`: sender nonce.
 pub const TX_ACTIVITY_NONCE: &str = "nonce";
-/// `tx_activity`: transaction-hash QMDB operation location, copied from `tx_meta`.
+/// `tx_activity`: transaction-history QMDB operation location, copied from `tx_meta`.
 pub const TX_ACTIVITY_QMDB_LOCATION: &str = "qmdb_location";
+
+/// `tx_activity`: authenticated index in this account's history.
+pub const TX_ACTIVITY_ACCOUNT_INDEX: &str = "account_index";
 
 // ---------- account_meta columns ----------
 
@@ -79,6 +87,11 @@ pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
 /// `account_meta`: account-state QMDB operation location (primary key second column).
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
+
+/// `account_meta`: authenticated count of this account's transactions.
+pub const ACCOUNT_META_TX_COUNT: &str = "tx_count";
+/// `account_meta`: block that appended this state operation.
+pub const ACCOUNT_META_WRITE_HEIGHT: &str = "write_height";
 
 /// Build the metadata-store [`KvSchema`] for every SQL table.
 pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String> {
@@ -112,6 +125,8 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_BODY, DataType::Binary, false),
                 TableColumnConfig::new(TX_META_HEIGHT, DataType::UInt64, false),
+                TableColumnConfig::new(TX_META_SENDER_INDEX, DataType::UInt64, false),
+                TableColumnConfig::new(TX_META_RECIPIENT_INDEX, DataType::UInt64, false),
             ],
             vec![TX_META_DIGEST.to_string()],
             vec![],
@@ -132,12 +147,11 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
                 TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
                 TableColumnConfig::new(TX_ACTIVITY_QMDB_LOCATION, DataType::UInt64, false),
+                TableColumnConfig::new(TX_ACTIVITY_ACCOUNT_INDEX, DataType::UInt64, false),
             ],
             vec![
                 TX_ACTIVITY_ACCOUNT.to_string(),
-                TX_ACTIVITY_HEIGHT.to_string(),
-                TX_ACTIVITY_INDEX.to_string(),
-                TX_ACTIVITY_ROLE.to_string(),
+                TX_ACTIVITY_ACCOUNT_INDEX.to_string(),
             ],
             vec![],
         )?
@@ -149,6 +163,8 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
                 TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
                 TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
+                TableColumnConfig::new(ACCOUNT_META_TX_COUNT, DataType::UInt64, false),
+                TableColumnConfig::new(ACCOUNT_META_WRITE_HEIGHT, DataType::UInt64, false),
             ],
             vec![
                 ACCOUNT_META_ACCOUNT.to_string(),

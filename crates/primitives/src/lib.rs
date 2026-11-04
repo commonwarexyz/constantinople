@@ -14,6 +14,9 @@ pub use signed::{
 mod account;
 pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce};
 
+mod history;
+pub use history::TransactionHistoryEntry;
+
 mod auth;
 pub use auth::{TransactionPublicKey, TransactionSignature};
 
@@ -21,7 +24,7 @@ mod cache;
 pub use cache::PublicKeyCache;
 
 mod block;
-pub use block::{Block, BlockCfg, Header, SealedBlock};
+pub use block::{Block, BlockCfg, Header, SealedBlock, StateSyncProof};
 
 pub mod proposal;
 

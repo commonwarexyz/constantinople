@@ -15,7 +15,8 @@ use crate::{
     publisher::certificate::CertifiedHeader,
     sql_schema::{
         BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, TX_META_BODY, TX_META_DIGEST,
-        TX_META_HEIGHT, TX_META_QMDB_LOCATION, TX_META_TABLE, build_meta_schema,
+        TX_META_HEIGHT, TX_META_QMDB_LOCATION, TX_META_RECIPIENT_INDEX, TX_META_SENDER_INDEX,
+        TX_META_TABLE, build_meta_schema,
     },
 };
 use bytes::Bytes;
@@ -79,6 +80,10 @@ pub struct TransactionMetadata {
     pub qmdb_location: u64,
     /// Encoded signed transaction bytes.
     pub body: Bytes,
+    /// Sender account-history index reported by the index.
+    pub sender_index: u64,
+    /// Recipient account-history index reported by the index.
+    pub recipient_index: u64,
 }
 
 /// A publisher-reported finalized height and its Store visibility sequence.
@@ -389,7 +394,7 @@ impl IndexerClient {
     {
         let digest_hex = hex_lower(digest.as_ref());
         let query = format!(
-            "SELECT {TX_META_QMDB_LOCATION}, {TX_META_BODY}, {TX_META_HEIGHT} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
+            "SELECT {TX_META_QMDB_LOCATION}, {TX_META_BODY}, {TX_META_HEIGHT}, {TX_META_SENDER_INDEX}, {TX_META_RECIPIENT_INDEX} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
         );
         let batches = self.sql.sql(&query).await?.collect().await?;
         let Some(batch) = first_row(batches) else {
@@ -398,6 +403,8 @@ impl IndexerClient {
         let qmdb_location = column::<UInt64Array>(&batch, 0, "tx_meta.qmdb_location")?.value(0);
         let body = verified_transaction_body::<H>(&batch, 1, digest)?;
         let height = column::<UInt64Array>(&batch, 2, "tx_meta.height")?.value(0);
+        let sender_index = column::<UInt64Array>(&batch, 3, "tx_meta.sender_index")?.value(0);
+        let recipient_index = column::<UInt64Array>(&batch, 4, "tx_meta.recipient_index")?.value(0);
         let Some(target) = self.publication_target::<H>(height).await? else {
             return Ok(None);
         };
@@ -410,6 +417,8 @@ impl IndexerClient {
             height,
             qmdb_location,
             body,
+            sender_index,
+            recipient_index,
         }))
     }
 
@@ -598,6 +607,8 @@ mod tests {
                         CellValue::UInt64(qmdb_location),
                         CellValue::Binary(body.clone()),
                         CellValue::UInt64(height),
+                        CellValue::UInt64(0),
+                        CellValue::UInt64(0),
                     ],
                 )
                 .expect("stage out-of-order transaction metadata");

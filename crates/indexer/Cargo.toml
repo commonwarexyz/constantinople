@@ -70,6 +70,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 connectrpc-build.workspace = true
 
 [dev-dependencies]
+constantinople-account-proof.workspace = true
 p256.workspace = true
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-coding.workspace = true

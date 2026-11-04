@@ -41,7 +41,7 @@ where
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
             AnyTarget::new(
-                block.header.state_root,
+                block.state_sync.ops_root,
                 non_empty_range!(
                     mmr::Location::new(block.header.state_range.start()),
                     mmr::Location::new(block.header.state_range.end())
@@ -164,12 +164,12 @@ where
             let (start, operations) = batches.0.operations();
             let pinned_nodes = batches
                 .0
-                .pinned_nodes(&database)
+                .ops_pinned_nodes(&database)
                 .expect("finalized state frontier must be available before apply");
             FinalizedRange {
                 start,
                 end: batches.0.bounds().tip.size,
-                root: batches.0.root(),
+                root: batches.0.ops_root(),
                 pinned_nodes,
                 operations,
             }
@@ -193,6 +193,7 @@ where
 
         FinalizedArtifacts {
             state,
+            state_boundary: batches.0.boundary(),
             transactions,
         }
     }

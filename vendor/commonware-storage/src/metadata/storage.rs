@@ -1,0 +1,741 @@
+use super::{Config, Error};
+use crate::{Context, SyncCompletion};
+use commonware_codec::{Codec, Copying, FixedSize, ReadExt};
+use commonware_cryptography::{Crc32, crc32};
+use commonware_runtime::{
+    BLOB_PAGE_SIZE, Blob, BufMut, Error as RError, Handle, IoBufMut, ReadOptions, WriteOptions,
+    telemetry::metrics::{Counter, Gauge, GaugeExt, MetricsExt as _},
+};
+use commonware_utils::{Span, Widen, futures::try_join_all};
+use futures::FutureExt as _;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use tracing::{debug, warn};
+
+/// The names of the two blobs that store metadata.
+const BLOB_NAMES: [&[u8]; 2] = [b"left", b"right"];
+
+/// Information about a value in a [Wrapper].
+struct Info {
+    start: usize,
+    length: usize,
+}
+
+impl Info {
+    /// Create a new [Info].
+    const fn new(start: usize, length: usize) -> Self {
+        Self { start, length }
+    }
+}
+
+/// One of the two wrappers that store metadata.
+struct Wrapper<B: Blob, K: Span> {
+    blob: B,
+    version: u64,
+    lengths: HashMap<K, Info>,
+    modified: BTreeSet<K>,
+    data: IoBufMut,
+}
+
+impl<B: Blob, K: Span> Wrapper<B, K> {
+    /// Create a new [Wrapper].
+    const fn new(blob: B, version: u64, lengths: HashMap<K, Info>, data: IoBufMut) -> Self {
+        Self {
+            blob,
+            version,
+            lengths,
+            modified: BTreeSet::new(),
+            data,
+        }
+    }
+
+    /// Create a new empty [Wrapper].
+    fn empty(blob: B) -> Self {
+        Self {
+            blob,
+            version: 0,
+            lengths: HashMap::new(),
+            modified: BTreeSet::new(),
+            data: IoBufMut::default(),
+        }
+    }
+}
+
+/// State used during [Metadata::sync] operations.
+struct State<B: Blob, K: Span> {
+    cursor: usize,
+    next_version: u64,
+    key_order_changed: u64,
+    blobs: [Wrapper<B, K>; 2],
+    /// The completion of the last started sync, until observed.
+    ///
+    /// At most one sync is ever in flight: a new sync always targets the copy the pending sync
+    /// left as last-known-durable, so it must first prove the pending sync completed.
+    pending: Option<SyncCompletion>,
+}
+
+/// The store's state, boxed so the public [Metadata] handle stays pointer-sized.
+struct Inner<E: Context, K: Span, V: Codec> {
+    context: E,
+
+    map: BTreeMap<K, V>,
+    partition: String,
+    state: State<E::Blob, K>,
+
+    sync_overwrites: Counter,
+    sync_rewrites: Counter,
+    keys: Gauge,
+}
+
+/// One copy of the store, as loaded at startup.
+enum Loaded<B: Blob, K: Span, V> {
+    /// The copy decoded cleanly (an empty blob decodes to an empty map).
+    Valid(BTreeMap<K, V>, Wrapper<B, K>),
+    /// The copy holds bytes that fail validation.
+    Invalid(B),
+}
+
+impl<E: Context, K: Span, V: Codec> Inner<E, K, V> {
+    /// See [Metadata::init].
+    async fn init(context: E, cfg: Config<V::Cfg>) -> Result<Self, Error> {
+        // Open dedicated blobs
+        let (left_blob, left_len) = context.open(&cfg.partition, BLOB_NAMES[0]).await?;
+        let (right_blob, right_len) = context.open(&cfg.partition, BLOB_NAMES[1]).await?;
+
+        // Find latest blob (check which includes a hash of the other). Syncs alternate copies
+        // and drain the previous sync first, so at most one copy is ever mid-write: both copies
+        // failing validation is corruption, and adopting a fresh store would mask it.
+        let left = Self::load(&cfg.codec_config, 0, left_blob, left_len).await?;
+        let right = Self::load(&cfg.codec_config, 1, right_blob, right_len).await?;
+        if matches!((&left, &right), (Loaded::Invalid(_), Loaded::Invalid(_))) {
+            return Err(Error::Corruption(
+                "both metadata copies failed validation".into(),
+            ));
+        }
+        let (left_map, left_wrapper) = Self::normalize(left).await?;
+        let (right_map, right_wrapper) = Self::normalize(right).await?;
+
+        // Choose latest blob
+        let mut map = left_map;
+        let mut cursor = 0;
+        let mut version = left_wrapper.version;
+        if right_wrapper.version > left_wrapper.version {
+            cursor = 1;
+            map = right_map;
+            version = right_wrapper.version;
+        }
+        let next_version = version.checked_add(1).expect("version overflow");
+
+        // Create metrics
+        let sync_rewrites =
+            context.counter("sync_rewrites", "number of syncs that rewrote all data");
+        let sync_overwrites = context.counter(
+            "sync_overwrites",
+            "number of syncs that modified existing data",
+        );
+        let keys = context.gauge("keys", "number of tracked keys");
+
+        // Return metadata
+        let _ = keys.try_set(map.len());
+        Ok(Self {
+            context,
+
+            map,
+            partition: cfg.partition,
+            state: State {
+                cursor,
+                next_version,
+                key_order_changed: next_version, // rewrite on startup because we don't have a diff record
+                blobs: [left_wrapper, right_wrapper],
+                pending: None,
+            },
+
+            sync_rewrites,
+            sync_overwrites,
+            keys,
+        })
+    }
+
+    async fn load(
+        codec_config: &V::Cfg,
+        index: usize,
+        blob: E::Blob,
+        len: u64,
+    ) -> Result<Loaded<E::Blob, K, V>, Error> {
+        // Get blob length
+        if len == 0 {
+            // Empty blob
+            return Ok(Loaded::Valid(BTreeMap::new(), Wrapper::empty(blob)));
+        }
+
+        // The encoded buffer is retained after decoding, so pages read here need not remain
+        // in the OS page cache.
+        let len: usize = len.try_into().expect("blob too large for platform");
+        let buf = blob
+            .read_at(0, len, ReadOptions::DONT_CACHE)
+            .await?
+            .coalesce();
+
+        // Verify integrity.
+        //
+        // 8 bytes for version + 4 bytes for checksum.
+        if buf.len() < 8 + crc32::Digest::SIZE {
+            warn!(blob = index, len = buf.len(), "blob is too short");
+            return Ok(Loaded::Invalid(blob));
+        }
+
+        // Extract checksum
+        let bytes = buf.as_ref();
+        let checksum_index = buf.len() - crc32::Digest::SIZE;
+        let stored_checksum = u32::from_be_bytes(bytes[checksum_index..].try_into().unwrap());
+        let computed_checksum = Crc32::checksum(&bytes[..checksum_index]);
+        if stored_checksum != computed_checksum {
+            warn!(
+                blob = index,
+                stored = stored_checksum,
+                computed = computed_checksum,
+                "checksum mismatch"
+            );
+            return Ok(Loaded::Invalid(blob));
+        }
+
+        // Get parent
+        let version = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+
+        // Extract data
+        //
+        // If the checksum is correct, we assume data is correctly packed and we don't perform
+        // length checks on the cursor.
+        let mut data = BTreeMap::new();
+        let mut lengths = HashMap::new();
+        let mut cursor = u64::SIZE;
+        while cursor < checksum_index {
+            // Read key
+            let key =
+                K::read(&mut Copying(&bytes[cursor..])).expect("unable to read key from blob");
+            cursor += key.encode_size();
+
+            // Read value
+            let value = V::read_cfg(&mut Copying(&bytes[cursor..]), codec_config)
+                .expect("unable to read value from blob");
+            lengths.insert(key.clone(), Info::new(cursor, value.encode_size()));
+            cursor += value.encode_size();
+            data.insert(key, value);
+        }
+
+        Ok(Loaded::Valid(
+            data,
+            Wrapper::new(blob, version, lengths, buf),
+        ))
+    }
+
+    /// Adopt a valid copy, or durably reset the one copy a crash left mid-write.
+    async fn normalize(
+        copy: Loaded<E::Blob, K, V>,
+    ) -> Result<(BTreeMap<K, V>, Wrapper<E::Blob, K>), Error> {
+        match copy {
+            Loaded::Valid(map, wrapper) => Ok((map, wrapper)),
+            Loaded::Invalid(blob) => {
+                blob.resize(0).await?;
+                blob.sync().await?;
+                Ok((BTreeMap::new(), Wrapper::empty(blob)))
+            }
+        }
+    }
+
+    /// See [Metadata::get].
+    fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// See [Metadata::get_mut].
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        // Get value
+        let value = self.map.get_mut(key)?;
+
+        // Mark key as modified.
+        //
+        // We need to mark both blobs as modified because we may need to update both files.
+        let cursor = self.state.cursor;
+        self.state.blobs[cursor].modified.insert(key.clone());
+        self.state.blobs[1 - cursor].modified.insert(key.clone());
+
+        Some(value)
+    }
+
+    /// See [Metadata::clear].
+    fn clear(&mut self) {
+        // Clear map
+        self.map.clear();
+
+        // Mark key order as changed
+        self.state.key_order_changed = self.state.next_version;
+        self.keys.set(0);
+    }
+
+    /// See [Metadata::put].
+    fn put(&mut self, key: K, value: V) -> Option<V> {
+        // Insert value, getting previous value if it existed
+        let previous = self.map.insert(key.clone(), value);
+
+        // Mark key as modified.
+        //
+        // We need to mark both blobs as modified because we may need to update both files.
+        if previous.is_some() {
+            let cursor = self.state.cursor;
+            self.state.blobs[cursor].modified.insert(key.clone());
+            self.state.blobs[1 - cursor].modified.insert(key);
+        } else {
+            self.state.key_order_changed = self.state.next_version;
+        }
+        let _ = self.keys.try_set(self.map.len());
+        previous
+    }
+
+    /// See [Metadata::upsert].
+    fn upsert(&mut self, key: K, f: impl FnOnce(&mut V))
+    where
+        V: Default,
+    {
+        if let Some(value) = self.get_mut(&key) {
+            // Update existing value
+            f(value);
+        } else {
+            // Insert new value
+            let mut value = V::default();
+            f(&mut value);
+            self.put(key, value);
+        }
+    }
+
+    /// See [Metadata::remove].
+    fn remove(&mut self, key: &K) -> Option<V> {
+        // Get value
+        let past = self.map.remove(key);
+
+        // Mark key as modified.
+        if past.is_some() {
+            self.state.key_order_changed = self.state.next_version;
+        }
+        let _ = self.keys.try_set(self.map.len());
+
+        past
+    }
+
+    /// See [Metadata::keys].
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.map.keys()
+    }
+
+    /// See [Metadata::retain].
+    fn retain(&mut self, mut f: impl FnMut(&K, &V) -> bool) {
+        // Retain only keys that satisfy the predicate
+        let old_len = self.map.len();
+        self.map.retain(|k, v| f(k, v));
+        let new_len = self.map.len();
+
+        // If the number of keys has changed, mark the key order as changed
+        if new_len != old_len {
+            self.state.key_order_changed = self.state.next_version;
+            let _ = self.keys.try_set(self.map.len());
+        }
+    }
+
+    /// Wait for an in-flight sync started by [Metadata::start_sync], surfacing its failure.
+    async fn wait_for_pending(&mut self) -> Result<(), RError> {
+        // A failure is surfaced without writing: the failed copy's on-disk state is unknown,
+        // and a write to the other (only durable) copy could destroy both. The consuming
+        // caller destroys the store on the error.
+        let Some(completion) = &self.state.pending else {
+            return Ok(());
+        };
+        completion.clone().await?;
+        self.state.pending = None;
+        Ok(())
+    }
+
+    /// See [Metadata::sync].
+    async fn sync(&mut self) -> Result<(), RError> {
+        self.wait_for_pending().await?;
+        self.write_next_version(false).await?;
+        Ok(())
+    }
+
+    /// See [Metadata::start_sync].
+    async fn start_sync(&mut self) -> Result<Handle<()>, RError> {
+        self.wait_for_pending().await?;
+        self.write_next_version(true).await
+    }
+
+    /// Write and persist the next version of the store to the target blob.
+    async fn write_next_version(&mut self, pipelined: bool) -> Result<Handle<()>, RError> {
+        // Extract values we need
+        let cursor = self.state.cursor;
+        let next_version = self.state.next_version;
+        let key_order_changed = self.state.key_order_changed;
+
+        // Compute next version.
+        //
+        // While it is possible that extremely high-frequency updates to metadata could cause an
+        // eventual overflow of version, syncing once per millisecond would overflow in 584,942,417
+        // years.
+        let past_version = self.state.blobs[cursor].version;
+        let next_next_version = next_version.checked_add(1).expect("version overflow");
+
+        // Get target blob (the one we will modify)
+        let target_cursor = 1 - cursor;
+
+        // When key order is stable, each blob's modified set tracks the value
+        // deltas it has not yet received. If the target has none, the current
+        // cursor already points at a durable copy of the latest state and
+        // writing another version would only rotate blobs.
+        if key_order_changed < past_version && self.state.blobs[target_cursor].modified.is_empty() {
+            return Ok(Handle::ready(Ok(())));
+        }
+
+        // Update the state.
+        self.state.cursor = target_cursor;
+        self.state.next_version = next_next_version;
+
+        // Get a mutable reference to the target blob.
+        let target = &mut self.state.blobs[target_cursor];
+
+        // Determine if we can overwrite existing data in place, updating the
+        // encoded buffer for equal-size values as we go. If any value changes
+        // encoded length, subsequent offsets shift and the blob must be rebuilt.
+        let mut overwrite = true;
+        if key_order_changed < past_version {
+            for key in target.modified.iter() {
+                let info = target.lengths.get(key).expect("key must exist");
+                let new_value = self.map.get(key).expect("key must exist");
+                if info.length == new_value.encode_size() {
+                    // Overwrite existing value
+                    let start = info.start;
+                    let end = start + info.length;
+                    let mut buf = &mut target.data.as_mut()[start..end];
+                    new_value.write(&mut buf);
+                } else {
+                    // Rewrite all
+                    overwrite = false;
+                    break;
+                }
+            }
+        } else {
+            // If the key order has changed, we need to rewrite all data
+            overwrite = false;
+        }
+
+        // Overwrite existing data
+        if overwrite {
+            // Update version
+            (&mut target.data.as_mut()[0..u64::SIZE]).put_u64(next_version);
+
+            // Update checksum
+            let checksum_index = target.data.len() - crc32::Digest::SIZE;
+            let checksum = Crc32::checksum(&target.data.as_ref()[..checksum_index]);
+            (&mut target.data.as_mut()[checksum_index..]).put_u32(checksum);
+
+            // Freeze the encoded buffer so async writes can share it without copying, then recover
+            // the mutable buffer after all writes complete. Since we retain the buffer in memory,
+            // every write requests cache bypass.
+            let data = std::mem::take(&mut target.data).freeze();
+
+            // A store no larger than one blob page is written whole: its changed values, version,
+            // and checksum share that page, so one write replaces several.
+            let full_write = data.len() <= Widen::widen(BLOB_PAGE_SIZE);
+            if full_write {
+                // This write includes every changed byte, so a non-pipelined sync can request
+                // durability with it.
+                let options = if pipelined {
+                    WriteOptions::DONT_CACHE
+                } else {
+                    WriteOptions::SYNC | WriteOptions::DONT_CACHE
+                };
+                target.blob.write_at(0, data.clone(), options).await?;
+            } else {
+                // Larger metadata stores write only modified values, the version, and the checksum.
+                let writes = target
+                    .modified
+                    .iter()
+                    .map(|key| {
+                        let info = target.lengths.get(key).expect("key must exist");
+                        let start = info.start;
+                        let end = start + info.length;
+                        target.blob.write_at(
+                            Widen::widen(start),
+                            data.slice(start..end),
+                            WriteOptions::DONT_CACHE,
+                        )
+                    })
+                    .chain([
+                        target
+                            .blob
+                            .write_at(0, data.slice(0..u64::SIZE), WriteOptions::DONT_CACHE),
+                        target.blob.write_at(
+                            Widen::widen(checksum_index),
+                            data.slice(checksum_index..checksum_index + crc32::Digest::SIZE),
+                            WriteOptions::DONT_CACHE,
+                        ),
+                    ]);
+                try_join_all(writes).await?;
+            }
+            let sync = if pipelined {
+                Some(target.blob.start_sync().await)
+            } else if full_write {
+                // The full write above already persisted the store.
+                None
+            } else {
+                target.blob.sync().await?;
+                None
+            };
+
+            // Clear modified keys to avoid writing the same data
+            target.modified.clear();
+
+            // Update state
+            target.version = next_version;
+            target.data = IoBufMut::from(data);
+            self.sync_overwrites.inc();
+            return Ok(self.record_pending(sync));
+        }
+
+        // Clear modified keys to avoid writing the same data
+        target.modified.clear();
+
+        // Since we can't overwrite in place, we rewrite the entire blob.
+        // `IoBufMut` does not grow, so compute the final encoded length before
+        // selecting a destination buffer.
+        let mut lengths = HashMap::with_capacity(self.map.len());
+        let mut next_data_len = u64::SIZE + crc32::Digest::SIZE;
+        for (key, value) in &self.map {
+            let value_len = value.encode_size();
+            lengths.insert(key.clone(), Info::new(0, value_len));
+            next_data_len += key.encode_size() + value_len;
+        }
+
+        // Capture the old length before reusing this buffer so shrinking
+        // rewrites still resize the persisted blob.
+        let target_data_len = target.data.len();
+
+        // Reuse the encoded buffer when its allocation is already large enough.
+        let mut next_data = if target.data.capacity() >= next_data_len {
+            let mut data = std::mem::take(&mut target.data);
+            data.clear();
+            data
+        } else {
+            IoBufMut::with_capacity(next_data_len)
+        };
+        next_data.put_u64(next_version);
+
+        // Build new data
+        for (key, value) in &self.map {
+            key.write(&mut next_data);
+            let info = lengths.get_mut(key).expect("key must exist");
+            info.start = next_data.len();
+            value.write(&mut next_data);
+        }
+        next_data.put_u32(Crc32::checksum(next_data.as_ref()));
+
+        // Shrinking rewrites must also persist the resize, so they need a full sync.
+        let next_data = next_data.freeze();
+        let shrinking = next_data.len() < target_data_len;
+
+        // We retain the encoded buffer in memory below, so every write requests cache bypass.
+        let sync = if pipelined {
+            target
+                .blob
+                .write_at(0, next_data.clone(), WriteOptions::DONT_CACHE)
+                .await?;
+            if shrinking {
+                target.blob.resize(next_data.len() as u64).await?;
+            }
+            Some(target.blob.start_sync().await)
+        } else if shrinking {
+            target
+                .blob
+                .write_at(0, next_data.clone(), WriteOptions::DONT_CACHE)
+                .await?;
+            target.blob.resize(next_data.len() as u64).await?;
+            target.blob.sync().await?;
+            None
+        } else {
+            // Non-shrinking rewrites are a single write and can use range-scoped
+            // durability.
+            target
+                .blob
+                .write_at(
+                    0,
+                    next_data.clone(),
+                    WriteOptions::SYNC | WriteOptions::DONT_CACHE,
+                )
+                .await?;
+            None
+        };
+
+        // Update blob state
+        target.version = next_version;
+        target.lengths = lengths;
+        target.data = IoBufMut::from(next_data);
+
+        self.sync_rewrites.inc();
+        Ok(self.record_pending(sync))
+    }
+
+    /// Record a started blob sync (if any) as the pending sync and return its observer handle.
+    fn record_pending(&mut self, sync: Option<Handle<()>>) -> Handle<()> {
+        let Some(sync) = sync else {
+            return Handle::ready(Ok(()));
+        };
+        let completion: SyncCompletion = sync.boxed().shared();
+        let handle = Handle::from_future(completion.clone());
+        self.state.pending = Some(completion);
+        handle
+    }
+
+    /// See [Metadata::destroy].
+    async fn destroy(mut self) -> Result<(), Error> {
+        // The removal order below relies on the cursor naming the newest durable copy, which a
+        // failed started sync breaks, so that failure is surfaced before anything is removed.
+        self.wait_for_pending().await?;
+
+        // Remove the older copy first. A reopen after an interrupted destroy then finds the
+        // newest generation or an empty store, never a superseded generation.
+        let State { cursor, blobs, .. } = self.state;
+        drop(blobs);
+        for i in [1 - cursor, cursor] {
+            self.context
+                .remove(&self.partition, Some(BLOB_NAMES[i]))
+                .await?;
+            debug!(blob = i, "destroyed blob");
+        }
+        match self.context.remove(&self.partition, None).await {
+            Ok(()) => {}
+            Err(RError::PartitionMissing(_)) => {
+                // Partition already removed or never existed.
+            }
+            Err(err) => return Err(Error::Runtime(err)),
+        }
+        Ok(())
+    }
+}
+
+/// Implementation of [Metadata] storage.
+///
+/// Storage-mutating functions consume the store and return it only on success: an error (or a
+/// dropped future) destroys the handle.
+pub struct Metadata<E: Context, K: Span, V: Codec>(Box<Inner<E, K, V>>);
+
+impl<E: Context, K: Span, V: Codec> std::fmt::Debug for Metadata<E, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metadata")
+            .field("keys", &self.0.map.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Context, K: Span, V: Codec> Metadata<E, K, V> {
+    /// Initialize a new [Metadata] instance.
+    pub async fn init(context: E, cfg: Config<V::Cfg>) -> Result<Self, Error> {
+        Ok(Self(Box::new(Inner::init(context, cfg).await?)))
+    }
+
+    /// Get a value from [Metadata] (if it exists).
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.0.get(key)
+    }
+
+    /// Get a mutable reference to a value from [Metadata] (if it exists).
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.0.get_mut(key)
+    }
+
+    /// Clear all values from [Metadata]. The new state will not be persisted until [Self::sync] is
+    /// called.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Put a value into [Metadata].
+    ///
+    /// If the key already exists, the value will be overwritten and the previous
+    /// value is returned. The value stored will not be persisted until [Self::sync]
+    /// is called.
+    pub fn put(&mut self, key: K, value: V) -> Option<V> {
+        self.0.put(key, value)
+    }
+
+    /// Perform a [Self::put] and [Self::sync] in a single operation.
+    ///
+    /// Like calling [Self::sync] directly, this commits all pending metadata
+    /// changes, not just the provided key.
+    pub async fn put_sync(mut self, key: K, value: V) -> Result<Self, Error> {
+        self.0.put(key, value);
+        self.0.sync().await?;
+        Ok(self)
+    }
+
+    /// Update (or insert) a value in [Metadata] using a closure.
+    pub fn upsert(&mut self, key: K, f: impl FnOnce(&mut V))
+    where
+        V: Default,
+    {
+        self.0.upsert(key, f);
+    }
+
+    /// Update (or insert) a value in [Metadata] using a closure and sync immediately.
+    pub async fn upsert_sync(mut self, key: K, f: impl FnOnce(&mut V)) -> Result<Self, Error>
+    where
+        V: Default,
+    {
+        self.0.upsert(key, f);
+        self.0.sync().await?;
+        Ok(self)
+    }
+
+    /// Remove a value from [Metadata] (if it exists).
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        self.0.remove(key)
+    }
+
+    /// Iterate over all keys in metadata.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.0.keys()
+    }
+
+    /// Retain only the keys that satisfy the predicate.
+    pub fn retain(&mut self, f: impl FnMut(&K, &V) -> bool) {
+        self.0.retain(f);
+    }
+
+    /// Atomically commit the current state of [Metadata].
+    pub async fn sync(mut self) -> Result<Self, Error> {
+        self.0.sync().await?;
+        Ok(self)
+    }
+
+    /// Atomically begin committing the current state of [Metadata], returning a completion handle.
+    ///
+    /// Awaiting the returned [Handle] provides the same guarantee as [Self::sync]. A started
+    /// sync's failure surfaces on the handle and again on the next sync, which fails (destroying
+    /// the store) without writing. At most one sync is in flight: a new call writes nothing
+    /// until the prior sync completes. Dropping the handle neither cancels the sync nor loses a
+    /// failure.
+    pub async fn start_sync(mut self) -> Result<(Self, Handle<()>), Error> {
+        let handle = self.0.start_sync().await?;
+        Ok((self, handle))
+    }
+
+    /// Wait for a sync started by [Self::start_sync] to complete, surfacing its failure without
+    /// writing anything.
+    pub(crate) async fn wait_for_sync(&mut self) -> Result<(), Error> {
+        Ok(self.0.wait_for_pending().await?)
+    }
+
+    /// Remove the underlying blobs for this [Metadata].
+    ///
+    /// The older copy is removed first, so a reopen after an interrupted destroy finds either the
+    /// newest generation or an empty store, never a superseded generation. A started sync that
+    /// failed is reported before either copy is removed.
+    pub async fn destroy(self) -> Result<(), Error> {
+        self.0.destroy().await
+    }
+}

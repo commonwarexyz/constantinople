@@ -1,0 +1,165 @@
+//! Shared implementation for ordered Current QMDB variants.
+//!
+//! This module contains impl blocks that are generic over `ValueEncoding`, allowing them to be
+//! used by both fixed and variable ordered QMDB implementations.
+
+use super::proof::constant::{ExclusionProof, KeyValueProof};
+use crate::{
+    Context,
+    index::Ordered as OrderedIndex,
+    journal::contiguous::{Contiguous, Mutable},
+    merkle::{self, Location},
+    qmdb::{
+        Error,
+        any::{
+            ValueEncoding,
+            ordered::{Operation, Update},
+        },
+        operation::Key,
+    },
+};
+use commonware_codec::Codec;
+use commonware_cryptography::Hasher;
+use commonware_parallel::Strategy;
+use core::ops::RangeBounds;
+use futures::stream::Stream;
+
+/// The generic Db type for ordered Current QMDB variants.
+///
+/// This type is generic over the index type `I`, allowing it to be used with both regular
+/// and partitioned indices.
+pub type Db<F, E, C, K, V, I, H, const N: usize, S> =
+    crate::qmdb::current::db::Db<F, E, C, I, H, Update<K, V>, N, S>;
+
+// Shared read-only functionality.
+impl<
+    F: merkle::Graftable,
+    E: Context,
+    C: Contiguous<Item = Operation<F, K, V>>,
+    K: Key,
+    V: ValueEncoding,
+    I: OrderedIndex<Value = Location<F>>,
+    H: Hasher,
+    const N: usize,
+    S: Strategy,
+> Db<F, E, C, K, V, I, H, N, S>
+where
+    Operation<F, K, V>: Codec,
+{
+    /// Get the value of `key` in the db, or None if it has no value.
+    pub async fn get(&self, key: &K) -> Result<Option<V::Value>, Error<F>> {
+        self.any.get(key).await
+    }
+
+    /// Get the operation that currently defines the span whose range contains `key`, or None if the
+    /// DB is empty.
+    pub async fn get_span(&self, key: &K) -> Result<Option<(Location<F>, Update<K, V>)>, Error<F>> {
+        self.any.get_span(key).await
+    }
+
+    /// Returns the smallest active key strictly greater than `key`, or `None` if there is none.
+    ///
+    /// The query key need not be active. This lookup does not wrap around to the first key.
+    pub async fn get_next_key(&self, key: &K) -> Result<Option<K>, Error<F>> {
+        self.any.get_next_key(key).await
+    }
+
+    /// Returns the largest active key strictly less than `key`, or `None` if there is none.
+    ///
+    /// The query key need not be active. This lookup does not wrap around to the last key.
+    pub async fn get_prev_key(&self, key: &K) -> Result<Option<K>, Error<F>> {
+        self.any.get_prev_key(key).await
+    }
+
+    /// Streams active (key, value) pairs in ascending key order within `range`.
+    pub fn stream_range<'a>(
+        &'a self,
+        range: impl RangeBounds<K> + Send + 'a,
+    ) -> impl Stream<Item = Result<(K, V::Value), Error<F>>> + Send + 'a {
+        self.any.stream_range(range)
+    }
+
+    /// Streams active keys in ascending order within `range`.
+    pub fn keys<'a>(
+        &'a self,
+        range: impl RangeBounds<K> + Send + 'a,
+    ) -> impl Stream<Item = Result<K, Error<F>>> + Send + 'a {
+        self.any.keys(range)
+    }
+}
+
+impl<
+    F: merkle::Graftable,
+    E: Context,
+    C: Mutable<Item = Operation<F, K, V>>,
+    K: Key,
+    V: ValueEncoding,
+    I: OrderedIndex<Value = Location<F>>,
+    H: Hasher,
+    const N: usize,
+    S: Strategy,
+> Db<F, E, C, K, V, I, H, N, S>
+where
+    Operation<F, K, V>: Codec,
+{
+    /// Generate and return a proof of the current value of `key`, along with the other
+    /// [KeyValueProof] required to verify the proof. Returns KeyNotFound error if the key is not
+    /// currently assigned any value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [Error::KeyNotFound] if the key is not currently assigned any value.
+    pub async fn key_value_proof(
+        &self,
+        key: K,
+    ) -> Result<KeyValueProof<F, K, H::Digest, N>, Error<F>> {
+        let op_loc = self.any.get_with_loc(&key).await?;
+        let Some((data, loc)) = op_loc else {
+            return Err(Error::<F>::KeyNotFound);
+        };
+        let proof = self.operation_proof(loc).await?;
+
+        Ok(KeyValueProof {
+            proof,
+            next_key: data.next_key,
+        })
+    }
+
+    /// Generate and return a proof that the specified `key` does not exist in the db.
+    ///
+    /// # Errors
+    ///
+    /// Returns [Error::KeyExists] if the key exists in the db.
+    pub async fn exclusion_proof(
+        &self,
+        key: &K,
+    ) -> Result<ExclusionProof<F, K, V, H::Digest, N>, Error<F>> {
+        match self.any.get_span(key).await? {
+            Some((loc, key_data)) => {
+                if key_data.key == *key {
+                    // Cannot prove exclusion of a key that exists in the db.
+                    return Err(Error::<F>::KeyExists);
+                }
+                let op_proof = self.operation_proof(loc).await?;
+                Ok(ExclusionProof::KeyValue(op_proof, key_data))
+            }
+            None => {
+                // The DB is empty. Use the last CommitFloor to prove emptiness. The Commit proof
+                // variant requires the CommitFloor's floor to equal its own location (genuinely
+                // empty at commit time). If this doesn't hold, the persisted state is inconsistent.
+                let last_commit_loc = self.any.log.size() - 1;
+                let op = self.any.log.read(*last_commit_loc).await?;
+                let Operation::CommitFloor(value, floor) = op else {
+                    unreachable!("last_commit_loc should always point to a CommitFloor");
+                };
+                assert_eq!(
+                    floor, last_commit_loc,
+                    "inconsistent commit floor: expected last_commit_loc={}, got floor={}",
+                    last_commit_loc, floor
+                );
+                let op_proof = self.operation_proof(last_commit_loc).await?;
+                Ok(ExclusionProof::Commit(op_proof, value))
+            }
+        }
+    }
+}

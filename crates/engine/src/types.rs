@@ -29,7 +29,7 @@ use commonware_cryptography::{
 use commonware_glue::stateful::{Stateful, db::Shared};
 use commonware_storage::{
     mmr,
-    qmdb::{any::unordered::fixed, sync::Database},
+    qmdb::{current::ordered::fixed, sync::Database},
     translator::EightCap,
 };
 use constantinople_application::consensus::{FinalizedHookFn, TransactionHistoryDb};
@@ -121,7 +121,7 @@ where
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
+pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, 32, T>;
 
 pub type StateSyncDb<E, H, T> = Shared<StateDb<E, H, T>>;
 

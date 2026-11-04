@@ -25,17 +25,19 @@ use commonware_consensus::{
 use commonware_cryptography::{Committable as _, Digest as _, Digested, Signer as _};
 use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_parallel::Sequential;
+use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
 use commonware_storage::{
+    journal::contiguous::fixed::Config as JournalConfig,
     merkle::{Family as _, mem::Mem},
-    qmdb::any::unordered::Update,
+    qmdb::{current::ordered::fixed::Db, floor::Proportional},
+    translator::TwoCap,
 };
-use commonware_utils::{iter::NonEmpty, non_empty_range};
-use constantinople_application::consensus::{
-    StateOperation as CapturedStateOperation, TransactionHistoryOperation,
-};
+use commonware_utils::{NZU16, NZU64, NZUsize, iter::NonEmpty, non_empty_range};
+use constantinople_application::consensus::TransactionHistoryOperation;
 use constantinople_engine::types::{EngineBlock, EngineCodedBlock};
 use constantinople_primitives::{
-    Block, Header as BlockHeader, Nonce, Sealable, TRANSACTION_NAMESPACE, TransactionPublicKey,
+    Block, Header as BlockHeader, Nonce, Sealable, StateSyncProof, TRANSACTION_NAMESPACE,
+    TransactionHistoryEntry, TransactionPublicKey,
 };
 use exoware_sdk::StoreWriteBatch;
 use exoware_simulator::{AppState, RocksStore, connect_stack};
@@ -188,8 +190,80 @@ fn append_root<Op: Encode>(
     root
 }
 
+fn state_boundaries(
+    counts: &[u64],
+    account: AccountKey,
+) -> Vec<(Digest, u64, u64, StateSyncProof<Digest>)> {
+    let counts = counts.to_vec();
+    deterministic::Runner::default().start(|context| async move {
+        let page_cache = CacheRef::new(NZU16!(88), NZUsize!(8));
+        let mut db =
+            Db::<mmr::Family, _, AccountKey, Account, Sha256, TwoCap, 32, Sequential>::init(
+                context,
+                commonware_storage::qmdb::current::Config {
+                    merkle_config: commonware_storage::merkle::full::Config {
+                        journal_partition: "browse-state-merkle".into(),
+                        metadata_partition: "browse-state-merkle-meta".into(),
+                        items_per_blob: NZU64!(11),
+                        write_buffer: NZUsize!(1024),
+                        replay_buffer: NZUsize!(1024),
+                        strategy: Sequential,
+                        page_cache: page_cache.clone(),
+                    },
+                    journal_config: JournalConfig {
+                        partition: "browse-state-operations".into(),
+                        items_per_blob: NZU64!(7),
+                        page_cache,
+                        write_buffer: NZUsize!(1024),
+                        replay_buffer: NZUsize!(1024),
+                    },
+                    grafted_metadata_partition: "browse-state-grafted-meta".into(),
+                    translator: TwoCap,
+                    init_cache: None,
+                    init_buffer: NZUsize!(4096),
+                    init_concurrency: (),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mut boundaries = Vec::with_capacity(counts.len());
+        let mut nonce = 0;
+        for count in counts {
+            nonce += count;
+            let mut batch = db.new_batch();
+            if count > 0 {
+                batch = batch.write(
+                    account,
+                    Some(Account {
+                        balance: 100,
+                        nonce: Nonce::new(nonce, 0),
+                        tx_count: nonce,
+                    }),
+                );
+            }
+            let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+            let state_sync = StateSyncProof {
+                ops_root: batch.ops_root(),
+                witness: batch.ops_root_witness().clone(),
+            };
+            db = db.apply_batch(batch).await.unwrap();
+            let bounds = db.bounds();
+            boundaries.push((
+                db.root(),
+                db.sync_boundary().as_u64(),
+                bounds.end.as_u64(),
+                state_sync,
+            ));
+        }
+        db.destroy().await.unwrap();
+        boundaries
+    })
+}
+
 impl Chain {
     async fn new(counts: impl IntoIterator<Item = u64>) -> Self {
+        let counts = counts.into_iter().collect::<Vec<_>>();
         let mut rng = StdRng::from_seed([42; 32]);
         let (schemes, verifier) = threshold(&mut rng, b"constantinople_CONSENSUS", 4);
         let coding = coding_config_for_participants(schemes.len() as u16);
@@ -197,14 +271,13 @@ impl Chain {
         let sender = TransactionPublicKey::ed25519(signer.public_key());
         let account = AccountKey::from_public_key(&sender);
         let leader = ed25519::SigningKey::from_seed(9).public_key();
-        let mut state = Mem::<mmr::Family, Digest>::new();
+
+        // The deterministic runner must not inherit this Tokio task's cooperative budget.
+        let state_counts = counts.clone();
+        let states = tokio::task::spawn_blocking(move || state_boundaries(&state_counts, account))
+            .await
+            .unwrap();
         let mut transactions = Mem::<mmr::Family, Digest>::new();
-        append_root(
-            &mut state,
-            &[CapturedStateOperation::CommitFloor(None, Location::new(0))],
-            1,
-            0,
-        );
         append_root(
             &mut transactions,
             &[TransactionHistoryOperation::<Sha256>::Commit(
@@ -214,7 +287,6 @@ impl Chain {
             1,
             0,
         );
-        let mut state_end = 1;
         let mut transaction_end = 1;
         let mut parent_transaction_start = 0;
         let mut nonce = 0;
@@ -227,7 +299,9 @@ impl Chain {
             Digest::EMPTY,
             coding,
         ));
-        for (index, count) in counts.into_iter().enumerate() {
+        for (index, (count, (state_root, state_start, state_end, state_sync))) in
+            counts.into_iter().zip(states).enumerate()
+        {
             let height = index as u64 + 1;
             let floor = parent_transaction_start;
             parent_transaction_start = transaction_end;
@@ -251,7 +325,11 @@ impl Chain {
             let mut operations = body
                 .iter()
                 .map(|transaction| {
-                    TransactionHistoryOperation::<Sha256>::Append(*transaction.message_digest())
+                    TransactionHistoryOperation::<Sha256>::Append(TransactionHistoryEntry {
+                        digest: *transaction.message_digest(),
+                        sender_index: transaction.value().nonce,
+                        recipient_index: transaction.value().nonce,
+                    })
                 })
                 .collect::<Vec<_>>();
             operations.push(TransactionHistoryOperation::<Sha256>::Commit(
@@ -261,19 +339,6 @@ impl Chain {
             transaction_end += operations.len() as u64;
             let transactions_root =
                 append_root(&mut transactions, &operations, transaction_end, floor);
-            let mut operations = Vec::new();
-            if count > 0 {
-                operations.push(CapturedStateOperation::Update(Update(
-                    account,
-                    Account {
-                        balance: 100,
-                        nonce: Nonce::new(nonce, 0),
-                    },
-                )));
-            }
-            operations.push(CapturedStateOperation::CommitFloor(None, Location::new(0)));
-            state_end += operations.len() as u64;
-            let state_root = append_root(&mut state, &operations, state_end, 0);
             let header = BlockHeader {
                 context: SimplexContext {
                     round: Round::new(Epoch::zero(), View::new(height)),
@@ -284,12 +349,13 @@ impl Chain {
                 height,
                 timestamp: (height - 1) / 2,
                 state_root,
-                state_range: non_empty_range!(0, state_end),
+                state_range: non_empty_range!(state_start, state_end),
                 transactions_root,
                 transactions_range: non_empty_range!(floor, transaction_end),
             };
-            let block: EngineBlock<Sha256, VerifyingKey> =
-                Block::new(header, body).seal(&mut Sha256::default()).into();
+            let block: EngineBlock<Sha256, VerifyingKey> = Block::new(header, body, state_sync)
+                .seal(&mut Sha256::default())
+                .into();
             let coded = EngineCodedBlock::encode(
                 Digested::precomputed(block.clone(), *block.seal()),
                 coding,
@@ -867,12 +933,16 @@ async fn generated_search_returns_one_match_and_validates_byte_width() {
             nonce_base: 0,
             nonce_bitmap: 0,
             qmdb_location: 1,
+            tx_count: 0,
+            write_height: 1,
         }),
         encode_tx_meta_row(TxMetaRow {
             digest: [0xcd; 32],
             qmdb_location: 1,
             body: Bytes::new(),
             height: 1,
+            sender_index: 0,
+            recipient_index: 0,
         }),
     ] {
         writer.insert(row.table, row.values).unwrap();

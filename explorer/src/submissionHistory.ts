@@ -35,6 +35,9 @@ export interface SubmittedTransaction {
     readonly value: string;
     readonly nonce: string;
     readonly submittedAt: number;
+    /** Local time from submission until the relayer reported finalization; not authenticated. */
+    readonly reportedInMs: number | null;
+    readonly reportedHeight: number | null;
     readonly finalizationObservedInMs: number | null;
     readonly proofObservedInMs: number | null;
     readonly status: SubmittedTransactionStatus;
@@ -75,6 +78,47 @@ const REJECTED_STATE = {
     proof: { status: 'unavailable', detail: 'transaction rejected' },
 } as const;
 
+/** One stop on a submission's local timeline, in order from submission. */
+export interface TimelineStep {
+    readonly kind: 'reported' | 'verified';
+    readonly state: 'done' | 'pending' | 'failed';
+    readonly label: string;
+    /** Milliseconds after submission when the step was first observed locally. */
+    readonly elapsedMs: number | null;
+    readonly detail: string;
+}
+
+/**
+ * The row's progress from submission: the relayer's unauthenticated finalization report, then
+ * the browser-verified certificate and inclusion proof. The timeline ends at the first pending
+ * or failed step.
+ */
+export function submissionTimeline(tx: SubmittedTransaction): TimelineStep[] {
+    const verified = tx.certificate.status === 'verified' && tx.proof.status === 'verified';
+    if (tx.status === 'rejected') {
+        return [{ kind: 'reported', state: 'failed', label: 'rejected', elapsedMs: null, detail: tx.detail }];
+    }
+    const reported: TimelineStep = tx.reportedInMs !== null || verified
+        ? {
+            kind: 'reported', state: 'done', elapsedMs: tx.reportedInMs,
+            label: tx.reportedHeight !== null ? `reported h${tx.reportedHeight}` : 'reported', detail: '',
+        }
+        : { kind: 'reported', state: 'pending', label: 'awaiting report', elapsedMs: null, detail: tx.detail };
+    if (reported.state === 'pending') return [reported];
+    if (verified) {
+        return [reported, {
+            kind: 'verified', state: 'done', elapsedMs: tx.proofObservedInMs,
+            label: `cert h${tx.certificate.height} / loc ${tx.proof.location}`, detail: '',
+        }];
+    }
+    const failure = tx.proof.status === 'error' ? tx.proof.detail
+        : tx.certificate.status === 'error' ? tx.certificate.detail : null;
+    if (failure !== null) {
+        return [reported, { kind: 'verified', state: 'failed', label: 'verification failed', elapsedMs: null, detail: failure }];
+    }
+    return [reported, { kind: 'verified', state: 'pending', label: 'awaiting proof', elapsedMs: null, detail: tx.detail }];
+}
+
 export function prependTransaction(
     transaction: SubmittedTransaction,
     current: SubmittedTransaction[],
@@ -96,12 +140,14 @@ export function markSubmissionReconciling(
 export function markValidatorFinalizationObserved(
     digest: string,
     height: number,
-    _observedAt: number,
+    observedAt: number,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
     return updateReconciling(digest, current, (tx) => ({
         ...tx,
         detail: `reported h${height}`,
+        reportedInMs: tx.reportedInMs ?? Math.max(0, observedAt - tx.submittedAt),
+        reportedHeight: tx.reportedHeight ?? height,
     }));
 }
 
@@ -285,6 +331,9 @@ export function restoreSubmittedTransaction(value: unknown): SubmittedTransactio
         status: 'reconciling',
         detail: 'saved submission',
         finalizedHeight: null,
+        reportedInMs: storedDuration(transaction.reportedInMs),
+        reportedHeight: typeof transaction.reportedHeight === 'number' && Number.isSafeInteger(transaction.reportedHeight) && transaction.reportedHeight > 0
+            ? transaction.reportedHeight : null,
         finalizationObservedInMs: storedDuration(transaction.finalizationObservedInMs),
         proofObservedInMs: storedDuration(transaction.proofObservedInMs),
         certificate: WAITING_FINALIZATION_CERTIFICATE,

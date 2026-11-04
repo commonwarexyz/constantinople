@@ -1,0 +1,172 @@
+[package]
+name = "commonware-storage"
+edition.workspace = true
+publish = true
+version.workspace = true
+license.workspace = true
+description = "Persist and retrieve data from an abstract store."
+readme = "README.md"
+homepage.workspace = true
+repository = "https://github.com/commonwarexyz/monorepo/tree/main/storage"
+documentation = "https://docs.rs/commonware-storage"
+
+[lints]
+workspace = true
+
+[dependencies]
+ahash = { workspace = true, features = ["no-rng"] }
+anyhow.workspace = true
+arbitrary = { workspace = true, optional = true, features = ["derive"] }
+bytes = { workspace = true, default-features = false }
+cfg-if.workspace = true
+commonware-codec = { workspace = true, default-features = false }
+commonware-cryptography = { workspace = true, default-features = false }
+commonware-formatting = { workspace = true, default-features = false }
+commonware-macros.workspace = true
+commonware-parallel = { workspace = true, default-features = false }
+commonware-runtime = { workspace = true, optional = true }
+commonware-utils = { workspace = true, default-features = false }
+futures = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+hashbrown.workspace = true
+thiserror.workspace = true
+tracing = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+[dev-dependencies]
+commonware-allocator = { workspace = true, features = ["mimalloc"] }
+commonware-bench.workspace = true
+commonware-conformance.workspace = true
+commonware-math.workspace = true
+commonware-parallel = { workspace = true, features = ["test-utils"] }
+commonware-runtime = { workspace = true, features = ["test-utils"] }
+commonware-storage = { path = ".", default-features = false, features = ["test-utils"] }
+criterion.workspace = true
+paste.workspace = true
+rand = { workspace = true, features = ["alloc"] }
+rand_distr.workspace = true
+rstest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+commonware-bench = { workspace = true, features = ["gungraun"] }
+gungraun = { workspace = true, features = ["client_requests"] }
+
+[package.metadata.cargo-udeps.ignore]
+# These are exercised only by the cfg-gated benchmark tracking target, so cargo-udeps flags
+# them falsely.
+development = ["commonware-bench", "gungraun", "rand_distr"]
+
+[features]
+default = [ "std" ]
+std = [
+	"ahash/runtime-rng",
+	"ahash/std",
+	"anyhow/std",
+	"bytes/std",
+	"commonware-codec/std",
+	"commonware-cryptography/std",
+	"commonware-formatting/std",
+	"commonware-macros/std",
+	"commonware-parallel/std",
+	"commonware-runtime",
+	"commonware-utils/std",
+	"futures",
+	"futures-util",
+	"futures-util/std",
+	"thiserror/std",
+	"tracing",
+	"zstd",
+]
+arbitrary = [
+	"commonware-codec/arbitrary",
+	"commonware-cryptography/arbitrary",
+	"commonware-runtime?/arbitrary",
+	"commonware-utils/arbitrary",
+	"dep:arbitrary",
+]
+fuzzing = [ "test-utils" ]
+test-utils = []
+test-traits = []
+
+[lib]
+bench = false
+
+[[bench]]
+name = "cold_read"
+harness = false
+path = "src/qmdb/benches/cold_read.rs"
+
+[[bench]]
+name = "constantinople"
+harness = false
+path = "src/qmdb/benches/constantinople.rs"
+
+[[bench]]
+name = "qmdb"
+harness = false
+path = "src/qmdb/benches/bench.rs"
+required-features = ["test-traits"]
+
+[[bench]]
+name = "qmdb_gungraun"
+harness = false
+path = "src/qmdb/benches/bench_gungraun.rs"
+required-features = ["test-traits"]
+
+[[bench]]
+name = "scale"
+harness = false
+path = "src/qmdb/benches/scale.rs"
+required-features = ["test-traits"]
+
+[[bench]]
+name="archive"
+harness = false
+path = "src/archive/benches/bench.rs"
+
+[[bench]]
+name="bmt"
+harness = false
+path = "src/bmt/benches/bench.rs"
+
+[[bench]]
+name="freezer"
+harness = false
+path = "src/freezer/benches/bench.rs"
+
+[[bench]]
+name="index"
+harness = false
+path = "src/index/benches/bench.rs"
+
+[[bench]]
+name = "index_scale"
+harness = false
+path = "src/index/benches/scale.rs"
+
+[[bench]]
+name="journal"
+harness = false
+path = "src/journal/benches/bench.rs"
+
+[[bench]]
+name="merkle"
+harness = false
+path = "src/merkle/benches/bench.rs"
+
+[[bench]]
+name="ordinal"
+harness = false
+path = "src/ordinal/benches/bench.rs"
+
+[[bench]]
+name="metadata"
+harness = false
+path = "src/metadata/benches/bench.rs"
+
+[[bench]]
+name="rmap"
+harness = false
+path = "src/rmap/benches/bench.rs"

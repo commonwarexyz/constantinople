@@ -1,14 +1,16 @@
+import { accountHistoryPage } from './accountPage.ts';
 import { initQmdbWasm, QmdbProofVerifier } from '@exowarexyz/qmdb';
+import { initAccountProofWasm, verifyCurrentAccount } from './accountProof.ts';
 import { type SimplexCertificateVerifier, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { createExplorerClient } from './rpc.ts';
-import { ActivityMode, type ProofBundle, type WatchBlocksResponse } from './gen/constantinople/explorer/v1/explorer_pb.ts';
+import { type ProofBundle, type WatchBlocksResponse } from './gen/constantinople/explorer/v1/explorer_pb.ts';
 import { accountKeyFromPublicKey, bytesEqual, fromHex, parseAccountKeyHex, toArrayBuffer, toHex } from './codec.ts';
 import {
     authenticatedHeader, decodeAccountValue, finalizedTargetFromCertificate,
     readU64Be, simplexFinalizationVerifier,
     MAX_ANCESTRY_HEADERS, MAX_EXECUTION_HEADER_BYTES, MAX_FINALIZATION_CERTIFICATE_BYTES,
-    type AccountActivityMode, type AccountTransactionPage, type DecodedBlockHeader,
-    type LatestProofTarget, type VerifiedAccountProof, type VerifiedFinalizationTarget,
+    type AccountTransactionPage, type DecodedBlockHeader,
+    type LatestProofTarget, type VerifiedAccountExclusion, type VerifiedAccountProof, type VerifiedFinalizationTarget,
     type VerifiedTransactionProof,
 } from './qmdb.ts';
 
@@ -29,7 +31,7 @@ const TRANSACTION_BODY_BYTES = 82;
  */
 const MAX_TRANSACTION_BYTES = 919;
 
-/** Verifies the SHA-256 MMR proofs used by both the state and transaction logs. */
+/** Verifies the SHA-256 MMR transaction log proofs. */
 const verifier = new QmdbProofVerifier({ merkleFamily: 'mmr', hashFamily: 'sha256' });
 
 type CertificateVerifier = SimplexCertificateVerifier<VerifiedSimplexCertificate, VerifiedSimplexCertificate>;
@@ -52,10 +54,11 @@ interface CommonOptions {
 
 export interface AccountBundleOptions extends CommonOptions {
     readonly account: string;
-    readonly mode?: AccountActivityMode;
     readonly cursor?: Uint8Array | string | null;
     readonly at?: { readonly height: bigint; readonly blockDigest: Uint8Array };
     readonly includeTransactions?: boolean;
+    readonly accountLocation?: bigint;
+    readonly expectedTxCount?: bigint;
 }
 
 export interface BlockBundleOptions extends CommonOptions {
@@ -70,8 +73,10 @@ export interface TransactionBundleOptions extends CommonOptions {
 interface TransactionRow {
     readonly location: bigint;
     readonly body: Uint8Array;
+    readonly senderIndex: bigint;
+    readonly recipientIndex: bigint;
 
-    /** Indexer-reported position, authenticated only in block and single-transaction bundles. */
+    /** Position is authenticated by the owning block for block and transaction views. */
     readonly height: bigint;
     readonly index: number;
 
@@ -84,7 +89,7 @@ interface Envelope {
     readonly certificate: Uint8Array;
     readonly headers: Uint8Array[];
     readonly sequenceNumber: bigint;
-    readonly account: { readonly location: bigint; readonly proof: Uint8Array } | null;
+    readonly account: { readonly location: bigint; readonly proof: Uint8Array; readonly writeHeight: bigint; readonly encodedOperation?: Uint8Array; readonly exclusion?: true } | null;
     readonly transactions: TransactionRow[];
     readonly transactionsProof: Uint8Array | null;
     readonly nextCursor: string | null;
@@ -181,17 +186,20 @@ interface CanonicalTransaction {
     readonly location: bigint;
 }
 
-/**
- * Historical inclusion under one snapshot. Activity heights and indices are unauthenticated
- * pagination hints.
- */
-export interface VerifiedAccountBundle {
+/** Account state and a complete history interval at one certified root. */
+export type VerifiedAccountBundle = {
     readonly target: LatestProofTarget;
-    /** Null means the indexer supplied no account update. */
-    readonly account: VerifiedAccountProof | null;
     readonly page: AccountTransactionPage;
     readonly transactionProofs: VerifiedTransactionProof[];
-}
+} & ({
+    readonly kind: 'inclusion';
+    readonly account: VerifiedAccountProof;
+    readonly absence: null;
+} | {
+    readonly kind: 'exclusion';
+    readonly account: null;
+    readonly absence: VerifiedAccountExclusion;
+});
 
 export interface VerifiedBlockBundle {
     readonly target: LatestProofTarget;
@@ -216,9 +224,9 @@ export async function prewarmProofVerification(material: string): Promise<void> 
 export async function loadAccountBundle(options: AccountBundleOptions): Promise<VerifiedAccountBundle> {
     const request = accountRequest(options);
     return verifyAccountBundle(request, await loadEnvelope(request, () => createExplorerClient(request.indexerUrl).getAccount({
-        account: fromHex(request.account), mode: { all: ActivityMode.ALL, sent: ActivityMode.SENT, received: ActivityMode.RECEIVED }[request.mode],
+        account: fromHex(request.account),
         cursor: request.cursor ?? undefined, at: request.at?.height, digest: request.at?.blockDigest,
-        activity: request.includeTransactions,
+        activity: request.includeTransactions, accountLocation: request.accountLocation,
     }, { signal: request.signal }), 'account'));
 }
 
@@ -235,75 +243,48 @@ export async function loadTransactionBundle(options: TransactionBundleOptions): 
 }
 
 export async function verifyAccountBundle(options: AccountBundleOptions, raw: unknown): Promise<VerifiedAccountBundle> {
-    // Account pages are certified directly, without ancestry, and must stay on the requested
-    // snapshot. A balance-only request must return no activity.
     const request = accountRequest(options);
     const envelope = parseEnvelope(raw, 10);
-    if (envelope.headers.length !== 0) throw new Error('account bundle must use a directly certified snapshot');
     const target = await certifiedTarget(request, envelope);
     if (request.at && (target.height !== request.at.height || !bytesEqual(target.blockDigest, request.at.blockDigest))) {
         throw new Error('account bundle does not match requested snapshot');
     }
-    if (!request.includeTransactions && (envelope.transactions.length !== 0 || envelope.nextCursor !== null)) {
+    if (!request.includeTransactions && (envelope.transactions.length !== 0 || envelope.transactionsProof !== null || envelope.nextCursor !== null)) {
         throw new Error('balance-only bundle contains activity');
     }
-
-    // Rows are newest first, so each must sort strictly before the cursor and the row preceding it.
-    const cursor = request.cursor === null ? null : decodeCursor(request.cursor);
-    const tuples = envelope.transactions.map((row) => {
-        if (row.role !== 0 && row.role !== 1) throw new Error('invalid account activity role');
-        if ((request.mode === 'sent' && row.role !== 0) || (request.mode === 'received' && row.role !== 1)) {
-            throw new Error('account activity does not match requested mode');
-        }
-        return [row.height, BigInt(row.index), BigInt(row.role)] as const;
-    });
-    let previous = cursor;
-    for (const tuple of tuples) {
-        if (previous && compareCursor(tuple, previous) >= 0) throw new Error('account activity is not strictly after requested cursor');
-        previous = tuple;
-    }
-
-    // A location may repeat only as the sent and received rows of one self-transfer.
-    const locations = new Map<bigint, TransactionRow>();
-    for (const row of envelope.transactions) {
-        const prior = locations.get(row.location);
-        if (prior && (prior.height !== row.height || prior.index !== row.index || prior.role === row.role || !bytesEqual(prior.body, row.body))) {
-            throw new Error('conflicting account activity at one location');
-        }
-        locations.set(row.location, row);
-    }
-
-    // A next cursor appears only after a full page and must equal the last row's sort key.
-    const nextCursor = envelope.nextCursor === null ? null : hex(envelope.nextCursor, 'account cursor', 24, 24);
-    if (nextCursor && (tuples.length !== 10 || !previous || compareCursor(decodeCursor(nextCursor), previous) !== 0)) {
-        throw new Error('account next cursor does not match last page row');
-    }
-
-    // Report the verified certificate, then verify the state and transaction proofs concurrently.
     request.signal?.throwIfAborted();
     request.onFinalizationVerified?.({ height: target.height, view: target.view });
-    const [account, transactions] = await Promise.all([
-        verifyAccount(envelope, target, fromHex(request.account)),
-        verifyTransactions(envelope, target),
-    ]);
-
-    // Each authenticated body must involve the account in its claimed role. Height and block index
-    // come from the unauthenticated row.
-    const rows = transactions.map((transaction, index) => {
-        const row = envelope.transactions[index]!;
-        const sent = row.role === 0;
-        if ((sent ? transaction.sender : transaction.recipient) !== request.account) {
-            throw new Error('transaction body does not involve the requested account in its claimed role');
-        }
-        return {
-            digest: transaction.digest, direction: sent ? 'sent' as const : 'received' as const,
-            counterparty: sent ? transaction.recipient : transaction.sender,
-            value: transaction.value, nonce: transaction.nonce,
-            height: row.height, blockIndex: row.index, location: row.location,
-        };
-    });
     request.signal?.throwIfAborted();
-    return { target, account, page: { rows, nextCursor }, transactionProofs: transactions.map((tx) => tx.proof) };
+    const lookup = await verifyAccount(envelope, target, fromHex(request.account), request.signal);
+    const pinned = lookup.kind === 'hit' ? lookup.account : null;
+    if (request.accountLocation !== undefined && pinned?.location !== request.accountLocation) {
+        throw new Error('account bundle does not match pinned account location');
+    }
+    if (request.expectedTxCount !== undefined && pinned?.txCount !== request.expectedTxCount) {
+        throw new Error('account bundle does not match pinned transaction count');
+    }
+    if (lookup.kind === 'miss') {
+        if (envelope.headers.length || envelope.transactions.length || envelope.transactionsProof !== null || envelope.nextCursor !== null) {
+            throw new Error('account exclusion cannot contain history');
+        }
+        request.signal?.throwIfAborted();
+        return { kind: 'exclusion', target, account: null,
+            absence: { accountKey: request.account, timestampMs: target.timestampMs, ...lookup.absence },
+            page: { rows: [], nextCursor: null }, transactionProofs: [] };
+    }
+    const account = lookup.account;
+    const transactions = await verifyTransactions(envelope, target);
+    if (transactions.some((transaction) => transaction.location >= account.transactionEnd)) {
+        throw new Error('account history is newer than its authenticated account version');
+    }
+    const page = request.includeTransactions ? accountHistoryPage(
+        request.account, account.txCount, request.cursor,
+        envelope.nextCursor === null ? null : hex(envelope.nextCursor, 'account cursor', 8, 8),
+        transactions.map((transaction, index) => ({ ...transaction, ...envelope.transactions[index] })),
+    ) : { rows: [], nextCursor: null };
+    request.signal?.throwIfAborted();
+    const { transactionEnd: _transactionEnd, ...verifiedAccount } = account;
+    return { kind: 'inclusion', target, account: verifiedAccount, absence: null, page, transactionProofs: transactions.map((tx) => tx.proof) };
 }
 
 export async function verifyBlockBundle(options: BlockBundleOptions, raw: unknown): Promise<VerifiedBlockBundle> {
@@ -371,8 +352,10 @@ type BundleKind = 'account' | 'block' | 'transaction';
 
 async function loadEnvelope(options: CommonOptions, load: () => Promise<ProofBundle>, kind: BundleKind): Promise<unknown> {
     options.signal?.throwIfAborted();
-    const initialization = prewarmProofVerification(options.simplexVerificationMaterial)
-        .then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+    const initialization = Promise.all([
+        prewarmProofVerification(options.simplexVerificationMaterial),
+        ...(kind === 'account' ? [initAccountProofWasm()] : []),
+    ]).then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
     const bundle = await load();
     options.signal?.throwIfAborted();
     const raw = proofBundleInput(bundle, kind);
@@ -400,14 +383,19 @@ export function proofBundleInput(bundle: ProofBundle, kind: BundleKind): unknown
         account: bundle.account ? {
             location: u64(bundle.account.location, 'account location').toString(),
             proof: bytes(bundle.account.proof, 'account proof', MAX_PROOF_BYTES),
+            writeHeight: u64(bundle.account.writeHeight, 'account write height').toString(),
+            ...(bundle.account.claim.case === 'encodedOperation'
+                ? { encodedOperation: bytes(bundle.account.claim.value, 'account operation', 97) }
+                : bundle.account.claim.case === 'exclusion' ? { exclusion: bundle.account.claim.value } : {}),
         } : null,
         transactions: bundle.transactions.map((row) => ({
             location: u64(row.location, 'transaction location').toString(),
             body: bytes(row.body, 'signed transaction', MAX_TRANSACTION_BYTES),
             height: u64(row.height, 'transaction height').toString(), index: row.index, role: row.role,
+            senderIndex: u64(row.senderIndex, 'sender index').toString(), recipientIndex: u64(row.recipientIndex, 'recipient index').toString(),
         })),
         transactionsProof: bundle.transactionsProof === undefined ? null : bytes(bundle.transactionsProof, 'transaction multiproof', MAX_PROOF_BYTES),
-        nextCursor: next.case === 'activityCursor' ? bytes(next.value, 'account cursor', 24)
+        nextCursor: next.case === 'activityCursor' ? bytes(next.value, 'account cursor', 8)
             : next.case === 'blockOffset' ? u64(next.value, 'block offset').toString() : null,
     };
 }
@@ -476,6 +464,7 @@ async function authenticatedChain(target: CertifiedTarget, headers: readonly Uin
         const parent = await authenticatedHeader(bytes, digest, current.height - 1n);
         if (parent.timestampMs > current.timestampMs) throw new Error('block timestamp precedes its parent');
         appendInterval(current, parent);
+        stateAppendInterval(current, parent);
         current = parent;
         chain.push({ header: current, digest });
     }
@@ -492,12 +481,41 @@ function appendInterval(block: DecodedBlockHeader, parent?: DecodedBlockHeader) 
     return { start, end };
 }
 
-async function verifyAccount(envelope: Envelope, target: LatestProofTarget, account: Uint8Array): Promise<VerifiedAccountProof | null> {
-    if (envelope.account === null) return null;
-    const { location, proof } = envelope.account;
+function stateAppendInterval(block: DecodedBlockHeader, parent?: DecodedBlockHeader) {
+    const start = block.height === 1n ? 1n : parent?.stateTip;
+    const end = block.stateTip - 1n;
+    if (start === undefined || start > end) throw new Error('owning-block state interval is invalid');
+    return { start, end };
+}
+
+/** A verified account lookup: the active update, or the operation and key span excluding it. */
+type AccountLookup =
+    | { readonly kind: 'hit'; readonly account: VerifiedAccountProof & { transactionEnd: bigint } }
+    | { readonly kind: 'miss'; readonly absence: Pick<VerifiedAccountExclusion, 'location' | 'span' | 'proofSizeBytes'> };
+
+async function verifyAccount(envelope: Envelope, target: CertifiedTarget, account: Uint8Array, signal?: AbortSignal): Promise<AccountLookup> {
+    if (envelope.account === null) throw new Error('missing account proof');
+    const { location, proof, writeHeight, encodedOperation, exclusion } = envelope.account;
+    const verified = await verifyCurrentAccount(proof, target.stateRoot, account, target.stateTip - 1n, encodedOperation, exclusion === true);
+    signal?.throwIfAborted();
+    if (verified.type === 'miss') {
+        if (location !== 0n || writeHeight !== 0n) throw new Error('account exclusion has inclusion metadata');
+        if (verified.location >= target.stateTip) throw new Error('account exclusion is outside certified state interval');
+        return { kind: 'miss', absence: { location: verified.location, proofSizeBytes: verified.proofSizeBytes,
+            span: verified.lower && verified.upper ? { lower: toHex(verified.lower), upper: toHex(verified.upper) } : null } };
+    }
+    if (verified.location !== location) throw new Error('account proof location does not match its operation');
+    if (writeHeight === 0n || writeHeight > target.height) throw new Error('invalid account write height');
     if (location < target.stateStart || location >= target.stateTip - 1n) throw new Error('account update is outside certified state interval');
-    const verified = await verifier.verifyFixedUnorderedUpdate(proof, { tip: target.stateTip - 1n, startLocation: location, maxLocations: 1 }, target.stateRoot, location, account, 24);
-    return { ...decodeAccountValue(verified.value), location, tip: target.stateTip - 1n, proofSizeBytes: verified.proofSizeBytes };
+    const lowest = writeHeight === 1n ? 1n : writeHeight - 1n;
+    const chain = await authenticatedChain(target, envelope.headers, lowest, signal);
+    const index = Number(target.height - writeHeight);
+    const writer = chain[index]!.header;
+    const { start, end } = stateAppendInterval(writer, chain[index + 1]?.header);
+    if (location < start || location >= end) throw new Error('account location is outside its writing block');
+    return { kind: 'hit', account: { ...decodeAccountValue(verified.value), location, tip: target.stateTip - 1n,
+        writeHeight, timestampMs: writer.timestampMs, transactionEnd: writer.transactionsTip - 1n,
+        proofSizeBytes: verified.proofSizeBytes } };
 }
 
 async function verifyTransactions(envelope: Envelope, target: LatestProofTarget): Promise<Array<CanonicalTransaction & { proof: VerifiedTransactionProof }>> {
@@ -507,21 +525,25 @@ async function verifyTransactions(envelope: Envelope, target: LatestProofTarget)
     }
     if (envelope.transactionsProof === null) throw new Error('transaction page is missing its multiproof');
 
-    // Each location below the certified tip expects the digest of its body. Repeated locations must
-    // agree, and the multiproof covers each distinct location once.
+    // The history commitment binds the body digest and both participant indices.
     const transactions = await Promise.all(envelope.transactions.map(decodeTransaction));
-    const expectations = new Map<bigint, string>();
+    const expectations = new Map<bigint, Uint8Array>();
     for (let index = 0; index < transactions.length; index++) {
         const transaction = transactions[index]!;
         const row = envelope.transactions[index]!;
-        if (row.height === 0n || row.height > target.height || row.location >= target.transactionsTip - 1n) {
+        if (row.location === 0n || row.location >= target.transactionsTip - 1n) {
             throw new Error('transaction is outside certified history');
         }
+        const value = new Uint8Array(48);
+        value.set(fromHex(transaction.digest));
+        const indices = new DataView(value.buffer);
+        indices.setBigUint64(32, row.senderIndex);
+        indices.setBigUint64(40, row.recipientIndex);
         const previous = expectations.get(row.location);
-        if (previous !== undefined && previous !== transaction.digest) throw new Error('conflicting transaction bodies at one location');
-        expectations.set(row.location, transaction.digest);
+        if (previous !== undefined && !bytesEqual(previous, value)) throw new Error('conflicting transaction entries at one location');
+        expectations.set(row.location, value);
     }
-    const expected = [...expectations].sort(([left], [right]) => left < right ? -1 : 1).map(([location, digest]) => ({ location, value: fromHex(digest) }));
+    const expected = [...expectations].sort(([left], [right]) => left < right ? -1 : 1).map(([location, value]) => ({ location, value }));
     const proof = await verifier.verifyFixedKeylessAppendMany(envelope.transactionsProof, { tip: target.transactionsTip - 1n }, target.transactionsRoot, expected);
     return transactions.map((transaction) => ({ ...transaction, proof: {
         location: transaction.location, tip: target.transactionsTip - 1n,
@@ -567,14 +589,19 @@ function parseEnvelope(raw: unknown, pageSize: number): Envelope {
         const row = record(entry, 'transaction row');
         if (!Number.isInteger(row.index) || (row.index as number) < 0 || (row.index as number) > 0xffffffff) throw new Error('invalid transaction index');
         if (row.role !== undefined && row.role !== 0 && row.role !== 1) throw new Error('invalid transaction role');
-        return { location: decimal(row.location, 'transaction location'), body: hex(row.body, 'signed transaction', 1, MAX_TRANSACTION_BYTES), height: decimal(row.height, 'transaction height'), index: row.index as number, role: row.role as number | undefined };
+        return { location: decimal(row.location, 'transaction location'), body: hex(row.body, 'signed transaction', 1, MAX_TRANSACTION_BYTES), height: decimal(row.height, 'transaction height'), index: row.index as number, role: row.role as number | undefined, senderIndex: decimal(row.senderIndex, 'sender index'), recipientIndex: decimal(row.recipientIndex, 'recipient index') };
     });
     const account = value.account === null ? null : record(value.account, 'account proof');
+    if (account && ((account.encodedOperation !== undefined) === (account.exclusion !== undefined)
+        || (account.exclusion !== undefined && account.exclusion !== true))) {
+        throw new Error('account proof must contain one inclusion or exclusion claim');
+    }
     if (value.nextCursor !== null && (typeof value.nextCursor !== 'string' || value.nextCursor.length > 48)) throw new Error('invalid next cursor');
     return {
         certificate: hex(value.certificate, 'certificate', 1, MAX_FINALIZATION_CERTIFICATE_BYTES), headers,
         sequenceNumber: decimal(value.sequenceNumber, 'Store sequence'),
-        account: account === null ? null : { location: decimal(account.location, 'account location'), proof: hex(account.proof, 'account proof', 1, MAX_PROOF_BYTES) },
+        account: account === null ? null : { location: decimal(account.location, 'account location'), proof: hex(account.proof, 'account proof', 1, MAX_PROOF_BYTES), writeHeight: decimal(account.writeHeight, 'account write height'),
+            ...(account.encodedOperation === undefined ? { exclusion: true as const } : { encodedOperation: hex(account.encodedOperation, 'account operation', 97, 97) }) },
         transactions, transactionsProof: value.transactionsProof === null ? null : hex(value.transactionsProof, 'transaction multiproof', 1, MAX_PROOF_BYTES),
         nextCursor: value.nextCursor as string | null,
     };
@@ -597,20 +624,20 @@ function certificateContext(material: string): Promise<CertificateContext> {
 }
 
 function accountRequest(options: AccountBundleOptions) {
-    const mode = options.mode ?? 'all';
-    if (mode !== 'all' && mode !== 'sent' && mode !== 'received') throw new Error('invalid activity mode');
     const cursor = options.cursor == null ? null : typeof options.cursor === 'string'
-        ? hex(options.cursor, 'account cursor', 24, 24) : options.cursor.slice();
-    if (cursor) {
-        const [, , role] = decodeCursor(cursor);
-        if ((mode === 'sent' && role !== 0n) || (mode === 'received' && role !== 1n)) throw new Error('account cursor does not match activity mode');
-    }
+        ? hex(options.cursor, 'account cursor', 8, 8) : options.cursor.slice();
+    if (cursor && cursor.length !== 8) throw new Error('invalid account cursor');
     const at = options.at === undefined ? undefined : { height: u64(options.at.height, 'snapshot height', true), blockDigest: options.at.blockDigest.slice() };
     if (at && at.blockDigest.length !== 32) throw new Error('invalid snapshot digest');
-
-    // A cursor names a position in one snapshot's activity, so paging requires that snapshot.
-    if (cursor && !at) throw new Error('account pagination requires a fixed snapshot');
-    return { ...options, account: toHex(parseAccountKeyHex(options.account)), mode, cursor, at, includeTransactions: options.includeTransactions ?? true };
+    const accountLocation = options.accountLocation === undefined ? undefined : u64(options.accountLocation, 'account location');
+    const expectedTxCount = options.expectedTxCount === undefined ? undefined : u64(options.expectedTxCount, 'transaction count');
+    if (cursor && (!at || accountLocation === undefined || expectedTxCount === undefined)) {
+        throw new Error('account pagination requires a fixed snapshot, account location and transaction count');
+    }
+    if (accountLocation !== undefined && !at) throw new Error('account location requires a fixed snapshot');
+    if (cursor && readU64Be(cursor, 0) > expectedTxCount!) throw new Error('account cursor exceeds authenticated count');
+    if (options.includeTransactions === false && cursor) throw new Error('balance-only request cannot include a cursor');
+    return { ...options, account: toHex(parseAccountKeyHex(options.account)), cursor, at, accountLocation, expectedTxCount, includeTransactions: options.includeTransactions ?? true };
 }
 
 function blockRequest(options: BlockBundleOptions) {
@@ -644,20 +671,4 @@ function decimal(value: unknown, label: string): bigint {
 function u64(value: bigint, label: string, positive = false): bigint {
     if (typeof value !== 'bigint' || value < (positive ? 1n : 0n) || value > MAX_U64) throw new Error(`invalid ${label}`);
     return value;
-}
-
-/** Decodes a 24-byte activity cursor as big-endian height, block index, and role. */
-function decodeCursor(cursor: Uint8Array): readonly [bigint, bigint, bigint] {
-    if (cursor.length !== 24) throw new Error('invalid account cursor');
-    const tuple = [readU64Be(cursor, 0), readU64Be(cursor, 8), readU64Be(cursor, 16)] as const;
-    if (tuple[0] === 0n || tuple[1] > 0xffffffffn || tuple[2] > 1n) throw new Error('invalid account cursor');
-    return tuple;
-}
-
-function compareCursor(left: readonly bigint[], right: readonly bigint[]): number {
-    for (let index = 0; index < 3; index++) {
-        if (left[index]! < right[index]!) return -1;
-        if (left[index]! > right[index]!) return 1;
-    }
-    return 0;
 }

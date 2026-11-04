@@ -10,6 +10,10 @@ use crate::{
         certificate::CertificateReporter,
         fixture::{Scheme, threshold},
         qmdb::{CapturedFinalizedUpload, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+        sql::{
+            AccountMetaRow, TxActivityRole, TxActivityRow, encode_account_meta_row,
+            encode_tx_activity_row,
+        },
     },
     store::writer_store_client,
     test_store::ObservedStore,
@@ -32,20 +36,23 @@ use commonware_cryptography::{
 };
 use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_parallel::Sequential;
-use commonware_runtime::{Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, buffer::paged::CacheRef};
 use commonware_storage::{
+    journal::contiguous::fixed::Config as JournalConfig,
     merkle::{Family as _, mem::Mem},
-    qmdb::any::unordered::Update,
+    qmdb::{current::ordered::fixed::Db, floor::Proportional},
+    translator::TwoCap,
 };
-use commonware_utils::{NZUsize, non_empty_range};
+use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
+use constantinople_account_proof::{VerifiedAccountLookup, verify_current_account_lookup};
 use constantinople_application::consensus::{
-    FinalizedArtifacts, FinalizedRange, StateOperation as CapturedStateOperation,
-    TransactionHistoryOperation,
+    FinalizedArtifacts, FinalizedRange, TransactionHistoryOperation,
 };
 use constantinople_engine::types::{EngineBlock, EngineCodedBlock, EngineFinalization};
 use constantinople_primitives::{
-    Block, Header as BlockHeader, Nonce, PublicKeyCache, Sealable, TRANSACTION_NAMESPACE,
-    Transaction, TransactionPublicKey, TransactionSignature, verify_transactions,
+    Block, Header as BlockHeader, Nonce, PublicKeyCache, Sealable, StateSyncProof,
+    TRANSACTION_NAMESPACE, Transaction, TransactionHistoryEntry, TransactionPublicKey,
+    TransactionSignature, verify_transactions,
 };
 use p256::ecdsa::{SigningKey, signature::Signer as _};
 use rand::{SeedableRng, rngs::StdRng};
@@ -66,6 +73,9 @@ struct FixtureBlock {
     /// Transaction-hash QMDB location of the block's first transaction.
     first_transaction: u64,
     transactions: Vec<SignedTransaction<Sha256>>,
+    history: Vec<TransactionHistoryEntry<Digest>>,
+    account_location: Option<u64>,
+    account_write_height: Option<u64>,
 }
 
 /// Chained fixture blocks and the accounts their transactions touch.
@@ -232,7 +242,14 @@ fn webauthn_transaction() -> SignedTransaction<Sha256> {
 /// Builds four chained blocks with 3, 55, 0, and 2 transactions, each with a
 /// threshold finalization. Block 2's upload omits its certificate, and block 4
 /// carries a maximum-size WebAuthn transaction.
-async fn fixture() -> Fixture {
+async fn fixture(context: commonware_runtime::tokio::Context) -> Fixture {
+    fixture_with_counts(context, &[3, 55, 0, 2]).await
+}
+
+async fn fixture_with_counts(
+    context: commonware_runtime::tokio::Context,
+    counts: &[u64],
+) -> Fixture {
     // Derive deterministic consensus, transaction, and leader keys.
     let mut rng = StdRng::from_seed([42; 32]);
     let (schemes, verifier) = threshold(&mut rng, b"constantinople_CONSENSUS", 4);
@@ -243,8 +260,37 @@ async fn fixture() -> Fixture {
     let recipient = AccountKey::from_public_key(&receiver);
     let leader = ed25519::SigningKey::from_seed(9).public_key();
 
-    // Both QMDB logs start with an initial commit at location zero.
-    let mut state_operations = vec![CapturedStateOperation::CommitFloor(None, Location::new(0))];
+    let page_cache = CacheRef::new(NZU16!(88), NZUsize!(8));
+    let mut state_db =
+        Db::<mmr::Family, _, AccountKey, Account, Sha256, TwoCap, 32, Sequential>::init(
+            context,
+            commonware_storage::qmdb::current::Config {
+                merkle_config: commonware_storage::merkle::full::Config {
+                    journal_partition: "fixture-state-merkle".into(),
+                    metadata_partition: "fixture-state-merkle-meta".into(),
+                    items_per_blob: NZU64!(11),
+                    write_buffer: NZUsize!(1024),
+                    replay_buffer: NZUsize!(1024),
+                    strategy: Sequential,
+                    page_cache: page_cache.clone(),
+                },
+                journal_config: JournalConfig {
+                    partition: "fixture-state-operations".into(),
+                    items_per_blob: NZU64!(7),
+                    page_cache,
+                    write_buffer: NZUsize!(1024),
+                    replay_buffer: NZUsize!(1024),
+                },
+                grafted_metadata_partition: "fixture-state-grafted-meta".into(),
+                translator: TwoCap,
+                init_cache: None,
+                init_buffer: NZUsize!(4096),
+                init_concurrency: (),
+            },
+            None,
+        )
+        .await
+        .unwrap();
     let mut transaction_operations = vec![TransactionHistoryOperation::<Sha256>::Commit(
         None,
         Location::new(0),
@@ -260,25 +306,32 @@ async fn fixture() -> Fixture {
     ));
     let mut nonce = 0;
     let mut balance = 100;
+    let mut sender_count = 0;
+    let mut recipient_count = 0;
 
-    for (index, count) in [3, 55, 0, 2].into_iter().enumerate() {
+    for (index, &count) in counts.iter().enumerate() {
         // Each block's transaction floor is its parent's first transaction, so
         // earlier blocks fall below the floor of later certificates.
         let height = index as u64 + 1;
-        let state_start = state_operations.len() as u64;
         let transaction_start = transaction_operations.len() as u64;
         let first_transaction = transaction_operations.len() as u64;
         let transaction_floor = blocks.last().map_or(0, |parent| parent.first_transaction);
 
         // Every transfer goes to the recipient except each block's last, which
         // is a self-transfer. Block 4's last slot holds the WebAuthn fixture.
+        let mut history = Vec::new();
         let transactions = (0..count)
             .map(|index| {
                 if height == 4 && index == 1 {
                     let transaction = webauthn_transaction();
-                    transaction_operations.push(TransactionHistoryOperation::<Sha256>::Append(
-                        *transaction.message_digest(),
-                    ));
+                    let entry = TransactionHistoryEntry {
+                        digest: *transaction.message_digest(),
+                        sender_index: 0,
+                        recipient_index: 0,
+                    };
+                    transaction_operations
+                        .push(TransactionHistoryOperation::<Sha256>::Append(entry));
+                    history.push(entry);
                     return transaction;
                 }
                 let to = if index + 1 == count {
@@ -293,30 +346,87 @@ async fn fixture() -> Fixture {
                     Transaction::<Digest>::new(sender.clone(), to, NonZeroU64::MIN, nonce)
                         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
                 nonce += 1;
-                transaction_operations.push(TransactionHistoryOperation::<Sha256>::Append(
-                    *transaction.message_digest(),
-                ));
+                let entry = TransactionHistoryEntry {
+                    digest: *transaction.message_digest(),
+                    sender_index: sender_count,
+                    recipient_index: if transaction.value().to == account {
+                        sender_count
+                    } else {
+                        let index = recipient_count;
+                        recipient_count += 1;
+                        index
+                    },
+                };
+                sender_count += 1;
+                transaction_operations.push(TransactionHistoryOperation::<Sha256>::Append(entry));
+                history.push(entry);
                 transaction
             })
             .collect::<Vec<_>>();
 
-        // Close the block with a transaction commit, an account update, and a
-        // state commit.
         transaction_operations.push(TransactionHistoryOperation::<Sha256>::Commit(
             None,
             Location::new(transaction_floor),
         ));
-        state_operations.push(CapturedStateOperation::Update(Update(
-            account,
-            Account {
-                balance,
-                nonce: Nonce::new(nonce, 0),
-            },
-        )));
-        state_operations.push(CapturedStateOperation::CommitFloor(None, Location::new(1)));
-
-        // Capture both ranges and seal a header that commits to their roots.
-        let state = captured_range(&state_operations, state_start, 0);
+        let mut batch = state_db.new_batch();
+        if sender_count > 0 {
+            batch = batch.write(
+                account,
+                Some(Account {
+                    balance,
+                    nonce: Nonce::new(nonce, 0),
+                    tx_count: sender_count,
+                }),
+            );
+            batch = batch.write(
+                recipient,
+                Some(Account {
+                    balance: recipient_count,
+                    nonce: Nonce::default(),
+                    tx_count: recipient_count,
+                }),
+            );
+        }
+        if height == 4 {
+            batch = batch.write(
+                AccountKey::from_public_key(transactions[1].value().sender().unwrap()),
+                Some(Account {
+                    balance: 100,
+                    nonce: Nonce::new(1, 0),
+                    tx_count: 1,
+                }),
+            );
+        }
+        let batch = batch
+            .merkleize(&state_db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let (state_start, operations) = batch.operations();
+        let state = FinalizedRange {
+            start: state_start,
+            end: batch.bounds().tip.size,
+            root: batch.ops_root(),
+            pinned_nodes: batch.ops_pinned_nodes(&state_db).unwrap(),
+            operations,
+        };
+        let state_boundary = batch.boundary();
+        let state_sync = StateSyncProof {
+            ops_root: batch.ops_root(),
+            witness: batch.ops_root_witness().clone(),
+        };
+        state_db = state_db.apply_batch(batch).await.unwrap();
+        let account_location = state_db
+            .get_span(&account)
+            .await
+            .unwrap()
+            .map(|(loc, _)| loc.as_u64());
+        let account_write_height = account_location.map(|location| {
+            if location >= state_start.as_u64() {
+                height
+            } else {
+                blocks.last().unwrap().account_write_height.unwrap()
+            }
+        });
         let transactions_range = captured_range(
             &transaction_operations,
             transaction_start,
@@ -331,15 +441,15 @@ async fn fixture() -> Fixture {
             parent,
             height,
             timestamp: height,
-            state_root: state.root,
-            state_range: non_empty_range!(0, state.end.as_u64()),
+            state_root: state_boundary.root,
+            state_range: non_empty_range!(state_db.sync_boundary().as_u64(), state.end.as_u64()),
             transactions_root: transactions_range.root,
             transactions_range: non_empty_range!(
                 transaction_floor,
                 transactions_range.end.as_u64()
             ),
         };
-        let block: TestBlock = Block::new(header, transactions.clone())
+        let block: TestBlock = Block::new(header, transactions.clone(), state_sync)
             .seal(&mut Sha256::default())
             .into();
 
@@ -362,6 +472,7 @@ async fn fixture() -> Fixture {
                 height as i64,
                 FinalizedArtifacts {
                     state,
+                    state_boundary,
                     transactions: transactions_range,
                 },
             )
@@ -377,8 +488,12 @@ async fn fixture() -> Fixture {
             upload,
             first_transaction,
             transactions,
+            history,
+            account_location,
+            account_write_height,
         });
     }
+    state_db.destroy().await.unwrap();
     Fixture {
         blocks,
         account,
@@ -515,6 +630,8 @@ fn bundle_json(bundle: &proto::ProofBundle) -> Value {
                 "body": hex(&row.body),
                 "height": row.height.to_string(),
                 "index": row.index,
+                "senderIndex": row.sender_index.to_string(),
+                "recipientIndex": row.recipient_index.to_string(),
             });
             if let Some(role) = row.role {
                 value["role"] = json!(role.to_i32());
@@ -526,10 +643,23 @@ fn bundle_json(bundle: &proto::ProofBundle) -> Value {
         "certificate": hex(&bundle.certificate),
         "headers": bundle.headers.iter().map(|header| hex(header)).collect::<Vec<_>>(),
         "sequenceNumber": bundle.sequence_number.to_string(),
-        "account": bundle.account.as_option().map(|account| json!({
-            "location": account.location.to_string(),
-            "proof": hex(&account.proof),
-        })),
+        "account": bundle.account.as_option().map(|account| {
+            let mut value = json!({
+                "location": account.location.to_string(),
+                "proof": hex(&account.proof),
+                "writeHeight": account.write_height.to_string(),
+            });
+            match account.claim.as_ref().expect("account proof must carry a claim") {
+                proto::account_proof::Claim::EncodedOperation(operation) => {
+                    value["encodedOperation"] = json!(hex(operation));
+                }
+                proto::account_proof::Claim::Exclusion(exclusion) => {
+                    assert!(*exclusion);
+                    value["exclusion"] = json!(true);
+                }
+            }
+            value
+        }),
         "transactions": transactions,
         "transactionsProof": bundle.transactions_proof.as_ref().map(|proof| hex(proof)),
         "nextCursor": next_cursor,
@@ -568,6 +698,14 @@ fn assert_transactions(bundle: &Value, block: &FixtureBlock, offset: usize, coun
             (block.first_transaction + position as u64).to_string()
         );
         assert_eq!(row["body"], hex(&block.transactions[position].encode()));
+        assert_eq!(
+            row["senderIndex"],
+            block.history[position].sender_index.to_string()
+        );
+        assert_eq!(
+            row["recipientIndex"],
+            block.history[position].recipient_index.to_string()
+        );
     }
     assert_eq!(bundle["transactionsProof"].is_null(), count == 0);
 }
@@ -598,9 +736,32 @@ async fn assert_transaction_proof(client: &StoreClient, bundle: &Value, certifie
     // certified root.
     assert_eq!(proof.ops_root, certified.block.header.transactions_root);
     assert!(proof.verify::<Sha256>());
+    for (location, bytes) in &proof.operations {
+        let TransactionOperation::Append(entry) =
+            TransactionOperation::decode_cfg(Bytes::copy_from_slice(bytes), &()).unwrap()
+        else {
+            panic!("transaction proof must contain an append");
+        };
+        assert_eq!(entry.encode().len(), 48);
+        let row = bundle["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["location"].as_str().unwrap().parse::<u64>().unwrap() == location.as_u64()
+            })
+            .unwrap();
+        let transaction = SignedTransaction::<Sha256>::decode(Bytes::from(hex_bytes_dynamic(
+            row["body"].as_str().unwrap(),
+        )))
+        .unwrap();
+        assert_eq!(entry.digest, *transaction.message_digest());
+        assert_eq!(row["senderIndex"], entry.sender_index.to_string());
+        assert_eq!(row["recipientIndex"], entry.recipient_index.to_string());
+    }
     assert_eq!(
         bundle["transactionsProof"],
-        hex(&encode_historical_multi_proof(&proof))
+        hex(&encode_operation_multi_proof(&proof))
     );
 
     // A changed operation or root must fail verification.
@@ -610,6 +771,333 @@ async fn assert_transaction_proof(client: &StoreClient, bundle: &Value, certifie
     let mut wrong_root = proof;
     wrong_root.ops_root = Digest::EMPTY;
     assert!(!wrong_root.verify::<Sha256>());
+}
+
+fn verify_account_bundle(
+    bundle: &Value,
+    key: AccountKey,
+    block: &FixtureBlock,
+) -> VerifiedAccountLookup {
+    let certificate = Certificate::decode_cfg(
+        Bytes::from(hex_bytes_dynamic(bundle["certificate"].as_str().unwrap())),
+        &((), ()),
+    )
+    .unwrap();
+    let header = certificate.header.header();
+    assert_eq!(header.height, block.block.header.height);
+    assert_eq!(header.state_root, block.block.header.state_root);
+    assert_eq!(header.state_range, block.block.header.state_range);
+    let account = &bundle["account"];
+    let proof = hex_bytes_dynamic(account["proof"].as_str().unwrap());
+    let operation = account["encodedOperation"].as_str().map(hex_bytes_dynamic);
+    let exclusion = account["exclusion"].as_bool().unwrap_or(false);
+    verify_current_account_lookup(
+        &proof,
+        header.state_root.as_ref(),
+        key.as_ref(),
+        header.state_range.end() - 1,
+        operation,
+        exclusion,
+    )
+    .unwrap()
+}
+
+fn assert_exclusion(bundle: &Value, key: AccountKey, block: &FixtureBlock) {
+    let VerifiedAccountLookup::Absent {
+        key: proven,
+        location,
+        ..
+    } = verify_account_bundle(bundle, key, block)
+    else {
+        panic!("expected an exclusion proof");
+    };
+    assert_eq!(proven, key);
+    assert!(location < block.block.header.state_range.end());
+    let account = &bundle["account"];
+    assert_eq!(account["location"], "0");
+    assert_eq!(account["writeHeight"], "0");
+    assert_eq!(account["exclusion"], true);
+    assert!(account.get("encodedOperation").is_none());
+    assert_eq!(bundle["headers"], json!([]));
+    assert_eq!(bundle["transactions"], json!([]));
+    assert!(bundle["transactionsProof"].is_null());
+    assert!(bundle["nextCursor"].is_null());
+}
+
+fn assert_lookup_context_rejected(bundle: &Value, key: AccountKey, block: &FixtureBlock) {
+    let account = &bundle["account"];
+    let proof = hex_bytes_dynamic(account["proof"].as_str().unwrap());
+    let operation = account["encodedOperation"].as_str().map(hex_bytes_dynamic);
+    let exclusion = account["exclusion"].as_bool().unwrap_or(false);
+    let root = block.block.header.state_root.as_ref();
+    let tip = block.block.header.state_range.end() - 1;
+    let check = |bytes: &[u8], root: &[u8], key: &[u8], tip, operation, exclusion| {
+        verify_current_account_lookup(bytes, root, key, tip, operation, exclusion).is_err()
+    };
+    let mut changed_root = root.to_vec();
+    changed_root[0] ^= 1;
+    assert!(check(
+        &proof,
+        &changed_root,
+        key.as_ref(),
+        tip,
+        operation.clone(),
+        exclusion
+    ));
+    assert!(check(
+        &proof,
+        root,
+        key.as_ref(),
+        tip + 1,
+        operation.clone(),
+        exclusion
+    ));
+    assert!(check(
+        &proof[..proof.len() - 1],
+        root,
+        key.as_ref(),
+        tip,
+        operation.clone(),
+        exclusion
+    ));
+    let mut trailing = proof.clone();
+    trailing.push(0);
+    assert!(check(
+        &trailing,
+        root,
+        key.as_ref(),
+        tip,
+        operation.clone(),
+        exclusion
+    ));
+    if let Some(encoded) = operation.as_ref() {
+        assert_eq!(encoded.len(), 97);
+        assert!(check(
+            &proof,
+            root,
+            &[0; 32],
+            tip,
+            operation.clone(),
+            exclusion
+        ));
+        assert!(check(&proof, root, key.as_ref(), tip, None, true));
+        let mut changed_operation = encoded.clone();
+        changed_operation[33] ^= 1;
+        assert!(check(
+            &proof,
+            root,
+            key.as_ref(),
+            tip,
+            Some(changed_operation),
+            false
+        ));
+        assert!(check(
+            &proof,
+            root,
+            key.as_ref(),
+            tip,
+            Some(encoded[..96].to_vec()),
+            false
+        ));
+        assert!(check(&proof, root, key.as_ref(), tip, operation, true));
+    } else {
+        assert!(check(&proof, root, key.as_ref(), tip, None, false));
+    }
+}
+
+/// Checks the complete descending interval certified by an account's count.
+fn assert_account_page(bundle: &Value, end: u64) {
+    let start = end.saturating_sub(ACCOUNT_PAGE as u64);
+    let rows = bundle["transactions"].as_array().unwrap();
+    assert_eq!(rows.len() as u64, end - start);
+    for (row, expected) in rows.iter().zip((start..end).rev()) {
+        let index = if row["role"] == 0 {
+            &row["senderIndex"]
+        } else {
+            assert_eq!(row["role"], 1);
+            &row["recipientIndex"]
+        };
+        assert_eq!(index, &json!(expected.to_string()));
+    }
+    if start == 0 {
+        assert!(bundle["nextCursor"].is_null());
+    } else {
+        assert_eq!(bundle["nextCursor"], hex(&start.to_be_bytes()));
+    }
+}
+
+fn activity_hint(fixture: &Fixture, transaction_index: usize) -> TxActivityRow {
+    let block = &fixture.blocks[1];
+    let transaction = block.transactions[transaction_index].value();
+    TxActivityRow {
+        account: fixture.account.as_ref().try_into().unwrap(),
+        account_index: block.history[transaction_index].sender_index,
+        role: TxActivityRole::Sender,
+        height: 2,
+        index: transaction_index as u32,
+        digest: block.transactions[transaction_index]
+            .message_digest()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+        counterparty: transaction.to.as_ref().try_into().unwrap(),
+        value: transaction.value.get(),
+        nonce: transaction.nonce,
+        qmdb_location: block.first_transaction + transaction_index as u64,
+    }
+}
+
+#[test]
+fn account_pages_reject_untrusted_sql_hints() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        let fixture = fixture(context.child("state_fixture")).await;
+        let environment = FixtureStore::open(context).await;
+        for block in &fixture.blocks[..3] {
+            publish(&environment.publisher, &environment.reporter, block, true).await;
+        }
+        let location = fixture.blocks[2].account_location.unwrap();
+        let write_height = fixture.blocks[2].account_write_height.unwrap();
+        let request = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            at: Some(3),
+            digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            account_location: Some(location),
+            ..Default::default()
+        };
+        let baseline = proof_bundle(&environment.router, &request).await;
+        assert_account_page(&baseline, 58);
+        let explorer = Explorer::new(&environment.client).unwrap();
+        let anchor = explorer
+            .anchor(1, Some((3, *fixture.blocks[2].block.seal())), true)
+            .await
+            .unwrap();
+        let table = anchor
+            .sql
+            .deregister_table("account_meta")
+            .unwrap()
+            .unwrap();
+        anchor
+            .sql
+            .register_table(
+                "account_meta",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(table.schema(), vec![vec![]])
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let parsed = AccountRequest::parse(request.clone()).unwrap();
+        let error = match explorer.account_proof(&anchor, &parsed).await {
+            Err(error) => error,
+            Ok(_) => panic!("a native hit without SQL provenance must remain unavailable"),
+        };
+        assert_eq!(error.0, ErrorCode::Unavailable);
+        assert_eq!(error.1, "account update metadata is not available");
+        let missing = AccountRequest::parse(proto::GetAccountRequest {
+            account: vec![0; 32],
+            ..Default::default()
+        })
+        .unwrap();
+        let AccountLookup::Absent(proof) = explorer.account_proof(&anchor, &missing).await.unwrap()
+        else {
+            panic!("a native miss must yield an exclusion without SQL metadata");
+        };
+        assert_eq!(proof.location, 0);
+        assert_eq!(proof.write_height, 0);
+        assert!(matches!(
+            proof.claim,
+            Some(proto::account_proof::Claim::Exclusion(true))
+        ));
+        anchor.sql.deregister_table("account_meta").unwrap();
+        anchor.sql.register_table("account_meta", table).unwrap();
+        let schema = build_meta_schema(sql_meta_client(&environment.client).unwrap()).unwrap();
+        let mut writer = schema.batch_writer();
+
+        // Each replacement keeps the SQL key while changing evidence for a
+        // page position. Restoring it must restore the same proven page.
+        for (case, expected_error) in [
+            ("omitted", "account history page is incomplete"),
+            (
+                "wrong index",
+                "transaction does not occupy the requested account index",
+            ),
+            (
+                "wrong role",
+                "transaction does not occupy the requested account index",
+            ),
+            ("duplicate", "duplicate account transaction"),
+        ] {
+            let target = match case {
+                // The remaining page must stay contiguous to exercise its length check.
+                "omitted" => 45,
+                "duplicate" => 53,
+                _ => 54,
+            };
+            let mut hint = activity_hint(&fixture, target);
+            match case {
+                "omitted" => hint.height = 4,
+                "wrong index" => {
+                    hint = activity_hint(&fixture, 44);
+                    hint.account_index = 57;
+                }
+                "wrong role" => hint.role = TxActivityRole::Receiver,
+                "duplicate" => {
+                    hint = activity_hint(&fixture, 54);
+                    hint.account_index = 56;
+                }
+                _ => unreachable!(),
+            }
+            let row = encode_tx_activity_row(hint);
+            writer.insert(row.table, row.values).unwrap();
+            writer.flush().await.unwrap();
+            let (status, body) =
+                post(&environment.router, "GetAccount", request.encode_to_vec()).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{case}: {body:?}"
+            );
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["code"], "internal", "{case}");
+            assert_eq!(error["message"], expected_error, "{case}");
+
+            let row = encode_tx_activity_row(activity_hint(&fixture, target));
+            writer.insert(row.table, row.values).unwrap();
+            writer.flush().await.unwrap();
+            let restored = proof_bundle(&environment.router, &request).await;
+            assert_eq!(restored["transactions"], baseline["transactions"], "{case}");
+        }
+
+        // The certified count rejects fabricated past and future page bounds.
+        for (count, height, expected_error) in [
+            (57, write_height, "account proof disagrees with metadata"),
+            (59, write_height, "account proof disagrees with metadata"),
+            (
+                u64::MAX,
+                write_height,
+                "account proof disagrees with metadata",
+            ),
+            (58, 1, "account update is outside its inclusion block"),
+        ] {
+            let row = encode_account_meta_row(AccountMetaRow {
+                account: fixture.account.as_ref().try_into().unwrap(),
+                balance: 44,
+                nonce_base: 58,
+                nonce_bitmap: 0,
+                qmdb_location: location,
+                tx_count: count,
+                write_height: height,
+            });
+            writer.insert(row.table, row.values).unwrap();
+            writer.flush().await.unwrap();
+            let (status, body) =
+                post(&environment.router, "GetAccount", request.encode_to_vec()).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["message"], expected_error);
+        }
+        environment.close().await;
+    });
 }
 
 /// Publishes blocks 1 through 3 with only block 3 certified, then returns the
@@ -639,13 +1127,44 @@ async fn historical_bundles(
     let proof = native
         .operation_multi_proof(
             Location::new(certified.block.header.transactions_range.end() - 1),
-            &[Location::new(block.first_transaction)],
+            &[
+                Location::new(block.first_transaction),
+                Location::new(block.first_transaction + 2),
+            ],
             None,
         )
         .await
         .expect("locations below the inactivity floor must remain provable");
     assert_eq!(proof.ops_root, certified.block.header.transactions_root);
     assert!(proof.verify::<Sha256>());
+    if let Some(path) = std::env::var_os("EXPLORER_ACTIVITY_FIXTURE_PATH") {
+        let operations = proof
+            .operations
+            .iter()
+            .map(|(location, bytes)| {
+                let TransactionOperation::Append(entry) =
+                    TransactionOperation::decode_cfg(Bytes::copy_from_slice(bytes), &()).unwrap()
+                else {
+                    panic!("history fixture must prove an append");
+                };
+                json!({
+                    "location": location.as_u64().to_string(),
+                    "digest": hex(entry.digest.as_ref()),
+                    "senderIndex": entry.sender_index.to_string(),
+                    "recipientIndex": entry.recipient_index.to_string(),
+                    "value": hex(&entry.encode()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let export = json!({
+            "root": hex(proof.ops_root.as_ref()),
+            "tip": (certified.block.header.transactions_range.end() - 1).to_string(),
+            "proof": hex(&encode_operation_multi_proof(&proof)),
+            "operations": operations,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&export).unwrap())
+            .expect("requested history proof fixture must be writable");
+    }
 
     // Both routes prove block 1 through block 3's certificate.
     let historical_block = proof_bundle(
@@ -677,7 +1196,7 @@ async fn historical_bundles(
 #[test]
 fn historical_transactions_below_inactivity_floor_remain_available() {
     commonware_runtime::tokio::Runner::default().start(|context| async move {
-        let fixture = fixture().await;
+        let fixture = fixture(context.child("state_fixture")).await;
         Box::pin(historical_bundles(context, &fixture)).await;
     });
 }
@@ -685,7 +1204,7 @@ fn historical_transactions_below_inactivity_floor_remain_available() {
 #[test]
 fn published_feed_carries_indirect_finality_and_exact_append_intervals() {
     commonware_runtime::tokio::Runner::default().start(|context| async move {
-        let fixture = fixture().await;
+        let fixture = fixture(context.child("state_fixture")).await;
         let environment = FixtureStore::open(context).await;
         for (index, block) in fixture.blocks[..3].iter().enumerate() {
             publish(
@@ -834,7 +1353,7 @@ async fn serve_fixture_if_requested(router: Router, fixture: &Fixture) {
 fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
     commonware_runtime::tokio::Runner::default().start(|context| async move {
         // The fixture's WebAuthn block must pass ordinary signature verification.
-        let fixture = fixture().await;
+        let fixture = fixture(context.child("state_fixture")).await;
         assert!(verify_transactions(
             TRANSACTION_NAMESPACE,
             &mut StdRng::from_seed([77; 32]),
@@ -877,7 +1396,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         };
         let lagging_account = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&lagging_account), 1);
-        assert_eq!(lagging_account["transactions"].as_array().unwrap().len(), 3);
+        assert_account_page(&lagging_account, 3);
 
         // Certifying block 3 lets block 1 prove directly and block 2 prove
         // through block 3's ancestry.
@@ -938,8 +1457,18 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         // activity rows.
         let account = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&account), 3);
-        assert_eq!(account["account"]["location"], "5");
-        assert_eq!(account["transactions"].as_array().unwrap().len(), 10);
+        let account_location = fixture.blocks[2].account_location.unwrap();
+        let account_write_height = fixture.blocks[2].account_write_height.unwrap();
+        assert_eq!(account["account"]["location"], account_location.to_string());
+        assert_eq!(account["account"]["writeHeight"], account_write_height.to_string());
+        let expected_headers = fixture.blocks[account_write_height.saturating_sub(2) as usize..2]
+            .iter().rev().map(|block| hex(&block.block.header.encode())).collect::<Vec<_>>();
+        assert_eq!(account["headers"], json!(expected_headers));
+        assert!(matches!(verify_account_bundle(&account, fixture.account, &fixture.blocks[2]),
+            VerifiedAccountLookup::Present { location, account: value, .. }
+            if location == account_location && value.tx_count == 58));
+        assert_lookup_context_rejected(&account, fixture.account, &fixture.blocks[2]);
+        assert_account_page(&account, 58);
         assert_eq!(account["transactions"][0]["index"], 54);
         assert_eq!(account["transactions"][0]["role"], 0);
         assert_transaction_proof(client, &account, &fixture.blocks[2]).await;
@@ -949,31 +1478,99 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             cursor: Some(hex_bytes_dynamic(account["nextCursor"].as_str().unwrap())),
             at: Some(3),
             digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            account_location: Some(account_location),
             ..account_request.clone()
         };
         let next = proof_bundle(router, &pinned).await;
+        assert_account_page(&next, 48);
         assert_eq!(next["transactions"][0]["index"], 44);
         assert_eq!(next["transactions"][9]["index"], 35);
+        let oldest = proof_bundle(router, &proto::GetAccountRequest {
+            cursor: Some(3_u64.to_be_bytes().to_vec()),
+            ..pinned.clone()
+        }).await;
+        assert_account_page(&oldest, 3);
+        assert_eq!(oldest["transactions"][0]["height"], "1");
+        assert_transaction_proof(client, &oldest, &fixture.blocks[2]).await;
+        let exhausted = proof_bundle(router, &proto::GetAccountRequest {
+            cursor: Some(0_u64.to_be_bytes().to_vec()),
+            ..pinned.clone()
+        }).await;
+        assert_account_page(&exhausted, 0);
+        assert_eq!(exhausted["account"], account["account"]);
+        assert!(exhausted["transactionsProof"].is_null());
+        for (invalid, expected_status) in [
+            (proto::GetAccountRequest {
+                cursor: Some(u64::MAX.to_be_bytes().to_vec()),
+                ..pinned.clone()
+            }, StatusCode::BAD_REQUEST),
+            (proto::GetAccountRequest {
+                digest: Some(vec![0; 32]),
+                ..pinned.clone()
+            }, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (status, _) = post(router, "GetAccount", invalid.encode_to_vec()).await;
+            assert_eq!(status, expected_status);
+        }
+        let (status, _) = post(router, "GetAccount", proto::GetAccountRequest {
+            account_location: Some(account_location + 1),
+            ..pinned.clone()
+        }.encode_to_vec()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-        // Disabling activity keeps the account proof and returns no rows.
+        // State-only requests retain the account proof without an activity page.
         let state_only = proof_bundle(router, &proto::GetAccountRequest {
             activity: Some(false),
             ..account_request.clone()
         }).await;
+        assert_eq!(state_only["account"], account["account"]);
         assert!(state_only["transactions"].as_array().unwrap().is_empty());
         assert!(state_only["transactionsProof"].is_null());
-        assert_eq!(state_only["account"], account["account"]);
+        assert!(state_only["nextCursor"].is_null());
 
-        // The recipient has no state update, and its received filter returns
-        // only receiver rows.
+        // Recipient indices advance independently of the sender's self-transfers.
         let recipient = proof_bundle(router, &proto::GetAccountRequest {
             account: fixture.recipient.as_ref().to_vec(),
-            mode: 2.into(),
             ..Default::default()
         }).await;
-        assert!(recipient["account"].is_null());
+        assert_account_page(&recipient, 56);
         assert_eq!(recipient["transactions"][0]["index"], 53);
         assert_eq!(recipient["transactions"][0]["role"], 1);
+        assert_transaction_proof(client, &recipient, &fixture.blocks[2]).await;
+
+        // Absence is authenticated at the same certified state boundary as a hit.
+        let unknown = proof_bundle(router, &proto::GetAccountRequest {
+            account: vec![0; 32],
+            ..Default::default()
+        }).await;
+        let missing = AccountKey::from([0; 32]);
+        assert_exclusion(&unknown, missing, &fixture.blocks[2]);
+        assert_lookup_context_rejected(&unknown, missing, &fixture.blocks[2]);
+        let absent_proof = hex_bytes_dynamic(unknown["account"]["proof"].as_str().unwrap());
+        assert!(verify_current_account_lookup(
+            &absent_proof, fixture.blocks[2].block.header.state_root.as_ref(),
+            fixture.account.as_ref(), fixture.blocks[2].block.header.state_range.end() - 1,
+            None, true,
+        ).is_err());
+        let future_key = AccountKey::from_public_key(fixture.blocks[3].transactions[1].value().sender().unwrap());
+        let future_request = proto::GetAccountRequest {
+            account: future_key.as_ref().to_vec(), at: Some(3),
+            digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            ..Default::default()
+        };
+        let future_absence = proof_bundle(router, &future_request).await;
+        assert_exclusion(&future_absence, future_key, &fixture.blocks[2]);
+
+        let empty_fixture = fixture_with_counts(context.child("empty_state"), &[0]).await;
+        let empty_environment = FixtureStore::open(context.child("empty_store")).await;
+        publish(&empty_environment.publisher, &empty_environment.reporter, &empty_fixture.blocks[0], true).await;
+        let empty_account = proof_bundle(&empty_environment.router, &proto::GetAccountRequest {
+            account: vec![0; 32], ..Default::default()
+        }).await;
+        assert_exclusion(&empty_account, missing, &empty_fixture.blocks[0]);
+        assert_exclusion(&empty_account, AccountKey::from([255; 32]), &empty_fixture.blocks[0]);
+        assert_lookup_context_rejected(&empty_account, missing, &empty_fixture.blocks[0]);
+        empty_environment.close().await;
 
         // A transaction in block 2 proves through block 3's certificate.
         let digest = hex(fixture.blocks[1].transactions[54].message_digest().as_ref());
@@ -998,8 +1595,17 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         ] {
             assert_eq!(after_arrival[field], next[field], "pinned field {field} must not change");
         }
+        let frozen_absence = proof_bundle(router, &future_request).await;
+        assert_eq!(frozen_absence["account"], future_absence["account"]);
+        assert_exclusion(&frozen_absence, future_key, &fixture.blocks[2]);
+        let future_present = proof_bundle(router, &proto::GetAccountRequest {
+            account: future_key.as_ref().to_vec(), activity: Some(false), ..Default::default()
+        }).await;
+        assert!(matches!(verify_account_bundle(&future_present, future_key, &fixture.blocks[3]),
+            VerifiedAccountLookup::Present { account: value, .. } if value.tx_count == 1));
         let account_with_history = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&account_with_history), 4);
+        assert_account_page(&account_with_history, 59);
         assert!(account_with_history["transactions"].as_array().unwrap().iter().any(|row| {
             row["location"].as_str().unwrap().parse::<u64>().unwrap()
                 < fixture.blocks[3].block.header.transactions_range.start()
@@ -1038,8 +1644,12 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
                 "emptyBlock": empty,
                 "accountBundle": account,
                 "accountNext": next,
+                "accountOldest": oldest,
+                "accountExhausted": exhausted,
                 "accountStateOnly": state_only,
                 "recipientBundle": recipient,
+                "unknownAccount": unknown,
+                "emptyAccount": empty_account,
                 "transactionBundle": transaction,
                 "webauthnDigest": webauthn_digest,
                 "webauthnBlock": webauthn_block,
@@ -1116,61 +1726,45 @@ async fn malformed_inputs_are_rejected_before_store_reads() {
         proto::GetBlockRequest::default().encode_to_vec(),
     ));
 
-    // Unknown protobuf enum values must not become the default activity mode.
-    for mode in [-1, 3, i32::MAX] {
-        requests.push((
-            "GetAccount",
-            proto::GetAccountRequest {
-                mode: mode.into(),
-                ..valid_account.clone()
-            }
-            .encode_to_vec(),
-        ));
-    }
-
-    // Cursor fields encode a reachable height, index, and account role.
-    for length in [0, 1, 23, 25] {
+    // Cursors are fixed-width exclusive indices and require both snapshot pins.
+    for length in [0, 1, 7, 9, 24] {
         requests.push((
             "GetAccount",
             proto::GetAccountRequest {
                 cursor: Some(vec![0; length]),
+                at: Some(1),
+                digest: Some(vec![0; 32]),
+                account_location: Some(1),
                 ..valid_account.clone()
             }
             .encode_to_vec(),
         ));
     }
-    for (height, index, role) in [
-        (0_u64, 0_u64, 0_u64),
-        (1, u64::from(u32::MAX) + 1, 0),
-        (1, 0, 2),
+    for (at, digest, account_location) in [
+        (None, None, None),
+        (Some(1), Some(vec![0; 32]), None),
+        (None, None, Some(1)),
     ] {
-        let cursor = [
-            height.to_be_bytes(),
-            index.to_be_bytes(),
-            role.to_be_bytes(),
-        ]
-        .concat();
         requests.push((
             "GetAccount",
             proto::GetAccountRequest {
-                cursor: Some(cursor),
+                cursor: Some(1_u64.to_be_bytes().to_vec()),
+                at,
+                digest,
+                account_location,
                 ..valid_account.clone()
             }
             .encode_to_vec(),
         ));
     }
-    for (mode, role) in [(1, 1_u64), (2, 0_u64)] {
-        let cursor = [1_u64.to_be_bytes(), 0_u64.to_be_bytes(), role.to_be_bytes()].concat();
-        requests.push((
-            "GetAccount",
-            proto::GetAccountRequest {
-                mode: mode.into(),
-                cursor: Some(cursor),
-                ..valid_account.clone()
-            }
-            .encode_to_vec(),
-        ));
-    }
+    requests.push((
+        "GetAccount",
+        proto::GetAccountRequest {
+            account_location: Some(1),
+            ..valid_account.clone()
+        }
+        .encode_to_vec(),
+    ));
 
     // Snapshot pins require both a positive height and a complete digest.
     for (at, digest) in [

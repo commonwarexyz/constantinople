@@ -13,11 +13,10 @@
 //! credit received in the block, including a self-transfer's, cannot fund a debit in the same
 //! block. Every final balance must fit in a `u64`.
 //!
-//! An absent key reads as [`Account::default`], and settlement deletes a key whose account settles
-//! to that default. No block settles a key to the default in a state that only settlement has
-//! written since an empty genesis: a sender's consumed nonce differs from the default nonce, and
-//! an account that has never sent holds at least the default balance, so its nonzero credits leave
-//! it above that balance. Every key a block changes is therefore written, never deleted.
+//! Every accepted transaction increments the history count of each distinct participant once.
+//! Counts cannot wrap: an exhausted sender or recipient rejects the transfer. An absent key reads
+//! as [`Account::default`]. Every accepted participant differs from its starting account and the
+//! default because its count increased, so settlement always writes it.
 
 use commonware_cryptography::Hasher;
 use commonware_glue::transfers::{self, Change, Transfer};
@@ -61,8 +60,8 @@ where
 pub struct TransferAccount(pub Account);
 
 impl transfers::Account for TransferAccount {
-    /// The nonce a transfer consumes.
-    type Effect = u64;
+    /// A sender consumes its nonce; a recipient only advances its history count.
+    type Effect = Option<u64>;
 
     fn balance(&self) -> u64 {
         self.0.balance
@@ -72,8 +71,15 @@ impl transfers::Account for TransferAccount {
         self.0.balance = balance;
     }
 
-    fn apply(&mut self, nonce: u64) -> bool {
-        self.0.nonce.consume(nonce)
+    fn apply(&mut self, nonce: Option<u64>) -> bool {
+        let Some(tx_count) = self.0.tx_count.checked_add(1) else {
+            return false;
+        };
+        if nonce.is_some_and(|nonce| !self.0.nonce.consume(nonce)) {
+            return false;
+        }
+        self.0.tx_count = tx_count;
+        true
     }
 }
 
@@ -81,16 +87,21 @@ impl Transfer for PreparedTransfer {
     type Key = AccountKey;
     type Account = TransferAccount;
 
-    /// The sender's change consumes the nonce and debits the value, and the recipient's change
-    /// credits it. A self-transfer lists its sender twice, so both settle as one change that debits
-    /// and credits the value.
-    fn changes(&self) -> impl Iterator<Item = (&AccountKey, Change<u64>)> {
+    /// Each distinct participant advances its history count. The sender also consumes its nonce.
+    /// A self-transfer credits its sender without applying a second effect.
+    fn changes(&self) -> impl Iterator<Item = (&AccountKey, Change<Option<u64>>)> {
+        let credit = Change::credit(self.value);
+        let credit = if self.sender == self.recipient {
+            credit
+        } else {
+            credit.with_effect(None)
+        };
         [
             (
                 &self.sender,
-                Change::debit(self.value).with_effect(self.nonce),
+                Change::debit(self.value).with_effect(Some(self.nonce)),
             ),
-            (&self.recipient, Change::credit(self.value)),
+            (&self.recipient, credit),
         ]
         .into_iter()
     }

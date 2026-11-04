@@ -29,15 +29,15 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::{Family as _, full::Config as MmrConfig, mem::Mem, mmr},
-    qmdb::{any::FixedConfig, chain::Bounds, keyless::fixed as keyless_fixed},
+    qmdb::{current::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
     Account, AccountKey, Block, Header, LazySignedTransaction, Nonce, PublicKeyCache, Sealable,
-    SealedBlock, SignedTransaction, Transaction, TransactionPublicKey, TransactionSignature,
-    proposal::MAXIMUM_BLOCK_SIZE,
+    SealedBlock, SignedTransaction, StateSyncProof, Transaction, TransactionHistoryEntry,
+    TransactionPublicKey, TransactionSignature, proposal::MAXIMUM_BLOCK_SIZE,
 };
 use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
@@ -56,7 +56,7 @@ const TEST_TX_NS: &[u8] = b"constantinople-application-test-transactions";
 
 fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     StateSyncTarget::new(
-        sha256::Digest::EMPTY,
+        StateSyncProof::initial::<sha256::Sha256>().ops_root,
         non_empty_range!(mmr::Location::new(0), mmr::Location::new(1)),
     )
 }
@@ -79,6 +79,7 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             write_buffer: NZUsize!(4096),
             replay_buffer: NZUsize!(4096),
         },
+        grafted_metadata_partition: "verify-invalid-state-grafted-metadata".into(),
         translator: EightCap,
         init_cache: Some(NZUsize!(1024)),
         init_buffer: NZUsize!(1 << 21),
@@ -100,15 +101,6 @@ fn transaction_config(cache: CacheRef) -> keyless_fixed::CompactConfig<Sequentia
         },
         commit_codec_config: (),
     }
-}
-
-fn sync_range_from_bounds<D>(
-    bounds: &Bounds<mmr::Family, D>,
-) -> commonware_utils::range::NonEmptyRange<mmr::Location>
-where
-    D: Digest,
-{
-    non_empty_range!(bounds.inactivity_floor, bounds.tip.size)
 }
 
 type TestBlock = SealedBlock<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
@@ -153,6 +145,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             Some(Account {
                 balance: 1_000_000,
                 nonce: Nonce::default(),
+                tx_count: 0,
             }),
         );
     }
@@ -161,7 +154,14 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         .merkleize()
         .await
         .expect("genesis transactions");
-    let state_target = StateSyncTarget::new(state.root(), sync_range_from_bounds(state.bounds()));
+    let state_sync = StateSyncProof {
+        ops_root: state.ops_root(),
+        witness: state.ops_root_witness().clone(),
+    };
+    let state_target = StateSyncTarget::new(
+        state.ops_root(),
+        non_empty_range!(state.sync_boundary(), state.bounds().tip.size),
+    );
     let transaction_target = TransactionHistoryTarget {
         root: transactions.root(),
         size: transactions.bounds().tip.size,
@@ -169,13 +169,28 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     dbs.apply((state, transactions)).await;
     assert!(dbs.finalize().await.durable().await);
 
-    let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
-        &mut sha256::Sha256::default(),
-        leader.public_key(),
-        0,
-        state_target.clone(),
-        transaction_target.clone(),
-    );
+    let parent = Block::<sha256::Digest, _, sha256::Sha256>::new(
+        Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader: leader.public_key(),
+                parent: (View::zero(), sha256::Digest::EMPTY),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: 0,
+            timestamp: 0,
+            state_root: state_sync.root::<sha256::Sha256>(),
+            state_range: non_empty_range!(
+                state_target.range.start().as_u64(),
+                state_target.range.end().as_u64()
+            ),
+            transactions_root: transaction_target.root,
+            transactions_range: non_empty_range!(0, transaction_target.size.as_u64()),
+        },
+        Vec::new(),
+        state_sync,
+    )
+    .seal(&mut sha256::Sha256::default());
     VerifyHarness {
         app: TestApp::new(
             context.child("app"),
@@ -233,6 +248,7 @@ fn unexecuted_child_header(
 
 fn sized_unverified_block(
     header: Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>,
+    state_sync: StateSyncProof<sha256::Digest>,
     encoded_size: usize,
 ) -> TestBlock {
     let lazy = |payload_size: usize| {
@@ -243,16 +259,18 @@ fn sized_unverified_block(
             .expect("lazy framing should decode without materializing the invalid payload")
     };
     let transaction = lazy(256);
-    let count = (encoded_size - header.encode_size()) / transaction.encode_size();
+    let prefix_size = header.encode_size() + state_sync.encode_size();
+    let count = (encoded_size - prefix_size) / transaction.encode_size();
     let mut body = vec![transaction; count - 1];
     let remaining = encoded_size
-        - header.encode_size()
+        - prefix_size
         - count.encode_size()
         - body.iter().map(|tx| tx.encode_size()).sum::<usize>();
     let payload_size = remaining - remaining.encode_size();
     body.push(lazy(payload_size));
     let block = Block {
         header,
+        state_sync,
         body: body.into(),
     }
     .seal(&mut sha256::Sha256::default());
@@ -286,6 +304,7 @@ fn verify_checks_block_size_before_fetching_parent() {
         ] {
             let block = sized_unverified_block(
                 unexecuted_child_header(&parent, &consensus_context),
+                parent.state_sync.clone(),
                 encoded_size,
             );
             let mut parent_polled = false;
@@ -354,6 +373,109 @@ fn propose_rejects_oversized_transaction_source_output() {
 }
 
 #[test]
+fn verify_and_replay_reject_invalid_constructed_state_witness() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let proposed = app
+            .propose_child(
+                (context.child("propose_witness"), consensus_context.clone()),
+                Arc::new(parent.clone()),
+                dbs.new_batches().await,
+                &mut TestSource::new(Vec::new()),
+            )
+            .await
+            .expect("empty child proposes");
+        assert!(proposed.block.verify_state_root());
+        assert!(
+            app.verify_child(
+                (
+                    context.child("verify_valid_witness"),
+                    consensus_context.clone()
+                ),
+                Arc::new(proposed.block.clone()),
+                std::future::ready(Some(Arc::new(parent.clone()))),
+                dbs.new_batches().await,
+            )
+            .await
+            .is_some()
+        );
+        assert!(
+            StatefulApplication::process(
+                &mut app,
+                (
+                    context.child("replay_valid_witness"),
+                    consensus_context.clone()
+                ),
+                ancestry::from_iter([Digested::precomputed(
+                    proposed.block.clone(),
+                    proposed.block.digest(),
+                )]),
+                dbs.new_batches().await,
+                Finality::Finalized,
+            )
+            .await
+            .is_some()
+        );
+
+        // The auxiliary proof can change without changing the certified header or body.
+        for corrupt_ops in [true, false] {
+            let mut invalid = proposed.block.clone().into_inner();
+            if corrupt_ops {
+                assert_ne!(invalid.state_sync.ops_root, sha256::Digest::EMPTY);
+                invalid.state_sync.ops_root = sha256::Digest::EMPTY;
+            } else {
+                assert_ne!(
+                    invalid.state_sync.witness.grafted_root,
+                    sha256::Digest::EMPTY
+                );
+                invalid.state_sync.witness.grafted_root = sha256::Digest::EMPTY;
+            }
+            assert!(!invalid.verify_state_root());
+            let invalid = invalid.seal(&mut sha256::Sha256::default());
+            assert_eq!(invalid.digest(), proposed.block.digest());
+            assert!(
+                app.verify_child(
+                    (
+                        context.child("verify_invalid_witness"),
+                        consensus_context.clone()
+                    ),
+                    Arc::new(invalid.clone()),
+                    std::future::ready(Some(Arc::new(parent.clone()))),
+                    dbs.new_batches().await,
+                )
+                .await
+                .is_none()
+            );
+            assert!(
+                StatefulApplication::process(
+                    &mut app,
+                    (
+                        context.child("replay_invalid_witness"),
+                        consensus_context.clone()
+                    ),
+                    ancestry::from_iter([Digested::precomputed(invalid.clone(), invalid.digest())]),
+                    dbs.new_batches().await,
+                    Finality::Finalized,
+                )
+                .await
+                .is_none()
+            );
+        }
+    });
+}
+
+#[test]
 fn verify_rejects_invalid_body() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
@@ -378,6 +500,7 @@ fn verify_rejects_invalid_body() {
                 transfer(&sender, &recipient, 1),
                 transfer(&sender, &recipient, 2),
             ],
+            parent.state_sync.clone(),
         )
         .seal(&mut sha256::Sha256::default());
 
@@ -421,6 +544,7 @@ fn replay_rejects_invalid_body() {
                 transfer(&sender, &recipient, 1),
                 transfer(&sender, &recipient, 2),
             ],
+            parent.state_sync.clone(),
         )
         .seal(&mut sha256::Sha256::default());
 
@@ -462,8 +586,12 @@ fn replay_rejects_transaction_floor_past_commit() {
         let commit = parent.header.transactions_range.end();
         let mut header = unexecuted_child_header(&parent, &consensus_context);
         header.transactions_range = non_empty_range!(commit + 1, commit + 2);
-        let block = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
-            .seal(&mut sha256::Sha256::default());
+        let block = Block::<sha256::Digest, _, sha256::Sha256>::new(
+            header,
+            Vec::new(),
+            parent.state_sync.clone(),
+        )
+        .seal(&mut sha256::Sha256::default());
 
         // Replay must reject the floor as invalid instead of panicking.
         let result = StatefulApplication::process(
@@ -501,6 +629,7 @@ fn verify_rejects_missing_parent() {
         let block = Block::<sha256::Digest, _, sha256::Sha256>::new(
             header,
             vec![transfer(&sender, &recipient, 1)],
+            parent.state_sync.clone(),
         )
         .seal(&mut sha256::Sha256::default());
 
@@ -568,13 +697,64 @@ fn propose_drops_inapplicable_and_refills() {
         // verification.
         let accepted = app
             .verify_child(
-                (context.child("verify"), consensus_context),
+                (context.child("verify"), consensus_context.clone()),
                 Arc::new(proposed.block.clone()),
                 std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
-            .await;
-        assert!(accepted.is_some());
+            .await
+            .expect("accepted body verifies");
+        let replayed = app
+            .apply_block(
+                (context.child("replay"), consensus_context.clone()),
+                &proposed.block,
+                dbs.new_batches().await,
+            )
+            .await
+            .expect("accepted body replays");
+        for execution in [&accepted, &replayed] {
+            assert_eq!(execution.0.root(), proposed.merkleized.0.root());
+            assert_eq!(execution.1.root(), proposed.merkleized.1.root());
+        }
+        let artifacts = StatefulApplication::capture(
+            &mut app,
+            (context.child("capture"), consensus_context),
+            &proposed.block,
+            &proposed.merkleized,
+            dbs.readers(),
+        )
+        .await;
+        let entries: Vec<_> = artifacts
+            .transactions
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                super::TransactionHistoryOperation::<sha256::Sha256>::Append(entry) => Some(*entry),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                TransactionHistoryEntry {
+                    digest: *keep.message_digest(),
+                    sender_index: 0,
+                    recipient_index: 0
+                },
+                TransactionHistoryEntry {
+                    digest: *refill.message_digest(),
+                    sender_index: 0,
+                    recipient_index: 1
+                },
+            ]
+        );
+        assert_eq!(
+            finalized_range_root(
+                &artifacts.transactions,
+                proposed.block.header.transactions_range.start()
+            ),
+            proposed.block.header.transactions_root,
+        );
     });
 }
 
@@ -689,9 +869,18 @@ fn prepare_restages_on_a_replacement_parent() {
 
         // Stamping P2 ahead of the local clock lets only a child of P2 take
         // its timestamp.
-        let Block { mut header, body } = p2.block.into_inner();
+        let Block {
+            mut header,
+            state_sync,
+            body,
+        } = p2.block.into_inner();
         header.timestamp = 10_000;
-        let p2_block = Block { header, body }.seal(&mut sha256::Sha256::default());
+        let p2_block = Block {
+            header,
+            state_sync,
+            body,
+        }
+        .seal(&mut sha256::Sha256::default());
         let p2_state = p2.merkleized;
 
         // Each request for view 2 offers the sender's nonce-0 transfer.
@@ -903,11 +1092,20 @@ fn finalized_capture_preserves_both_authenticated_ranges() {
 
             assert_eq!(artifacts.state.start.as_u64(), parent_state_end);
             assert_eq!(artifacts.state.end.as_u64(), header.state_range.end());
-            assert_eq!(artifacts.state.root, header.state_root);
+            assert_eq!(artifacts.state.root, proposed.block.state_sync.ops_root);
+            assert_eq!(artifacts.state_boundary.root, header.state_root);
             assert_eq!(
-                finalized_range_root(&artifacts.state, header.state_range.start()),
-                header.state_root,
+                artifacts.state_boundary.witness,
+                proposed.block.state_sync.witness,
             );
+            assert_eq!(
+                finalized_range_root(
+                    &artifacts.state,
+                    proposed.merkleized.0.bounds().inactivity_floor.as_u64(),
+                ),
+                proposed.block.state_sync.ops_root,
+            );
+            assert!(proposed.block.verify_state_root());
             assert_eq!(
                 artifacts.transactions.start.as_u64(),
                 parent_transaction_end
@@ -948,21 +1146,16 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             mut app,
             dbs,
             leader,
-            state_target,
-            transaction_target,
+            parent,
             ..
         } = Box::pin(verify_harness(&context)).await;
 
         // Stamp the parent ahead of the local clock, as a proposer whose clock
         // runs fast would. A child built before the local clock catches up
         // takes the parent's timestamp.
-        let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
-            &mut sha256::Sha256::default(),
-            leader.public_key(),
-            10_000,
-            state_target,
-            transaction_target,
-        );
+        let mut parent = parent.into_inner();
+        parent.header.timestamp = 10_000;
+        let parent = parent.seal(&mut sha256::Sha256::default());
 
         // Propose an empty child while the local clock is still behind the
         // parent.
@@ -1012,13 +1205,17 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
 
         // The identical block with its timestamp rewound below the parent's is
         // rejected by the timestamp check alone.
-        let Block { mut header, body } = proposed.block.into_inner();
+        let Block {
+            mut header,
+            state_sync,
+            body,
+        } = proposed.block.into_inner();
         assert!(
             body.is_empty(),
             "stale block must mirror the empty proposal"
         );
         header.timestamp = parent.header.timestamp - 1;
-        let stale = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
+        let stale = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new(), state_sync)
             .seal(&mut sha256::Sha256::default());
         let rejected = app
             .verify_child(
@@ -1069,6 +1266,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
                 )
             })
             .collect(),
+        StateSyncProof::initial::<sha256::Sha256>(),
     )
     .seal(&mut sha256::Sha256::default());
 
@@ -1076,6 +1274,47 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
         parent_transactions_inactivity_floor(&parent),
         commonware_storage::mmr::Location::new(6)
     );
+}
+
+#[test]
+fn initial_state_sync_proof_matches_native_empty_database() {
+    deterministic::Runner::default().start(|context| async move {
+        let cache = CacheRef::new(NZU16!(16), NZUsize!(4096));
+        let dbs = TestDbs::init(
+            context.child("empty_dbs"),
+            (state_config(cache.clone()), transaction_config(cache)),
+            None,
+        )
+        .await;
+        let readers = dbs.readers();
+        let state = readers.0.read().await;
+        let proof = StateSyncProof::initial::<sha256::Sha256>();
+        assert_eq!(proof.ops_root, state.ops_root());
+        assert_eq!(
+            proof.witness,
+            state.ops_root_witness().await.expect("native witness")
+        );
+        assert_eq!(proof.root::<sha256::Sha256>(), state.root());
+        assert!(proof.verify::<sha256::Sha256>(&state.root()));
+        assert_eq!(state.sync_boundary(), mmr::Location::new(0));
+        assert_eq!(state.bounds().end, mmr::Location::new(1));
+
+        let block = genesis_block::<sha256::Digest, _, sha256::Sha256>(
+            &mut sha256::Sha256::default(),
+            ed25519::SigningKey::from_seed(11).public_key(),
+            0,
+            StateSyncTarget::new(
+                state.ops_root(),
+                non_empty_range!(state.sync_boundary(), state.bounds().end),
+            ),
+            TransactionHistoryTarget {
+                root: sha256::Digest::EMPTY,
+                size: mmr::Location::new(1),
+            },
+        );
+        assert_eq!(block.header.state_root, state.root());
+        assert_eq!(block.state_sync, proof);
+    });
 }
 
 #[test]

@@ -26,14 +26,14 @@ test('search normalizes one identity and calls its generated RPC', async (t) => 
     assert.equal(fetch.mock.callCount(), 1);
 });
 
-test('search opens either match directly and distinguishes absent from unavailable', async (t) => {
+test('search opens matches and routes an unindexed key to its account proof', async (t) => {
     let step = 0;
     t.mock.method(globalThis, 'fetch', explorerFetch({ search(request) {
         if (step++ === 0) return { kind: SearchKind.ACCOUNT, value: request.value };
         throw new ConnectError('not available', step === 2 ? Code.NotFound : Code.Unavailable);
     } }));
     assert.deepEqual(await run(), { kind: 'account', value: digest });
-    assert.equal(await run(), null);
+    assert.deepEqual(await run(), { kind: 'account', value: digest });
     await assert.rejects(run(), (error) => error instanceof ConnectError && error.code === Code.Unavailable);
 });
 

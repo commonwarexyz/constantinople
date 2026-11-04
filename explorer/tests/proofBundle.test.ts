@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { create } from '@bufbuild/protobuf';
 import { Code, ConnectError } from '@connectrpc/connect';
 import { initQmdbWasm, QmdbProofVerifier } from '@exowarexyz/qmdb';
@@ -8,13 +8,17 @@ import { ensureSimplexWasm } from '@exowarexyz/simplex/wasm';
 import type { VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { fromHex, toArrayBuffer, toHex } from '../src/codec.ts';
 import { authenticatedHeader, finalizedTargetFromCertificate } from '../src/qmdb.ts';
+import { initAccountProofWasm } from '../src/accountProof.ts';
+import { blockRecency } from '../src/blockRecency.ts';
 import {
     loadAccountBundle, loadBlockBundle, loadTransactionBundle,
     verifyAccountBundle, verifyBlockBundle, verifyTransactionBundle, proofBundleInput,
 } from '../src/proofBundle.ts';
 import { isRetryableAccountProofError, isRetryableProofError } from '../src/proofRetry.ts';
-import { ActivityMode, ProofBundleSchema, type ProofBundle, type TransactionRole } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
+import { ProofBundleSchema, type ProofBundle, type TransactionRole } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
 import { explorerFetch } from './rpcTest.ts';
+import { accountCursor } from '../src/accountPage.ts';
+import { nativeActivityFixtureIssue, nativeFixtureSkip, nativeProofFixtureIssue, readFixture } from './fixtureSource.ts';
 import { assertSubmittedTransactionMatches, restoreSubmittedTransaction } from '../src/submissionHistory.ts';
 
 const options = { indexerUrl: 'https://indexer.example', simplexVerificationMaterial: '00' };
@@ -24,12 +28,12 @@ const account = '11'.repeat(32);
 const empty = () => ({ certificate: '00', headers: [], sequenceNumber: '0', account: null, transactions: [], transactionsProof: null, nextCursor: null });
 
 /** One transaction row as encoded on the wire. */
-interface WireRow { location: string; body: string; height: string; index: number; role?: number }
+interface WireRow { location: string; body: string; height: string; index: number; role?: number; senderIndex: string; recipientIndex: string }
 
 /** Combined indexer response as encoded on the wire. */
 interface WireBundle {
     certificate: string; headers: string[]; sequenceNumber: string;
-    account: { location: string; proof: string } | null;
+    account: { location: string; proof: string; writeHeight: string; encodedOperation?: string; exclusion?: boolean } | null;
     transactions: WireRow[]; transactionsProof: string | null; nextCursor: string | null;
 }
 
@@ -41,27 +45,37 @@ interface PublisherFixture {
     accountStateOnly: WireBundle; recipientBundle: WireBundle; transactionBundle: WireBundle;
     webauthnBlock: WireBundle; webauthnBundle: WireBundle; webauthnDigest: string;
     historicalBlock: WireBundle; historicalTransaction: WireBundle; historicalDigest: string;
-    accountWithHistory: WireBundle;
+    accountWithHistory: WireBundle; accountOldest: WireBundle; accountExhausted: WireBundle; unknownAccount: WireBundle; emptyAccount: WireBundle;
 }
 
+const nativeFixture = await readFixture<PublisherFixture>('proofBundle');
+const nativeSkip = nativeFixtureSkip(nativeProofFixtureIssue(nativeFixture));
+
 async function publisherFixture(): Promise<PublisherFixture> {
-    return JSON.parse(await readFile(new URL('../../tests/fixtures/proofBundle.json', import.meta.url), 'utf8')) as PublisherFixture;
+    return nativeFixture;
+}
+
+function nativeTest(name: string, run: (context: TestContext) => Promise<void>): void {
+    test(name, { skip: nativeSkip }, run);
 }
 
 function rpcBundle(wire: WireBundle): ProofBundle {
     const nextCursor: ProofBundle['nextCursor'] = wire.nextCursor === null ? { case: undefined }
-        : /^[0-9a-f]{48}$/.test(wire.nextCursor)
+        : /^[0-9a-f]{16}$/.test(wire.nextCursor)
             ? { case: 'activityCursor', value: fromHex(wire.nextCursor) }
             : { case: 'blockOffset', value: BigInt(wire.nextCursor) };
     return create(ProofBundleSchema, {
         certificate: fromHex(wire.certificate), headers: wire.headers.map(fromHex),
         sequenceNumber: BigInt(wire.sequenceNumber),
         account: wire.account === null ? undefined : {
-            location: BigInt(wire.account.location), proof: fromHex(wire.account.proof),
+            location: BigInt(wire.account.location), proof: fromHex(wire.account.proof), writeHeight: BigInt(wire.account.writeHeight),
+            claim: wire.account.encodedOperation !== undefined ? { case: 'encodedOperation', value: fromHex(wire.account.encodedOperation) }
+                : wire.account.exclusion !== undefined ? { case: 'exclusion', value: wire.account.exclusion } : { case: undefined },
         },
         transactions: wire.transactions.map((row) => ({
             location: BigInt(row.location), body: fromHex(row.body), height: BigInt(row.height),
             index: row.index, role: row.role as TransactionRole | undefined,
+            senderIndex: BigInt(row.senderIndex), recipientIndex: BigInt(row.recipientIndex),
         })),
         transactionsProof: wire.transactionsProof === null ? undefined : fromHex(wire.transactionsProof),
         nextCursor,
@@ -76,18 +90,22 @@ test.before(async () => {
     await Promise.all([
         initQmdbWasm(toArrayBuffer(await readFile(new URL('./generated/wasm/exoware_qmdb_wasm_bg.wasm', import.meta.resolve('@exowarexyz/qmdb'))))),
         ensureSimplexWasm({ module_or_path: await readFile(new URL('./generated/wasm/exoware_simplex_wasm_bg.wasm', import.meta.resolve('@exowarexyz/simplex/wasm'))) }),
+        initAccountProofWasm(toArrayBuffer(await readFile(new URL('../../src/gen/account_wasm/constantinople_account_proof_bg.wasm', import.meta.url)))),
     ]);
 });
 
 test('malformed request identities are rejected before any fetch', async (t) => {
     // Malformed identities and a cursor without a snapshot must all fail before fetch.
     const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected fetch'); });
-    const cursor = new Uint8Array(24);
+    const cursor = new Uint8Array(8);
     cursor[7] = 1;
     for (const request of [
         () => loadAccountBundle({ ...options, account: 'ab' }),
-        () => loadAccountBundle({ ...options, account, mode: 'wrong' as 'all' }),
         () => loadAccountBundle({ ...options, account, cursor }),
+        () => loadAccountBundle({ ...options, account, cursor, at: { height: 1n, blockDigest: new Uint8Array(32) } }),
+        () => loadAccountBundle({ ...options, account, cursor, at: { height: 1n, blockDigest: new Uint8Array(32) }, accountLocation: 1n }),
+        () => loadAccountBundle({ ...options, account, cursor, at: { height: 1n, blockDigest: new Uint8Array(32) }, expectedTxCount: 1n }),
+        () => loadAccountBundle({ ...options, account, cursor: accountCursor(2n), at: { height: 1n, blockDigest: new Uint8Array(32) }, accountLocation: 1n, expectedTxCount: 1n }),
         () => loadAccountBundle({ ...options, account, at: { height: 1n, blockDigest: new Uint8Array(31) } }),
         () => loadBlockBundle({ ...options, height: 0n }),
         () => loadBlockBundle({ ...options, height: 1n, offset: -1n }),
@@ -98,7 +116,7 @@ test('malformed request identities are rejected before any fetch', async (t) => 
 
 test('hostile wire sizes and noncanonical numbers fail before certificate verification', async () => {
     // Every case exceeds a size bound or uses a noncanonical encoding that parsing must reject.
-    const rows = [{ location: '1', body: '00', height: '1', index: 0, role: 0 }];
+    const rows = [{ location: '1', body: '00', height: '1', index: 0, role: 0, senderIndex: '0', recipientIndex: '0' }];
     const cases = [
         { ...empty(), certificate: '00'.repeat(16 * 1024 + 1) },
         { ...empty(), certificate: 'AA' },
@@ -109,6 +127,10 @@ test('hostile wire sizes and noncanonical numbers fail before certificate verifi
         { ...empty(), transactions: Array(11).fill(rows[0]) },
         { ...empty(), transactions: [{ ...rows[0], body: '00'.repeat(920) }] },
         { ...empty(), transactions: [{ ...rows[0], location: 1 }] },
+        ...['-1', '01', '18446744073709551616'].flatMap((value) => [
+            { ...empty(), transactions: [{ ...rows[0], senderIndex: value }] },
+            { ...empty(), transactions: [{ ...rows[0], recipientIndex: value }] },
+        ]),
         { ...empty(), transactions: [{ ...rows[0], role: 2 }] },
         { ...empty(), transactionsProof: '00'.repeat(1024 * 1024 + 1) },
         { ...empty(), nextCursor: '00'.repeat(25) },
@@ -125,14 +147,18 @@ test('typed proof inputs enforce bounds before certificate verification', () => 
         (bundle) => { bundle.transactions = Array(51).fill(bundle.transactions[0]); },
         (bundle) => { bundle.transactions[0]!.body = new Uint8Array(920); },
         (bundle) => { bundle.transactions[0]!.location = -1n; },
+        (bundle) => { bundle.transactions[0]!.senderIndex = -1n; },
+        (bundle) => { bundle.transactions[0]!.recipientIndex = 1n << 64n; },
+        (bundle) => { bundle.account!.writeHeight = -1n; },
+        (bundle) => { bundle.account!.claim = { case: 'encodedOperation', value: new Uint8Array(98) }; },
         (bundle) => { bundle.account!.proof = new Uint8Array(1024 * 1024 + 1); },
         (bundle) => { bundle.transactionsProof = new Uint8Array(1024 * 1024 + 1); },
         (bundle) => { bundle.nextCursor = { case: 'activityCursor', value: new Uint8Array(25) }; },
     ];
     for (const mutate of mutations) {
         const bundle = rpcBundle({
-            ...empty(), account: { location: '1', proof: '00' },
-            transactions: [{ location: '1', body: '00', height: '1', index: 0 }],
+            ...empty(), account: { location: '1', proof: '00', writeHeight: '1', encodedOperation: '00'.repeat(97) },
+            transactions: [{ location: '1', body: '00', height: '1', index: 0, senderIndex: '0', recipientIndex: '0' }],
         });
         mutate(bundle);
         assert.throws(() => proofBundleInput(bundle, 'account'), /invalid|oversized|exceeds/);
@@ -140,7 +166,7 @@ test('typed proof inputs enforce bounds before certificate verification', () => 
 });
 
 test('typed proof cursors must belong to the requested view', () => {
-    const accountCursor: ProofBundle['nextCursor'] = { case: 'activityCursor', value: new Uint8Array(24) };
+    const accountCursor: ProofBundle['nextCursor'] = { case: 'activityCursor', value: new Uint8Array(8) };
     const blockCursor: ProofBundle['nextCursor'] = { case: 'blockOffset', value: 50n };
     for (const [kind, cursor] of [
         ['account', blockCursor], ['block', accountCursor],
@@ -157,7 +183,7 @@ test('typed proof cursors must belong to the requested view', () => {
 
 test('unknown typed transaction roles are rejected before finalization', async (t) => {
     const fixture = await publisherFixture();
-    const bundle = rpcBundle(fixture.accountBundle);
+    const bundle = rpcBundle({ ...empty(), transactions: [{ location: '1', body: '00', height: '1', index: 0, role: 0, senderIndex: '0', recipientIndex: '0' }] });
     bundle.transactions[0]!.role = 99 as TransactionRole;
     t.mock.method(globalThis, 'fetch', explorerFetch({ getAccount: () => bundle }));
     let finalized = false;
@@ -201,7 +227,7 @@ test('aggregate availability is retryable while unsupported work is terminal', a
 test('network failures in aggregate fetch and response streams remain retryable', async (t) => {
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
-    const handler = explorerFetch({ getAccount: () => rpcBundle(fixture.accountBundle) });
+    const handler = explorerFetch({ getAccount: () => rpcBundle(empty()) });
     let stage: 'fetch' | 'stream' = 'fetch';
     const failure = new TypeError('Failed to fetch');
     t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -262,7 +288,7 @@ test('aggregate transport classification preserves cancellation and rejects malf
     });
     t.mock.restoreAll();
 
-    const handler = explorerFetch({ getAccount: () => rpcBundle(fixture.accountBundle) });
+    const handler = explorerFetch({ getAccount: () => rpcBundle(empty()) });
     t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
         const response = await handler(input, init);
         const body = new Uint8Array(await response.arrayBuffer());
@@ -283,7 +309,7 @@ test('already canceled loads issue no request', async (t) => {
     assert.equal(fetch.mock.callCount(), 0);
 });
 
-test('real publisher certificates and proofs authenticate direct, descendant, empty and paginated blocks', async () => {
+nativeTest('real publisher certificates and proofs authenticate direct, descendant, empty and paginated blocks', async () => {
     // Block 1 is certified directly, and verification material is normalized before use.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
@@ -318,7 +344,7 @@ test('real publisher certificates and proofs authenticate direct, descendant, em
     assert.equal(transaction.location, last.transactions.at(-1)!.location);
 });
 
-test('transaction details expose authenticated fields and exact owning block position', async () => {
+nativeTest('transaction details expose authenticated fields and exact owning block position', async () => {
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     const wire = structuredClone(fixture.transactionBundle);
@@ -336,7 +362,7 @@ test('transaction details expose authenticated fields and exact owning block pos
     assert.equal(details.target.height, page.target.height);
 });
 
-test('repeated certificates reuse only the last authenticated target and still hash transaction bodies', async (t) => {
+nativeTest('repeated certificates reuse only the last authenticated target and still hash transaction bodies', async (t) => {
     // Prime the cache with a different certificate, then count header and body hashes. The
     // certified header for block 1 is the last bytes of its certificate.
     const fixture = await publisherFixture();
@@ -367,7 +393,7 @@ test('repeated certificates reuse only the last authenticated target and still h
     assert.equal(bodyHashes(), 9);
 });
 
-test('certificate reuse requires every signed and unsigned byte to match', async () => {
+nativeTest('certificate reuse requires every signed and unsigned byte to match', async () => {
     // Flip a signature byte, a header byte, or append a byte. Each change must fail full
     // verification and leave the cached good certificate usable.
     const fixture = await publisherFixture();
@@ -387,7 +413,7 @@ test('certificate reuse requires every signed and unsigned byte to match', async
     }
 });
 
-test('returned target buffers cannot mutate a reused certificate target', async () => {
+nativeTest('returned target buffers cannot mutate a reused certificate target', async () => {
     // Zero every buffer in a fresh result and a cached result, then verify again unchanged.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
@@ -404,7 +430,7 @@ test('returned target buffers cannot mutate a reused certificate target', async 
     assert.deepEqual(await verifyBlockBundle({ ...opts, height: 1n }, fixture.directBlock), expected);
 });
 
-test('single-transaction finalization requires membership and the requested digest', async () => {
+nativeTest('single-transaction finalization requires membership and the requested digest', async () => {
     // The covering certificate is above the block, yet finalization reports the owning block.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), digest: fixture.transactionDigest };
@@ -430,7 +456,7 @@ test('single-transaction finalization requires membership and the requested dige
     assert.deepEqual(observed, []);
 });
 
-test('a real transaction proof does not authenticate altered saved submission fields', async () => {
+nativeTest('a real transaction proof does not authenticate altered saved submission fields', async () => {
     const fixture = await publisherFixture();
     const proof = await verifyTransactionBundle({
         ...fixtureOptions(fixture), digest: fixture.transactionDigest,
@@ -457,7 +483,7 @@ test('a real transaction proof does not authenticate altered saved submission fi
     }
 });
 
-test('historical block appends remain provable below a later inactivity floor', async () => {
+nativeTest('historical block appends remain provable below a later inactivity floor', async () => {
     // Locations below the covering target's start remain provable through the transaction root.
     const fixture = await publisherFixture();
     const block = await verifyBlockBundle({ ...fixtureOptions(fixture), height: 1n }, fixture.historicalBlock);
@@ -466,7 +492,7 @@ test('historical block appends remain provable below a later inactivity floor', 
     assert.ok(block.transactions.every(({ location }) => location < block.target.transactionsStart));
 });
 
-test('historical single transactions remain provable below a later inactivity floor', async () => {
+nativeTest('historical single transactions remain provable below a later inactivity floor', async () => {
     // The proven location lies below the start of a later covering target.
     const fixture = await publisherFixture();
     const proof = await verifyTransactionBundle({ ...fixtureOptions(fixture), digest: fixture.historicalDigest }, fixture.historicalTransaction);
@@ -475,7 +501,7 @@ test('historical single transactions remain provable below a later inactivity fl
     assert.ok(proof.location < covering.target.transactionsStart);
 });
 
-test('historical account activity remains provable below the snapshot inactivity floor', async () => {
+nativeTest('historical account activity remains provable below the snapshot inactivity floor', async () => {
     // At least one activity row lies below the snapshot's transaction range start.
     const fixture = await publisherFixture();
     const bundle = await verifyAccountBundle({ ...fixtureOptions(fixture), account: fixture.account }, fixture.accountWithHistory);
@@ -484,7 +510,7 @@ test('historical account activity remains provable below the snapshot inactivity
     assert.ok(bundle.page.rows.some(({ location }) => location < bundle.target.transactionsStart));
 });
 
-test('cached verifiers remain bound to their BLS verification material', async () => {
+nativeTest('cached verifiers remain bound to their BLS verification material', async () => {
     // Cache a verifier for the real material, then try a valid but different group key.
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), height: 1n };
@@ -503,7 +529,7 @@ test('cached verifiers remain bound to their BLS verification material', async (
     assert.deepEqual(await verifyBlockBundle(opts, fixture.directBlock), expected);
 });
 
-test('canceling one concurrent aggregate load leaves the other caller independent', async (t) => {
+nativeTest('canceling one concurrent aggregate load leaves the other caller independent', async (t) => {
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const first = new AbortController();
@@ -543,40 +569,137 @@ test('canceling one concurrent aggregate load leaves the other caller independen
     assert.equal(fetch.mock.callCount(), 2);
 });
 
-test('account rows derive fields from authenticated bodies and keep the snapshot across pages', async () => {
-    // The first page derives direction, counterparty, and value from the signed bodies.
+nativeTest('account rows derive authenticated indices and pin the account version across pages', async () => {
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const first = await verifyAccountBundle(opts, fixture.accountBundle);
     assert.equal(first.target.height, 3n);
     assert.ok(first.account);
+    assert.equal(first.account.txCount, 58n);
+    assert.equal(first.account.writeHeight, 3n);
+    assert.equal(first.account.timestampMs, 3n);
     assert.equal(first.page.rows.length, 10);
     assert.equal(first.page.rows[0]!.direction, 'sent');
     assert.equal(first.page.rows[0]!.counterparty, fixture.account);
     assert.equal(first.page.rows[0]!.value, 1n);
-
-    // The next page stays on the first page's snapshot and returns no repeated transactions.
-    const next = await verifyAccountBundle({ ...opts, cursor: first.page.nextCursor, at: { height: first.target.height, blockDigest: first.target.blockDigest } }, fixture.accountNext);
-    assert.equal(next.page.rows[0]!.blockIndex, 44);
+    assert.equal(first.page.rows[0]!.accountIndex, 57n);
+    assert.equal(first.page.rows[0]!.senderIndex, first.page.rows[0]!.recipientIndex);
+    assert.equal(first.page.rows.filter((row) => row.digest === first.page.rows[0]!.digest).length, 1);
+    assert.ok(first.page.rows.every((row) => !('height' in row) && !('blockIndex' in row)));
+    assert.deepEqual(first.page.nextCursor, accountCursor(48n));
+    const pinned = { ...opts, at: { height: first.target.height, blockDigest: first.target.blockDigest },
+        accountLocation: first.account.location, expectedTxCount: first.account.txCount };
+    const next = await verifyAccountBundle({ ...pinned, cursor: first.page.nextCursor }, fixture.accountNext);
+    assert.equal(next.page.rows[0]!.accountIndex, 47n);
     assert.ok(next.page.rows.every((row) => !first.page.rows.some((prior) => prior.digest === row.digest)));
+    const oldest = await verifyAccountBundle({ ...pinned, cursor: accountCursor(3n) }, fixture.accountOldest);
+    assert.deepEqual(oldest.page.rows.map((row) => row.accountIndex), [2n, 1n, 0n]);
+    assert.equal(oldest.page.nextCursor, null);
+    const exhausted = await verifyAccountBundle({ ...pinned, cursor: accountCursor(0n) }, fixture.accountExhausted);
+    assert.deepEqual(exhausted.page, { rows: [], nextCursor: null });
+    assert.deepEqual(exhausted.account, first.account);
 
-    // Received mode, balance-only, and missing account updates each verify independently.
-    const received = await verifyAccountBundle({ ...opts, account: fixture.recipient, mode: 'received' }, fixture.recipientBundle);
+    const received = await verifyAccountBundle({ ...opts, account: fixture.recipient }, fixture.recipientBundle);
     assert.ok(received.page.rows.every((row) => row.direction === 'received' && row.counterparty === fixture.account));
+    assert.equal(received.account?.txCount, 56n);
     const onlyState = await verifyAccountBundle({ ...opts, includeTransactions: false }, fixture.accountStateOnly);
-    assert.deepEqual(onlyState.page.rows, []);
+    assert.deepEqual(onlyState.page, { rows: [], nextCursor: null });
     assert.deepEqual(onlyState.account, first.account);
-    const unknown = await verifyAccountBundle(opts, { ...fixture.accountBundle, account: null });
+    await assert.rejects(verifyAccountBundle(opts, { ...fixture.accountBundle, account: null }), /missing account proof/);
+    const unknown = await verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, fixture.unknownAccount);
+    assert.equal(unknown.kind, 'exclusion');
     assert.equal(unknown.account, null);
-    assert.equal(unknown.page.rows.length, 10);
+    assert.equal(unknown.absence?.accountKey, '00'.repeat(32));
+    assert.equal(unknown.absence?.timestampMs, unknown.target.timestampMs);
+    assert.deepEqual(unknown.page, { rows: [], nextCursor: null });
 
-    // A later visibility floor does not change the authenticated snapshot.
-    const laterFloor = await verifyAccountBundle(opts, { ...fixture.accountBundle, sequenceNumber: '18446744073709551615' });
-    assert.deepEqual(laterFloor.account, first.account);
-    assert.deepEqual(laterFloor.page, first.page);
+    const laterSequence = await verifyAccountBundle(opts, { ...fixture.accountBundle, sequenceNumber: '18446744073709551615' });
+    assert.deepEqual(laterSequence.account, first.account);
+    assert.deepEqual(laterSequence.page, first.page);
 });
 
-test('the full supported WebAuthn encoding verifies at the 919-byte boundary', async () => {
+nativeTest('native exclusion authenticates only absence at its exact certified root', async () => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), account: '00'.repeat(32) };
+    const absent = await verifyAccountBundle(opts, fixture.unknownAccount);
+    assert.equal(absent.kind, 'exclusion');
+    assert.ok(absent.absence);
+    assert.equal(absent.absence.accountKey, opts.account);
+    assert.equal(absent.absence.timestampMs, absent.target.timestampMs);
+    assert.ok(absent.absence.proofSizeBytes > 0);
+    assert.equal(absent.account, null);
+    assert.deepEqual(absent.page, { rows: [], nextCursor: null });
+    assert.deepEqual(absent.transactionProofs, []);
+    for (const field of ['balance', 'nonce', 'nonceBitmap', 'txCount', 'writeHeight']) {
+        assert.equal(field in absent.absence, false);
+    }
+    assert.ok(absent.absence.location < absent.target.stateTip);
+    assert.ok(absent.absence.span === null || /^[0-9a-f]{64}$/.test(absent.absence.span.lower + absent.absence.span.upper.slice(64)));
+    assert.equal(blockRecency(absent.target.timestampMs, Number(absent.target.timestampMs)).kind, 'recent');
+    assert.equal(blockRecency(absent.target.timestampMs, Number(absent.target.timestampMs) + 61_000).kind, 'stale');
+
+    await assert.rejects(verifyAccountBundle({ ...opts, account: fixture.account }, fixture.unknownAccount));
+    const otherRoot = structuredClone(fixture.unknownAccount);
+    assert.notEqual(otherRoot.certificate, fixture.directBlock.certificate);
+    otherRoot.certificate = fixture.directBlock.certificate;
+    await assert.rejects(verifyAccountBundle(opts, otherRoot));
+
+    const account = fixture.unknownAccount.account!;
+    for (const proof of ['', account.proof.slice(0, -2), account.proof + '00',
+        (Number.parseInt(account.proof.slice(0, 2), 16) ^ 0xff).toString(16).padStart(2, '0') + account.proof.slice(2)]) {
+        await assert.rejects(verifyAccountBundle(opts, { ...fixture.unknownAccount, account: { ...account, proof } }));
+    }
+    for (const extra of [{ account: null }, { headers: [fixture.descendantBlock.headers[0]!] },
+        { transactions: [fixture.accountBundle.transactions[0]!] }, { transactionsProof: fixture.accountBundle.transactionsProof },
+        { nextCursor: '0000000000000000' }]) {
+        await assert.rejects(verifyAccountBundle(opts, { ...fixture.unknownAccount, ...extra }));
+    }
+    for (const metadata of [{ location: '1' }, { writeHeight: '1' }]) {
+        await assert.rejects(verifyAccountBundle(opts, { ...fixture.unknownAccount, account: { ...account, ...metadata } }), /inclusion metadata/);
+    }
+});
+
+nativeTest('native empty-database proof authenticates absence without account metadata', async () => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), account: '00'.repeat(32) };
+    const empty = await verifyAccountBundle(opts, fixture.emptyAccount);
+    assert.equal(empty.kind, 'exclusion');
+    assert.equal(empty.account, null);
+    assert.equal(empty.absence?.accountKey, opts.account);
+    assert.deepEqual(empty.page, { rows: [], nextCursor: null });
+    assert.deepEqual(empty.transactionProofs, []);
+    const otherKey = await verifyAccountBundle({ ...opts, account: 'ff'.repeat(32) }, fixture.emptyAccount);
+    assert.equal(otherKey.kind, 'exclusion');
+    const forged = structuredClone(fixture.emptyAccount);
+    forged.certificate = fixture.accountBundle.certificate;
+    await assert.rejects(verifyAccountBundle(opts, forged));
+});
+
+nativeTest('native proof claims cannot exchange inclusion and exclusion', async () => {
+    const fixture = await publisherFixture();
+    const opts = fixtureOptions(fixture);
+    const hit = structuredClone(fixture.accountStateOnly);
+    delete hit.account!.encodedOperation;
+    hit.account!.exclusion = true;
+    hit.account!.location = '0';
+    hit.account!.writeHeight = '0';
+    await assert.rejects(verifyAccountBundle({ ...opts, account: fixture.account, includeTransactions: false }, hit));
+
+    const miss = structuredClone(fixture.unknownAccount);
+    delete miss.account!.exclusion;
+    miss.account!.encodedOperation = fixture.accountBundle.account!.encodedOperation;
+    await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, miss));
+    for (const claim of [{ exclusion: false }, { exclusion: true, encodedOperation: fixture.accountBundle.account!.encodedOperation }]) {
+        await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, {
+            ...fixture.unknownAccount, account: { ...fixture.unknownAccount.account!, ...claim },
+        }), /one inclusion or exclusion claim/);
+    }
+    await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, {
+        ...fixture.unknownAccount, account: { location: '0', writeHeight: '0', proof: fixture.unknownAccount.account!.proof },
+    }), /one inclusion or exclusion claim/);
+});
+
+nativeTest('the full supported WebAuthn encoding verifies at the 919-byte boundary', async () => {
     // A maximum-size WebAuthn transaction verifies alone and within its block.
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
@@ -596,41 +719,28 @@ test('the full supported WebAuthn encoding verifies at the 919-byte boundary', a
     await assert.rejects(verifyTransactionBundle({ ...opts, digest: fixture.webauthnDigest }, malformed), /oversized signed transaction/);
 });
 
-test('self-transfer roles share one proven location and SQL display hints cannot change authenticated fields', async () => {
-    // Present one self-transfer as both its received and sent rows under one multiproof.
+nativeTest('a self-transfer appears once and untrusted display hints cannot change authenticated fields', async () => {
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
-    const self = fixture.transactionBundle.transactions[0]!;
-    const wire = {
-        ...fixture.accountBundle,
-        transactions: [{ ...self, role: 1 }, { ...self, role: 0 }],
-        transactionsProof: fixture.transactionBundle.transactionsProof,
-        nextCursor: null,
-    };
-    const verified = await verifyAccountBundle(opts, wire);
-    assert.deepEqual(verified.page.rows.map(({ direction }) => direction), ['received', 'sent']);
-    assert.ok(verified.page.rows.every(({ counterparty }) => counterparty === fixture.account));
-    assert.equal(verified.transactionProofs[0]!.location, verified.transactionProofs[1]!.location);
-
-    // Extra unauthenticated fields on the rows are ignored.
-    const hints = { ...wire, transactions: wire.transactions.map((row) => ({
-        ...row, value: '999999', nonce: '999999', sender: 'ff'.repeat(32), recipient: 'ee'.repeat(32), digest: 'dd'.repeat(32),
-    })) };
+    const verified = await verifyAccountBundle(opts, fixture.accountBundle);
+    const self = verified.page.rows[0]!;
+    assert.equal(self.counterparty, fixture.account);
+    assert.equal(self.direction, 'sent');
+    const hints = structuredClone(fixture.accountBundle);
+    Object.assign(hints.transactions[0]!, { value: '999999', nonce: '999999', sender: 'ff'.repeat(32), recipient: 'ee'.repeat(32), digest: 'dd'.repeat(32), height: '999', index: 999 });
     assert.deepEqual(await verifyAccountBundle(opts, hints), verified);
-
-    // A duplicated role or a conflicting index at the same location is rejected.
-    await assert.rejects(verifyAccountBundle(opts, { ...wire, transactions: [wire.transactions[1]!, wire.transactions[1]!] }));
-    await assert.rejects(verifyAccountBundle(opts, { ...wire, transactions: [{ ...wire.transactions[0]!, index: self.index + 1 }, wire.transactions[1]!] }));
+    const duplicate = structuredClone(fixture.accountBundle);
+    duplicate.transactions[1] = { ...duplicate.transactions[0]! };
+    await assert.rejects(verifyAccountBundle(opts, duplicate));
 });
 
-test('every aggregate view uses one typed RPC with locally verified evidence', async (t) => {
+nativeTest('every aggregate view uses one typed RPC with locally verified evidence', async (t) => {
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     const urls: string[] = [];
     const handler = explorerFetch({
         getAccount(request) {
             assert.deepEqual(request.account, fromHex(fixture.account));
-            assert.equal(request.mode, ActivityMode.ALL);
             assert.equal(request.activity, true);
             assert.equal(request.cursor, undefined);
             assert.equal(request.at, undefined);
@@ -665,7 +775,28 @@ test('every aggregate view uses one typed RPC with locally verified evidence', a
         `${options.indexerUrl}/constantinople.explorer.v1.ExplorerService/${method}`));
 });
 
-test('real aggregate proofs reject altered certificates, ancestry, positions, bodies and cursors', async () => {
+nativeTest('typed account continuation sends the first verified account location and snapshot', async (t) => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), account: fixture.account };
+    const first = await verifyAccountBundle(opts, fixture.accountBundle);
+    assert.ok(first.account);
+    let requests = 0;
+    t.mock.method(globalThis, 'fetch', explorerFetch({ getAccount(request) {
+        requests++;
+        assert.deepEqual(request.cursor, first.page.nextCursor);
+        assert.equal(request.at, first.target.height);
+        assert.deepEqual(request.digest, first.target.blockDigest);
+        assert.equal(request.accountLocation, first.account!.location);
+        return rpcBundle(fixture.accountNext);
+    } }));
+    const next = await loadAccountBundle({ ...opts, cursor: first.page.nextCursor,
+        at: { height: first.target.height, blockDigest: first.target.blockDigest },
+        accountLocation: first.account.location, expectedTxCount: first.account.txCount });
+    assert.equal(next.page.rows[0]!.accountIndex, 47n);
+    assert.equal(requests, 1);
+});
+
+nativeTest('real aggregate proofs reject altered certificates, ancestry, positions, bodies and cursors', async () => {
     const fixture = await publisherFixture();
     const opts = fixtureOptions(fixture);
     const mutated = (value: string, byte = 0) => {
@@ -683,6 +814,8 @@ test('real aggregate proofs reject altered certificates, ancestry, positions, bo
         (wire: WireBundle) => { wire.transactions[0]!.location = '0'; },
         (wire: WireBundle) => { wire.transactions[0]!.height = '1'; },
         (wire: WireBundle) => { wire.transactions[0]!.index++; },
+        (wire: WireBundle) => { wire.transactions[0]!.senderIndex = (BigInt(wire.transactions[0]!.senderIndex) + 1n).toString(); },
+        (wire: WireBundle) => { wire.transactions[0]!.recipientIndex = (BigInt(wire.transactions[0]!.recipientIndex) + 1n).toString(); },
         (wire: WireBundle) => { wire.transactions[0]!.body = mutated(wire.transactions[0]!.body, 34); },
         (wire: WireBundle) => { wire.transactions[0]!.body = mutated(wire.transactions[0]!.body, 66); },
         (wire: WireBundle) => { wire.transactions[0]!.body = mutated(wire.transactions[0]!.body, 74); },
@@ -703,17 +836,72 @@ test('real aggregate proofs reject altered certificates, ancestry, positions, bo
     const first = await verifyAccountBundle(accountOpts, fixture.accountBundle);
     await assert.rejects(verifyAccountBundle({ ...accountOpts, at: { height: 3n, blockDigest: new Uint8Array(32) } }, fixture.accountBundle), /requested snapshot/);
     await assert.rejects(verifyAccountBundle({ ...accountOpts, account: fixture.recipient }, fixture.accountBundle));
-    await assert.rejects(verifyAccountBundle(accountOpts, { ...fixture.accountBundle, nextCursor: '00'.repeat(24) }), /cursor/);
+    await assert.rejects(verifyAccountBundle(accountOpts, { ...fixture.accountBundle, nextCursor: '00'.repeat(8) }), /cursor/);
     const changedState = structuredClone(fixture.accountBundle);
     changedState.account!.proof = mutated(changedState.account!.proof);
     await assert.rejects(verifyAccountBundle(accountOpts, changedState));
     const changedLocation = structuredClone(fixture.accountBundle);
     changedLocation.account!.location = '0';
     await assert.rejects(verifyAccountBundle(accountOpts, changedLocation));
-    await assert.rejects(verifyAccountBundle({ ...accountOpts, cursor: first.page.nextCursor, at: { height: 3n, blockDigest: first.target.blockDigest } }, fixture.accountBundle), /after requested cursor/);
+    assert.ok(first.account);
+    await assert.rejects(verifyAccountBundle({ ...accountOpts, cursor: first.page.nextCursor, at: { height: 3n, blockDigest: first.target.blockDigest }, accountLocation: first.account.location, expectedTxCount: first.account.txCount }, fixture.accountBundle), /count interval|descending interval/);
 });
 
-test('cancellation during finalization never returns a completed proof or account page', async () => {
+nativeTest('native account pages reject missing, repeated, reordered and hidden invalid history', async () => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), account: fixture.account };
+    const baseline = await verifyAccountBundle(opts, fixture.accountBundle);
+    assert.equal(baseline.page.rows.length, 10);
+    for (const mutate of [
+        (wire: WireBundle) => { wire.transactions.splice(4, 1); },
+        (wire: WireBundle) => { wire.transactions[1] = { ...wire.transactions[0]! }; },
+        (wire: WireBundle) => { [wire.transactions[1], wire.transactions[2]] = [wire.transactions[2]!, wire.transactions[1]!]; },
+        (wire: WireBundle) => { wire.transactions[1]!.location = wire.transactions[0]!.location; },
+        (wire: WireBundle) => { wire.transactions[0]!.senderIndex = (BigInt(wire.transactions[0]!.senderIndex) + 1n).toString(); },
+        (wire: WireBundle) => { wire.transactions[0]!.recipientIndex = (BigInt(wire.transactions[0]!.recipientIndex) + 1n).toString(); },
+        (wire: WireBundle) => { wire.transactions[0]!.role = 1; },
+        (wire: WireBundle) => { wire.nextCursor = null; },
+        (wire: WireBundle) => { wire.nextCursor = toHex(accountCursor(47n)); },
+    ]) {
+        const wire = structuredClone(fixture.accountBundle);
+        mutate(wire);
+        await assert.rejects(verifyAccountBundle(opts, wire));
+    }
+    await assert.rejects(verifyAccountBundle(opts, fixture.recipientBundle));
+});
+
+nativeTest('native account state binds its writer, snapshot, location and transaction count', async () => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), account: fixture.account };
+    const first = await verifyAccountBundle(opts, fixture.accountBundle);
+    assert.ok(first.account);
+    const pinned = { ...opts, at: { height: first.target.height, blockDigest: first.target.blockDigest },
+        accountLocation: first.account.location, expectedTxCount: first.account.txCount, cursor: first.page.nextCursor };
+    await assert.rejects(verifyAccountBundle({ ...pinned, accountLocation: first.account.location + 1n }, fixture.accountNext), /pinned account location/);
+    for (const expectedTxCount of [57n, 59n, (1n << 64n) - 1n]) {
+        await assert.rejects(verifyAccountBundle({ ...pinned, expectedTxCount }, fixture.accountNext), /pinned transaction count/);
+    }
+    await assert.rejects(verifyAccountBundle({ ...pinned, at: { ...pinned.at, height: 2n } }, fixture.accountNext), /requested snapshot/);
+    await assert.rejects(verifyAccountBundle({ ...pinned, at: { ...pinned.at, blockDigest: new Uint8Array(32) } }, fixture.accountNext), /requested snapshot/);
+    for (const writeHeight of ['0', '1', '2', '4']) {
+        const wire = structuredClone(fixture.accountBundle);
+        wire.account!.writeHeight = writeHeight;
+        if (writeHeight === '1' || writeHeight === '2') wire.headers = [...fixture.descendantBlock.headers];
+        await assert.rejects(verifyAccountBundle(opts, wire), /write height|writing block|height|integer/);
+    }
+});
+
+nativeTest('cancellation while native account verification is pending returns no page', async () => {
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), account: fixture.account };
+    await verifyAccountBundle(opts, fixture.accountBundle);
+    const controller = new AbortController();
+    await assert.rejects(verifyAccountBundle({ ...opts, signal: controller.signal,
+        onFinalizationVerified: () => { queueMicrotask(() => controller.abort(new Error('account switched during state proof'))); },
+    }, fixture.accountBundle), /account switched during state proof/);
+});
+
+nativeTest('cancellation during finalization never returns a completed proof or account page', async () => {
     // Abort from the finalization callback. Verification must stop with that reason.
     const fixture = await publisherFixture();
     const controller = new AbortController();
@@ -725,7 +913,7 @@ test('cancellation during finalization never returns a completed proof or accoun
     assert.equal(finalized, 1);
 });
 
-test('a fetch completing after cancellation cannot publish the previous request', async (t) => {
+nativeTest('a fetch completing after cancellation cannot publish the previous request', async (t) => {
     const fixture = await publisherFixture();
     const controller = new AbortController();
     t.after(() => controller.abort());
@@ -755,24 +943,31 @@ test('a fetch completing after cancellation cannot publish the previous request'
     assert.equal(finalized, false);
 });
 
-test('standalone WASM proves the existing multiproof without transport and rejects changed context', async () => {
-    // The fixture multiproof verifies directly against its root, tip, and expected digests.
-    const fixture = JSON.parse(await readFile(new URL('../../tests/fixtures/transactionActivityProof.json', import.meta.url), 'utf8')) as {
-        root: string; tip: string; proof: string; operations: Array<{ location: string; digest: string }>;
-    };
+test('standalone WASM verifies full history48 values and rejects changed context', async (t) => {
+    // Native history values verify directly against the certified root and tip.
+    const fixture = await readFixture<{
+        root: string; tip: string; proof: string; operations: Array<{ location: string; digest: string; value: string }>;
+    }>('transactionActivityProof');
+    const skip = nativeFixtureSkip(nativeActivityFixtureIssue(fixture));
+    if (skip) { t.skip(skip); return; }
     const verifier = new QmdbProofVerifier({ merkleFamily: 'mmr', hashFamily: 'sha256' });
-    const expected = fixture.operations.map((operation) => ({ location: BigInt(operation.location), value: fromHex(operation.digest) }));
+    const expected = fixture.operations.map((operation) => ({ location: BigInt(operation.location), value: fromHex(operation.value) }));
     const prove = (root = fromHex(fixture.root), tip = BigInt(fixture.tip), entries = expected, proof = fromHex(fixture.proof)) =>
         verifier.verifyFixedKeylessAppendMany(proof, { tip }, root, entries);
     const verified = await prove();
     assert.equal(verified.proofSizeBytes, fixture.proof.length / 2);
     assert.deepEqual(verified.operations.map(({ location }) => location), expected.map(({ location }) => location));
 
-    // Changing the root, tip, a location, a digest, or a proof byte must fail.
+    // Changing the root, tip, a location, a full history value, or a proof byte must fail.
     await assert.rejects(prove(new Uint8Array(32)));
     await assert.rejects(prove(undefined, BigInt(fixture.tip) + 1n));
     await assert.rejects(prove(undefined, undefined, expected.map((entry, index) => index === 0 ? { ...entry, location: 0n } : entry)));
-    await assert.rejects(prove(undefined, undefined, expected.map((entry, index) => index === 0 ? { ...entry, value: new Uint8Array(32) } : entry)));
+    await assert.rejects(prove(undefined, undefined, expected.map((entry, index) => index === 0 ? { ...entry, value: new Uint8Array(48) } : entry)));
+    for (const offset of [32, 40]) {
+        const entries = structuredClone(expected);
+        entries[0]!.value[offset] ^= 1;
+        await assert.rejects(prove(undefined, undefined, entries));
+    }
     const proof = fromHex(fixture.proof); proof[proof.length - 1] ^= 1;
     await assert.rejects(prove(undefined, undefined, undefined, proof));
 });
