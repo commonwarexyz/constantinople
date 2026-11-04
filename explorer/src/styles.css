@@ -482,6 +482,7 @@ button:disabled {
 /* Homepage: histogram, statistics, block log */
 
 .histogram-frame {
+    --histogram-column: 8px;
     flex: 0 0 auto;
     width: 100%;
     display: flex;
@@ -489,54 +490,36 @@ button:disabled {
     overflow: hidden;
 }
 
-/* The ASCII histogram sizes its glyph grid in pixels so columns fit the frame; it is exempt from
-   the text tokens. */
+/*
+ * The histogram is a row of fixed-pixel-width columns, one per observed block, right-aligned so
+ * new batches append without sliding. Bars are boxes rather than glyphs so adjacent columns meet
+ * without seams. It is exempt from the text tokens.
+ */
 .histogram {
-    width: max-content;
-    max-width: 100%;
+    width: 100%;
     height: clamp(90px, 13.5vh, 165px);
     margin: 0;
     display: flex;
-    flex-direction: column;
+    align-items: flex-end;
     justify-content: flex-end;
     padding: 0 0 clamp(0.75rem, 1.4vw, 1.5rem);
     border-bottom: 1px solid var(--theme-border);
-    font-family: var(--font-family-mono);
-    font-size: 14px;
-    line-height: 1;
-    letter-spacing: 0;
     overflow: hidden;
-    white-space: pre;
-    justify-self: center;
-    position: relative;
 }
 
-.histogram__plot {
-    position: relative;
-    color: var(--theme-accent);
-    display: flex;
-    flex-direction: column;
-    flex: 0 0 auto;
-    width: max-content;
+/*
+ * A bar's height is its block's share of the visible peak; an actual empty block is a dim
+ * baseline tick, so a run of empty blocks reads as a thin dim line rather than a bead chain.
+ */
+.histogram__column {
+    flex: 0 0 var(--histogram-column);
+    height: calc(var(--bar, 0) * 100%);
+    background: var(--theme-accent);
 }
 
-.histogram__line {
-    display: block;
-}
-
-.histogram__zeros {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    color: var(--theme-text-dim);
-}
-
-.histogram__measure {
-    position: absolute;
-    top: 0;
-    left: 0;
-    visibility: hidden;
-    pointer-events: none;
+.histogram__column--empty {
+    height: 2px;
+    background: var(--theme-text-dim);
 }
 
 .observed-stats {
@@ -1195,13 +1178,12 @@ button:disabled {
     }
 
     .histogram-frame {
+        --histogram-column: 4px;
         height: clamp(140px, 28dvh, 260px);
     }
 
     .histogram {
-        width: 100%;
         height: 100%;
-        font-size: 7px;
         padding-bottom: 0;
         border-bottom: none;
     }
@@ -1339,8 +1321,8 @@ button:disabled {
         display: none;
     }
 
-    .histogram {
-        font-size: 6px;
+    .histogram-frame {
+        --histogram-column: 3px;
     }
 }
 
