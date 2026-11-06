@@ -2,10 +2,39 @@
 
 use super::db::TransactionHistoryTarget;
 use crate::executor::PreparedTransfer;
-use ahash::AHashMap;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_storage::{mmr, qmdb::any::batch::Slot};
 use constantinople_primitives::{Account, AccountKey, SealedBlock, TransactionHistoryEntry};
+use std::{collections::HashMap, hash::BuildHasherDefault};
+
+/// Hashes an account key by its leading eight bytes. Keys are public keys, so the prefix is
+/// already uniform, and the map still compares full keys, so a collision only costs a probe.
+#[derive(Default)]
+struct KeyPrefixHasher(u64);
+
+impl std::hash::Hasher for KeyPrefixHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(prefix) = bytes.first_chunk::<8>() {
+            self.0 = u64::from_le_bytes(*prefix);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// The settled transaction count of every `Put` slot, in slot order. A compact stand-in for
+/// the slots so entry derivation can run beside the state merkleize without copying them.
+pub(super) fn tx_counts(slots: &[Slot<Account>]) -> Vec<Option<u64>> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Slot::Put(account) => Some(account.tx_count),
+            Slot::Keep | Slot::Delete => None,
+        })
+        .collect()
+}
 
 /// Derives block-order indices from the settled counts of an accepted body.
 ///
@@ -15,16 +44,13 @@ use constantinople_primitives::{Account, AccountKey, SealedBlock, TransactionHis
 pub(super) fn entries<D: Digest>(
     accepted: impl DoubleEndedIterator<Item = (PreparedTransfer, D)> + ExactSizeIterator,
     keys: &[AccountKey],
-    slots: &[Slot<Account>],
+    counts: &[Option<u64>],
 ) -> Vec<TransactionHistoryEntry<D>> {
-    assert_eq!(keys.len(), slots.len());
-    let mut counts: AHashMap<_, _> = keys
+    assert_eq!(keys.len(), counts.len());
+    let mut counts: HashMap<_, _, BuildHasherDefault<KeyPrefixHasher>> = keys
         .iter()
-        .zip(slots)
-        .filter_map(|(key, slot)| match slot {
-            Slot::Put(account) => Some((*key, account.tx_count)),
-            Slot::Keep | Slot::Delete => None,
-        })
+        .zip(counts)
+        .filter_map(|(key, count)| count.map(|count| (*key, count)))
         .collect();
     let mut result = Vec::with_capacity(accepted.len());
     for (transfer, digest) in accepted.rev() {
@@ -149,7 +175,10 @@ mod tests {
         }
         let mut keys = selection.keys().to_vec();
         let mut slots = account_slots(selection.settle(&Sequential));
-        assert_eq!(entries(accepted.iter().copied(), &keys, &slots), expected);
+        assert_eq!(
+            entries(accepted.iter().copied(), &keys, &tx_counts(&slots)),
+            expected
+        );
         for (key, slot) in keys.iter().zip(&slots) {
             if let Slot::Put(account) = slot {
                 assert_eq!(account.tx_count, counts[key]);
@@ -158,7 +187,10 @@ mod tests {
 
         keys.reverse();
         slots.reverse();
-        assert_eq!(entries(accepted.iter().copied(), &keys, &slots), expected);
+        assert_eq!(
+            entries(accepted.iter().copied(), &keys, &tx_counts(&slots)),
+            expected
+        );
 
         let body: Vec<_> = accepted.iter().map(|(transfer, _)| *transfer).collect();
         for seed in [0, 1, 2] {
@@ -170,7 +202,7 @@ mod tests {
                 .collect();
             let slots = account_slots(plan.settle(&starting_accounts(reads), &Sequential).unwrap());
             assert_eq!(
-                entries(accepted.iter().copied(), plan.keys(), &slots),
+                entries(accepted.iter().copied(), plan.keys(), &tx_counts(&slots)),
                 expected
             );
         }

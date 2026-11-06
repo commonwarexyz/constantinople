@@ -149,8 +149,8 @@ where
     compute_with(batch, transfers, strategy, |_, slots| slots).await
 }
 
-// The finish callback derives history while the plan still owns its key order,
-// without copying keys or slots or scheduling a second settlement job.
+// The finish callback runs inside the settlement job, while the plan still owns its key
+// order, so callers can keep what they need from the keys without a second job.
 async fn compute_with<E, H, S, R>(
     batch: StateBatch<E, H, EightCap, S>,
     transfers: Arc<Vec<PreparedTransfer>>,
@@ -463,19 +463,25 @@ where
         accounts = selection.keys().len().traced()
     );
     let work_size = selection.keys().len();
-    let (slots, entries) = strategy
+    let (slots, keys) = strategy
         .spawn(work_size, move |s: S| {
             settle_span.in_scope(|| {
                 let keys = selection.keys().to_vec();
                 let slots = executor::account_slots(selection.settle(&s));
-                let entries = history::entries(accepted.into_iter(), &keys, &slots);
-                (slots, entries)
+                (slots, keys)
             })
         })
         .await;
-    let apply_span = info_span!("application.execute.apply", txs = entries.len().traced());
-    let transaction_batch = strategy.spawn(entries.len(), move |_: S| {
-        apply_span.in_scope(|| apply_transaction_entries(transaction_batch, &entries))
+
+    // History entries derive from the settled counts but are not needed by the state
+    // merkleize, so their derivation and append run beside it instead of ahead of it.
+    let apply_span = info_span!("application.execute.apply", txs = accepted.len().traced());
+    let counts = history::tx_counts(&slots);
+    let transaction_batch = strategy.spawn(accepted.len(), move |_: S| {
+        apply_span.in_scope(|| {
+            let entries = history::entries(accepted.into_iter(), &keys, &counts);
+            apply_transaction_entries(transaction_batch, &entries)
+        })
     });
 
     let body_size = body.len().encode_size() + framed_bytes;
@@ -522,14 +528,20 @@ where
 
     let accepted = Arc::clone(&transfers);
     let (staged, settled) = compute_with(state_batch, transfers, &strategy, move |keys, slots| {
-        let entries = history::entries(accepted.iter().copied().zip(digests), keys, &slots);
-        (slots, entries)
+        (slots, keys.to_vec())
     })
     .await;
-    let (slots, entries) = settled.ok_or(STATIC_INVALID_TRANSACTION)?;
-    let apply_span = info_span!("application.execute.apply", txs = entries.len().traced());
-    let transaction_batch = strategy.spawn(entries.len(), move |_: S| {
-        apply_span.in_scope(|| apply_transaction_entries(transaction_batch, &entries))
+    let (slots, keys) = settled.ok_or(STATIC_INVALID_TRANSACTION)?;
+
+    // History entries derive from the settled counts but are not needed by the state
+    // merkleize, so their derivation and append run beside it instead of ahead of it.
+    let apply_span = info_span!("application.execute.apply", txs = accepted.len().traced());
+    let counts = history::tx_counts(&slots);
+    let transaction_batch = strategy.spawn(accepted.len(), move |_: S| {
+        apply_span.in_scope(|| {
+            let entries = history::entries(accepted.iter().copied().zip(digests), &keys, &counts);
+            apply_transaction_entries(transaction_batch, &entries)
+        })
     });
 
     Ok(finalize_child(
@@ -561,14 +573,15 @@ where
 
     let accepted = Arc::clone(&transfers);
     let (staged, settled) = compute_with(state_batch, transfers, &strategy, move |keys, slots| {
-        let entries = history::entries(accepted.iter().copied().zip(digests), keys, &slots);
-        (slots, entries)
+        (slots, keys.to_vec())
     })
     .await;
-    let (slots, entries) = settled.ok_or(STATIC_INVALID_TRANSACTION)?;
-    let apply_span = info_span!("application.execute.apply", txs = entries.len().traced());
-    let transaction_batch = strategy.spawn(entries.len(), move |_: S| {
+    let (slots, keys) = settled.ok_or(STATIC_INVALID_TRANSACTION)?;
+    let apply_span = info_span!("application.execute.apply", txs = accepted.len().traced());
+    let counts = history::tx_counts(&slots);
+    let transaction_batch = strategy.spawn(accepted.len(), move |_: S| {
         apply_span.in_scope(|| {
+            let entries = history::entries(accepted.iter().copied().zip(digests), &keys, &counts);
             apply_transaction_entries(transaction_batch, &entries)
                 .with_inactivity_floor(transaction_floor)
         })

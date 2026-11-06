@@ -1659,7 +1659,6 @@ dependencies = [
 name = "constantinople-application"
 version = "2026.7.0"
 dependencies = [
- "ahash",
  "bytes",
  "commonware-actor",
  "commonware-allocator",
