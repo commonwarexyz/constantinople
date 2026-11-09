@@ -29,7 +29,7 @@ use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
 use commonware_storage::{
     journal::contiguous::fixed::Config as JournalConfig,
     merkle::{Family as _, mem::Mem},
-    qmdb::{current::ordered::fixed::Db, floor::Proportional},
+    qmdb::{current::unordered::fixed::Db, floor::Proportional},
     translator::TwoCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, iter::NonEmpty, non_empty_range};

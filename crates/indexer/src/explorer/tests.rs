@@ -40,7 +40,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, buffer::paged::CacheRef};
 use commonware_storage::{
     journal::contiguous::fixed::Config as JournalConfig,
     merkle::{Family as _, mem::Mem},
-    qmdb::{current::ordered::fixed::Db, floor::Proportional},
+    qmdb::{current::unordered::fixed::Db, floor::Proportional},
     translator::TwoCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
@@ -416,10 +416,10 @@ async fn fixture_with_counts(
         };
         state_db = state_db.apply_batch(batch).await.unwrap();
         let account_location = state_db
-            .get_span(&account)
+            .key_value_proof(account)
             .await
-            .unwrap()
-            .map(|(loc, _)| loc.as_u64());
+            .ok()
+            .map(|proof| proof.loc.as_u64());
         let account_write_height = account_location.map(|location| {
             if location >= state_start.as_u64() {
                 height
@@ -802,26 +802,11 @@ fn verify_account_bundle(
     .unwrap()
 }
 
-fn assert_exclusion(bundle: &Value, key: AccountKey, block: &FixtureBlock) {
-    let VerifiedAccountLookup::Absent {
-        key: proven,
-        location,
-        ..
-    } = verify_account_bundle(bundle, key, block)
-    else {
-        panic!("expected an exclusion proof");
-    };
-    assert_eq!(proven, key);
-    assert!(location < block.block.header.state_range.end());
-    let account = &bundle["account"];
-    assert_eq!(account["location"], "0");
-    assert_eq!(account["writeHeight"], "0");
-    assert_eq!(account["exclusion"], true);
-    assert!(account.get("encodedOperation").is_none());
-    assert_eq!(bundle["headers"], json!([]));
-    assert_eq!(bundle["transactions"], json!([]));
-    assert!(bundle["transactionsProof"].is_null());
-    assert!(bundle["nextCursor"].is_null());
+/// Checks that an account without an active update is reported as not found. The unordered
+/// account database has no key spans, so absence carries no proof.
+async fn assert_not_found(router: &Router, request: &proto::GetAccountRequest) {
+    let (status, body) = post(router, "GetAccount", request.encode_to_vec()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
 }
 
 fn assert_lookup_context_rejected(bundle: &Value, key: AccountKey, block: &FixtureBlock) {
@@ -871,7 +856,7 @@ fn assert_lookup_context_rejected(bundle: &Value, key: AccountKey, block: &Fixtu
         exclusion
     ));
     if let Some(encoded) = operation.as_ref() {
-        assert_eq!(encoded.len(), 97);
+        assert_eq!(encoded.len(), 65);
         assert!(check(
             &proof,
             root,
@@ -896,7 +881,7 @@ fn assert_lookup_context_rejected(bundle: &Value, key: AccountKey, block: &Fixtu
             root,
             key.as_ref(),
             tip,
-            Some(encoded[..96].to_vec()),
+            Some(encoded[..64].to_vec()),
             false
         ));
         assert!(check(&proof, root, key.as_ref(), tip, operation, true));
@@ -998,16 +983,11 @@ fn account_pages_reject_untrusted_sql_hints() {
             ..Default::default()
         })
         .unwrap();
-        let AccountLookup::Absent(proof) = explorer.account_proof(&anchor, &missing).await.unwrap()
-        else {
-            panic!("a native miss must yield an exclusion without SQL metadata");
+        let error = match explorer.account_proof(&anchor, &missing).await {
+            Err(error) => error,
+            Ok(_) => panic!("a native miss must be reported as not found"),
         };
-        assert_eq!(proof.location, 0);
-        assert_eq!(proof.write_height, 0);
-        assert!(matches!(
-            proof.claim,
-            Some(proto::account_proof::Claim::Exclusion(true))
-        ));
+        assert_eq!(error.0, ErrorCode::NotFound);
         anchor.sql.deregister_table("account_meta").unwrap();
         anchor.sql.register_table("account_meta", table).unwrap();
         let schema = build_meta_schema(sql_meta_client(&environment.client).unwrap()).unwrap();
@@ -1538,38 +1518,24 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         assert_eq!(recipient["transactions"][0]["role"], 1);
         assert_transaction_proof(client, &recipient, &fixture.blocks[2]).await;
 
-        // Absence is authenticated at the same certified state boundary as a hit.
-        let unknown = proof_bundle(router, &proto::GetAccountRequest {
+        // An account without an active update is not found, with no absence proof.
+        let unknown = proto::GetAccountRequest {
             account: vec![0; 32],
             ..Default::default()
-        }).await;
-        let missing = AccountKey::from([0; 32]);
-        assert_exclusion(&unknown, missing, &fixture.blocks[2]);
-        assert_lookup_context_rejected(&unknown, missing, &fixture.blocks[2]);
-        let absent_proof = hex_bytes_dynamic(unknown["account"]["proof"].as_str().unwrap());
-        assert!(verify_current_account_lookup(
-            &absent_proof, fixture.blocks[2].block.header.state_root.as_ref(),
-            fixture.account.as_ref(), fixture.blocks[2].block.header.state_range.end() - 1,
-            None, true,
-        ).is_err());
+        };
+        assert_not_found(router, &unknown).await;
         let future_key = AccountKey::from_public_key(fixture.blocks[3].transactions[1].value().sender().unwrap());
         let future_request = proto::GetAccountRequest {
             account: future_key.as_ref().to_vec(), at: Some(3),
             digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
             ..Default::default()
         };
-        let future_absence = proof_bundle(router, &future_request).await;
-        assert_exclusion(&future_absence, future_key, &fixture.blocks[2]);
+        assert_not_found(router, &future_request).await;
 
         let empty_fixture = fixture_with_counts(context.child("empty_state"), &[0]).await;
         let empty_environment = FixtureStore::open(context.child("empty_store")).await;
         publish(&empty_environment.publisher, &empty_environment.reporter, &empty_fixture.blocks[0], true).await;
-        let empty_account = proof_bundle(&empty_environment.router, &proto::GetAccountRequest {
-            account: vec![0; 32], ..Default::default()
-        }).await;
-        assert_exclusion(&empty_account, missing, &empty_fixture.blocks[0]);
-        assert_exclusion(&empty_account, AccountKey::from([255; 32]), &empty_fixture.blocks[0]);
-        assert_lookup_context_rejected(&empty_account, missing, &empty_fixture.blocks[0]);
+        assert_not_found(&empty_environment.router, &unknown).await;
         empty_environment.close().await;
 
         // A transaction in block 2 proves through block 3's certificate.
@@ -1595,9 +1561,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         ] {
             assert_eq!(after_arrival[field], next[field], "pinned field {field} must not change");
         }
-        let frozen_absence = proof_bundle(router, &future_request).await;
-        assert_eq!(frozen_absence["account"], future_absence["account"]);
-        assert_exclusion(&frozen_absence, future_key, &fixture.blocks[2]);
+        assert_not_found(router, &future_request).await;
         let future_present = proof_bundle(router, &proto::GetAccountRequest {
             account: future_key.as_ref().to_vec(), activity: Some(false), ..Default::default()
         }).await;
@@ -1648,8 +1612,6 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
                 "accountExhausted": exhausted,
                 "accountStateOnly": state_only,
                 "recipientBundle": recipient,
-                "unknownAccount": unknown,
-                "emptyAccount": empty_account,
                 "transactionBundle": transaction,
                 "webauthnDigest": webauthn_digest,
                 "webauthnBlock": webauthn_block,

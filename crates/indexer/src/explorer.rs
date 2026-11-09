@@ -28,8 +28,7 @@ use commonware_cryptography_curve25519::signing::VerifyingKey;
 use commonware_storage::{
     merkle::{Location, mmr},
     qmdb::{
-        any::{ordered, value::FixedEncoding},
-        current::ordered::proof::constant::ExclusionProof,
+        any::{unordered, value::FixedEncoding},
         keyless,
     },
 };
@@ -49,8 +48,8 @@ use datafusion::arrow::{
 };
 use exoware_qmdb::{
     QmdbError,
-    adapter::{Keyless, Ordered},
-    proof::{RawKeyLookupProof, encode_operation_multi_proof},
+    adapter::{Keyless, Unordered},
+    proof::encode_operation_multi_proof,
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, RangeMode, ReadSession, StoreClient};
 use exoware_simplex::{Finalized, keys};
@@ -96,7 +95,7 @@ type Certificate = Finalized<
     EngineCommitment<Sha256, VerifyingKey>,
 >;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
-type StateLog = Ordered<
+type StateLog = Unordered<
     mmr::Family,
     Sha256,
     AccountKey,
@@ -106,7 +105,7 @@ type StateLog = Ordered<
 >;
 type HistoryEntry = TransactionHistoryEntry<Digest>;
 type TransactionLog = Keyless<mmr::Family, Sha256, HistoryEntry, FixedEncoding<HistoryEntry>>;
-type StateOperation = ordered::Operation<mmr::Family, AccountKey, FixedEncoding<AccountValue>>;
+type StateOperation = unordered::Operation<mmr::Family, AccountKey, FixedEncoding<AccountValue>>;
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<HistoryEntry>>;
 
 /// Store clients shared by every explorer route.
@@ -145,7 +144,7 @@ impl Explorer {
             simplex: simplex_client(client)?,
             sql_store,
             sql,
-            state: StateLog::new(state_qmdb_client(client)?, (), ()),
+            state: StateLog::new(state_qmdb_client(client)?, ()),
             transactions: TransactionLog::new(transactions_qmdb_client(client)?, ()),
         })
     }
@@ -166,6 +165,10 @@ impl Failure {
 
     fn invalid(message: impl Into<String>) -> Self {
         Self(ErrorCode::Internal, message.into())
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self(ErrorCode::NotFound, message.into())
     }
 
     fn limit(message: impl Into<String>) -> Self {
@@ -274,10 +277,9 @@ struct AccountEvidence {
     transaction_end: u64,
 }
 
-/// A current account value with its history boundary, or authenticated absence.
+/// A current account value with its history boundary.
 enum AccountLookup {
     Present(AccountEvidence),
-    Absent(AccountProof),
 }
 
 /// Checks a fixed-width application identity or cursor before reading Store.
@@ -506,7 +508,8 @@ impl Explorer {
         }))
     }
 
-    /// Proves the account's value or absence at the certified state boundary.
+    /// Proves the account's value at the certified state boundary. An account with no active
+    /// update there is reported as not found, without an absence proof.
     async fn account_proof(
         &self,
         anchor: &Anchor,
@@ -523,13 +526,18 @@ impl Explorer {
             Some(anchor.floor()?),
         ))
         .await?;
-        if lookups.len() != 1 {
+        if lookups.len() > 1 {
             return Err(Failure::invalid(
                 "account lookup returned an invalid result count",
             ));
         }
-        let (location, value, encoded, encoded_operation) = match lookups.pop().unwrap() {
-            RawKeyLookupProof::Hit(raw) => {
+        let (location, value, encoded, encoded_operation) = match lookups.pop() {
+            None => {
+                return Err(Failure::not_found(
+                    "account has no update at the certified state boundary",
+                ));
+            }
+            Some(raw) => {
                 if raw.watermark.as_u64() != tip
                     || raw.root != anchor.header.state_root
                     || raw.proof.range_proof.proof.leaves.as_u64() != end
@@ -541,7 +549,7 @@ impl Explorer {
                 let StateOperation::Update(update) = &raw.operation else {
                     return Err(Failure::invalid("account proof does not contain an update"));
                 };
-                if update.key != request.key {
+                if update.0 != request.key {
                     return Err(Failure::invalid("account proof names a different key"));
                 }
                 let location = raw.proof.loc.as_u64();
@@ -551,39 +559,13 @@ impl Explorer {
                 {
                     return Err(Failure::pending("pinned account update is not available"));
                 }
-                let value = Account::decode(Bytes::copy_from_slice(update.value.as_ref()))?;
+                let value = Account::decode(Bytes::copy_from_slice(update.1.as_ref()))?;
                 (
                     location,
                     value,
                     raw.proof.encode().to_vec(),
                     raw.operation.encode().to_vec(),
                 )
-            }
-            RawKeyLookupProof::Miss(raw) => {
-                let operation_proof = match &raw.proof {
-                    ExclusionProof::KeyValue(proof, _) | ExclusionProof::Commit(proof, _) => proof,
-                };
-                if raw.watermark.as_u64() != tip
-                    || raw.root != anchor.header.state_root
-                    || raw.requested_key != request.key
-                    || operation_proof.range_proof.proof.leaves.as_u64() != end
-                {
-                    return Err(Failure::invalid(
-                        "account exclusion does not match certified snapshot",
-                    ));
-                }
-                if request.account_location.is_some() {
-                    return Err(Failure::pending("pinned account update is not available"));
-                }
-                let encoded = raw.proof.encode().to_vec();
-                bounded_proof(&encoded)?;
-                return Ok(AccountLookup::Absent(AccountProof {
-                    location: 0,
-                    proof: encoded,
-                    write_height: 0,
-                    claim: Some(proto::account_proof::Claim::Exclusion(true)),
-                    ..Default::default()
-                }));
             }
         };
         bounded_proof(&encoded)?;
@@ -1006,7 +988,8 @@ impl Explorer {
     }
 }
 
-/// Serves an account value and history page, or verified absence, at one certified snapshot.
+/// Serves an account value and history page at one certified snapshot. An account with no active
+/// update there is reported as not found.
 async fn account(
     explorer: &Explorer,
     request: proto::GetAccountRequest,
@@ -1030,7 +1013,6 @@ async fn account(
             bundle.headers = account.headers;
             bundle.account = Some(account.proof).into();
         }
-        AccountLookup::Absent(proof) => bundle.account = Some(proof).into(),
     }
 
     // Report the floor after every read, since each read can raise it.

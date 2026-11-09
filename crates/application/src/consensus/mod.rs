@@ -21,7 +21,7 @@
 //! A proposer instead selects its body one candidate at a time, dropping each
 //! that cannot settle, so the body it proposes settles under the verifier's plan.
 //!
-//! Touched accounts are staged out of the ordered state QMDB in one read,
+//! Touched accounts are staged out of the unordered state QMDB in one read,
 //! and final account values are recorded as one slot per staged read, so
 //! merkleization reuses each key's resolved location. The state commitment
 //! depends on the final key/value set. Transaction history is append-only, so

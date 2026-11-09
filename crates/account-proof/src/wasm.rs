@@ -3,10 +3,8 @@ use commonware_codec::Encode;
 use js_sys::{BigInt, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
-/// Authenticate one fixed account lookup, returning a hit or miss and throwing on failure.
-///
-/// A miss carries the location of the operation whose key span excludes the key and, unless the
-/// database was empty, the bracketing `lower` and `upper` active keys.
+/// Authenticate one fixed account inclusion, returning a hit and throwing on failure. Absence is
+/// not authenticated: the server reports a missing account as not found.
 #[wasm_bindgen]
 pub fn verify_current_account_lookup(
     proof: &[u8],
@@ -32,26 +30,6 @@ pub fn verify_current_account_lookup(
                 &Uint8Array::from(account.encode().as_ref()).into(),
             )?;
             ("hit", key)
-        }
-        VerifiedAccountLookup::Absent {
-            key,
-            location,
-            span,
-        } => {
-            Reflect::set(&result, &"location".into(), &BigInt::from(location).into())?;
-            if let Some((lower, upper)) = span {
-                Reflect::set(
-                    &result,
-                    &"lower".into(),
-                    &Uint8Array::from(lower.as_ref()).into(),
-                )?;
-                Reflect::set(
-                    &result,
-                    &"upper".into(),
-                    &Uint8Array::from(upper.as_ref()).into(),
-                )?;
-            }
-            ("miss", key)
         }
     };
     Reflect::set(&result, &"type".into(), &kind.into())?;

@@ -26,7 +26,7 @@ use commonware_storage::{
     qmdb::{
         any::{
             operation::Operation as AnyOperation,
-            ordered::{Operation as OrderedOperation, Update as OrderedUpdate},
+            unordered::{Operation as UnorderedOperation, Update as UnorderedUpdate},
             value::FixedEncoding,
         },
         current, keyless,
@@ -82,7 +82,7 @@ const MAX_CONCURRENT_CHUNKS: usize = 64;
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
-type StateOperation = OrderedOperation<QmdbFamily, AccountKey, StateEncoding>;
+type StateOperation = UnorderedOperation<QmdbFamily, AccountKey, StateEncoding>;
 type TransactionEncoding<H> = FixedEncoding<TransactionHistoryEntry<<H as Hasher>::Digest>>;
 type TransactionOperation<H> = keyless::Operation<QmdbFamily, TransactionEncoding<H>>;
 
@@ -1299,12 +1299,7 @@ fn account_rows<D: Digest>(
                 reason: "state operation bytes do not decode",
             }
         })?;
-        let AnyOperation::Update(OrderedUpdate {
-            key,
-            value: account,
-            ..
-        }) = operation
-        else {
+        let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
             continue;
         };
         rows.push(encode_account_meta_row(AccountMetaRow {
@@ -1491,7 +1486,7 @@ mod tests {
         journal::contiguous::fixed::Config as JournalConfig,
         merkle::mem::Mem,
         qmdb::{
-            current::{batch::Boundary, ordered::fixed::Db},
+            current::{batch::Boundary, unordered::fixed::Db},
             floor::Proportional,
         },
         translator::TwoCap,
@@ -1499,7 +1494,7 @@ mod tests {
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
     use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
     use constantinople_primitives::{Block, Header, Sealable, SignedTransaction, StateSyncProof};
-    use exoware_qmdb::adapter::{Keyless, Ordered};
+    use exoware_qmdb::adapter::{Keyless, Unordered};
     use rand::{SeedableRng, rngs::StdRng};
     use std::{pin::pin, sync::Mutex as StdMutex};
     use tracing::{
@@ -2630,14 +2625,14 @@ mod tests {
             second.published().await.unwrap();
             third.published().await.unwrap();
 
-            let state = Ordered::<
+            let state = Unordered::<
                 QmdbFamily,
                 Sha256,
                 AccountKey,
                 AccountValue,
                 STATE_PROOF_CHUNK_SIZE,
                 StateEncoding,
-            >::new(state_qmdb_client(&physical).unwrap(), (), ());
+            >::new(state_qmdb_client(&physical).unwrap(), ());
             let transactions = Keyless::<
                 QmdbFamily,
                 Sha256,
@@ -2911,7 +2906,7 @@ mod tests {
                 .enumerate()
                 .rev()
                 .find_map(|(offset, op)| {
-                    matches!(op, AnyOperation::Update(update) if update.key == key)
+                    matches!(op, AnyOperation::Update(update) if update.0 == key)
                         .then_some(state.range.start + offset as u64)
                 })
                 .expect("native floor walk emits account update");
@@ -3294,14 +3289,14 @@ mod tests {
 
             assert_eq!(target(&target_client, 1).await, Some(first_digest));
             assert_eq!(target(&target_client, 2).await, Some(second_digest));
-            let state = Ordered::<
+            let state = Unordered::<
                 QmdbFamily,
                 Sha256,
                 AccountKey,
                 AccountValue,
                 STATE_PROOF_CHUNK_SIZE,
                 StateEncoding,
-            >::new(state_client, (), ());
+            >::new(state_client, ());
             let transactions = Keyless::<
                 QmdbFamily,
                 Sha256,

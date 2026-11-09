@@ -8,15 +8,15 @@ use commonware_glue::stateful::db::{
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
-    index::ordered::Index as OrderedIndex,
+    index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
     mmr,
     qmdb::{
         any::{
-            batch::Slot, operation::Operation as AnyOperation, ordered::Update as OrderedUpdate,
-            value::FixedEncoding,
+            batch::Slot, operation::Operation as AnyOperation,
+            unordered::Update as UnorderedUpdate, value::FixedEncoding,
         },
-        current::ordered::fixed,
+        current::unordered::fixed,
         keyless::fixed as keyless_fixed,
         sync::{CompactTarget, Target as AnyTarget},
     },
@@ -36,7 +36,7 @@ pub type TransactionHistoryOperation<H> =
     keyless_fixed::Operation<mmr::Family, TransactionHistoryEntry<<H as Hasher>::Digest>>;
 
 pub type StateOperation =
-    AnyOperation<mmr::Family, OrderedUpdate<AccountKey, FixedEncoding<Account>>>;
+    AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>;
 
 pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
@@ -57,9 +57,9 @@ pub type StateBatch<E, H, T, S> = CurrentUnmerkleized<
     mmr::Family,
     E,
     FixedJournal<E, StateOperation>,
-    OrderedIndex<T, mmr::Location>,
+    UnorderedIndex<T, mmr::Location>,
     H,
-    OrderedUpdate<AccountKey, FixedEncoding<Account>>,
+    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
     32,
     S,
 >;
@@ -70,9 +70,9 @@ pub type StateStaged<E, H, T, S> = CurrentStaged<
     mmr::Family,
     E,
     FixedJournal<E, StateOperation>,
-    OrderedIndex<T, mmr::Location>,
+    UnorderedIndex<T, mmr::Location>,
     H,
-    OrderedUpdate<AccountKey, FixedEncoding<Account>>,
+    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
     32,
     S,
 >;
