@@ -7,7 +7,7 @@ use commonware_cryptography::sha256;
 use commonware_cryptography_curve25519::signing as ed25519;
 
 /// Maximum encoded block size accepted by consensus, including its header and body framing.
-pub const MAXIMUM_BLOCK_SIZE: usize = 16 * 1024 * 1024;
+pub const MAXIMUM_BLOCK_SIZE: usize = 31 * 1024 * 1024;
 
 /// Maximum encoded application message accepted by the validator network.
 pub const MAXIMUM_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;

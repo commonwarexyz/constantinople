@@ -975,7 +975,10 @@ mod unit_tests {
                 .seal(&mut sha256::Sha256::default())
                 .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
-        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < 4096);
+
+        // The budget reserves framing for minimum-size transactions, so the slack a maximum
+        // proposal leaves grows with the block size.
+        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < MAXIMUM_BLOCK_SIZE / 4096);
         type TestShard = Shard<
             EngineBlock<sha256::Sha256, ed25519::VerifyingKey>,
             ReedSolomon<sha256::Sha256>,

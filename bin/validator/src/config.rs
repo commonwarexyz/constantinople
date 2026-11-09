@@ -38,12 +38,14 @@ pub(crate) const fn default_upload_budget_bytes() -> u64 {
     3 * 1024 * 1024 * 1024
 }
 
+// A proposal fills the whole block the protocol accepts, and the pool holds several blocks of
+// candidates so a full block is always available under load.
 pub(crate) const fn default_max_propose_bytes() -> usize {
-    8 * 1024 * 1024
+    MAXIMUM_BLOCK_SIZE
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
-    64 * 1024 * 1024
+    256 * 1024 * 1024
 }
 
 // Sized so operation-log pages stay cached, or at least in Clock2Q+ ghost
