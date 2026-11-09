@@ -9,9 +9,8 @@ mod traces;
 
 use crate::{config::IndexerConfig, run::CriticalTask};
 use budget::{FINALIZED_UPLOAD_AMPLIFICATION, FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, UploadBudget};
-use commonware_cryptography::{
-    bls12381::primitives::variant::MinSig, ed25519::PublicKey, sha256::Sha256,
-};
+use commonware_cryptography::{bls12381::primitives::variant::MinSig, sha256::Sha256};
+use commonware_cryptography_curve25519::signing::VerifyingKey;
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     Clock as _, Handle, Spawner as _, Strategizer as _, Supervisor as _,
@@ -56,14 +55,14 @@ const DURATION_BUCKETS: [f64; 27] = [
 ];
 
 type EngineCertReporter =
-    CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
-type EnginePublisher = Publisher<Sha256, PublicKey>;
-type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey, MinSig>;
-type EngineCapturedUpload = CapturedFinalizedUpload<Sha256, PublicKey, MinSig>;
+    CertificateReporter<Sha256, VerifyingKey, ThresholdScheme<VerifyingKey, MinSig>>;
+type EnginePublisher = Publisher<Sha256, VerifyingKey>;
+type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, VerifyingKey, MinSig>;
+type EngineCapturedUpload = CapturedFinalizedUpload<Sha256, VerifyingKey, MinSig>;
 type FinalizedPayloads = PayloadStore<RuntimeContext>;
-type EngineFinalizationReader = FinalizationReader<Sha256, PublicKey, MinSig>;
+type EngineFinalizationReader = FinalizationReader<Sha256, VerifyingKey, MinSig>;
 type ValidatorFinalizedHook =
-    FinalizedHookFn<EngineCommitment<Sha256, PublicKey>, Sha256, PublicKey>;
+    FinalizedHookFn<EngineCommitment<Sha256, VerifyingKey>, Sha256, VerifyingKey>;
 
 /// Saturating conversion for gauge increments and decrements.
 fn metric_i64(value: u64) -> i64 {

@@ -1,7 +1,8 @@
 //! Ring-pattern transaction signing and batch sizing.
 
 use crate::accounts::SpamAccount;
-use commonware_cryptography::{Sha256, ed25519};
+use commonware_cryptography::Sha256;
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
     SignedTransaction, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
@@ -14,7 +15,7 @@ pub type Tx = SignedTransaction<Sha256>;
 /// Signs one transaction for a single sender in the ring.
 fn sign_one(
     sender: &SpamAccount,
-    recipient: &ed25519::PublicKey,
+    recipient: &ed25519::VerifyingKey,
     value: NonZeroU64,
     nonce: u64,
 ) -> Tx {

@@ -3,7 +3,7 @@
 
 use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
+use constantinople_primitives::{Header, LazySignedTransaction, SealedBlock};
 use std::future::Future;
 
 /// Supplies transactions for block proposals and finalized block updates.
@@ -14,11 +14,15 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    /// Returns the transactions to include in the next proposal.
+    /// Returns the transactions to include in the next proposal, each decoded and with its
+    /// signature accepted, held in the handle a block body stores so the proposal can take them
+    /// without copying.
     ///
     /// `round` is the consensus round the proposal targets. Speculative
-    /// pre-builds call this before the round is entered, so implementations
-    /// must not assume the round is live.
+    /// pre-builds call this before the round is entered and before `parent`
+    /// certifies, so implementations must not assume the round is live or
+    /// that `parent` will finalize. A caller may also abandon a build, so
+    /// returned transactions may never be proposed and are not handed back.
     ///
     /// `filled` is the sum of encoded signed transaction sizes already in the
     /// proposal. The implementation must stay within its transaction byte
@@ -29,7 +33,7 @@ where
         parent: &Header<C, H::Digest, P>,
         round: Round,
         filled: usize,
-    ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send;
+    ) -> impl Future<Output = Vec<LazySignedTransaction<H>>> + Send;
 }
 
 #[cfg(feature = "mocks")]

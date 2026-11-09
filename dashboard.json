@@ -2788,12 +2788,220 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 83
+      },
+      "id": 96,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "sum by(event) (rate(engine_simplex_voter_handoff_events_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Handoff Events/s",
+      "transparent": true,
+      "type": "timeseries",
+      "description": "Term-start handoff lifecycle events across validators, by event. RelayedBeforeCertification counts proposals relayed on an uncertified parent. VotedBeforeCertification counts proposals voted on before their parent certified."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 83
+      },
+      "id": 97,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "sum by(reason) (rate(engine_simplex_voter_handoff_abandoned_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Handoffs Abandoned/s",
+      "transparent": true,
+      "type": "timeseries",
+      "description": "Handoff requests, candidates, and builds abandoned before the proposer voted, by reason."
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 91
       },
       "id": 43,
       "panels": [],
@@ -2832,7 +3040,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 92
       },
       "id": 47,
       "options": {
@@ -2934,7 +3142,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 91
+        "y": 99
       },
       "id": 46,
       "options": {
@@ -3049,7 +3257,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 91
+        "y": 99
       },
       "id": 42,
       "options": {
@@ -3089,7 +3297,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 99
+        "y": 107
       },
       "id": 14,
       "panels": [],
@@ -3161,7 +3369,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 100
+        "y": 108
       },
       "id": 27,
       "options": {
@@ -3264,7 +3472,7 @@
         "h": 9,
         "w": 8,
         "x": 8,
-        "y": 100
+        "y": 108
       },
       "id": 28,
       "options": {
@@ -3366,7 +3574,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 100
+        "y": 108
       },
       "id": 18,
       "options": {
@@ -3468,7 +3676,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 109
+        "y": 117
       },
       "id": 15,
       "options": {
@@ -3570,7 +3778,7 @@
         "h": 9,
         "w": 8,
         "x": 8,
-        "y": 109
+        "y": 117
       },
       "id": 16,
       "options": {
@@ -3641,7 +3849,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 109
+        "y": 117
       },
       "id": 17,
       "options": {
@@ -3756,7 +3964,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 118
+        "y": 126
       },
       "id": 19,
       "options": {
@@ -3859,7 +4067,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 118
+        "y": 126
       },
       "id": 59,
       "options": {
@@ -3898,7 +4106,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 127
+        "y": 135
       },
       "id": 26,
       "panels": [],
@@ -3969,7 +4177,7 @@
         "h": 9,
         "w": 6,
         "x": 0,
-        "y": 128
+        "y": 136
       },
       "id": 21,
       "options": {
@@ -4068,7 +4276,7 @@
         "h": 9,
         "w": 6,
         "x": 6,
-        "y": 128
+        "y": 136
       },
       "id": 20,
       "options": {
@@ -4168,7 +4376,7 @@
         "h": 9,
         "w": 6,
         "x": 12,
-        "y": 128
+        "y": 136
       },
       "id": 22,
       "options": {
@@ -4266,7 +4474,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 128
+        "y": 136
       },
       "id": 40,
       "options": {
@@ -4365,7 +4573,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 145
       },
       "id": 24,
       "options": {
@@ -4406,7 +4614,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 145
+        "y": 153
       },
       "id": 37,
       "panels": [],
@@ -4477,7 +4685,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "id": 38,
       "options": {
@@ -4575,7 +4783,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 146
+        "y": 154
       },
       "id": 39,
       "options": {
@@ -4615,7 +4823,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "id": 25,
       "panels": [],
@@ -4687,7 +4895,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 155
+        "y": 163
       },
       "id": 23,
       "options": {
@@ -4727,11 +4935,11 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 164
+        "y": 172
       },
       "id": 65,
       "panels": [],
-      "title": "Buffer Pools",
+      "title": "Allocator",
       "type": "row"
     },
     {
@@ -4739,7 +4947,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "High-water mark of tracked network buffers per size class (never decremented; capped at max_per_class=8192). A class pinned at its cap is undersized; a class near zero is dead weight.",
+      "description": "Mimalloc's accounting of committed memory, which leaves out the pinned reservation. On Unix, purging returns pages to the OS without lowering this figure, so its gap to RSS is not allocator overhead.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4791,7 +4999,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -4799,7 +5008,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 165
+        "y": 173
       },
       "id": 66,
       "options": {
@@ -4824,16 +5033,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "max by(size_class) (runtime_network_buffer_pool_buffer_pool_created{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
+          "expr": "max by(deployer_name, deployer_ip) (runtime_allocator_committed_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "{{size_class}}B",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A",
           "useBackend": false
         }
       ],
-      "title": "Network Buffers Created",
+      "title": "Committed Bytes",
       "transparent": true,
       "type": "timeseries"
     },
@@ -4842,7 +5051,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Allocations denied because a network size class hit max_per_class. This is the direct signal the network pool is too small. Any sustained non-zero rate warrants raising the cap for that class.",
+      "description": "Bytes handed out to callers by mimalloc, as of each thread's last statistics merge (may lag live usage).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4894,7 +5103,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -4902,7 +5112,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 165
+        "y": 173
       },
       "id": 67,
       "options": {
@@ -4927,16 +5137,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum by(size_class) (rate(runtime_network_buffer_pool_buffer_pool_exhausted_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "max by(deployer_name, deployer_ip) (runtime_allocator_allocated_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "{{size_class}}B",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A",
           "useBackend": false
         }
       ],
-      "title": "Network Exhaustions/s",
+      "title": "Allocated Bytes",
       "transparent": true,
       "type": "timeseries"
     },
@@ -4945,7 +5155,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Requests larger than the pool max (network 1 MiB, storage 8 MiB) bypass pooling entirely and heap-allocate. A steady rate means a hot path is sized past the pool and should either shrink or the pool max should grow.",
+      "description": "Address space mimalloc has reserved from the OS, including the pinned reservation.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4997,7 +5207,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -5005,7 +5216,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 165
+        "y": 173
       },
       "id": 68,
       "options": {
@@ -5030,31 +5241,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate(runtime_network_buffer_pool_buffer_pool_oversized_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "max by(deployer_name, deployer_ip) (runtime_allocator_reserved_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} + runtime_allocator_pinned_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "network",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A",
           "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "sum(rate(runtime_storage_buffer_pool_buffer_pool_oversized_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "legendFormat": "storage",
-          "range": true,
-          "refId": "B",
-          "useBackend": false
         }
       ],
-      "title": "Oversized Requests/s",
+      "title": "Reserved Bytes",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5063,7 +5259,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "High-water mark of tracked storage buffers per size class (cap 1024 per class). One pool backs every page cache (engine state, engine other, indexer) plus journal write buffers; classes pinned at cap mean the caches could not pre-allocate what they were configured for.",
+      "description": "Mimalloc pages in use, as of each thread's last statistics merge (may lag live usage).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5115,7 +5311,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "none"
         },
         "overrides": []
       },
@@ -5123,7 +5320,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 165
+        "y": 173
       },
       "id": 69,
       "options": {
@@ -5148,16 +5345,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "max by(size_class) (runtime_storage_buffer_pool_buffer_pool_created{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
+          "expr": "max by(deployer_name, deployer_ip) (runtime_allocator_pages{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "{{size_class}}B",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A",
           "useBackend": false
         }
       ],
-      "title": "Storage Buffers Created",
+      "title": "Allocator Pages",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5166,7 +5363,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Denied storage-pool allocations. Page caches pre-allocate their slots from this shared pool at startup, so exhaustion at runtime means caches plus write buffers oversubscribe the pool configuration.",
+      "description": "Rate at which mimalloc returns memory to the OS. Sustained purging alongside high RSS indicates churn or fragmentation.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5218,7 +5415,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "Bps"
         },
         "overrides": []
       },
@@ -5226,7 +5424,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 173
+        "y": 181
       },
       "id": 70,
       "options": {
@@ -5251,18 +5449,343 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate(runtime_storage_buffer_pool_buffer_pool_exhausted_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum by(deployer_name, deployer_ip) (rate(runtime_allocator_purged_bytes_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "storage exhausted",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A",
           "useBackend": false
         }
       ],
-      "title": "Storage Exhaustions/s",
+      "title": "Purged Bytes/s",
       "transparent": true,
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Rate of purge operations performed by mimalloc.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 181
+      },
+      "id": 92,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum by(deployer_name, deployer_ip) (rate(runtime_allocator_purge_calls_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Purge Calls/s",
+      "transparent": true,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Rate of memory mappings mimalloc requests from the OS. Steady non-zero rates indicate the heap is still growing or being recycled.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 181
+      },
+      "id": 93,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum by(deployer_name, deployer_ip) (rate(runtime_allocator_mmap_calls_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "mmap Calls/s",
+      "transparent": true,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Rate of allocations larger than mimalloc's largest size class; these bypass size-class pages.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 181
+      },
+      "id": 94,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum by(deployer_name, deployer_ip) (rate(runtime_allocator_huge_allocations_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Huge Allocations/s",
+      "transparent": true,
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 189
+      },
+      "id": 95,
+      "panels": [],
+      "title": "Storage & Logs",
+      "type": "row"
     },
     {
       "datasource": {
@@ -5330,8 +5853,8 @@
       "gridPos": {
         "h": 8,
         "w": 6,
-        "x": 6,
-        "y": 173
+        "x": 0,
+        "y": 190
       },
       "id": 71,
       "options": {
@@ -5433,8 +5956,8 @@
       "gridPos": {
         "h": 8,
         "w": 6,
-        "x": 12,
-        "y": 173
+        "x": 6,
+        "y": 190
       },
       "id": 72,
       "options": {
@@ -5536,8 +6059,8 @@
       "gridPos": {
         "h": 8,
         "w": 6,
-        "x": 18,
-        "y": 173
+        "x": 12,
+        "y": 190
       },
       "id": 73,
       "options": {
@@ -5588,7 +6111,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 181
+        "y": 198
       },
       "id": 44,
       "options": {
@@ -5633,7 +6156,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 191
+        "y": 208
       },
       "id": 45,
       "options": {
@@ -5670,7 +6193,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 200
+        "y": 217
       },
       "id": 74,
       "panels": [],
@@ -5685,7 +6208,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 201
+        "y": 218
       },
       "fieldConfig": {
         "defaults": {
@@ -5796,7 +6319,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 201
+        "y": 218
       },
       "fieldConfig": {
         "defaults": {
@@ -5916,7 +6439,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 201
+        "y": 218
       },
       "fieldConfig": {
         "defaults": {
@@ -6037,7 +6560,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 209
+        "y": 226
       },
       "fieldConfig": {
         "defaults": {
@@ -6203,7 +6726,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 209
+        "y": 226
       },
       "fieldConfig": {
         "defaults": {
@@ -6325,7 +6848,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 209
+        "y": 226
       },
       "fieldConfig": {
         "defaults": {
@@ -6424,7 +6947,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 217
+        "y": 234
       },
       "fieldConfig": {
         "defaults": {
@@ -6721,7 +7244,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 217
+        "y": 234
       },
       "fieldConfig": {
         "defaults": {
@@ -6843,7 +7366,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 217
+        "y": 234
       },
       "fieldConfig": {
         "defaults": {
@@ -6964,7 +7487,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 225
+        "y": 242
       },
       "fieldConfig": {
         "defaults": {
@@ -7095,7 +7618,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 225
+        "y": 242
       },
       "fieldConfig": {
         "defaults": {
@@ -7216,7 +7739,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 225
+        "y": 242
       },
       "fieldConfig": {
         "defaults": {
@@ -7325,7 +7848,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 233
+        "y": 250
       },
       "fieldConfig": {
         "defaults": {
@@ -7457,7 +7980,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 233
+        "y": 250
       },
       "fieldConfig": {
         "defaults": {
@@ -7578,7 +8101,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 233
+        "y": 250
       },
       "fieldConfig": {
         "defaults": {
@@ -7689,7 +8212,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 241
+        "y": 258
       },
       "fieldConfig": {
         "defaults": {
@@ -7811,7 +8334,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 241
+        "y": 258
       },
       "fieldConfig": {
         "defaults": {

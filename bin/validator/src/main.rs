@@ -8,9 +8,17 @@ mod run;
 mod state_reader;
 
 use clap::Parser;
+use commonware_allocator::mimalloc::{Config, MiMalloc, Purge, Reserve};
+use std::time::Duration;
 
+/// Reserves an arena for the default page caches and working set, exempt from allocator purging.
+/// Other arenas delay purging to retain memory across recurring work such as metrics scrapes.
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: MiMalloc = MiMalloc::new(Config {
+    purge: Purge::After(Duration::from_secs(60)),
+    reserve: Some(Reserve::pinned(16 << 30)),
+    ..Config::DEFAULT
+});
 
 fn main() {
     let cli = cli::Cli::parse();

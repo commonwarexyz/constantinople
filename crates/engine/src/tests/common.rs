@@ -11,13 +11,14 @@ use commonware_cryptography::{
         dkg::feldman_desmedt::{Output, deal},
         primitives::{group::Share, sharing::Mode, variant::MinSig},
     },
-    ed25519,
     sha256::Sha256,
 };
+use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
-use commonware_runtime::Quota;
+use commonware_runtime::{Quota, deterministic};
 use commonware_utils::{
-    Acknowledgement, N3f1, TryCollect, acknowledgement::Exact, channel::mpsc, sync::Mutex, test_rng,
+    Acknowledgement, N3f1, NZU32, TryCollect, acknowledgement::Exact, channel::mpsc, sync::Mutex,
+    test_rng,
 };
 use std::{
     collections::BTreeMap,
@@ -28,13 +29,14 @@ use std::{
 };
 
 pub(crate) type TestHasher = Sha256;
-pub(crate) type TestPrivateKey = ed25519::PrivateKey;
-pub(crate) type TestPublicKey = ed25519::PublicKey;
+pub(crate) type TestPrivateKey = ed25519::SigningKey;
+pub(crate) type TestPublicKey = ed25519::VerifyingKey;
 pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
 pub(crate) type TestBlock = ApplicationBlock<TestHasher, TestPublicKey>;
 pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
-pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);
+pub(crate) const TEST_QUOTA: Quota =
+    Quota::per_second(std::num::NonZeroU32::MAX).allow_burst(NZU32!(1_024));
 
 #[derive(Clone, Default)]
 pub(crate) struct RestartBarrier {
@@ -190,8 +192,16 @@ where
 
 #[derive(Clone)]
 pub(crate) struct ValidatorState {
+    /// Marshal mailbox of the validator's engine.
     pub(crate) marshal: TestMarshalMailbox,
+
+    /// Height of the state-sync floor block this validator resolved at this or
+    /// an earlier startup, if it has state-synced.
     pub(crate) startup_sync_height: Option<u64>,
+
+    /// Runtime context whose metrics export covers every validator in the
+    /// simulation, because all validators share one executor registry.
+    pub(crate) context: Arc<deterministic::Context>,
 }
 
 impl PartialEq for ValidatorState {

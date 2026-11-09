@@ -1,12 +1,12 @@
 import {
     memo,
+    useCallback,
     useEffect,
     useMemo,
     useRef,
     useState,
-    type CSSProperties,
 } from 'react';
-import { SqlClient } from '@exowarexyz/sql';
+import { SearchForm, type SearchHandle } from './SearchForm';
 import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
@@ -16,29 +16,23 @@ import {
     toHex,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
+import { readStoredHistory } from './historyStorage';
+import { buildHistogram, formatAverageTxPerBlock } from './histogram';
+import { type VerifiedBlock, subscribeBlocks } from './indexer';
+import { appendVerifiedBatch, EMPTY_FEED } from './feedState';
+import { submitTransactions } from './mempool';
 import {
-    wakeCoveredReconciliations,
-    type TransactionReconciliation,
-} from './reconciliationQueue';
-import { type ObservedBlock, subscribeBlocksFromTargets } from './indexer';
-import {
-    fetchAccount,
-    submitTransactions,
-    type AccountView,
-} from './mempool';
+    loadAccountBundle,
+    loadBlockBundle,
+    loadTransactionBundle,
+    prewarmProofVerification,
+} from './proofBundle';
 import {
     TransactionSubmissionError,
     isDeterministicSubmissionRejection,
     singleTransactionOutcome,
 } from './submissionResponse';
 import {
-    fetchAccountTransactionsPage,
-    fetchAccountProofMetadata,
-    prefetchFinalizedCertificate,
-    fetchAndVerifyAccountProof,
-    fetchAndVerifyTransactionProof,
-    fetchAndVerifyTransactionRowProof,
-    fetchLatestProofTarget,
     type AccountActivityMode,
     type AccountTransactionRow,
     type LatestProofTarget,
@@ -56,15 +50,10 @@ import {
 import {
     accountRetryReason,
     errorMessage,
-    isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
     retryAccountWork,
 } from './proofRetry';
-import {
-    createSharedProofTargets,
-    type PublishedProofTarget,
-} from './proofTarget';
 import {
     clearSession,
     createWallet,
@@ -77,7 +66,6 @@ import {
     WAITING_FINALIZATION_PROOF,
     assignReconciliationOrder,
     isAccountKeyHex,
-    markReconciliationCertificate,
     markReconciliationError,
     markReconciliationFetching,
     markReconciliationWaiting,
@@ -85,47 +73,30 @@ import {
     markSubmissionRejected,
     markTransactionFinalized,
     markValidatorFinalizationObserved,
-    normalizeSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
     selectReconciliations,
     shouldReconcileTransaction,
-    type BlockCertificateState,
     type SubmittedTransaction,
     type TransactionProofState,
 } from './submissionHistory';
 
-/** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
 const BLOCK_LOG_MAX = 80;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
 const HISTOGRAM_HEIGHT = 18;
 const HISTOGRAM_MAX_ROWS = 200;
-const HISTOGRAM_MIN_ROWS = 8;
-const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
+const HISTOGRAM_MIN_ROWS = 1;
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const LIVE_STATUS_TEXT = '>>> live';
-const LIVE_STATUS_SYMBOLS = [...LIVE_STATUS_TEXT];
 
 type Status =
     | { kind: 'connecting' }
     | { kind: 'live' }
     | { kind: 'error'; message: string };
 
-// The explorer subscribes to `metadata-indexer` for block rows and queries
-// `qmdb-indexer` for submitted-transaction proofs. Defaults match
-// `bin/deploy/src/local.rs`; override the VITE_* URLs for non-default deployments.
-const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
-const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
-const DEFAULT_STORE_URL = 'http://127.0.0.1:8090';
-const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
-
-const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
-const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
-const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
+const indexerUrl = import.meta.env.VITE_INDEXER_URL ?? 'http://127.0.0.1:8092';
 const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
-const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
 
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
@@ -137,9 +108,34 @@ type AccountProofState =
       } & VerifiedAccountProof)
     | { readonly status: 'error'; readonly detail: string };
 
-interface AccountPage {
-    readonly account: string;
-    readonly rows: AccountTransactionRow[];
+/** A proven historical account update, bound to the wallet that requested it. */
+interface WalletAccountView {
+    readonly balance: bigint;
+    readonly nonce: { readonly base: bigint; readonly bitmap: bigint };
+    readonly wallet: ActiveWallet;
+    readonly accountKey: string;
+    readonly snapshotHeight: bigint;
+    readonly location: bigint;
+}
+
+/** A verified block page and its position in the pagination history. */
+type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>> & {
+    readonly offset: bigint;
+    readonly pageNumber: number;
+};
+
+/** Certified height and block digest that pin an account's pages to one snapshot. */
+type AccountSnapshot = { readonly height: bigint; readonly blockDigest: Uint8Array };
+
+/** One in-flight account update read, shared by requests for the same wallet. */
+interface WalletRefresh {
+    readonly wallet: ActiveWallet;
+    readonly accountKey: string;
+    readonly controller: AbortController;
+    promise: Promise<void>;
+
+    /** Set when a finalization arrives mid-read, so one more read follows the current one. */
+    again: boolean;
 }
 
 interface AccountTxWithProof {
@@ -147,9 +143,30 @@ interface AccountTxWithProof {
     readonly proof: TransactionProofState;
 }
 
+interface AccountPageData {
+    readonly key: string;
+    readonly account: string;
+    readonly pageNumber: number;
+    readonly target: LatestProofTarget;
+    readonly proof: AccountProofState;
+    readonly transactions: AccountTxWithProof[];
+    readonly nextCursor: Uint8Array | null;
+}
+
+interface PageRequest {
+    readonly key: string;
+    readonly loading: boolean;
+    readonly message: string;
+}
+
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
     readonly latestBlockAt: number | null;
+}
+
+interface TransactionReconciliation {
+    readonly controller: AbortController;
+    timer: number | null;
 }
 
 function disposeReconciliation(reconciliation: TransactionReconciliation) {
@@ -160,23 +177,19 @@ function disposeReconciliation(reconciliation: TransactionReconciliation) {
 const MAX_CONCURRENT_RECONCILIATIONS = 3;
 
 export default function App() {
-    const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
-    // Cumulative counter across every block observed on the stream. Tracked
-    // independently of `blocks` so the rate keeps climbing when older entries
-    // roll off the histogram buffer.
-    const [totalTxObserved, setTotalTxObserved] = useState(0);
-    const [totalBlocksObserved, setTotalBlocksObserved] = useState(0);
-    const [observedRateWindow, setObservedRateWindow] = useState<ObservedRateWindow>({
-        firstBlockAt: null,
-        latestBlockAt: null,
-    });
+    const [feed, setFeed] = useState(EMPTY_FEED);
+    const { blocks, totalTxObserved, totalBlocksObserved, observedRateWindow } = feed;
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const [isWalletOpen, setIsWalletOpen] = useState(false);
-    const [isSearchOpen, setIsSearchOpen] = useState(false);
+    const searchRef = useRef<SearchHandle>(null);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
-    const [walletAccountKey, setWalletAccountKey] = useState<string | null>(null);
+
+    // The address is tagged with its wallet so a late derivation cannot label a newer wallet.
+    const [walletAddress, setWalletAddress] = useState<{ wallet: ActiveWallet; key: string } | null>(null);
+    const walletAccountKey = walletAddress && walletAddress.wallet === wallet ? walletAddress.key : null;
+
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
-    const [account, setAccount] = useState<AccountView | null>(null);
+    const [account, setAccount] = useState<WalletAccountView | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
     const [toKey, setToKey] = useState('');
     const [value, setValue] = useState('1');
@@ -186,21 +199,31 @@ export default function App() {
     const [history, setHistory] = useState<SubmittedTransaction[]>([]);
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
-    const [accountInput, setAccountInput] = useState(() => accountFromLocation());
-    const [publishedProofTarget, setPublishedProofTarget] =
-        useState<PublishedProofTarget | null>(null);
-    const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
-    const [accountProof, setAccountProof] = useState<AccountProofState>({
-        status: 'waiting',
-        detail: 'enter an account',
-    });
-    const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
-    const [accountPage, setAccountPage] = useState<AccountPage | null>(null);
-    const [accountActivityError, setAccountActivityError] = useState('');
+    const [lookupBlock, setLookupBlock] = useState(() => blockFromLocation());
+    const [lookupTransaction, setLookupTransaction] = useState(() => transactionFromLocation());
+    const [transactionBundle, setTransactionBundle] = useState<Awaited<ReturnType<typeof loadTransactionBundle>> | null>(null);
+    const [transactionRequest, setTransactionRequest] = useState<PageRequest>({ key: '', loading: false, message: '' });
+    const [blockOffsets, setBlockOffsets] = useState<bigint[]>([0n]);
+    const [blockBundle, setBlockBundle] = useState<BlockBundle | null>(null);
+    const [blockMessage, setBlockMessage] = useState('');
+    const [blockLoading, setBlockLoading] = useState(false);
+    const [accountRefresh, setAccountRefresh] = useState(0);
+
+    // An account view keeps its certified snapshot across pages and filter changes until the
+    // account changes or the user refreshes.
+    const accountSnapshotRef = useRef<{ account: string; target: AccountSnapshot } | null>(null);
+
+    // Asynchronous wallet reads compare against the latest wallet and address before publishing.
+    const walletRefreshRef = useRef<WalletRefresh | null>(null);
+    const activeWalletRef = useRef(wallet);
+    const activeWalletKeyRef = useRef(walletAccountKey);
+    activeWalletRef.current = wallet;
+    activeWalletKeyRef.current = walletAccountKey;
+
+    const [accountPageData, setAccountPageData] = useState<AccountPageData | null>(null);
+    const [accountRequest, setAccountRequest] = useState<PageRequest>({ key: '', loading: false, message: '' });
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
-    const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
-    const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const [storageError, setStorageError] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
@@ -211,16 +234,13 @@ export default function App() {
     const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
-        accountMessage === 'loading account metadata' ||
+        accountMessage === 'loading account update proof' ||
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInAccountKey = walletAccountKey;
     const historyKey = submittedTransactionHistoryKey(
         {
             indexerUrl,
-            qmdbUrl,
-            storeUrl,
-            mempoolUrl,
             simplexVerificationMaterial,
         },
         signedInAccountKey,
@@ -232,13 +252,29 @@ export default function App() {
     const reconciliationFailuresRef = useRef(new Map<string, number>());
     const reconciliationSequenceRef = useRef(0);
     const foregroundSubmissionsRef = useRef(new Set<string>());
-    const publishedProofTargetRef = useRef<PublishedProofTarget | null>(publishedProofTarget);
     activeHistoryKeyRef.current = historyKey;
     loadedHistoryKeyRef.current = loadedHistoryKey;
-    publishedProofTargetRef.current = publishedProofTarget;
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
-    const proofTargetReady = publishedProofTarget !== null;
-    const accountTargetReady = accountTarget !== null;
+    const currentAccountViewKey = JSON.stringify([
+        lookupAccount, accountActivityMode, currentAccountCursor ? bytesToHex(currentAccountCursor) : null,
+    ]);
+    const pinnedAccount = accountSnapshotRef.current;
+
+    // A pending page keeps the previous rows and their proof together under the same snapshot.
+    const displayedAccount = accountPageData && (
+        accountPageData.key === currentAccountViewKey || (
+            accountPageData.account === lookupAccount && pinnedAccount?.account === lookupAccount &&
+            accountPageData.target.height === pinnedAccount.target.height &&
+            bytesToHex(accountPageData.target.blockDigest) === bytesToHex(pinnedAccount.target.blockDigest)
+        )
+    ) ? accountPageData : null;
+    const accountRequestMatches = accountRequest.key === currentAccountViewKey;
+    const accountLoading = !accountRequestMatches || accountRequest.loading;
+    const accountNextCursor = displayedAccount?.nextCursor ?? null;
+    const accountPaginationReady = !accountLoading && displayedAccount?.key === currentAccountViewKey &&
+        pinnedAccount?.account === lookupAccount;
+    const walletAccount = account?.wallet === wallet && account.accountKey === walletAccountKey ? account : null;
+    const currentBlockOffset = blockOffsets[blockOffsets.length - 1] ?? 0n;
 
     const setLocalNonceState = (nextNonce: NonceState) => {
         nextNonceRef.current = nextNonce;
@@ -256,24 +292,6 @@ export default function App() {
         applyLocalNonceReservations();
     };
 
-    // Render delivered blocks immediately so the UI adds no buffering delay
-    // to publication or catch-up delivery.
-    const applyObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
-        if (nextBlocks.length === 0) return;
-
-        setBlocks((current) => upsertBoundedBatch(nextBlocks, current));
-        setTotalTxObserved(
-            (current) =>
-                current + nextBlocks.reduce((total, block) => total + block.txCount, 0),
-        );
-        setTotalBlocksObserved((current) => current + nextBlocks.length);
-        setObservedRateWindow((current) => ({
-            firstBlockAt: current.firstBlockAt ?? nextBlocks[0].arrivedAt,
-            latestBlockAt: nextBlocks[nextBlocks.length - 1].arrivedAt,
-        }));
-        setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
-    };
-
     useEffect(() => {
         try {
             const restoredWallet = restoreWalletSession();
@@ -288,13 +306,6 @@ export default function App() {
 
     useEffect(() => {
         const controller = new AbortController();
-        const targets = createSharedProofTargets(storeUrl, {
-            signal: controller.signal,
-            onError: (message) =>
-                setStatus({ kind: 'error', message: `proof target error: ${message}` }),
-        });
-        const blockTargets = targets.subscribe({ signal: controller.signal });
-        const proofTargets = targets.subscribe({ signal: controller.signal });
         const failed = (error: unknown) => {
             if (controller.signal.aborted) return;
             setStatus({
@@ -304,34 +315,31 @@ export default function App() {
         };
 
         (async () => {
-            for await (const block of subscribeBlocksFromTargets(new SqlClient(indexerUrl), blockTargets, {
+            for await (const batch of subscribeBlocks(indexerUrl, {
+                simplexVerificationMaterial,
                 signal: controller.signal,
                 onError: (message) =>
                     setStatus({ kind: 'error', message: `backend error: ${message}` }),
                 onReconnect: () => setStatus({ kind: 'connecting' }),
             })) {
                 if (controller.signal.aborted) return;
-                applyObservedBlocks([block]);
+                setFeed((current) => appendVerifiedBatch(current, batch));
+                setStatus({ kind: 'live' });
             }
         })().catch(failed);
 
-        (async () => {
-            for await (const target of proofTargets) {
-                if (controller.signal.aborted) return;
-                setPublishedProofTarget((current) =>
-                    current && current.height >= target.height ? current : target,
-                );
-            }
-        })().catch(failed);
-
-        return () => {
-            controller.abort();
-            targets.close();
-        };
+        return () => controller.abort();
     }, []);
 
     useEffect(() => {
-        const restored = historyKey === null ? [] : readHistory(historyKey, setStorageError);
+        let restored: SubmittedTransaction[];
+        try {
+            restored = historyKey === null ? [] : readStoredHistory(historyKey, window.localStorage);
+        } catch (error) {
+            setStorageError(storageErrorMessage(error));
+            setLoadedHistoryKey(null);
+            return;
+        }
         reservedNoncesRef.current = new Set(
             restored
                 .filter(
@@ -348,7 +356,7 @@ export default function App() {
 
     useEffect(() => {
         if (!wallet) {
-            setWalletAccountKey(null);
+            setWalletAddress(null);
             return;
         }
 
@@ -356,11 +364,11 @@ export default function App() {
         accountKeyFromPublicKey(wallet.publicKey)
             .then((accountKey) => {
                 if (cancelled) return;
-                setWalletAccountKey(toHex(accountKey));
+                setWalletAddress({ wallet, key: toHex(accountKey) });
             })
             .catch((error) => {
                 if (cancelled) return;
-                setWalletAccountKey(null);
+                setWalletAddress(null);
                 setWalletMessage(error instanceof Error ? error.message : String(error));
             });
 
@@ -378,254 +386,131 @@ export default function App() {
 
     useEffect(() => {
         const onPopState = () => {
+            searchRef.current?.cancel();
             const next = accountFromLocation();
             setLookupAccount(next);
-            setAccountInput(next);
+            accountSnapshotRef.current = null;
             setAccountCursorStack([null]);
+            setLookupBlock(blockFromLocation());
+            setLookupTransaction(transactionFromLocation());
+            setBlockOffsets([0n]);
         };
         window.addEventListener('popstate', onPopState);
         return () => window.removeEventListener('popstate', onPopState);
     }, []);
 
+    // Start verifier initialization at load so the first proof does not wait for WebAssembly. A
+    // failure surfaces again when a proof load initializes the verifier.
     useEffect(() => {
-        if (!lookupAccount) {
-            setAccountTarget(null);
-            setAccountProof({ status: 'waiting', detail: 'enter an account' });
-            return;
-        }
-        if (!publishedProofTarget) {
-            setAccountTarget(null);
-            setAccountProof({ status: 'waiting', detail: 'waiting for provable state' });
-            return;
-        }
+        void prewarmProofVerification(simplexVerificationMaterial).catch(() => {});
+    }, []);
 
-        const controller = new AbortController();
-        setAccountTarget(null);
-        setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
-
-        retryAccountWork(async () => {
-            const attempt = new AbortController();
-            const signal = AbortSignal.any([controller.signal, attempt.signal]);
-            try {
-                const published = publishedProofTargetRef.current;
-                if (!published) {
-                    throw new Error('latest provable target is missing');
-                }
-                const targetPromise = fetchLatestProofTarget({
-                    storeUrl,
-                    sqlUrl: indexerUrl,
-                    simplexVerificationMaterial,
-                    publishedTarget: published,
-                    signal,
-                }).then((target) => {
-                    signal.throwIfAborted();
-                    setAccountTarget(target);
-                    return target;
-                });
-                const metadataPromise = fetchAccountProofMetadata({
-                    sqlUrl: indexerUrl,
-                    account: lookupAccount,
-                    minSequenceNumber: published.sequenceNumber,
-                    signal,
-                });
-
-                // A missing account must not prevent independent transaction proofs.
-                const [target, metadataResult] = await Promise.all([
-                    targetPromise,
-                    metadataPromise.then(
-                        (metadata) => ({ metadata }),
-                        (error: unknown) => ({ error }),
-                    ),
-                ]);
-                if ('error' in metadataResult) {
-                    const { error } = metadataResult;
-                    const detail = error instanceof Error ? error.message : String(error);
-                    if (isMissingAccountProofError(detail)) return { target, proof: null };
-                    throw error;
-                }
-                const { metadata } = metadataResult;
-
-                try {
-                    const proof = await fetchAndVerifyAccountProof({
-                        qmdbUrl,
-                        sqlUrl: indexerUrl,
-                        account: lookupAccount,
-                        target,
-                        metadata,
-                        signal,
-                    });
-                    return { target, proof };
-                } catch (error) {
-                    const detail = error instanceof Error ? error.message : String(error);
-                    if (isMissingAccountProofError(detail)) {
-                        return { target, proof: null };
-                    }
-                    throw error;
-                }
-            } finally {
-                attempt.abort();
-            }
-        }, controller.signal, isRetryableAccountProofError, {
-            onRetry: (error) => setAccountProof(retryingProofState(error)),
-        })
-            .then(({ target, proof }) => {
-                if (controller.signal.aborted) return;
-                if (proof === null) {
-                    setAccountProof({ status: 'missing', detail: 'not yet exists' });
-                    return;
-                }
-                setAccountProof({
-                    status: 'verified',
-                    detail: `verified at height ${target.height.toString()}`,
-                    ...proof,
-                });
-            })
-            .catch((error) => {
-                if (controller.signal.aborted) return;
-                setAccountProof({
-                    status: 'error',
-                    detail: error instanceof Error ? error.message : String(error),
-                });
-            });
-
-        return () => controller.abort();
-    }, [lookupAccount, proofTargetReady]);
-
-    // Only a change of account, page, or mode replaces the listed rows. The
-    // proof target arrives later and must not clear rows already on screen.
+    // Publish each verified page atomically. Pagination retains the preceding page until then.
     useEffect(() => {
+        const controller = new AbortController();
         if (!lookupAccount) {
-            setAccountPage(null);
-            setAccountTransactions([]);
-            setAccountNextCursor(null);
-            setAccountActivityError('');
+            setAccountPageData(null);
+            setAccountRequest({ key: currentAccountViewKey, loading: false, message: '' });
             return;
         }
-        if (!publishedProofTarget) return;
 
-        const controller = new AbortController();
-        setAccountPage(null);
-        setAccountTransactions([]);
-        setAccountNextCursor(null);
-        setAccountActivityError('');
-
-        const minSequenceNumber = publishedProofTarget.sequenceNumber;
-
-        retryAccountWork(
-            () => fetchAccountTransactionsPage({
-                sqlUrl: indexerUrl,
-                account: lookupAccount,
-                cursor: currentAccountCursor,
-                mode: accountActivityMode,
-                minSequenceNumber,
-                maxHeight: publishedProofTarget.height,
-                signal: controller.signal,
+        const retained = accountSnapshotRef.current;
+        const at = retained?.account === lookupAccount ? retained.target : undefined;
+        setAccountRequest({ key: currentAccountViewKey, loading: true, message: '' });
+        retryAccountWork(() => loadAccountBundle({
+            indexerUrl,
+            simplexVerificationMaterial,
+            account: lookupAccount,
+            mode: accountActivityMode,
+            cursor: currentAccountCursor ?? undefined,
+            at,
+            signal: controller.signal,
+        }), controller.signal, isRetryableAccountProofError, {
+            onRetry: (error) => setAccountRequest({
+                key: currentAccountViewKey, loading: true,
+                message: accountRetryReason(error) ?? errorMessage(error),
             }),
-            controller.signal,
-            isRetryableAccountProofError,
-            { onRetry: (error) => setAccountActivityError(accountRetryReason(error) ?? errorMessage(error)) },
-        )
-            .then((page) => {
-                if (controller.signal.aborted) return;
-                setAccountActivityError('');
-                setAccountNextCursor(page.nextCursor);
-                setAccountTransactions(page.rows.map((row) => ({
-                    row,
-                    proof: { status: 'waiting', detail: 'waiting for latest finalization' },
-                })));
-                setAccountPage({ account: lookupAccount, rows: page.rows });
-            })
-            .catch((error) => {
-                if (controller.signal.aborted) return;
-                setAccountPage(null);
-                setAccountTransactions([]);
-                setAccountNextCursor(null);
-                setAccountActivityError(error instanceof Error ? error.message : String(error));
+        }).then((bundle) => {
+            if (controller.signal.aborted) return;
+
+            // Keep the page, cursor and certificate bound to one verified snapshot.
+            accountSnapshotRef.current = { account: lookupAccount, target: bundle.target };
+            setAccountPageData({
+                key: currentAccountViewKey,
+                account: lookupAccount,
+                pageNumber: accountCursorStack.length,
+                target: bundle.target,
+                proof: bundle.account ? {
+                    status: 'verified', detail: `historical update under snapshot ${bundle.target.height}`, ...bundle.account,
+                } : { status: 'missing', detail: 'no indexed account update' },
+                transactions: bundle.page.rows.map((row, index) => ({
+                    row, proof: verifiedProofState(bundle.transactionProofs[index]!),
+                })),
+                nextCursor: bundle.page.nextCursor,
             });
-
+            setAccountRequest({ key: currentAccountViewKey, loading: false, message: '' });
+        }).catch((error) => {
+            if (controller.signal.aborted) return;
+            setAccountRequest({ key: currentAccountViewKey, loading: false, message: errorMessage(error) });
+        });
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode, proofTargetReady]);
+    }, [currentAccountViewKey, accountRefresh]);
 
-    // Each page keeps its certificate while row proofs run. Account-state
-    // retries must not restart independent transaction proofs.
+    // Load one verified block page. The block's certificate stays visible while another page of the
+    // same block loads.
     useEffect(() => {
-        if (!accountPage || !accountTarget || accountPage.account !== lookupAccount) return;
-
         const controller = new AbortController();
-        const rows = accountPage.rows;
-        const updateRow = (index: number, proof: TransactionProofState) => {
-            setAccountTransactions((current) =>
-                current.map((entry, position) =>
-                    position === index && entry.row.digest === rows[index]?.digest
-                        ? { ...entry, proof }
-                        : entry,
-                ),
-            );
-        };
-
-        rows.forEach((_row, index) => {
-            updateRow(index, { status: 'fetching', detail: 'fetching transaction proof' });
+        setBlockBundle((current) => current?.block.height === lookupBlock ? current : null);
+        setBlockMessage('');
+        if (lookupBlock === null) {
+            setBlockLoading(false);
+            return;
+        }
+        setBlockLoading(true);
+        retryAccountWork(() => loadBlockBundle({
+            indexerUrl, simplexVerificationMaterial, height: lookupBlock,
+            offset: currentBlockOffset, signal: controller.signal,
+        }), controller.signal, isRetryableAccountProofError, {
+            onRetry: (error) => setBlockMessage(accountRetryReason(error) ?? errorMessage(error)),
+        }).then((bundle) => {
+            if (controller.signal.aborted) return;
+            setBlockBundle({ ...bundle, offset: currentBlockOffset, pageNumber: blockOffsets.length });
+            setBlockMessage('');
+            setBlockLoading(false);
+        }).catch((error) => {
+            if (controller.signal.aborted) return;
+            setBlockMessage(errorMessage(error));
+            setBlockLoading(false);
         });
-
-        const newestHeight = rows.reduce(
-            (height, row) => row.height > height ? row.height : height,
-            0n,
-        );
-        let rowTarget = accountTarget;
-        let targetRefresh: Promise<LatestProofTarget> | undefined;
-        // A newer page can require a later certificate. Share that refresh
-        // across rows and retain it through retries without following the tip.
-        const rowProofTarget = (): Promise<LatestProofTarget> => {
-            const published = publishedProofTargetRef.current;
-            if (
-                newestHeight <= rowTarget.height ||
-                !published ||
-                published.height <= rowTarget.height
-            ) {
-                return Promise.resolve(rowTarget);
-            }
-            if (!targetRefresh) {
-                targetRefresh = fetchLatestProofTarget({
-                    storeUrl,
-                    sqlUrl: indexerUrl,
-                    simplexVerificationMaterial,
-                    publishedTarget: published,
-                    signal: controller.signal,
-                })
-                    .then((target) => {
-                        rowTarget = target;
-                        return target;
-                    })
-                    .finally(() => { targetRefresh = undefined; });
-            }
-            return targetRefresh;
-        };
-
-        rows.forEach((row, index) => {
-            retryAccountWork(async () => {
-                const target = await rowProofTarget();
-                return fetchAndVerifyTransactionRowProof({
-                    qmdbUrl,
-                    row,
-                    target,
-                    signal: controller.signal,
-                });
-            }, controller.signal, isRetryableAccountProofError, {
-                onRetry: (error) => updateRow(index, retryingProofState(error)),
-            })
-                .then((proof) => {
-                    if (controller.signal.aborted) return;
-                    updateRow(index, verifiedProofState(proof));
-                })
-                .catch((error) => {
-                    if (controller.signal.aborted) return;
-                    const detail = error instanceof Error ? error.message : String(error);
-                    updateRow(index, { status: 'error', detail });
-                });
-        });
-
         return () => controller.abort();
-    }, [accountPage, accountTargetReady, lookupAccount]);
+    }, [lookupBlock, currentBlockOffset]);
+
+    useEffect(() => {
+        const controller = new AbortController();
+        setTransactionBundle((current) => current?.transaction.digest === lookupTransaction ? current : null);
+        if (!lookupTransaction) {
+            setTransactionRequest({ key: '', loading: false, message: '' });
+            return;
+        }
+        setTransactionRequest({ key: lookupTransaction, loading: true, message: '' });
+        retryAccountWork(() => loadTransactionBundle({
+            indexerUrl, simplexVerificationMaterial, digest: lookupTransaction,
+            signal: controller.signal,
+        }), controller.signal, isRetryableProofError, {
+            onRetry: (error) => setTransactionRequest({
+                key: lookupTransaction, loading: true,
+                message: accountRetryReason(error) ?? errorMessage(error),
+            }),
+        }).then((bundle) => {
+            if (controller.signal.aborted) return;
+            setTransactionBundle(bundle);
+            setTransactionRequest({ key: lookupTransaction, loading: false, message: '' });
+        }).catch((error) => {
+            if (controller.signal.aborted) return;
+            setTransactionRequest({ key: lookupTransaction, loading: false, message: errorMessage(error) });
+        });
+        return () => controller.abort();
+    }, [lookupTransaction]);
 
     useEffect(() => {
         const reconciliations = reconciliationsRef.current;
@@ -648,24 +533,8 @@ export default function App() {
         );
     };
 
-    const wakeReconciliations = (height: bigint) => {
-        wakeCoveredReconciliations(
-            reconciliationsRef.current,
-            height,
-            (timer) => window.clearTimeout(timer),
-            requeueReconciliation,
-        );
-    };
-
-    useEffect(() => {
-        if (historyKey === null || loadedHistoryKey !== historyKey || !publishedProofTarget) return;
-        wakeReconciliations(publishedProofTarget.height);
-    }, [publishedProofTarget, historyKey, loadedHistoryKey]);
-
     useEffect(() => {
         if (historyKey === null || loadedHistoryKey !== historyKey) return;
-        const publishedTarget = publishedProofTargetRef.current;
-        if (!publishedTarget) return;
 
         const reconciliations = reconciliationsRef.current;
         const trackedDigests = new Set(history.map((tx) => tx.digest));
@@ -705,7 +574,6 @@ export default function App() {
             const reconciliation: TransactionReconciliation = {
                 controller: new AbortController(),
                 timer: null,
-                waitingForHeight: null,
             };
             reconciliations.set(tx.digest, reconciliation);
             const releaseReconciliation = () => {
@@ -715,39 +583,11 @@ export default function App() {
             };
             setHistory((current) => markReconciliationFetching(tx.digest, current));
 
-            fetchAndVerifyTransactionProof({
-                qmdbUrl,
-                storeUrl,
-                sqlUrl: indexerUrl,
+            loadTransactionBundle({
+                indexerUrl,
                 simplexVerificationMaterial,
                 digest: tx.digest,
-                publishedTarget,
-                finalizedHeight: tx.finalizedHeight === null ? undefined : BigInt(tx.finalizedHeight),
                 signal: reconciliation.controller.signal,
-                onFinalizationVerified: (target) => {
-                    if (
-                        reconciliation.controller.signal.aborted ||
-                        activeHistoryKeyRef.current !== historyKey ||
-                        reconciliations.get(tx.digest) !== reconciliation
-                    ) {
-                        return;
-                    }
-                    const height = Number(target.height);
-                    if (!Number.isSafeInteger(height)) {
-                        throw new Error('finalized transaction height exceeds Number.MAX_SAFE_INTEGER');
-                    }
-                    const certificate = verifiedBlockCertificateState(target);
-                    const observedAt = Date.now();
-                    setHistory((current) =>
-                        markReconciliationCertificate(
-                            tx.digest,
-                            height,
-                            certificate,
-                            observedAt,
-                            current,
-                        ),
-                    );
-                },
             })
                 .then((proof) => {
                     if (
@@ -759,38 +599,12 @@ export default function App() {
                     if (!releaseReconciliation()) return;
                     reconciliationOrderRef.current.delete(tx.digest);
                     reconciliationFailuresRef.current.delete(tx.digest);
-                    const height = Number(proof.height);
-                    const certificate = verifiedBlockCertificateState(proof);
-                    const proofState = verifiedProofState(proof);
                     const proofObservedAt = Date.now();
                     setHistory((current) =>
-                        markTransactionFinalized(
-                            tx.digest,
-                            height,
-                            certificate,
-                            proofState,
-                            proofObservedAt,
-                            current,
-                        ),
+                        markTransactionFinalized(proof, proofObservedAt, current),
                     );
                     if (wallet !== null && activeHistoryKeyRef.current === historyKey) {
-                        fetchAccount(mempoolUrl, wallet.publicKeyHex)
-                            .then((nextAccount) => {
-                                if (activeHistoryKeyRef.current !== historyKey) return;
-                                setAccount(nextAccount);
-                                setCommittedNonceState(accountNonceState(nextAccount));
-                                setAccountMessage(
-                                    nextAccount
-                                        ? 'committed account loaded'
-                                        : 'no committed account yet. default balance applies',
-                                );
-                            })
-                            .catch((error) => {
-                                if (activeHistoryKeyRef.current !== historyKey) return;
-                                setAccountMessage(
-                                    error instanceof Error ? error.message : String(error),
-                                );
-                            });
+                        void refreshAccount(true);
                     }
                 })
                 .catch((error) => {
@@ -818,13 +632,6 @@ export default function App() {
                         (reconciliationFailuresRef.current.get(tx.digest) ?? 0) + 1;
                     reconciliationFailuresRef.current.set(tx.digest, failures);
 
-                    // Only publication coverage waits can be resolved by a new target.
-                    // Missing old transactions and transport failures retain their backoff.
-                    reconciliation.waitingForHeight =
-                        tx.finalizedHeight !== null &&
-                        BigInt(tx.finalizedHeight) > publishedTarget.height
-                            ? BigInt(tx.finalizedHeight)
-                            : null;
                     const waitingDetail = 'reconciliation retry scheduled';
                     setHistory((current) =>
                         markReconciliationWaiting(tx.digest, waitingDetail, current),
@@ -841,11 +648,9 @@ export default function App() {
                         }
                         requeueReconciliation(tx.digest);
                     }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
-                    const latest = publishedProofTargetRef.current;
-                    if (latest) wakeReconciliations(latest.height);
                 });
         }
-    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet, proofTargetReady]);
+    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet]);
 
     useEffect(() => {
         return () => {
@@ -855,55 +660,78 @@ export default function App() {
         };
     }, []);
 
+    // Reads a historical account update without activity. Requests for the same wallet share one
+    // read, and a read for a replaced wallet is aborted.
+    const refreshAccount = (afterFinalization = false): Promise<void> => {
+        if (!wallet || !walletAccountKey) return Promise.resolve();
+        const existing = walletRefreshRef.current;
+        if (existing?.wallet === wallet && existing.accountKey === walletAccountKey) {
+            // A finalization during the read needs one later read to include it.
+            existing.again ||= afterFinalization;
+            return existing.promise;
+        }
+        existing?.controller.abort();
+
+        // Results publish only while this read is not aborted and its wallet is still active.
+        const controller = new AbortController();
+        const current = () => !controller.signal.aborted &&
+            activeWalletRef.current === wallet && activeWalletKeyRef.current === walletAccountKey;
+        const refresh: WalletRefresh = {
+            wallet, accountKey: walletAccountKey, controller, again: false,
+            promise: Promise.resolve(),
+        };
+        const promise = (async () => {
+            // Read again when a finalization arrived during the previous read.
+            do {
+                refresh.again = false;
+                setAccountMessage('loading account update proof');
+                try {
+                    const bundle = await retryAccountWork(() => loadAccountBundle({
+                        indexerUrl, simplexVerificationMaterial, account: walletAccountKey,
+                        includeTransactions: false, signal: controller.signal,
+                    }), controller.signal, isRetryableAccountProofError);
+                    if (!current()) return;
+                    const nextAccount = bundle.account ? {
+                        balance: bundle.account.balance,
+                        nonce: { base: bundle.account.nonce, bitmap: bundle.account.nonceBitmap },
+                        wallet, accountKey: walletAccountKey,
+                        snapshotHeight: bundle.target.height, location: bundle.account.location,
+                    } : null;
+                    setAccount(nextAccount);
+                    if (nextAccount) setCommittedNonceState(accountNonceState(nextAccount));
+                    setAccountMessage(nextAccount
+                        ? ''
+                        : 'no account update proof');
+                } catch (error) {
+                    if (!current()) return;
+                    setAccountMessage(errorMessage(error));
+                }
+            } while (refresh.again && current());
+        })().finally(() => {
+            if (walletRefreshRef.current === refresh) walletRefreshRef.current = null;
+        });
+        refresh.promise = promise;
+        walletRefreshRef.current = refresh;
+        return promise;
+    };
+
+    // A wallet change clears committed account state before the new wallet's first verified read.
     useEffect(() => {
+        setAccount(null);
+        committedNonceRef.current = emptyNonceState();
+        applyLocalNonceReservations();
         if (!wallet) {
-            setAccount(null);
-            committedNonceRef.current = emptyNonceState();
             reservedNoncesRef.current.clear();
             applyLocalNonceReservations();
             setAccountMessage('account metadata unavailable');
-            return;
+        } else if (walletAccountKey) {
+            void refreshAccount();
         }
-
-        let cancelled = false;
-        setAccountMessage('loading account metadata');
-
-        fetchAccount(mempoolUrl, wallet.publicKeyHex)
-            .then((nextAccount) => {
-                if (cancelled) return;
-                setAccount(nextAccount);
-                setCommittedNonceState(accountNonceState(nextAccount));
-                setAccountMessage(
-                    nextAccount
-                        ? 'committed account loaded'
-                        : 'no committed account yet; default balance applies',
-                );
-            })
-            .catch((error) => {
-                if (cancelled) return;
-                setAccount(null);
-                setAccountMessage(error instanceof Error ? error.message : String(error));
-            });
-
         return () => {
-            cancelled = true;
+            walletRefreshRef.current?.controller.abort();
+            walletRefreshRef.current = null;
         };
-    }, [wallet]);
-
-    const refreshAccount = async () => {
-        if (!wallet) return;
-        setAccountMessage('loading account metadata');
-        try {
-            const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
-            setAccount(nextAccount);
-            setCommittedNonceState(accountNonceState(nextAccount));
-            setAccountMessage(
-                nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
-            );
-        } catch (error) {
-            setAccountMessage(error instanceof Error ? error.message : String(error));
-        }
-    };
+    }, [wallet, walletAccountKey]);
 
     const handleCreateWallet = async () => {
         setWalletMessage('opening passkey prompt');
@@ -961,36 +789,42 @@ export default function App() {
         }
     };
 
-    const openAccountPage = (value: string): boolean => {
+    const openAccountPage = useCallback((value: string): boolean => {
         const normalized = normalizeAccountInput(value);
         if (!normalized) return false;
 
-        setSearchMessage('');
+        searchRef.current?.cancel();
+
+        // A new account starts from a fresh snapshot, and the account view replaces any block view.
+        if (normalized !== lookupAccount) accountSnapshotRef.current = null;
         setLookupAccount(normalized);
-        setAccountInput(normalized);
+        setLookupBlock(null);
+        setLookupTransaction('');
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
+        url.pathname = '/';
+        url.searchParams.delete('block');
+        url.searchParams.delete('transaction');
         url.searchParams.set('account', normalized);
         const nextLocation = `${url.pathname}${url.search}${url.hash}`;
         if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
             window.history.pushState(null, '', nextLocation);
         }
         setIsWalletOpen(false);
-        setIsSearchOpen(false);
         return true;
-    };
-
-    const submitAccountLookup = () => {
-        if (openAccountPage(accountInput)) return;
-        setSearchMessage('expected a 32-byte address');
-    };
+    }, [lookupAccount]);
 
     const clearAccountLookup = () => {
+        searchRef.current?.cancel();
         setLookupAccount('');
-        setAccountInput('');
+        setLookupBlock(null);
+        setLookupTransaction('');
+        accountSnapshotRef.current = null;
         setAccountCursorStack([null]);
-        setSearchMessage('');
         const url = new URL(window.location.href);
+        url.pathname = '/';
+        url.searchParams.delete('block');
+        url.searchParams.delete('transaction');
         url.searchParams.delete('account');
         const nextLocation = `${url.pathname}${url.search}${url.hash}`;
         if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
@@ -998,8 +832,48 @@ export default function App() {
         }
     };
 
+    const openBlockPage = useCallback((height: bigint) => {
+        // The block view replaces any account view and starts at the first page.
+        searchRef.current?.cancel();
+        setLookupAccount('');
+        accountSnapshotRef.current = null;
+        setLookupBlock(height);
+        setLookupTransaction('');
+        setBlockOffsets([0n]);
+        const url = new URL(window.location.href);
+        url.pathname = '/';
+        url.searchParams.delete('account');
+        url.searchParams.delete('transaction');
+        url.searchParams.set('block', height.toString());
+        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    }, []);
+
+    const openTransactionPage = useCallback((digest: string) => {
+        const normalized = normalizeAccountInput(digest);
+        if (!normalized) return;
+        searchRef.current?.cancel();
+        setIsWalletOpen(false);
+        setLookupAccount('');
+        setLookupBlock(null);
+        accountSnapshotRef.current = null;
+        setLookupTransaction(normalized);
+        const url = new URL(window.location.href);
+        url.pathname = '/';
+        url.searchParams.delete('account');
+        url.searchParams.delete('block');
+        url.searchParams.set('transaction', normalized);
+        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    }, []);
+
+    const refreshAccountPage = () => {
+        // Dropping the snapshot lets the first page select the newest certified target.
+        accountSnapshotRef.current = null;
+        setAccountCursorStack([null]);
+        setAccountRefresh((current) => current + 1);
+    };
+
     const nextAccountPage = () => {
-        if (!accountNextCursor) return;
+        if (!accountNextCursor || !accountPaginationReady) return;
         setAccountCursorStack((current) => [...current, accountNextCursor]);
     };
 
@@ -1010,7 +884,6 @@ export default function App() {
     const changeAccountActivityMode = (mode: AccountActivityMode) => {
         setAccountActivityMode(mode);
         setAccountCursorStack([null]);
-        setAccountNextCursor(null);
     };
 
     // Preserve reservations until committed account state reflects finalization.
@@ -1058,7 +931,7 @@ export default function App() {
             return;
         }
         const originHistoryKey = historyKey;
-        if (originHistoryKey === null) {
+        if (originHistoryKey === null || loadedHistoryKeyRef.current !== originHistoryKey) {
             setSubmitMessage('submitted transaction history is unavailable');
             return;
         }
@@ -1116,7 +989,7 @@ export default function App() {
             setSubmitMessage('submitting');
 
             const status = await submitTransactions(
-                mempoolUrl,
+                indexerUrl,
                 encodeTransactionBatch([encoded.bytes]),
             );
             if (status.status === 'pending') {
@@ -1125,7 +998,7 @@ export default function App() {
                     (current) =>
                         markSubmissionReconciling(
                             encoded.digestHex,
-                            'finality wait timed out. checking finalized proof',
+                            'submission timed out',
                             current,
                         ),
                 );
@@ -1133,24 +1006,9 @@ export default function App() {
                 return;
             }
             const outcome = singleTransactionOutcome(status);
-            if (outcome.kind === 'dropped') {
-                throw new TransactionSubmissionError(
-                    'rejected',
-                    'validator reported transaction dropped before finalization',
-                );
-            }
             if (outcome.kind === 'ambiguous') {
                 throw new TransactionSubmissionError('ambiguous', outcome.detail);
             }
-
-            // This warms only the verified certificate cache. Reconciliation still
-            // ties the digest to the block before showing its certificate as verified.
-            void prefetchFinalizedCertificate({
-                storeUrl,
-                sqlUrl: indexerUrl,
-                simplexVerificationMaterial,
-                height: BigInt(outcome.height),
-            }).catch(() => {});
 
             const observedAt = Date.now();
             updateSubmittedHistory(
@@ -1228,18 +1086,20 @@ export default function App() {
                             explorer
                         </button>
                     </h1>
+                    <SearchForm ref={searchRef} endpoint={indexerUrl} onOpenAccount={openAccountPage} onOpenTransaction={openTransactionPage} />
                     <div className="app__header-actions">
-                        <StatusBadge status={status} spinner={spinner} />
-                        <span className="app__header-separator" aria-hidden="true">
-                            ⬝
-                        </span>
-                        <button className="wallet-trigger" onClick={() => setIsSearchOpen(true)}>
-                            search
-                        </button>
-                        <span className="app__header-separator" aria-hidden="true">
-                            ⬝
-                        </span>
-                        <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
+                        {(status.kind !== 'live' || lookupAccount !== '' || lookupBlock !== null || lookupTransaction !== '') && (
+                            <>
+                                <StatusBadge status={status} spinner={spinner} height={blocks[0]?.height ?? null} />
+                                <span className="app__header-separator" aria-hidden="true">
+                                    ⬝
+                                </span>
+                            </>
+                        )}
+                        <button className="wallet-trigger" onClick={() => {
+                            searchRef.current?.cancel();
+                            setIsWalletOpen(true);
+                        }}>
                             wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
                         </button>
                     </div>
@@ -1250,24 +1110,54 @@ export default function App() {
                     </div>
                 )}
                 <main className="app__main app__main--minimal">
-                    <section className="explorer-stage" aria-label="live transaction throughput">
+                    <section className="explorer-stage" aria-label="block explorer">
                         {lookupAccount ? (
                             <AccountPage
                                 account={lookupAccount}
                                 onCopy={copyValue}
                                 onOpenAddress={openAccountPage}
-                                pageNumber={accountCursorStack.length}
-                                proof={accountProof}
-                                target={accountTarget}
-                                transactions={accountTransactions}
-                                activityError={accountActivityError}
+                                onOpenTransaction={openTransactionPage}
+                                pageNumber={displayedAccount?.pageNumber ?? accountCursorStack.length}
+                                pageRequestKey={currentAccountViewKey}
+                                retainingPage={displayedAccount !== null && displayedAccount.key !== currentAccountViewKey}
+                                proof={displayedAccount?.proof ?? { status: 'fetching', detail: 'verifying account evidence' }}
+                                target={displayedAccount?.target ?? null}
+                                transactions={displayedAccount?.transactions ?? []}
+                                activityError={accountRequestMatches ? accountRequest.message : ''}
+                                loading={accountLoading}
                                 activityMode={accountActivityMode}
-                                hasPrevious={accountCursorStack.length > 1}
-                                hasNext={accountNextCursor !== null}
+                                hasPrevious={accountPaginationReady && accountCursorStack.length > 1}
+                                hasNext={accountPaginationReady && accountNextCursor !== null}
                                 onActivityModeChange={changeAccountActivityMode}
                                 onPrevious={previousAccountPage}
                                 onNext={nextAccountPage}
+                                onRefresh={refreshAccountPage}
                             />
+                        ) : lookupBlock !== null ? (
+                            <BlockPage
+                                height={lookupBlock}
+                                offset={currentBlockOffset}
+                                bundle={blockBundle?.block.height === lookupBlock ? blockBundle : null}
+                                message={blockMessage}
+                                loading={blockLoading}
+                                pageNumber={blockOffsets.length}
+                                hasPrevious={blockOffsets.length > 1}
+                                onPrevious={() => setBlockOffsets((current) => current.slice(0, -1))}
+                                onNext={() => {
+                                    const next = blockBundle?.nextOffset;
+                                    if (next !== null && next !== undefined) {
+                                        setBlockOffsets((current) => [...current, next]);
+                                    }
+                                }}
+                                onOpenAddress={openAccountPage}
+                                onOpenTransaction={openTransactionPage}
+                            />
+                        ) : lookupTransaction ? (
+                            <TransactionPage digest={lookupTransaction}
+                                bundle={transactionBundle?.transaction.digest === lookupTransaction ? transactionBundle : null}
+                                message={transactionRequest.key === lookupTransaction ? transactionRequest.message : ''}
+                                loading={transactionRequest.key !== lookupTransaction || transactionRequest.loading}
+                                onCopy={copyValue} onOpenAddress={openAccountPage} onOpenBlock={openBlockPage} />
                         ) : (
                             <>
                                 <Histogram blocks={blocks} />
@@ -1277,7 +1167,7 @@ export default function App() {
                                     totalBlocksObserved={totalBlocksObserved}
                                     totalTxObserved={totalTxObserved}
                                 />
-                                <BlockLog blocks={blocks} />
+                                <BlockLog blocks={blocks} onOpenBlock={openBlockPage} />
                             </>
                         )}
                     </section>
@@ -1288,7 +1178,7 @@ export default function App() {
                             wallet={wallet}
                             walletAccountKey={walletAccountKey}
                             walletMessage={walletMessage}
-                            account={account}
+                            account={walletAccount}
                             accountMessage={accountMessage}
                             toKey={toKey}
                             value={value}
@@ -1300,7 +1190,7 @@ export default function App() {
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
-                            onRefreshAccount={refreshAccount}
+                            onRefreshAccount={() => { void refreshAccount(); }}
                             onClearSubmittedTransactions={clearSubmittedTransactionHistory}
                             onCopy={copyValue}
                             onToKeyChange={setToKey}
@@ -1315,19 +1205,6 @@ export default function App() {
                         />
                     </WalletModal>
                 )}
-                {isSearchOpen && (
-                    <SearchModal onClose={() => setIsSearchOpen(false)}>
-                        <AccountSearchPanel
-                            accountInput={accountInput}
-                            message={searchMessage}
-                            onAccountInputChange={(value) => {
-                                setAccountInput(value);
-                                setSearchMessage('');
-                            }}
-                            onSubmit={submitAccountLookup}
-                        />
-                    </SearchModal>
-                )}
                 {copyToast && <TerminalToast message={copyToast} />}
             </div>
         </div>
@@ -1338,66 +1215,96 @@ function AccountPage({
     account,
     onCopy,
     onOpenAddress,
+    onOpenTransaction,
     pageNumber,
+    pageRequestKey,
+    retainingPage,
     proof,
     target,
     transactions,
     activityError,
+    loading,
     activityMode,
     hasPrevious,
     hasNext,
     onActivityModeChange,
     onPrevious,
     onNext,
+    onRefresh,
 }: {
     account: string;
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
+    onOpenTransaction: (digest: string) => void;
     pageNumber: number;
+    pageRequestKey: string;
+    retainingPage: boolean;
     proof: AccountProofState;
     target: LatestProofTarget | null;
     transactions: AccountTxWithProof[];
     activityError: string;
+    loading: boolean;
     activityMode: AccountActivityMode;
     hasPrevious: boolean;
     hasNext: boolean;
     onActivityModeChange: (mode: AccountActivityMode) => void;
     onPrevious: () => void;
     onNext: () => void;
+    onRefresh: () => void;
 }) {
+    // Every row shares one multiproof, so the first row's tip describes the page. A self-transfer's
+    // two rows count as one proven location.
+    const transactionProof = transactions[0]?.proof;
+    const proofItems = new Set(transactions.map(({ row }) => row.location)).size;
     return (
-        <section className="account-page" aria-label="account proof">
+        <section className="account-page" aria-label="account proof" aria-busy={loading}>
             <div className="account-page__title">
-                <span>account</span>
+                <h2>account</h2>
+                <button onClick={onRefresh} disabled={loading}>refresh</button>
             </div>
             <div className="account-page__line">
                 <span className="account-page__prompt">address</span>
                 <CopyableValue value={account} onCopy={onCopy} />
             </div>
             <div className="account-proof-grid">
-                <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
-                <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
-                <ProofDatum
-                    label="state"
-                    value={
-                        proof.status === 'verified'
-                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
-                            : proof.detail
-                    }
-                />
-                <ProofDatum
-                    label="state proof"
-                    value={
-                        proof.status === 'verified'
-                            ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b`
-                            : proof.status === 'missing'
-                                ? proof.detail
-                                : proof.status
-                    }
-                />
+                <div className="account-proof-grid__details">
+                    <ProofDatum label="block" pending={!target} value={target ? shortHex(bytesToHex(target.blockDigest)) : '—'} />
+                    <ProofDatum
+                        label="historical update"
+                        pending={proof.status !== 'verified'}
+                        value={
+                            proof.status === 'verified'
+                                ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
+                                : proof.status === 'missing' ? 'unknown' : '—'
+                        }
+                    />
+                </div>
+                <div className="account-proof-grid__evidence account-proof-grid__evidence--three">
+                    <ProofDatum label="cert" verified={!!target} pending={!target} value={target ? `h${target.height.toString()} / v${target.view.toString()}` : '—'} />
+                    <ProofDatum
+                        label="transaction proof"
+                        verified={transactionProof?.status === 'verified'}
+                        pending={transactionProof?.status !== 'verified'}
+                        value={transactionProof?.status === 'verified'
+                            ? <span className="proof-badge">op{transactionProof.tip} / {proofItems}L</span>
+                            : '-'}
+                    />
+                    <ProofDatum
+                        label="account proof"
+                        verified={proof.status === 'verified'}
+                        pending={proof.status !== 'verified'}
+                        value={
+                            proof.status === 'verified'
+                                ? <span className="proof-badge">loc {proof.location}</span>
+                                : proof.status === 'missing'
+                                    ? 'not available'
+                                    : '—'
+                        }
+                    />
+                </div>
             </div>
             <div className="account-page__subhead">
-                <span>{activityMode} tx page {pageNumber}</span>
+                <h3>page {pageNumber}</h3>
                 <div className="account-page__modes" role="tablist" aria-label="account transaction filter">
                     {(['all', 'sent', 'received'] as const).map((mode) => (
                         <button
@@ -1413,43 +1320,45 @@ function AccountPage({
                     ))}
                 </div>
                 <div className="account-page__pager">
+                    <span key={pageRequestKey} aria-hidden="true"
+                        className={`account-page__progress${loading && retainingPage ? ' account-page__progress--pending' : ''}`}>loading</span>
                     <button disabled={!hasPrevious} onClick={onPrevious}>prev</button>
                     <button disabled={!hasNext} onClick={onNext}>next</button>
                 </div>
             </div>
+            <PageStatus message={activityError || (loading && !retainingPage ? target ? 'refreshing verified selection' : 'verifying account evidence' : '')} />
             <div className="account-tx-list">
-                {activityError && (
-                    <div className="account-tx-row account-tx-row--empty">{activityError}</div>
-                )}
-                {!activityError && transactions.length === 0 && (
-                    <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
+                {!target && <PendingTransactionRow includeDigest />}
+                {target && transactions.length === 0 && (
+                    <div className="account-tx-row account-tx-row--empty">no proven transactions returned</div>
                 )}
                 {transactions.map(({ row, proof: txProof }) => (
-                    <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
+                    <div className="account-tx-row" key={`${row.location}-${row.direction}`}>
                         <div className="account-tx-row__main">
-                            <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
-                            <CopyableValue value={row.digest} onCopy={onCopy} />
-                            <span>from</span>
-                            <AccountPageAddressValue
-                                account={account}
-                                value={row.direction === 'sent' ? account : row.counterparty}
-                                onCopy={onCopy}
-                                onOpenAddress={onOpenAddress}
-                            />
-                            <span>to</span>
-                            <AccountPageAddressValue
-                                account={account}
-                                value={row.direction === 'sent' ? row.counterparty : account}
-                                onCopy={onCopy}
-                                onOpenAddress={onOpenAddress}
-                            />
+                            <AddressValue kind="transaction" value={row.digest} onOpenAddress={onOpenTransaction} />
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">from</span>
+                                <AccountPageAddressValue
+                                    account={account}
+                                    value={row.direction === 'sent' ? account : row.counterparty}
+                                    onCopy={onCopy}
+                                    onOpenAddress={onOpenAddress}
+                                />
+                            </span>
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">to</span>
+                                <AccountPageAddressValue
+                                    account={account}
+                                    value={row.direction === 'sent' ? row.counterparty : account}
+                                    onCopy={onCopy}
+                                    onOpenAddress={onOpenAddress}
+                                />
+                            </span>
                         </div>
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>
                             <span>nonce {row.nonce.toString()}</span>
                             <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
-                            <span>proof</span>
-                            <ProofMark proof={txProof} />
                         </div>
                     </div>
                 ))}
@@ -1458,96 +1367,162 @@ function AccountPage({
     );
 }
 
-function ProofDatum({ label, value }: { label: string; value: string }) {
-    return (
-        <div className="account-proof-grid__cell">
-            <span>{label}</span>
-            <strong>{value}</strong>
-        </div>
-    );
-}
-
-function ProofMark({ proof }: { proof: TransactionProofState }) {
-    if (proof.status === 'verified') {
-        return <span className="tx-proof-check" title={proof.detail}>✓</span>;
-    }
-    if (proof.status === 'error') {
-        return <span className="tx-proof-error" title={proof.detail}>!</span>;
-    }
-    return <span className="tx-proof-spinner" title={proof.detail} />;
-}
-
-function SearchModal({
-    children,
-    onClose,
+function BlockPage({
+    height, offset, bundle, message, loading, pageNumber, hasPrevious,
+    onPrevious, onNext, onOpenAddress, onOpenTransaction,
 }: {
-    children: React.ReactNode;
-    onClose: () => void;
-}) {
-    useEffect(() => {
-        const closeOnEscape = (event: KeyboardEvent) => {
-            if (event.key !== 'Escape') return;
-            onClose();
-        };
-        window.addEventListener('keydown', closeOnEscape);
-        return () => window.removeEventListener('keydown', closeOnEscape);
-    }, [onClose]);
-
-    return (
-        <div
-            className="modal"
-            role="presentation"
-            onMouseDown={(event) => {
-                if (event.target === event.currentTarget) onClose();
-            }}
-        >
-            <section className="modal__panel modal__panel--search" role="dialog" aria-modal="true" aria-label="account search">
-                <header className="modal__header">
-                    <h2>search</h2>
-                    <button className="modal__close" onClick={onClose}>
-                        close
-                    </button>
-                </header>
-                {children}
-            </section>
-        </div>
-    );
-}
-
-function AccountSearchPanel({
-    accountInput,
-    message,
-    onAccountInputChange,
-    onSubmit,
-}: {
-    accountInput: string;
+    height: bigint;
+    offset: bigint;
+    bundle: BlockBundle | null;
     message: string;
-    onAccountInputChange: (value: string) => void;
-    onSubmit: () => void;
+    loading: boolean;
+    pageNumber: number;
+    hasPrevious: boolean;
+    onPrevious: () => void;
+    onNext: () => void;
+    onOpenAddress: (value: string) => void;
+    onOpenTransaction: (digest: string) => void;
+}) {
+    const pageIsCurrent = bundle?.offset === offset;
+    const transactionProof = bundle?.transactions[0]?.proof;
+    return (
+        <section className="account-page" aria-label="certified block" aria-busy={loading}>
+            <div className="account-page__title">
+                <h2>block {height.toString()}</h2>
+            </div>
+            <div className="account-proof-grid">
+                <div className="account-proof-grid__details">
+                    <ProofDatum pending={!bundle} label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '-'} />
+                    <ProofDatum pending={!bundle} label="transactions" value={bundle?.block.transactionCount.toString() ?? '-'} />
+                </div>
+                <div className="account-proof-grid__evidence">
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : '—'} />
+                    <ProofDatum
+                        label="transaction proof"
+                        verified={!!transactionProof}
+                        pending={!transactionProof}
+                        value={bundle && transactionProof
+                            ? <span className="proof-badge">op{transactionProof.tip} / {bundle.transactions.length}L</span>
+                            : '-'}
+                    />
+                </div>
+            </div>
+            <div className="account-page__subhead">
+                <h3>page {bundle?.pageNumber ?? pageNumber}</h3>
+                <div className="account-page__pager">
+                    <span key={offset.toString()} aria-hidden="true"
+                        className={`account-page__progress${loading && bundle && !pageIsCurrent ? ' account-page__progress--pending' : ''}`}>loading</span>
+                    <button disabled={!hasPrevious || loading || !pageIsCurrent} onClick={onPrevious}>prev</button>
+                    <button disabled={loading || !pageIsCurrent || bundle?.nextOffset == null} onClick={onNext}>next</button>
+                </div>
+            </div>
+            <PageStatus message={message || (loading && !bundle ? 'verifying block evidence' : '')} />
+            {bundle && bundle.transactions.length === 0 && <div className="account-tx-row">no transactions in this block</div>}
+            <div className="account-tx-list">
+                {!bundle && <PendingTransactionRow includeDigest />}
+                {bundle?.transactions.map((transaction) => (
+                    <div className="account-tx-row" key={transaction.location.toString()}>
+                        <div className="account-tx-row__main">
+                            <AddressValue kind="transaction" value={transaction.digest} onOpenAddress={onOpenTransaction} />
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">from</span>
+                                <AddressValue value={transaction.sender} onOpenAddress={onOpenAddress} />
+                            </span>
+                            <span className="tx-party">
+                                <span className="account-tx-row__label">to</span>
+                                <AddressValue value={transaction.recipient} onOpenAddress={onOpenAddress} />
+                            </span>
+                        </div>
+                        <div className="account-tx-row__meta">
+                            <span>value {transaction.value.toString()}</span>
+                            <span>nonce {transaction.nonce.toString()}</span>
+                            <span>loc {transaction.location.toString()}</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </section>
+    );
+}
+
+function TransactionPage({ digest, bundle, message, loading, onCopy, onOpenAddress, onOpenBlock }: {
+    digest: string;
+    bundle: Awaited<ReturnType<typeof loadTransactionBundle>> | null;
+    message: string;
+    loading: boolean;
+    onCopy: (value: string) => void;
+    onOpenAddress: (value: string) => void;
+    onOpenBlock: (height: bigint) => void;
+}) {
+    const transaction = bundle?.transaction;
+    return (
+        <section className="account-page" aria-label="verified transaction" aria-busy={loading}>
+            <div className="account-page__title"><h2>transaction</h2></div>
+            <div className="account-page__line">
+                <span className="account-page__prompt">hash</span>
+                <CopyableValue value={digest} onCopy={onCopy} />
+            </div>
+            <div className="account-proof-grid">
+                <div className="account-proof-grid__details">
+                    <ProofDatum pending={!bundle} label="block" value={bundle ? <button className="account-page__height-link" onClick={() => onOpenBlock(bundle.height)}>h{bundle.height.toString()}:{transaction!.index}</button> : '-'} />
+                    <ProofDatum pending={!bundle} label="location" value={bundle?.location.toString() ?? '-'} />
+                </div>
+                <div className="account-proof-grid__evidence">
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="cert" value={bundle ? `h${bundle.target.height} / v${bundle.target.view}` : '—'} />
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="transaction proof" value={bundle ? <span className="proof-badge">op{bundle.tip} / 1L</span> : '-'} />
+                </div>
+            </div>
+            <PageStatus message={message || (loading ? 'verifying transaction evidence' : '')} />
+            {!transaction && <PendingTransactionRow />}
+            {transaction && <div className="account-tx-row">
+                <div className="account-tx-row__main">
+                    <span className="tx-party"><span className="account-tx-row__label">from</span><AddressValue value={transaction.sender} onOpenAddress={onOpenAddress} /></span>
+                    <span className="tx-party"><span className="account-tx-row__label">to</span><AddressValue value={transaction.recipient} onOpenAddress={onOpenAddress} /></span>
+                </div>
+                <div className="account-tx-row__meta"><span>value {transaction.value.toString()}</span><span>nonce {transaction.nonce.toString()}</span></div>
+            </div>}
+        </section>
+    );
+}
+
+function VerifiedEvidence({ children }: { children: React.ReactNode }) {
+    return (
+        <span className="verified-evidence">
+            <span className="verified-evidence__check" aria-hidden="true">✓</span>
+            <span className="visually-hidden">verified in browser: </span>
+            {children}
+        </span>
+    );
+}
+
+function ProofDatum({ label, value, pending = false, verified = false }: {
+    label: string;
+    value: React.ReactNode;
+    pending?: boolean;
+    verified?: boolean;
 }) {
     return (
-        <section className="account-search">
-            <form
-                className="account-lookup"
-                onSubmit={(event) => {
-                    event.preventDefault();
-                    onSubmit();
-                }}
-            >
-                <label>
-                    <span>account&gt;</span>
-                    <input
-                        autoFocus
-                        value={accountInput}
-                        onChange={(event) => onAccountInputChange(event.target.value)}
-                        placeholder="address"
-                        spellCheck={false}
-                    />
-                </label>
-                <button type="submit">open</button>
-            </form>
-            {message && <div className="account-search__message">{message}</div>}
-        </section>
+        <div className={`account-proof-grid__cell${verified ? ' verified-surface' : ''}`}>
+            <span>{verified ? <VerifiedEvidence>{label}</VerifiedEvidence> : label}</span>
+            <strong className={pending ? 'page-pending' : undefined}>{value}</strong>
+        </div>
+    );
+}
+
+function PageStatus({ message }: { message: string }) {
+    return <div className="page-status" role="status">{message || '\u00a0'}</div>;
+}
+
+function PendingTransactionRow({ includeDigest = false }: { includeDigest?: boolean }) {
+    return (
+        <div className="account-tx-row page-pending" aria-label="transaction evidence pending">
+            <div className="account-tx-row__main">
+                {includeDigest && <span className="page-pending__address">—</span>}
+                <span className="tx-party"><span className="account-tx-row__label">from</span><span className="page-pending__address">—</span></span>
+                <span className="tx-party"><span className="account-tx-row__label">to</span><span className="page-pending__address">—</span></span>
+            </div>
+            <div className="account-tx-row__meta"><span>value —</span><span>nonce —</span></div>
+        </div>
     );
 }
 
@@ -1614,7 +1589,7 @@ function WalletPanel({
     wallet: ActiveWallet | null;
     walletAccountKey: string | null;
     walletMessage: string;
-    account: AccountView | null;
+    account: WalletAccountView | null;
     accountMessage: string;
     toKey: string;
     value: string;
@@ -1633,22 +1608,21 @@ function WalletPanel({
     onValueChange: (value: string) => void;
     onSubmit: () => void;
 }) {
-    const balance = account?.balance ?? 100;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
-    const isAccountLoading = accountMessage === 'loading account metadata';
+    const showWalletMessage = walletMessage !== '' && walletMessage !== 'signed in';
+    const isAccountLoading = accountMessage === 'loading account update proof';
     const walletAccountDisplay = walletAccountKey?.toLowerCase() ?? 'not authenticated';
 
     return (
         <section className="wallet">
             <div className="wallet__header">
-                <div>
-                    <div className="wallet__label">status</div>
-                    <div className="wallet__status">
+                {showWalletMessage && (
+                    <div className="wallet__status" role="status">
                         <SpinnerText active={isWalletLoading} spinner={spinner}>
                             {walletMessage}
                         </SpinnerText>
                     </div>
-                </div>
+                )}
                 <div className="wallet__actions">
                     {!wallet && <button onClick={onSignIn}>sign in</button>}
                     {!wallet && <button onClick={onCreateWallet}>new passkey</button>}
@@ -1677,12 +1651,25 @@ function WalletPanel({
                 </div>
                 <div className="wallet__cell">
                     <span>balance</span>
-                    <strong>{balance.toLocaleString()}</strong>
+                    <strong>{account?.balance.toString() ?? 'unknown'}</strong>
                 </div>
                 <div className="wallet__cell">
-                    <span>nonce</span>
+                    <span>local draft nonce</span>
                     <strong>{nonce}</strong>
                 </div>
+                {wallet && (
+                    <div className={`wallet__cell wallet__evidence${account ? ' verified-surface' : ''}`} role="status">
+                        <span>{account ? <VerifiedEvidence>account proof</VerifiedEvidence> : 'account evidence'}</span>
+                        {accountMessage && <div className="wallet__status">{accountMessage}</div>}
+                        {account && (
+                            <div className="wallet__history-values">
+                                <span>nonce <strong>{account.nonce.base.toString()}</strong></span>
+                                <span>loc <strong>{account.location.toString()}</strong></span>
+                                <span>snapshot <strong>h{account.snapshotHeight.toString()}</strong></span>
+                            </div>
+                        )}
+                    </div>
+                )}
             </div>
             <form
                 className="transfer"
@@ -1729,6 +1716,16 @@ function WalletPanel({
     );
 }
 
+function IdentifierValue({ value }: { value: string }) {
+    return (
+        <span className="copyable__value" aria-hidden="true">
+            <span className="copyable__full">{value}</span>
+            <span className="copyable__short">{shortHex(value)}</span>
+            <span className="copyable__compact">{shortHex(value, 6)}</span>
+        </span>
+    );
+}
+
 function CopyableValue({
     disabled = false,
     plain = false,
@@ -1753,22 +1750,26 @@ function CopyableValue({
 
     return (
         <button
+            aria-label={`copy ${value}`}
             className={className}
             disabled={disabled}
             onClick={handleClick}
+            title={value}
             type="button"
         >
-            <span className="copyable__value">{value}</span>
+            <IdentifierValue value={value} />
         </button>
     );
 }
 
 function AddressValue({
+    kind = 'address',
     disabled = false,
     plain = false,
     value,
     onOpenAddress,
 }: {
+    kind?: 'address' | 'transaction';
     disabled?: boolean;
     plain?: boolean;
     value: string;
@@ -1784,14 +1785,14 @@ function AddressValue({
 
     return (
         <button
-            aria-label={`open address ${value}`}
+            aria-label={`open ${kind} ${value}`}
             className={className}
             disabled={disabled}
             onClick={() => onOpenAddress(value)}
-            title="open address"
+            title={`open ${kind} ${value}`}
             type="button"
         >
-            <span className="copyable__value">{value}</span>
+            <IdentifierValue value={value} />
         </button>
     );
 }
@@ -1869,7 +1870,7 @@ function TransactionHistory({
 
     return (
         <section className="tx-history">
-            <div className="tx-history__title">submitted transactions</div>
+            <h3 className="tx-history__title">submitted transactions</h3>
             <div className="tx-list">
                 {transactions.map((tx) => (
                     <TransactionRecord
@@ -1900,163 +1901,55 @@ function TransactionRecord({
     tx: SubmittedTransaction;
 }) {
     const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
+    const verificationError = tx.proof.status === 'error' ? tx.proof.detail
+        : tx.certificate.status === 'error' ? tx.certificate.detail : null;
+    const pending = tx.status === 'reconciling';
+    const observedInMs = tx.proofObservedInMs ?? tx.finalizationObservedInMs;
     return (
         <div className="tx-record">
             <div className="tx-record__primary">
                 <span className="tx-record__label">tx</span>
                 <CopyableValue value={tx.digest} onCopy={onCopy} />
-                <span className="tx-record__label">from</span>
-                <AddressValue
-                    value={tx.sender}
-                    onOpenAddress={onOpenAddress}
-                />
-                <span className="tx-record__arrow" aria-hidden="true">→</span>
-                <span className="tx-record__label">to</span>
-                <AddressValue
-                    value={tx.to}
-                    onOpenAddress={onOpenAddress}
-                />
+                <span className="tx-party">
+                    <span className="tx-record__label">from</span>
+                    <AddressValue
+                        value={tx.sender}
+                        onOpenAddress={onOpenAddress}
+                    />
+                </span>
+                <span className="tx-party">
+                    <span className="tx-record__arrow" aria-hidden="true">→</span>
+                    <span className="tx-record__label">to</span>
+                    <AddressValue
+                        value={tx.to}
+                        onOpenAddress={onOpenAddress}
+                    />
+                </span>
                 <span className="tx-record__nonce">value {tx.value}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
             </div>
             <div className="tx-record__secondary">
-                <span className="tx-record__detail">{tx.detail}</span>
-                <span className="tx-sep" aria-hidden="true">·</span>
-                <span className="tx-label">cert</span>
-                <CertificateCell certificate={tx.certificate} finalizedHeight={tx.finalizedHeight} />
-                <span className="tx-sep" aria-hidden="true">·</span>
-                <span className="tx-label">proof</span>
-                <ProofCell ownsTx={ownsTx} proof={tx.proof} />
-                {tx.finalizationObservedInMs !== null && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">finalization observed</span>
-                        <span>{tx.finalizationObservedInMs}ms</span>
-                    </>
+                {pending && (
+                    <span className={`tx-record__state${verificationError ? ' verification-error' : ''}`}>
+                        {verificationError ? <span aria-hidden="true">!</span>
+                            : <span className="tx-proof-spinner" aria-hidden="true" />}
+                        {verificationError ? 'verification failed' : 'awaiting proof'}
+                    </span>
                 )}
-                {tx.proofObservedInMs !== null && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">proof observed</span>
-                        <span>{tx.proofObservedInMs}ms</span>
-                    </>
+                <span className={`tx-record__detail${verificationError ? ' verification-error' : ''}`}>{verificationError ?? tx.detail}</span>
+                {tx.certificate.status === 'verified' && (
+                    <VerifiedEvidence>cert</VerifiedEvidence>
                 )}
+                {ownsTx && tx.proof.status === 'verified' && (
+                    <VerifiedEvidence>transaction proof</VerifiedEvidence>
+                )}
+                {observedInMs !== null && <span className="tx-record__state">observed {observedInMs}ms</span>}
             </div>
         </div>
     );
 }
 
-function CertificateCell({
-    certificate,
-    finalizedHeight,
-}: {
-    certificate: BlockCertificateState;
-    finalizedHeight: number | null;
-}) {
-    if (certificate.status === 'verified') {
-        return (
-            <span
-                className="tx-proof-check"
-                aria-label="block certificate verified"
-                title="block certificate verified"
-            >
-                ✓
-            </span>
-        );
-    }
-    if (certificate.status === 'error') {
-        return (
-            <span className="tx-proof-error" aria-label={certificate.detail} title={certificate.detail}>
-                !
-            </span>
-        );
-    }
-    if (certificate.status === 'unavailable') {
-        return (
-            <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
-                -
-            </span>
-        );
-    }
-    if (finalizedHeight === null) {
-        return (
-            <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
-                -
-            </span>
-        );
-    }
-    return (
-        <span className="tx-proof-spinner" aria-label={certificate.detail} title={certificate.detail} />
-    );
-}
-
-function ProofCell({
-    ownsTx,
-    proof,
-}: {
-    ownsTx: boolean;
-    proof: TransactionProofState;
-}) {
-    if (!ownsTx) {
-        return (
-            <span className="tx-proof-muted" aria-label="QMDB proof not requested" title="QMDB proof not requested">
-                -
-            </span>
-        );
-    }
-    if (proof.status === 'verified') {
-        return (
-            <span className="tx-proof-check" aria-label="QMDB proof verified" title="QMDB proof verified">
-                ✓
-            </span>
-        );
-    }
-    if (proof.status === 'error') {
-        return (
-            <>
-                <span className="tx-proof-error" aria-label={proof.detail} title={proof.detail}>
-                    !
-                </span>
-                <span className="tx-proof-error-detail">{proof.detail}</span>
-            </>
-        );
-    }
-    if (proof.status === 'unavailable') {
-        return (
-            <span className="tx-proof-muted" aria-label={proof.detail} title={proof.detail}>
-                -
-            </span>
-        );
-    }
-    return (
-        <span className="tx-proof-spinner" aria-label={proof.detail} title={proof.detail} />
-    );
-}
-
-
-function upsertBoundedBatch(
-    blocks: readonly ObservedBlock[],
-    current: ObservedBlock[],
-): ObservedBlock[] {
-    const byHeight = new Map(current.map((entry) => [entry.height.toString(), entry]));
-    for (const block of blocks) {
-        byHeight.set(block.height.toString(), block);
-    }
-
-    const next = Array.from(byHeight.values());
-    next.sort((a, b) => compareBlockHeightDesc(a.height, b.height));
-    if (next.length > HISTOGRAM_MAX_COLUMNS) {
-        next.length = HISTOGRAM_MAX_COLUMNS;
-    }
-    return next;
-}
-
-function compareBlockHeightDesc(a: bigint, b: bigint): number {
-    if (a > b) return -1;
-    if (a < b) return 1;
-    return 0;
-}
 
 function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofState {
     return {
@@ -2068,24 +1961,10 @@ function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofSt
     };
 }
 
-function retryingProofState(error: unknown) {
-    return { status: 'waiting', detail: accountRetryReason(error) ?? errorMessage(error) } as const;
-}
-
-function verifiedBlockCertificateState(certificate: {
-    readonly height: bigint;
-    readonly view: bigint;
-}): BlockCertificateState {
-    return {
-        status: 'verified',
-        detail: `verified at height ${certificate.height.toString()}`,
-        height: certificate.height.toString(),
-        view: certificate.view.toString(),
-    };
-}
-
-function shortHex(value: string): string {
-    return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
+function shortHex(value: string, prefixLength = 10): string {
+    return value.length <= prefixLength + 9
+        ? value
+        : `${value.slice(0, prefixLength)}…${value.slice(-8)}`;
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -2100,7 +1979,7 @@ function normalizeAccountInput(value: string): string | null {
     return null;
 }
 
-function accountNonceState(account: AccountView | null): NonceState {
+function accountNonceState(account: WalletAccountView | null): NonceState {
     if (account === null) {
         return emptyNonceState();
     }
@@ -2121,29 +2000,29 @@ function accountFromLocation(): string {
     return pathMatch ? pathMatch[1].toLowerCase() : '';
 }
 
+function transactionFromLocation(): string {
+    const url = new URL(window.location.href);
+    return normalizeAccountInput(url.searchParams.get('transaction') ??
+        /^\/transaction\/([0-9a-fA-F]{64})$/.exec(url.pathname)?.[1] ?? '') ?? '';
+}
+
+/** Reads a positive u64 block height from `?block=` or `/block/<height>`. */
+function blockFromLocation(): bigint | null {
+    const url = new URL(window.location.href);
+    const value = url.searchParams.get('block') ?? /^\/block\/(\d+)$/.exec(url.pathname)?.[1];
+    if (!value || !/^[1-9]\d{0,19}$/.test(value)) return null;
+    const height = BigInt(value);
+    return height <= (1n << 64n) - 1n ? height : null;
+}
+
 function readHistory(
     key: string,
     onError?: (message: string) => void,
 ): SubmittedTransaction[] {
-    let raw: string | null;
     try {
-        raw = window.localStorage.getItem(key);
+        return readStoredHistory(key, window.localStorage);
     } catch (error) {
         onError?.(storageErrorMessage(error));
-        return [];
-    }
-    if (!raw) return [];
-
-    try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed)
-            ? parsed.reduce<SubmittedTransaction[]>((transactions, item) => {
-                  const transaction = normalizeSubmittedTransaction(item);
-                  if (transaction) transactions.push(transaction);
-                  return transactions;
-              }, [])
-            : [];
-    } catch {
         return [];
     }
 }
@@ -2176,7 +2055,7 @@ function useBrailleSpinner(active: boolean): string {
     return BRAILLE_SPINNER[index];
 }
 
-function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
+function StatusBadge({ status, spinner, height }: { status: Status; spinner: string; height: bigint | null }) {
     if (status.kind === 'connecting') {
         return (
             <span className="app__status">
@@ -2196,15 +2075,8 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
         );
     }
     return (
-        <span className="app__status live">
-            <span className="app__live-text" aria-hidden="true">
-                {LIVE_STATUS_SYMBOLS.map((symbol, index) => (
-                    <span className="app__live-symbol" key={index}>
-                        {symbol}
-                    </span>
-                ))}
-            </span>
-            <span className="visually-hidden">live</span>
+        <span className="app__status">
+            height <span className="accent">{height?.toString() ?? '—'}</span>
         </span>
     );
 }
@@ -2215,7 +2087,7 @@ const ExplorerStats = memo(function ExplorerStats({
     totalTxObserved,
     observedRateWindow,
 }: {
-    blocks: ObservedBlock[];
+    blocks: VerifiedBlock[];
     totalBlocksObserved: number;
     totalTxObserved: number;
     observedRateWindow: ObservedRateWindow;
@@ -2228,7 +2100,7 @@ const ExplorerStats = memo(function ExplorerStats({
         <dl className="observed-stats" aria-label="explorer statistics">
             <ExplorerStat label="latest height" value={stats.latestHeight} />
             <ExplorerStat
-                label="observed tx/sec"
+                label="local received tx/sec"
                 value={formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
             />
             <ExplorerStat label="total txs observed" value={stats.totalTxObserved} />
@@ -2248,7 +2120,7 @@ function ExplorerStat({ label, value }: { label: string; value: string }) {
 }
 
 function buildExplorerStats(
-    blocks: ObservedBlock[],
+    blocks: VerifiedBlock[],
     totalBlocksObserved: number,
     totalTxObserved: number,
 ): {
@@ -2259,7 +2131,7 @@ function buildExplorerStats(
 } {
     let latest: bigint | null = null;
     let peak = 0;
-    for (const block of blocks) {
+    for (const block of blocks.slice(0, HISTOGRAM_MAX_COLUMNS)) {
         if (latest === null || block.height > latest) {
             latest = block.height;
         }
@@ -2268,12 +2140,11 @@ function buildExplorerStats(
         }
     }
 
-    const avg = totalBlocksObserved === 0 ? 0 : totalTxObserved / totalBlocksObserved;
     return {
         latestHeight: latest?.toString() ?? '—',
-        totalTxObserved: totalTxObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
-        peakTxPerBlock: peak === 0 ? '—' : peak.toLocaleString(),
-        avgTxPerBlock: totalBlocksObserved === 0 ? '—' : Math.round(avg).toLocaleString(),
+        totalTxObserved: totalBlocksObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
+        peakTxPerBlock: totalBlocksObserved === 0 ? '—' : peak.toLocaleString(),
+        avgTxPerBlock: formatAverageTxPerBlock(totalTxObserved, totalBlocksObserved),
     };
 }
 
@@ -2299,7 +2170,7 @@ function formatObservedTxPerSecond(
     });
 }
 
-const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
+const Histogram = memo(function Histogram({ blocks }: { blocks: VerifiedBlock[] }) {
     const frameRef = useRef<HTMLDivElement>(null);
     const measureRef = useRef<HTMLSpanElement>(null);
     const [columns, setColumns] = useState(HISTOGRAM_INITIAL_COLUMNS);
@@ -2321,9 +2192,11 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
             );
             setColumns((current) => (current === nextColumns ? current : nextColumns));
 
-            const rawRows = Math.floor(frame.clientHeight / charHeight);
-            const isMobile = window.matchMedia('(max-width: 760px)').matches;
-            const availableRows = isMobile ? rawRows : Math.floor(rawRows / 2);
+            const chart = measure.parentElement;
+            if (!chart) return;
+            const style = getComputedStyle(chart);
+            const contentHeight = chart.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+            const availableRows = Math.floor(contentHeight / charHeight);
             const nextRows = Math.max(
                 HISTOGRAM_MIN_ROWS,
                 Math.min(HISTOGRAM_MAX_ROWS, availableRows),
@@ -2341,37 +2214,39 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
         };
     }, []);
 
-    const { lines, placeholderCount } = useMemo(
+    const { lines, zeroLine, domain } = useMemo(
         () => buildHistogram(blocks, columns, rows),
         [blocks, columns, rows],
     );
+
     return (
         <div className="histogram-frame" ref={frameRef}>
-            <pre className="histogram" aria-label="recent block transaction count histogram">
+            <pre className="histogram" aria-label={`recent block transaction counts, zero to ${domain} transactions per block; dots mark empty blocks`}>
                 <span className="histogram__measure" ref={measureRef} aria-hidden="true">
                     █
                 </span>
-                {lines.map((line, index) => (
-                    <span
-                        className="histogram__line"
-                        key={index}
-                        style={histogramLineStyle(index, rows)}
-                    >
-                        {placeholderCount > 0 && (
-                            <span style={HISTOGRAM_PLACEHOLDER_STYLE}>
-                                {line.slice(0, placeholderCount)}
-                            </span>
-                        )}
-                        {line.slice(placeholderCount)}
-                    </span>
-                ))}
+                <span className="histogram__plot">
+                    {lines.map((line, index) => (
+                        <span className="histogram__line" key={index}>
+                            {line}
+                        </span>
+                    ))}
+                    <span className="histogram__zeros">{zeroLine}</span>
+                </span>
             </pre>
         </div>
     );
 });
 
-const BlockLog = memo(function BlockLog({ blocks }: { blocks: ObservedBlock[] }) {
-    const recent = blocks.slice(0, BLOCK_LOG_MAX);
+const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
+    blocks: VerifiedBlock[];
+    onOpenBlock: (height: bigint) => void;
+}) {
+    // Hover and focus freeze the displayed rows so new blocks do not shift a row under the pointer.
+    // Touch input pauses only through focus.
+    const [pausedBlocks, setPausedBlocks] = useState<VerifiedBlock[] | null>(null);
+    const pointerInside = useRef(false);
+    const recent = (pausedBlocks ?? blocks).slice(0, BLOCK_LOG_MAX);
     const formatter = useMemo(
         () =>
             new Intl.DateTimeFormat(undefined, {
@@ -2393,9 +2268,29 @@ const BlockLog = memo(function BlockLog({ blocks }: { blocks: ObservedBlock[] })
                 <span># txs</span>
                 <span>timestamp</span>
             </div>
-            <div className="block-log__list">
+            <div
+                className="block-log__list"
+                onPointerEnter={(event) => {
+                    if (event.pointerType === 'touch') return;
+                    pointerInside.current = true;
+                    setPausedBlocks((current) => current ?? blocks);
+                }}
+                onPointerLeave={(event) => {
+                    if (event.pointerType === 'touch') return;
+                    pointerInside.current = false;
+                    if (!event.currentTarget.contains(document.activeElement)) {
+                        setPausedBlocks(null);
+                    }
+                }}
+                onFocus={() => setPausedBlocks((current) => current ?? blocks)}
+                onBlur={(event) => {
+                    if (!pointerInside.current && !event.currentTarget.contains(event.relatedTarget)) {
+                        setPausedBlocks(null);
+                    }
+                }}
+            >
                 {recent.map((block) => (
-                    <BlockLogRow key={block.height.toString()} block={block} formatter={formatter} />
+                    <BlockLogRow key={block.height.toString()} block={block} formatter={formatter} onOpenBlock={onOpenBlock} />
                 ))}
             </div>
         </section>
@@ -2405,80 +2300,53 @@ const BlockLog = memo(function BlockLog({ blocks }: { blocks: ObservedBlock[] })
 const BlockLogRow = memo(function BlockLogRow({
     block,
     formatter,
+    onOpenBlock,
 }: {
-    block: ObservedBlock;
+    block: VerifiedBlock;
     formatter: Intl.DateTimeFormat;
+    onOpenBlock: (height: bigint) => void;
 }) {
     const hash = useMemo(() => bytesToHex(block.digest), [block.digest]);
+
+    // A touch press focuses the row so the log freezes before the click lands. A canceled touch
+    // releases it.
     return (
-        <div className="block-row">
-            <span className="block-row__height">{block.height.toString()}</span>
+        <button
+            type="button"
+            className="block-row"
+            onPointerDown={(event) => {
+                if (event.pointerType === 'touch') {
+                    event.currentTarget.focus({ preventScroll: true });
+                }
+            }}
+            onPointerCancel={(event) => {
+                if (event.pointerType === 'touch') event.currentTarget.blur();
+            }}
+            onClick={() => onOpenBlock(block.height)}
+            aria-label={`view block ${block.height}`}
+            aria-describedby={`block-finality-${block.height}`}
+        >
+            <span className="block-row__height">
+                {block.height.toString()}
+                <span className="block-row__finality" id={`block-finality-${block.height}`}>
+                    <VerifiedEvidence>
+                        {block.height === block.finality.certifiedHeight
+                            ? `cert v${block.finality.certificateView}`
+                            : `via h${block.finality.certifiedHeight}`}
+                    </VerifiedEvidence>
+                </span>
+            </span>
             <span className="block-row__hash" title={hash}>
                 {shortHex(hash)}
             </span>
             <span className="block-row__txcount">{block.txCount.toLocaleString()}</span>
-            <span className="block-row__time">{formatter.format(block.arrivedAt)}</span>
-        </div>
+            <span className="block-row__time">{formatBlockTimestamp(block.timestampMs, formatter)}</span>
+        </button>
     );
 });
 
-const HISTOGRAM_PLACEHOLDER_STYLE: CSSProperties = { color: '#383838' };
-
-function buildHistogram(
-    blocks: ObservedBlock[],
-    width: number,
-    rows: number,
-): { lines: string[]; placeholderCount: number } {
-    const recent = blocks.slice(0, width).reverse();
-    const placeholderCount = Math.max(0, width - recent.length);
-    let peak = 0;
-    for (const block of recent) {
-        if (block.txCount > peak) peak = block.txCount;
-    }
-
-    const ramp = BLOCK_GLYPHS.length - 1;
-    const stepsPerColumn = rows * ramp;
-    const placeholderSteps = Math.round(stepsPerColumn * 0.5);
-
-    const columnSteps: number[] = [];
-    for (let i = 0; i < placeholderCount; i++) {
-        columnSteps.push(placeholderSteps);
-    }
-    if (peak === 0) {
-        for (let i = 0; i < recent.length; i++) {
-            columnSteps.push(0);
-        }
-    } else {
-        for (const block of recent) {
-            const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
-            columnSteps.push(Math.min(stepsPerColumn, Math.max(1, scaledSteps)));
-        }
-    }
-
-    const lines: string[] = [];
-    for (let row = 0; row < rows; row++) {
-        const rowsBelow = rows - 1 - row;
-        let line = '';
-        for (const steps of columnSteps) {
-            const glyphIndex = Math.max(0, Math.min(ramp, steps - rowsBelow * ramp));
-            line += BLOCK_GLYPHS[glyphIndex];
-        }
-        lines.push(line);
-    }
-    return { lines, placeholderCount };
-}
-
-function histogramLineStyle(rowIndex: number, rows: number): CSSProperties {
-    const ratio = 1 - rowIndex / Math.max(1, rows - 1);
-    return { color: histogramLineColor(ratio) };
-}
-
-function histogramLineColor(ratio: number): string {
-    const start = [32, 34, 36];
-    const end = [255, 178, 0];
-    const mix = Math.max(0, Math.min(1, ratio));
-    const channels = start.map((value, index) =>
-        Math.round(value + (end[index] - value) * mix),
-    );
-    return `rgb(${channels[0]}, ${channels[1]}, ${channels[2]})`;
+function formatBlockTimestamp(timestampMs: bigint, formatter: Intl.DateTimeFormat): string {
+    return timestampMs >= 0n && timestampMs <= 8_640_000_000_000_000n
+        ? formatter.format(Number(timestampMs))
+        : `${timestampMs} ms`;
 }

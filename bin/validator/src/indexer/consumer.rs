@@ -647,7 +647,7 @@ mod tests {
                     payload,
                 };
                 let position;
-                (queue, position) = queue.append(record).await.unwrap();
+                (queue, position) = queue.append(&record).await.unwrap();
                 assert_eq!(position, height - 1);
                 retained.insert(
                     position,

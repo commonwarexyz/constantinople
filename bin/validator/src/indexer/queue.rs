@@ -4,11 +4,11 @@ use super::{FinalizedPayloads, payloads::PayloadDescriptor};
 use commonware_codec::{Buf, FixedSize, Read, ReadExt as _, Write};
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
-    ed25519::PublicKey,
     sha256::{Digest, Sha256},
 };
+use commonware_cryptography_curve25519::signing::VerifyingKey;
 use commonware_runtime::{
-    Supervisor,
+    BLOB_PAGE_SIZE, Supervisor,
     buffer::paged::{self, CacheRef},
     tokio::Context as RuntimeContext,
 };
@@ -31,7 +31,7 @@ use tracing::info;
 // Queue records are under a hundred bytes. Small sections keep the payload
 // blobs of acknowledged entries on disk only until their section prunes.
 pub(super) const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(16);
-const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = paged::page_size(4_096);
+const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = paged::page_size(BLOB_PAGE_SIZE);
 const FINALIZED_QUEUE_PAGE_CACHE_PAGES: NonZeroUsize = NZUsize!(256);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(64 * 1024);
 const CAPTURE_RECEIPT_KEY: U64 = U64::new(0);
@@ -56,7 +56,7 @@ impl FinalizedQueueWriter {
     pub(super) async fn enqueue(&self, record: FinalizedQueueRecord) -> Result<u64, queue::Error> {
         let mut current = self.queue.lock().await;
         let queue = current.take().expect("finalized queue writer was lost");
-        let (queue, position) = queue.enqueue(record).await?;
+        let (queue, position) = queue.enqueue(&record).await?;
         *current = Some(queue);
         Ok(position)
     }
@@ -84,7 +84,7 @@ pub(super) struct LatestCaptureReceipt {
 
 impl LatestCaptureReceipt {
     pub(super) fn from_upload<S: OperationList, T: OperationList>(
-        upload: &QueuedFinalizedUpload<Sha256, PublicKey, MinSig, S, T>,
+        upload: &QueuedFinalizedUpload<Sha256, VerifyingKey, MinSig, S, T>,
     ) -> Self {
         Self {
             height: upload.height(),
@@ -94,7 +94,7 @@ impl LatestCaptureReceipt {
         }
     }
 
-    pub(super) fn matches_block(&self, block: &EngineBlock<Sha256, PublicKey>) -> bool {
+    pub(super) fn matches_block(&self, block: &EngineBlock<Sha256, VerifyingKey>) -> bool {
         self.height == block.header.height
             && self.block_digest == *block.seal()
             && self.state_end == block.header.state_range.end()
@@ -222,11 +222,7 @@ pub(super) async fn init_finalized_queue(
     context: RuntimeContext,
     partition_prefix: &str,
 ) -> (FinalizedQueue, FinalizedQueueReader) {
-    let page_cache = CacheRef::from_pooler(
-        &context,
-        FINALIZED_QUEUE_PAGE_SIZE,
-        FINALIZED_QUEUE_PAGE_CACHE_PAGES,
-    );
+    let page_cache = CacheRef::new(FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_PAGE_CACHE_PAGES);
     let config = queue::Config {
         partition: format!("{partition_prefix}-finalized-index-records"),
         items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,

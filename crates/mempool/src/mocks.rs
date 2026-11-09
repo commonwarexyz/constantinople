@@ -5,7 +5,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
-use constantinople_primitives::{Header, VerifiedTransaction};
+use constantinople_primitives::{Header, LazySignedTransaction, VerifiedTransaction};
 use core::{
     future::{Future, ready},
     marker::PhantomData,
@@ -22,7 +22,7 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    proposals: Arc<Mutex<VecDeque<Vec<VerifiedTransaction<H>>>>>,
+    proposals: Arc<Mutex<VecDeque<Vec<LazySignedTransaction<H>>>>>,
     _marker: PhantomData<(C, P)>,
 }
 
@@ -48,7 +48,7 @@ where
     /// Creates a new static source from queued proposal batches.
     pub fn new(proposals: Vec<Vec<VerifiedTransaction<H>>>) -> Self {
         Self {
-            proposals: Arc::new(Mutex::new(proposals.into())),
+            proposals: Arc::new(Mutex::new(proposals.into_iter().map(handles).collect())),
             _marker: PhantomData,
         }
     }
@@ -58,8 +58,15 @@ where
         self.proposals
             .lock()
             .expect("static transaction source lock poisoned")
-            .push_back(transactions);
+            .push_back(handles(transactions));
     }
+}
+
+fn handles<H: Hasher>(transactions: Vec<VerifiedTransaction<H>>) -> Vec<LazySignedTransaction<H>> {
+    transactions
+        .into_iter()
+        .map(LazySignedTransaction::new)
+        .collect()
 }
 
 impl<C, P, H> TransactionSource<C, P, H> for StaticTransactionSource<C, P, H>
@@ -75,7 +82,7 @@ where
         _parent: &Header<C, H::Digest, P>,
         _round: Round,
         _filled: usize,
-    ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
+    ) -> impl Future<Output = Vec<LazySignedTransaction<H>>> + Send {
         let transactions = self
             .proposals
             .lock()
@@ -110,7 +117,8 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
+    use commonware_cryptography::{Digest, Signer, sha256};
+    use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{
@@ -121,7 +129,7 @@ mod tests {
 
     const NAMESPACE: &[u8] = b"mempool-test";
 
-    fn sign_tx(key: &ed25519::PrivateKey, nonce: u64) -> VerifiedTransaction<sha256::Sha256> {
+    fn sign_tx(key: &ed25519::SigningKey, nonce: u64) -> VerifiedTransaction<sha256::Sha256> {
         let hasher = &mut sha256::Sha256::default();
         let public_key = TransactionPublicKey::ed25519(key.public_key());
         Transaction::new(
@@ -133,9 +141,9 @@ mod tests {
         .seal_and_sign(key, NAMESPACE, hasher)
     }
 
-    fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
+    fn test_context() -> Context<sha256::Digest, ed25519::VerifyingKey> {
         let mut rng = StdRng::from_seed([3; 32]);
-        let leader = ed25519::PrivateKey::random(&mut rng).public_key();
+        let leader = ed25519::SigningKey::random(&mut rng).public_key();
         Context {
             round: Round::new(Epoch::zero(), View::zero()),
             leader,
@@ -146,11 +154,11 @@ mod tests {
     #[test]
     fn static_source_drains_batches_in_order() {
         let mut rng = StdRng::from_seed([9; 32]);
-        let key = ed25519::PrivateKey::random(&mut rng);
+        let key = ed25519::SigningKey::random(&mut rng);
         let tx1 = sign_tx(&key, 0);
         let tx2 = sign_tx(&key, 1);
         let mut source =
-            StaticTransactionSource::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(
+            StaticTransactionSource::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
                 vec![vec![tx1.clone()], vec![tx2]],
             );
         let parent = Header {
@@ -170,9 +178,9 @@ mod tests {
         let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].value().nonce, tx1.value().nonce);
+        assert_eq!(first[0].get(), Some(&tx1));
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].value().nonce, 1);
+        assert_eq!(second[0].get().map(|tx| tx.value().nonce), Some(1));
         assert!(third.is_empty());
     }
 }

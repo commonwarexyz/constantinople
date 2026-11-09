@@ -1,567 +1,692 @@
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
-import test from 'node:test';
+import { readFile } from 'node:fs/promises';
+import test, { type TestContext } from 'node:test';
+import { create } from '@bufbuild/protobuf';
 import { BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
-import { Code, ConnectError } from '@connectrpc/connect';
-import type { DecodedQueryResult, Table } from '@exowarexyz/sql';
+import { Code, ConnectError, type ServiceImpl } from '@connectrpc/connect';
+import { initQmdbWasm } from '@exowarexyz/qmdb';
+import { ensureSimplexWasm } from '@exowarexyz/simplex/wasm';
 
+import { fromHex, toArrayBuffer, toHex } from '../src/codec.ts';
 import {
-    subscribeBlocksFromTargets,
-    type BlockMetadataSqlClient,
-} from '../src/indexer.ts';
-import { shareProofTargets, type PublishedProofTarget, type PublishedProofTargetStore } from '../src/proofTarget.ts';
+    ExplorerService, WatchBlocksResponseSchema, type WatchBlocksResponse,
+} from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
+import { subscribeBlocks, type VerifiedBlockBatch } from '../src/indexer.ts';
+import { createBlockBatchVerifier, verifyBlockBundle } from '../src/proofBundle.ts';
+import { explorerFetch } from './rpcTest.ts';
 
-const MAX_QUEUED_TARGETS = 4096;
+const INDEXER = 'https://indexer.example';
+const DIGESTS = [
+    '02b1918cde9d139569548a500ccca920e673fcd4dd107f592df40fe73c120410',
+    '7d443c0c127dcfcada61c9f4c327eb646a4597a97732141f2ee179e9f41abced',
+    '1e09c5718799f0be0419cfbe15b5f12751ade8fc370ab43c2cc2648975296f12',
+];
+type WatchBlocks = ServiceImpl<typeof ExplorerService>['watchBlocks'];
+interface WireBundle { certificate: string; headers: string[]; sequenceNumber: string }
+interface PublisherFixture {
+    verificationMaterial: string;
+    directBlock: WireBundle;
+    emptyBlock: WireBundle;
+    historicalBlock: WireBundle;
+}
+interface BlockFeedFixture {
+    verificationMaterial: string;
+    afterZero: WireBundle;
+    bootstrap: WireBundle;
+    resumed: WireBundle;
+    first: WireBundle;
+    emptyFirst: WireBundle;
+    conflictingFirst: WireBundle;
+}
+let fixture: PublisherFixture;
+let feedFixture: BlockFeedFixture;
 
-test('block subscription queries SQL after the target and keeps its sequence floor', async () => {
-    const events: string[] = [];
-    const target = proofTarget(7n, 23n, 0xa5);
-    const sql = sqlClient(async (query, minSequenceNumber) => {
-        events.push('sql');
-        assert.match(query, /FROM block_meta WHERE height = 7 LIMIT 1/);
-        assert.equal(minSequenceNumber, 23n);
-        return queryResult(41n, 7n, target.blockDigest, 9n);
+function options(material = fixture.verificationMaterial) {
+    return { simplexVerificationMaterial: material, reconnectDelayMs: 0 };
+}
+
+function frame(bundle: WireBundle, extra: Partial<WatchBlocksResponse> = {}): WatchBlocksResponse {
+    return create(WatchBlocksResponseSchema, {
+        certificate: fromHex(bundle.certificate), headers: bundle.headers.map(fromHex),
+        sequenceNumber: BigInt(bundle.sequenceNumber), ...extra,
     });
-    const stream = subscribeBlocksFromTargets(sql, targets(target, events));
+}
 
+function serve(context: TestContext, watchBlocks: WatchBlocks) {
+    return context.mock.method(globalThis, 'fetch', explorerFetch({ watchBlocks }));
+}
+
+async function nextBatch(stream: AsyncGenerator<VerifiedBlockBatch, void, void>): Promise<VerifiedBlockBatch> {
     const next = await stream.next();
-
     assert.equal(next.done, false);
-    assert.deepEqual(events, ['target', 'sql']);
-    assert.equal(next.value.height, 7n);
-    assert.deepEqual(next.value.digest, target.blockDigest);
-    assert.equal(next.value.txCount, 9);
+    assert.ok(next.value);
+    return next.value;
+}
+
+function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => { resolve = done; });
+    return { promise, resolve };
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+}
+
+function terminalError(error: unknown) {
+    assert.ok(error instanceof ConnectError);
+    assert.equal(error.code, Code.FailedPrecondition);
+    return true;
+}
+
+test.before(async () => {
+    fixture = JSON.parse(await readFile(new URL('../../tests/fixtures/proofBundle.json', import.meta.url), 'utf8'));
+    feedFixture = JSON.parse(await readFile(new URL('../../tests/fixtures/blockFeed.json', import.meta.url), 'utf8'));
+    await Promise.all([
+        initQmdbWasm(toArrayBuffer(await readFile(new URL('./generated/wasm/exoware_qmdb_wasm_bg.wasm', import.meta.resolve('@exowarexyz/qmdb'))))),
+        ensureSimplexWasm({ module_or_path: await readFile(new URL('./generated/wasm/exoware_simplex_wasm_bg.wasm', import.meta.resolve('@exowarexyz/simplex/wasm'))) }),
+    ]);
+});
+
+test('generated WatchBlocks authenticates the latest block using only its parent', async (context) => {
+    let requestSignal: AbortSignal | undefined;
+    const handler = explorerFetch({ async *watchBlocks(request) {
+        assert.equal(request.after, undefined);
+        yield frame(fixture.emptyBlock, { sequenceNumber: (1n << 64n) - 1n });
+    } });
+    context.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        assert.equal(String(input), `${INDEXER}/constantinople.explorer.v1.ExplorerService/WatchBlocks`);
+        assert.equal(init?.method, 'POST');
+        assert.equal(new Headers(init?.headers).get('Content-Type'), 'application/connect+proto');
+        assert.equal(init?.redirect, 'error');
+        requestSignal = init?.signal ?? undefined;
+        return handler(input, init);
+    });
+    const stream = subscribeBlocks(`${INDEXER}/`, options());
+    const before = Date.now();
+    const batch = await nextBatch(stream);
+    assert.deepEqual(batch.blocks.map((row) => ({ ...row, digest: toHex(row.digest) })), [{
+        height: 3n, digest: DIGESTS[2], txCount: 0, timestampMs: 3n,
+        finality: { certifiedHeight: 3n, certificateView: 3n },
+    }]);
+    assert.equal(batch.target.height, 3n);
+    assert.equal(toHex(batch.target.blockDigest), DIGESTS[2]);
+    assert.equal('sequenceNumber' in batch.target, false);
+    assert.equal(batch.sequenceNumberHint, (1n << 64n) - 1n);
+    assert.ok(batch.receivedAt >= before && batch.receivedAt <= Date.now());
+    await stream.return();
+    assert.equal(requestSignal?.aborted, true);
+});
+
+test('explicit genesis catch-up publishes one ascending batch with counts from parent ends', async (context) => {
+    const fetch = serve(context, async function* (request) {
+        assert.equal(request.after, 0n);
+        yield frame(fixture.historicalBlock);
+    });
+    const stream = subscribeBlocks(INDEXER, { ...options(), after: 0n });
+    const batch = await nextBatch(stream);
+    assert.deepEqual(batch.blocks.map((row) => row.height), [1n, 2n, 3n]);
+    assert.deepEqual(batch.blocks.map((row) => toHex(row.digest)), DIGESTS);
+    assert.deepEqual(batch.blocks.map((row) => row.txCount), [3, 55, 0]);
+    assert.deepEqual(batch.blocks.map((row) => row.timestampMs), [1n, 2n, 3n]);
+    assert.ok(batch.blocks.every((row) => row.finality.certifiedHeight === 3n && row.finality.certificateView === 3n));
+    assert.equal(fetch.mock.callCount(), 1);
     await stream.return();
 });
 
-test('missing block metadata retries without dropping the target', async () => {
-    const target = proofTarget(8n, 29n, 0x3c);
-    let targetPulls = 0;
-    let queries = 0;
-    const source = {
-        async *[Symbol.asyncIterator]() {
-            targetPulls++;
-            yield target;
-            targetPulls++;
-        },
-    };
-    const sql = sqlClient(async (_query, minSequenceNumber) => {
-        queries++;
-        assert.equal(minSequenceNumber, 29n);
-        if (queries === 1) return queryResult(29n);
-        return queryResult(31n, 8n, target.blockDigest, 4n);
+test('block one uses the canonical genesis tip without requesting a genesis header', async (context) => {
+    serve(context, async function* (request) {
+        assert.equal(request.after, 0n);
+        yield frame(fixture.directBlock);
     });
-    const stream = subscribeBlocksFromTargets(sql, source, { reconnectDelayMs: 0 });
-
-    const next = await stream.next();
-
-    assert.equal(next.done, false);
-    assert.equal(next.value.height, 8n);
-    assert.equal(queries, 2);
-    assert.equal(targetPulls, 1);
+    const stream = subscribeBlocks(INDEXER, { ...options(), after: 0n });
+    const batch = await nextBatch(stream);
+    assert.deepEqual(batch.blocks.map((row) => [row.height, row.txCount]), [[1n, 3]]);
     await stream.return();
 });
 
-test('missing block metadata catch-up stops when cancelled', async () => {
-    const target = proofTarget(8n, 29n, 0x3c);
-    const controller = new AbortController();
-    let queried!: () => void;
-    const queryStarted = new Promise<void>((resolve) => {
-        queried = resolve;
+test('real equal-timestamp blocks preserve counts as the transaction floor advances', async (context) => {
+    serve(context, async function* (request) {
+        assert.equal(request.after, 0n);
+        yield frame(feedFixture.afterZero);
     });
-    const sql = sqlClient(async () => {
-        queried();
-        return queryResult(29n);
-    });
-    const stream = subscribeBlocksFromTargets(sql, targets(target), {
-        signal: controller.signal,
-        reconnectDelayMs: 10_000,
-    });
-
-    const next = stream.next();
-    await queryStarted;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    controller.abort();
-
-    assert.deepEqual(await next, { done: true, value: undefined });
-    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
-});
-
-test('block metadata must match the proof target height and digest', async (context) => {
-    const target = proofTarget(9n, 34n, 0x11);
-
-    await context.test('height mismatch', async () => {
-        const sql = sqlClient(async () => queryResult(34n, 10n, target.blockDigest, 1n));
-        const stream = subscribeBlocksFromTargets(sql, targets(target));
-
-        await assert.rejects(stream.next(), /height 10 does not match proof target 9/);
-    });
-
-    await context.test('digest mismatch', async () => {
-        const sql = sqlClient(async () => queryResult(34n, 9n, digest(0x12), 1n));
-        const stream = subscribeBlocksFromTargets(sql, targets(target));
-
-        await assert.rejects(stream.next(), /digest does not match proof target at height 9/);
-    });
-});
-
-test('block metadata retries backend errors until cancelled', async () => {
-    const target = proofTarget(12n, 44n, 0x72);
-    const controller = new AbortController();
-    const errors: string[] = [];
-    let reconnects = 0;
-    const sql = sqlClient(async () => {
-        throw new ConnectError('backend unavailable', Code.Unavailable);
-    });
-    const stream = subscribeBlocksFromTargets(sql, targets(target), {
-        signal: controller.signal,
-        reconnectDelayMs: 0,
-        onError: (message) => {
-            errors.push(message);
-            if (errors.length === 2) controller.abort();
-        },
-        onReconnect: () => {
-            reconnects++;
-        },
-    });
-
-    assert.deepEqual(await stream.next(), { done: true, value: undefined });
-    assert.deepEqual(errors, ['[unavailable] backend unavailable', '[unavailable] backend unavailable']);
-    assert.equal(reconnects, 2);
-    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
-});
-
-test('block point reads retry server and proxy failures', async (context) => {
-    for (const failure of [
-        new ConnectError('failed to read response body: connection reset', Code.Internal),
-        new ConnectError('HTTP 520', Code.Unknown),
-    ]) {
-        await context.test(failure.message, async () => {
-            const target = proofTarget(7n, 23n, 7);
-            let queries = 0;
-            const sql = sqlClient(async () => {
-                if (++queries === 1) throw failure;
-                return queryResult(23n, 7n, target.blockDigest, 1n);
-            });
-            const stream = subscribeBlocksFromTargets(sql, targets(target), { reconnectDelayMs: 0 });
-
-            try {
-                assert.equal((await stream.next()).value?.height, 7n);
-                assert.equal(queries, 2);
-            } finally {
-                await stream.return();
-            }
-        });
-    }
-});
-
-test('a consistency lag on the block point read is retried as catch-up', async () => {
-    const target = proofTarget(7n, 23n, 0xa5);
-    const controller = new AbortController();
-    const errors: string[] = [];
-    let reconnects = 0;
-    let queries = 0;
-    const sql = sqlClient(async (_query, minSequenceNumber) => {
-        queries++;
-        assert.equal(minSequenceNumber, 23n);
-        if (queries === 1) {
-            throw new Error('HTTP error: 409 [aborted] minimum consistency token is not yet visible');
-        }
-        return queryResult(23n, 7n, target.blockDigest, 2n);
-    });
-    const stream = subscribeBlocksFromTargets(sql, targets(target), {
-        signal: controller.signal,
-        reconnectDelayMs: 60_000,
-        onError: (message) => errors.push(message),
-        onReconnect: () => {
-            reconnects++;
-        },
-    });
-
-    const stalled = setTimeout(() => controller.abort(), 2_000);
-    const next = await stream.next();
-    clearTimeout(stalled);
-
-    assert.equal(next.done, false, 'block delivery stalled behind a consistency lag');
-    assert.equal(next.value.height, 7n);
-    assert.equal(queries, 2);
-    assert.deepEqual(errors, []);
-    assert.equal(reconnects, 1);
+    const stream = subscribeBlocks(INDEXER, { ...options(feedFixture.verificationMaterial), after: 0n });
+    const batch = await nextBatch(stream);
+    assert.deepEqual(batch.blocks.map((row) => row.height), [1n, 2n, 3n, 4n]);
+    assert.deepEqual(batch.blocks.map((row) => row.txCount), [3, 0, 2, 1]);
+    assert.deepEqual(batch.blocks.map((row) => row.timestampMs), [0n, 0n, 1n, 1n]);
+    assert.ok(batch.blocks.every((row) => row.finality.certifiedHeight === 4n));
     await stream.return();
 });
 
-test('streamed metadata waits for its publication target and avoids a point read', async () => {
-    const first = proofTarget(7n, 23n, 0xa5);
-    const second = proofTarget(8n, 29n, 0x3c);
-    const queries: string[] = [];
-    const source = streamingSql([queryResult(25n, 8n, second.blockDigest, 9n)], async (query) => {
-        queries.push(query);
-        await source.ready;
-        return queryResult(23n, 7n, first.blockDigest, 1n);
+test('moving-floor bootstrap emits only the certified head and its own transaction count', async (context) => {
+    serve(context, async function* (request) {
+        assert.equal(request.after, undefined);
+        yield frame(feedFixture.bootstrap);
     });
-    let publish!: () => void;
-    const published = new Promise<void>((resolve) => { publish = resolve; });
-    const stream = subscribeBlocksFromTargets(source.client, (async function* () {
-        yield first;
-        await published;
-        yield second;
-    })());
-
-    assert.equal((await stream.next()).value?.height, 7n);
-    let delivered = false;
-    const pending = stream.next().then((value) => { delivered = true; return value; });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(delivered, false);
-    publish();
-
-    const block = (await pending).value;
-    assert.equal(block?.height, 8n);
-    assert.equal(block?.txCount, 9);
-    assert.equal(queries.length, 1);
-    await stream.return();
-    assert.equal(source.stopped(), true);
-});
-
-test('a streamed row beyond the publication sequence requires a point read', async () => {
-    const first = proofTarget(7n, 23n, 0xa5);
-    const second = proofTarget(8n, 29n, 0x3c);
-    const floors: Array<bigint | undefined> = [];
-    const source = streamingSql([queryResult(30n, 8n, second.blockDigest, 99n)], async (_query, minSequenceNumber) => {
-        floors.push(minSequenceNumber);
-        await source.ready;
-        return floors.length === 1
-            ? queryResult(23n, 7n, first.blockDigest, 1n)
-            : queryResult(31n, 8n, second.blockDigest, 9n);
-    });
-    const stream = subscribeBlocksFromTargets(source.client, (async function* () {
-        yield first;
-        yield second;
-    })());
-
-    await stream.next();
-    assert.equal((await stream.next()).value?.txCount, 9);
-    assert.deepEqual(floors, [23n, 29n]);
+    const stream = subscribeBlocks(INDEXER, options(feedFixture.verificationMaterial));
+    const batch = await nextBatch(stream);
+    assert.deepEqual(batch.blocks.map((row) => [row.height, row.txCount, row.timestampMs]), [[4n, 1, 1n]]);
     await stream.return();
 });
 
-test('streamed metadata must match the published digest', async () => {
-    const first = proofTarget(7n, 23n, 0xa5);
-    const second = proofTarget(8n, 29n, 0x3c);
-    const source = streamingSql([queryResult(25n, 8n, digest(0xff), 9n)], async () => {
-        await source.ready;
-        return queryResult(23n, 7n, first.blockDigest, 1n);
+test('an empty certified block one derives zero transactions from the genesis tip', async (context) => {
+    serve(context, async function* (request) {
+        assert.equal(request.after, 0n);
+        yield frame(feedFixture.emptyFirst);
     });
-    const stream = subscribeBlocksFromTargets(source.client, (async function* () {
-        yield first;
-        yield second;
-    })());
-
-    await stream.next();
-    await assert.rejects(stream.next(), /digest does not match proof target at height 8/);
-    assert.equal(source.stopped(), true);
-});
-
-test('evicted metadata is fetched without losing a published block', async () => {
-    const first = proofTarget(7n, 23n, 0xa5);
-    let queries = 0;
-    const frames = Array.from({ length: 140 }, (_, i) =>
-        queryResult(25n, BigInt(i + 8), digest(0xa5), 1n));
-    const source = streamingSql(frames, async () => {
-        queries++;
-        await source.ready;
-        return queryResult(29n, queries === 1 ? 7n : 8n, first.blockDigest, 1n);
-    });
-    const stream = subscribeBlocksFromTargets(source.client, (async function* () {
-        yield first;
-        yield proofTarget(8n, 29n, 0xa5);
-        yield proofTarget(147n, 30n, 0xa5);
-    })());
-
-    assert.equal((await stream.next()).value?.height, 7n);
-    assert.equal((await stream.next()).value?.height, 8n);
-    assert.equal((await stream.next()).value?.height, 147n);
-    assert.equal(queries, 2);
+    const stream = subscribeBlocks(INDEXER, { ...options(feedFixture.verificationMaterial), after: 0n });
+    const batch = await nextBatch(stream);
+    assert.deepEqual(batch.blocks.map((row) => [row.height, row.txCount, row.timestampMs]), [[1n, 0, 0n]]);
     await stream.return();
 });
 
-test('metadata subscription resumes live after a lost cursor while point reads cover gaps', async () => {
-    const first = proofTarget(7n, 23n, 0xa5);
-    const second = proofTarget(8n, 29n, 0x3c);
-    const source = streamingSql([queryResult(25n, 8n, second.blockDigest, 9n)], async () => {
-        await source.ready;
-        return queryResult(23n, 7n, first.blockDigest, 1n);
-    });
-    const subscribe = source.client.subscribe;
+test('reconnect accepts equal timestamps while bridging the first moving-floor block', async (context) => {
     const cursors: Array<bigint | undefined> = [];
-    source.client.subscribe = async function* (request, options) {
-        cursors.push(request.sinceSequenceNumber);
-        if (cursors.length === 1) {
-            const error = new ConnectError('cursor evicted', Code.OutOfRange);
-            error.details.push({
-                type: 'google.rpc.ErrorInfo',
-                value: new BinaryWriter()
-                    .tag(1, WireType.LengthDelimited)
-                    .string('BATCH_EVICTED')
-                    .tag(2, WireType.LengthDelimited)
-                    .string('log.stream')
-                    .finish(),
-            });
-            throw error;
-        }
-        yield* subscribe(request, options);
-    };
-    const errors: string[] = [];
-    const stream = subscribeBlocksFromTargets(source.client, (async function* () {
-        yield first;
-        yield second;
-    })(), { reconnectDelayMs: 0, onError: (message) => errors.push(message) });
-
-    assert.equal((await stream.next()).value?.height, 7n);
-    assert.equal((await stream.next()).value?.height, 8n);
-    assert.deepEqual(cursors, [23n, undefined]);
-    assert.deepEqual(errors, ['[out_of_range] cursor evicted']);
+    serve(context, async function* (request) {
+        cursors.push(request.after);
+        yield frame(cursors.length === 1 ? feedFixture.first : feedFixture.resumed);
+    });
+    const stream = subscribeBlocks(INDEXER, options(feedFixture.verificationMaterial));
+    const first = await nextBatch(stream);
+    const resumed = await nextBatch(stream);
+    assert.deepEqual(first.blocks.map((row) => [row.height, row.txCount]), [[1n, 3]]);
+    assert.deepEqual(resumed.blocks.map((row) => [row.height, row.txCount]), [[2n, 0], [3n, 2], [4n, 1]]);
+    assert.deepEqual(resumed.blocks.map((row) => row.timestampMs), [0n, 1n, 1n]);
+    assert.deepEqual(cursors, [undefined, 1n]);
     await stream.return();
-    assert.equal(source.stopped(), true);
 });
 
-function streamingSql(frames: DecodedQueryResult[], query: BlockMetadataSqlClient['query']) {
-    let ready!: () => void;
-    const received = new Promise<void>((resolve) => { ready = resolve; });
-    let stopped = false;
-    const client: BlockMetadataSqlClient = {
-        query,
-        async *subscribe(_request, options) {
-            const signal = options?.signal;
-            assert.ok(signal);
-            try {
-                for (const frame of frames) yield frame;
-                ready();
-                if (!signal.aborted) {
-                    await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
-                }
-            } finally {
-                stopped = true;
-            }
-        },
-    };
-    return { client, ready: received, stopped: () => stopped };
-}
-
-function sqlClient(
-    query: BlockMetadataSqlClient['query'],
-): BlockMetadataSqlClient {
-    return streamingSql([], query).client;
-}
-
-function queryResult(
-    sequenceNumber: bigint,
-    height?: bigint,
-    blockDigest?: Uint8Array,
-    txCount?: bigint,
-): DecodedQueryResult {
-    if (height === undefined || blockDigest === undefined || txCount === undefined) {
-        return { sequenceNumber, table: testTable([]) };
-    }
-    return {
-        sequenceNumber,
-        table: testTable([{ height, digest: blockDigest, tx_count: txCount }]),
-    };
-}
-
-function testTable(rows: readonly Record<string, unknown>[]): Table {
-    return {
-        numRows: rows.length,
-        getChild(column: string) {
-            if (!rows.some((row) => Object.hasOwn(row, column))) return null;
-            return { get: (index: number) => rows[index]?.[column] };
-        },
-    } as unknown as Table;
-}
-
-function proofTarget(
-    height: bigint,
-    sequenceNumber: bigint,
-    seed: number,
-): PublishedProofTarget {
-    return {
-        height,
-        blockDigest: digest(seed),
-        sequenceNumber,
-    };
-}
-
-async function* targets(target: PublishedProofTarget, events?: string[]) {
-    events?.push('target');
-    yield target;
-}
-
-function digest(seed: number): Uint8Array {
-    return new Uint8Array(32).fill(seed);
-}
-
-test('a blocked SQL read cannot delay proof listeners on the shared target source', async () => {
-    const controller = new AbortController();
-    let sqlStarted!: () => void;
-    const sqlPending = new Promise<void>((resolve) => { sqlStarted = resolve; });
-    let publish!: () => void;
-    const publication = new Promise<void>((resolve) => { publish = resolve; });
-    const store = {
-        async query() {
-            return { sequenceNumber: 10n, results: [{ key: heightKey(1n), value: digest(1) }] };
-        },
-        async *subscribe(_request: unknown, options: { signal?: AbortSignal } = {}) {
-            await publication;
-            yield { sequenceNumber: 20n, entries: [{ key: heightKey(2n), value: digest(2) }] };
-            await untilAborted(options.signal).catch(() => {});
-        },
-    } as PublishedProofTargetStore;
-    const shared = shareProofTargets(store, { signal: controller.signal });
-    const proof = shared.subscribe();
-    const blocks = subscribeBlocksFromTargets(sqlClient((_query, _floor, options) => {
-        sqlStarted();
-        return untilAborted(options?.signal);
-    }), shared.subscribe(), { signal: controller.signal });
-    const pendingBlock = blocks.next();
-    assert.equal((await proof.next()).value?.height, 1n);
-    await sqlPending;
-    publish();
-    assert.equal((await proof.next()).value?.height, 2n);
-    controller.abort();
-    assert.deepEqual(await pendingBlock, { done: true, value: undefined });
+test('a valid conflicting certificate at the accepted height cannot replace the cursor', async () => {
+    const verifier = createBlockBatchVerifier(feedFixture.verificationMaterial);
+    const first = await verifier.verify(frame(feedFixture.first));
+    assert.ok(first);
+    await assert.rejects(verifier.verify(frame(feedFixture.conflictingFirst)), /conflicts with its accepted head/);
+    assert.equal(verifier.after, 1n);
+    assert.equal(await verifier.verify(frame(feedFixture.first)), null);
+    const resumed = await verifier.verify(frame(feedFixture.resumed));
+    assert.ok(resumed);
+    assert.deepEqual(resumed.blocks.map((row) => row.height), [2n, 3n, 4n]);
+    assert.equal(verifier.after, 4n);
 });
 
-test('a SQL outage across a long target backlog resumes at the latest target', async () => {
-    const controller = new AbortController();
-    const backlog = 4100n;
-    const store = {
-        async query() {
-            return { sequenceNumber: 0n, results: [] };
-        },
-        async *subscribe(_request: unknown, options: { signal?: AbortSignal } = {}) {
-            for (let height = 1n; height <= backlog; height++) {
-                yield { sequenceNumber: height, entries: [{ key: heightKey(height), value: digest(1) }] };
-            }
-            await untilAborted(options.signal).catch(() => {});
-        },
-    } as PublishedProofTargetStore;
-    const shared = shareProofTargets(store, { signal: controller.signal });
-    const proof = shared.subscribe();
-    let recovered = false;
-    const blocks = subscribeBlocksFromTargets(sqlClient(async (query, floor) => {
-        if (!recovered) throw new ConnectError('SQL unavailable', Code.Unavailable);
-        const height = BigInt(/height = (\d+)/.exec(query)![1]!);
-        return queryResult(floor!, height, digest(1), 0n);
-    }), shared.subscribe(), { signal: controller.signal, reconnectDelayMs: 0 });
-
-    const first = blocks.next();
-    for (let height = 1n; height <= backlog; height++) {
-        assert.equal((await proof.next()).value?.height, height);
-    }
-    recovered = true;
-    let previous = (await first).value!.height;
-    let delivered = 1;
-    while (previous < backlog) {
-        const height = (await blocks.next()).value!.height;
-        assert.ok(height > previous);
-        previous = height;
-        delivered++;
-    }
-    assert.ok(delivered <= MAX_QUEUED_TARGETS + 1);
-    controller.abort();
-    await blocks.return();
+test('a valid advancing certificate cannot bridge a different accepted block-one digest', async () => {
+    const verifier = createBlockBatchVerifier(feedFixture.verificationMaterial);
+    await verifier.verify(frame(feedFixture.conflictingFirst));
+    await assert.rejects(verifier.verify(frame(feedFixture.resumed)), /ancestry does not match its accepted head/);
+    assert.equal(verifier.after, 1n);
+    assert.equal(await verifier.verify(frame(feedFixture.conflictingFirst)), null);
+    await assert.rejects(verifier.verify(frame(feedFixture.first)), /conflicts with its accepted head/);
+    assert.equal(verifier.after, 1n);
 });
 
-function heightKey(height: bigint): Uint8Array {
-    const key = new Uint8Array(8);
-    new DataView(key.buffer).setBigUint64(0, height);
-    return key;
-}
-
-function untilAborted(signal?: AbortSignal): Promise<never> {
-    return new Promise((_resolve, reject) => {
-        if (signal?.aborted) reject(signal.reason);
-        else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
-    });
-}
-
-test('permanent block query failures are terminal', async (context) => {
-    for (const failure of [
-        new ConnectError('no field named tx_count', Code.InvalidArgument),
-        new Error('SQL response is missing its Arrow schema'),
-    ]) {
-        await context.test(failure.message, async () => {
-            const controller = new AbortController();
-            let attempts = 0;
-            let errors = 0;
-            const sql = sqlClient(async () => {
-                attempts++;
-                throw failure;
-            });
-            const stream = subscribeBlocksFromTargets(sql, targets(proofTarget(7n, 23n, 7)), {
-                signal: controller.signal,
-                reconnectDelayMs: 0,
-                onError() {
-                    if (++errors === 2) controller.abort();
-                },
-            });
-
-            try {
-                await assert.rejects(stream.next(), { message: failure.message });
-                assert.equal(attempts, 1);
-                assert.equal(errors, 1);
-            } finally {
-                controller.abort();
-                await stream.return();
-            }
-        });
-    }
-});
-
-test('a permanently failed metadata stream stops while point reads keep delivering', async (context) => {
-    context.mock.timers.enable({ apis: ['setTimeout'] });
-    const controller = new AbortController();
-    const first = proofTarget(7n, 23n, 7);
-    const second = proofTarget(8n, 24n, 8);
-    let failed!: () => void;
-    const failure = new Promise<void>((resolve) => { failed = resolve; });
-    let subscriptions = 0;
-    let queries = 0;
+test('reconnect bridges the accepted digest independently of the shared certificate memo', async (context) => {
+    const cursors: Array<bigint | undefined> = [];
     const errors: string[] = [];
-    const sql: BlockMetadataSqlClient = {
-        async query() {
-            queries++;
-            const target = queries === 1 ? first : second;
-            return queryResult(target.sequenceNumber, target.height, target.blockDigest, 1n);
-        },
-        async *subscribe() {
-            subscriptions++;
-            throw new ConnectError('table subscription is unsupported', Code.Unimplemented);
-        },
-    };
-    const stream = subscribeBlocksFromTargets(sql, (async function* () {
-        yield first;
-        yield second;
-    })(), {
-        signal: controller.signal,
-        reconnectDelayMs: 0,
-        onError(message) {
-            errors.push(message);
-            failed();
-        },
+    let reconnects = 0;
+    serve(context, async function* (request) {
+        cursors.push(request.after);
+        if (cursors.length === 1) {
+            yield frame(fixture.directBlock);
+            throw new ConnectError('upstream unavailable', Code.Unavailable);
+        }
+        if (cursors.length === 2) {
+            yield frame(fixture.historicalBlock);
+            return;
+        }
+        yield frame(fixture.emptyBlock);
+        yield frame(fixture.directBlock);
+        throw new ConnectError('end of fixture', Code.FailedPrecondition);
     });
+    const stream = subscribeBlocks(INDEXER, {
+        ...options(), onError: (error) => errors.push(error), onReconnect: () => { reconnects++; },
+    });
+    const first = await nextBatch(stream);
+    assert.deepEqual(first.blocks.map((row) => row.height), [1n]);
+    await verifyBlockBundle({ indexerUrl: INDEXER, ...options(), height: 3n }, fixture.emptyBlock);
+    const second = await nextBatch(stream);
+    assert.deepEqual(second.blocks.map((row) => [row.height, row.txCount]), [[2n, 55], [3n, 0]]);
+    await verifyBlockBundle({ indexerUrl: INDEXER, ...options(), height: 1n }, fixture.directBlock);
+    await assert.rejects(stream.next(), terminalError);
+    assert.deepEqual(cursors, [undefined, 1n, 3n]);
+    assert.equal(reconnects, 3);
+    assert.deepEqual(errors.slice(0, 2), ['[unavailable] upstream unavailable', '[unavailable] block feed closed']);
+});
 
-    try {
-        const next = stream.next();
-        await failure;
-        context.mock.timers.tick(0);
-        await Promise.resolve();
-        assert.equal((await next).value?.height, 7n);
-        assert.equal((await stream.next()).value?.height, 8n);
-        assert.equal(subscriptions, 1);
-        assert.equal(queries, 2);
-        assert.deepEqual(errors, ['[unimplemented] table subscription is unsupported']);
-    } finally {
-        controller.abort();
-        await stream.return();
+for (const mutation of ['corrupt oldest', 'truncate oldest', 'missing overlap', 'missing middle', 'reverse ancestry', 'corrupt certificate'] as const) {
+    test(`invalid final evidence publishes no partial batch: ${mutation}`, async (context) => {
+        const cursors: Array<bigint | undefined> = [];
+        const message = frame(fixture.historicalBlock);
+        if (mutation === 'corrupt oldest') message.headers[1]![message.headers[1]!.length - 1] ^= 1;
+        if (mutation === 'truncate oldest') message.headers[1] = message.headers[1]!.slice(0, -1);
+        if (mutation === 'missing overlap') message.headers.pop();
+        if (mutation === 'missing middle') message.headers.shift();
+        if (mutation === 'reverse ancestry') message.headers.reverse();
+        if (mutation === 'corrupt certificate') message.certificate[0] ^= 1;
+        const fetch = serve(context, async function* (request) {
+            cursors.push(request.after);
+            if (cursors.length === 1) yield frame(fixture.directBlock);
+            else yield message;
+        });
+        const stream = subscribeBlocks(INDEXER, options());
+        const accepted = await nextBatch(stream);
+        const snapshot = structuredClone(accepted);
+        await assert.rejects(stream.next());
+        assert.deepEqual(accepted, snapshot);
+        assert.deepEqual(cursors, [undefined, 1n]);
+        assert.equal(fetch.mock.callCount(), 2);
+        assert.deepEqual(await stream.next(), { done: true, value: undefined });
+    });
+}
+
+test('rejected ancestry preserves the verifier cursor until a complete batch succeeds', async () => {
+    const verifier = createBlockBatchVerifier(fixture.verificationMaterial);
+    assert.equal(verifier.after, undefined);
+    await verifier.verify(frame(fixture.directBlock));
+    assert.equal(verifier.after, 1n);
+    const bad = frame(fixture.historicalBlock);
+    bad.headers[1]![bad.headers[1]!.length - 1] ^= 1;
+    await assert.rejects(verifier.verify(bad), /header|digest/i);
+    assert.equal(verifier.after, 1n);
+    const batch = await verifier.verify(frame(fixture.historicalBlock));
+    assert.ok(batch);
+    assert.deepEqual(batch.blocks.map((row) => row.height), [2n, 3n]);
+    assert.equal(verifier.after, 3n);
+    assert.equal(await verifier.verify(frame(fixture.emptyBlock)), null);
+    assert.equal(await verifier.verify(frame(fixture.directBlock)), null);
+    assert.equal(verifier.after, 3n);
+});
+
+test('canceling the last ancestor hash leaves the same verifier able to resume', { timeout: 5_000 }, async (context) => {
+    const verifier = createBlockBatchVerifier(fixture.verificationMaterial);
+    await verifier.verify(frame(fixture.directBlock));
+    const controller = new AbortController();
+    const hashing = deferred();
+    const release = deferred();
+    context.after(() => release.resolve());
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    const spy = context.mock.method(crypto.subtle, 'digest', async (...[algorithm, bytes]: Parameters<SubtleCrypto['digest']>) => {
+        if (toHex(new Uint8Array(bytes as ArrayBuffer)) === fixture.historicalBlock.headers[1]) {
+            hashing.resolve();
+            await release.promise;
+        }
+        return digest(algorithm, bytes);
+    });
+    const pending = verifier.verify(frame(fixture.historicalBlock), controller.signal);
+    const rejected = assert.rejects(pending);
+    await hashing.promise;
+    controller.abort();
+    release.resolve();
+    await rejected;
+    assert.equal(verifier.after, 1n);
+    spy.mock.restore();
+    const accepted = await verifier.verify(frame(fixture.historicalBlock));
+    assert.ok(accepted);
+    assert.deepEqual(accepted.blocks.map((row) => row.height), [2n, 3n]);
+    assert.equal(verifier.after, 3n);
+});
+
+test('abort while hashing the final overlap header publishes no new rows', { timeout: 5_000 }, async (context) => {
+    const controller = new AbortController();
+    context.after(() => controller.abort());
+    const hashing = deferred();
+    const release = deferred();
+    context.after(() => release.resolve());
+    const cursors: Array<bigint | undefined> = [];
+    const errors: string[] = [];
+    serve(context, async function* (request) {
+        cursors.push(request.after);
+        yield frame(cursors.length === 1 ? fixture.directBlock : fixture.historicalBlock);
+    });
+    const stream = subscribeBlocks(INDEXER, {
+        ...options(), signal: controller.signal, onError: (error) => errors.push(error),
+    });
+    const accepted = await nextBatch(stream);
+    const snapshot = structuredClone(accepted);
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    context.mock.method(crypto.subtle, 'digest', async (...[algorithm, bytes]: Parameters<SubtleCrypto['digest']>) => {
+        if (toHex(new Uint8Array(bytes as ArrayBuffer)) === fixture.historicalBlock.headers[1]) {
+            hashing.resolve();
+            await release.promise;
+        }
+        return digest(algorithm, bytes);
+    });
+    const pending = stream.next();
+    await hashing.promise;
+    controller.abort();
+    release.resolve();
+    assert.deepEqual(await pending, { done: true, value: undefined });
+    assert.deepEqual(accepted, snapshot);
+    assert.deepEqual(cursors, [undefined, 1n]);
+    assert.deepEqual(errors, ['[unavailable] block feed closed']);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('mutating published buffers cannot change the private resume digest or cached target', async (context) => {
+    const cursors: Array<bigint | undefined> = [];
+    serve(context, async function* (request) {
+        cursors.push(request.after);
+        yield frame(request.after === 1n ? fixture.historicalBlock
+            : cursors.length === 1 ? fixture.directBlock : fixture.emptyBlock);
+    });
+    const settings = options();
+    const stream = subscribeBlocks(INDEXER, settings);
+    const first = await nextBatch(stream);
+    const expectedTarget = structuredClone(first.target);
+    settings.simplexVerificationMaterial = '00';
+    first.blocks[0]!.digest.fill(0);
+    for (const value of Object.values(first.target)) if (value instanceof Uint8Array) value.fill(0);
+    const cached = await verifyBlockBundle({ indexerUrl: INDEXER, ...options(), height: 1n }, fixture.directBlock);
+    for (const key of ['blockDigest', 'stateRoot', 'transactionsRoot'] as const) {
+        assert.deepEqual(cached.target[key], expectedTarget[key]);
     }
+    const next = await nextBatch(stream);
+    assert.deepEqual(next.blocks.map((row) => toHex(row.digest)), DIGESTS.slice(1));
+    assert.equal(toHex(next.target.blockDigest), DIGESTS[2]);
+    assert.deepEqual(cursors, [undefined, 1n]);
+    await stream.return();
+    const fresh = subscribeBlocks(INDEXER, options());
+    assert.equal(toHex((await nextBatch(fresh)).target.blockDigest), DIGESTS[2]);
+    await fresh.return();
+});
+
+test('a certificate cached under one verification context cannot authenticate another', async (context) => {
+    serve(context, async function* () { yield frame(fixture.directBlock); });
+    const first = subscribeBlocks(INDEXER, options());
+    await nextBatch(first);
+    await first.return();
+    const foreignMaterial = fromHex(fixture.verificationMaterial);
+    foreignMaterial[0] ^= 1;
+    await assert.rejects(subscribeBlocks(INDEXER, {
+        ...options(), simplexVerificationMaterial: toHex(foreignMaterial),
+    }).next());
+    const restored = subscribeBlocks(INDEXER, options());
+    assert.equal(toHex((await nextBatch(restored)).blocks[0]!.digest), DIGESTS[0]);
+    await restored.return();
+});
+
+for (const [name, mutate, expected] of [
+    ['4097 headers', (message: WatchBlocksResponse) => { message.headers = Array.from({ length: 4097 }, () => new Uint8Array(1)); }, /header|ancestry/i],
+    ['513-byte header', (message: WatchBlocksResponse) => { message.headers = [new Uint8Array(513)]; }, /header/i],
+    ['16KiB+1 certificate', (message: WatchBlocksResponse) => { message.certificate = new Uint8Array(16 * 1024 + 1); }, /certificate/i],
+] as const) {
+    test(`feed rejects ${name} before hashing`, async (context) => {
+        const message = frame(fixture.emptyBlock);
+        mutate(message);
+        const digest = context.mock.method(crypto.subtle, 'digest');
+        const fetch = serve(context, async function* () { yield message; });
+        await assert.rejects(subscribeBlocks(INDEXER, options()).next(), expected);
+        assert.equal(digest.mock.callCount(), 0);
+        assert.equal(fetch.mock.callCount(), 1);
+        await assert.rejects(createBlockBatchVerifier('00').verify(message), expected);
+        assert.equal(digest.mock.callCount(), 0);
+    });
+}
+
+for (const [name, payload, expectedCode, expectedMessage] of [
+    ['oversized certificate length', () => new BinaryWriter().tag(5, WireType.LengthDelimited).uint32(16 * 1024 + 1).finish(), Code.ResourceExhausted, /size limit/],
+    ['oversized header length', () => new BinaryWriter().tag(6, WireType.LengthDelimited).uint32(513).finish(), Code.ResourceExhausted, /size limit/],
+    ['4097 empty headers', () => {
+        const writer = new BinaryWriter();
+        for (let index = 0; index < 4097; index++) writer.tag(6, WireType.LengthDelimited).uint32(0);
+        return writer.finish();
+    }, Code.ResourceExhausted, /size limit/],
+    ['wrong-wire sequence field', () => {
+        const headers = new BinaryWriter();
+        for (let index = 0; index < 4097; index++) headers.tag(6, WireType.LengthDelimited).uint32(0);
+        return new BinaryWriter().tag(4, WireType.LengthDelimited).bytes(headers.finish()).finish();
+    }, Code.InvalidArgument, /sequence encoding/],
+] as const) {
+    test(`raw Connect ${name} is rejected before generated decoding`, async (context) => {
+        const data = payload();
+        const envelope = new Uint8Array(5 + data.length);
+        new DataView(envelope.buffer).setUint32(1, data.length);
+        envelope.set(data, 5);
+        const digest = context.mock.method(crypto.subtle, 'digest');
+        const fetch = context.mock.method(globalThis, 'fetch', async () => new Response(envelope, {
+            headers: { 'content-type': 'application/connect+proto' },
+        }));
+        await assert.rejects(subscribeBlocks(INDEXER, options()).next(), (error: unknown) => {
+            assert.ok(error instanceof ConnectError);
+            assert.equal(error.code, expectedCode);
+            assert.match(error.rawMessage, expectedMessage);
+            return true;
+        });
+        assert.equal(digest.mock.callCount(), 0);
+        assert.equal(fetch.mock.callCount(), 1);
+    });
+}
+
+test('component limits include 4096 headers, 512 header bytes, and 16KiB certificate bytes', async () => {
+    const invalidContext = createBlockBatchVerifier('00');
+    let materialError: unknown;
+    try { await invalidContext.verify(frame(fixture.emptyBlock)); } catch (error) { materialError = error; }
+    assert.notEqual(materialError, undefined);
+    const materialMessage = String(materialError);
+    for (const mutate of [
+        (message: WatchBlocksResponse) => { message.headers = Array.from({ length: 4096 }, () => new Uint8Array(1)); },
+        (message: WatchBlocksResponse) => { message.headers = [new Uint8Array(512)]; },
+        (message: WatchBlocksResponse) => { message.certificate = new Uint8Array(16 * 1024); },
+    ]) {
+        const message = frame(fixture.emptyBlock);
+        mutate(message);
+        await assert.rejects(invalidContext.verify(message), (error: unknown) => {
+            assert.equal(String(error), materialMessage);
+            return true;
+        });
+        assert.equal(invalidContext.after, undefined);
+    }
+});
+
+test('3MiB+1 Connect frame length is rejected before its payload or any crypto is read', { timeout: 5_000 }, async (context) => {
+    const digest = context.mock.method(crypto.subtle, 'digest');
+    let payloadRead = false;
+    let canceled = false;
+    context.mock.method(globalThis, 'fetch', async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+            const envelope = new Uint8Array(5);
+            new DataView(envelope.buffer).setUint32(1, 3 * 1024 * 1024 + 1);
+            controller.enqueue(envelope);
+        },
+        pull() { payloadRead = true; },
+        cancel() { canceled = true; },
+    }, { highWaterMark: 0 }), { headers: { 'content-type': 'application/connect+proto' } }));
+    await assert.rejects(subscribeBlocks(INDEXER, options()).next(), (error: unknown) => {
+        assert.ok(error instanceof ConnectError);
+        assert.equal(error.code, Code.ResourceExhausted);
+        return true;
+    });
+    assert.equal(digest.mock.callCount(), 0);
+    assert.equal(payloadRead, false);
+    assert.equal(canceled, true);
+});
+
+test('an exact 3MiB frame waits for its payload and remains cancelable', { timeout: 5_000 }, async (context) => {
+    const controller = new AbortController();
+    context.after(() => controller.abort());
+    const readingPayload = deferred();
+    const digest = context.mock.method(crypto.subtle, 'digest');
+    context.mock.method(globalThis, 'fetch', async () => new Response(new ReadableStream<Uint8Array>({
+        start(source) {
+            const envelope = new Uint8Array(5);
+            new DataView(envelope.buffer).setUint32(1, 3 * 1024 * 1024);
+            source.enqueue(envelope);
+        },
+        pull() { readingPayload.resolve(); },
+    }, { highWaterMark: 0 }), { headers: { 'content-type': 'application/connect+proto' } }));
+    const pending = subscribeBlocks(INDEXER, { ...options(), signal: controller.signal }).next();
+    await readingPayload.promise;
+    controller.abort();
+    assert.deepEqual(await pending, { done: true, value: undefined });
+    assert.equal(digest.mock.callCount(), 0);
+});
+
+test('old unsigned protobuf summaries fail closed without an accepted cursor', async (context) => {
+    const cursors: Array<bigint | undefined> = [];
+    const fetch = serve(context, async function* (request) {
+        cursors.push(request.after);
+        yield create(WatchBlocksResponseSchema, { sequenceNumber: 9n });
+    });
+    await assert.rejects(subscribeBlocks(INDEXER, options()).next(), /certificate/i);
+    assert.equal(fetch.mock.callCount(), 1);
+    assert.deepEqual(cursors, [undefined]);
+});
+
+test('typed transient errors preserve the last accepted batch cursor', async (context) => {
+    const cursors: Array<bigint | undefined> = [];
+    const errors: string[] = [];
+    serve(context, async function* (request) {
+        cursors.push(request.after);
+        if (cursors.length === 1) {
+            yield frame(fixture.directBlock);
+            throw new ConnectError('upstream unavailable', Code.Unavailable);
+        }
+        if (cursors.length === 2) throw new ConnectError('upstream timeout', Code.DeadlineExceeded);
+        yield frame(fixture.historicalBlock);
+    });
+    const stream = subscribeBlocks(INDEXER, { ...options(), onError: (error) => errors.push(error) });
+    assert.deepEqual((await nextBatch(stream)).blocks.map((row) => row.height), [1n]);
+    assert.deepEqual((await nextBatch(stream)).blocks.map((row) => row.height), [2n, 3n]);
+    assert.deepEqual(cursors, [undefined, 1n, 1n]);
+    assert.deepEqual(errors, ['[unavailable] upstream unavailable', '[deadline_exceeded] upstream timeout']);
+    await stream.return();
+});
+
+for (const code of [
+    Code.InvalidArgument, Code.PermissionDenied, Code.Unauthenticated, Code.Unimplemented,
+    Code.DataLoss, Code.ResourceExhausted, Code.FailedPrecondition, Code.Internal, Code.Aborted,
+    Code.Unknown, Code.Canceled,
+]) {
+    test(`permanent Connect error ${Code[code]} is terminal`, async (context) => {
+        const fetch = serve(context, async function* () { throw new ConnectError('permanent failure', code); });
+        await assert.rejects(subscribeBlocks(INDEXER, options()).next(), (error: unknown) => {
+            assert.ok(error instanceof ConnectError);
+            assert.equal(error.code, code);
+            return true;
+        });
+        assert.equal(fetch.mock.callCount(), 1);
+    });
+}
+
+test('a transport failure reconnects without inventing a resume height', async (context) => {
+    const errors: string[] = [];
+    const handler = explorerFetch({ async *watchBlocks(request) {
+        assert.equal(request.after, undefined);
+        yield frame(fixture.directBlock);
+    } });
+    let requests = 0;
+    context.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (++requests === 1) throw new TypeError('Failed to fetch');
+        return handler(input, init);
+    });
+    const stream = subscribeBlocks(INDEXER, { ...options(), onError: (error) => errors.push(error) });
+    assert.equal((await nextBatch(stream)).blocks[0]!.height, 1n);
+    assert.equal(requests, 2);
+    assert.equal(errors.length, 1);
+    await stream.return();
+});
+
+for (const partialBatch of [false, true]) {
+    test(`truncated Connect ${partialBatch ? 'batch' : 'end envelope'} resumes from the last complete batch`, { timeout: 5_000 }, async (context) => {
+        const cursors: Array<bigint | undefined> = [];
+        const handler = explorerFetch({ async *watchBlocks(request) {
+            cursors.push(request.after);
+            yield frame(cursors.length === 1 ? fixture.directBlock : fixture.historicalBlock);
+        } });
+        let requests = 0;
+        context.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+            const response = await handler(input, init);
+            if (++requests > 1) return response;
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            const firstEnvelopeEnd = 5 + new DataView(bytes.buffer, bytes.byteOffset).getUint32(1);
+            return new Response(bytes.subarray(0, partialBatch ? firstEnvelopeEnd - 1 : bytes.length - 1), { headers: response.headers });
+        });
+        const stream = subscribeBlocks(INDEXER, { ...options(), after: 0n });
+        const first = await nextBatch(stream);
+        assert.deepEqual(first.blocks.map((row) => row.height), partialBatch ? [1n, 2n, 3n] : [1n]);
+        if (!partialBatch) assert.deepEqual((await nextBatch(stream)).blocks.map((row) => row.height), [2n, 3n]);
+        assert.deepEqual(cursors, [0n, partialBatch ? 0n : 1n]);
+        await stream.return();
+    });
+}
+
+test('abort cancels an active WatchBlocks read and releases the caller listener', { timeout: 5_000 }, async (context) => {
+    const controller = new AbortController();
+    context.after(() => controller.abort());
+    const reading = deferred();
+    let serverCanceled = false;
+    serve(context, async function* (_request, rpc) {
+        yield frame(fixture.directBlock);
+        reading.resolve();
+        await waitForAbort(rpc.signal);
+        serverCanceled = true;
+    });
+    const stream = subscribeBlocks(INDEXER, { ...options(), signal: controller.signal });
+    assert.equal((await nextBatch(stream)).blocks[0]!.height, 1n);
+    const pending = stream.next();
+    await reading.promise;
+    controller.abort();
+    assert.deepEqual(await pending, { done: true, value: undefined });
+    assert.equal(serverCanceled, true);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('iterator return cancels the generated streaming RPC', { timeout: 5_000 }, async (context) => {
+    const canceled = deferred();
+    serve(context, async function* (_request, rpc) {
+        yield frame(fixture.directBlock);
+        await waitForAbort(rpc.signal);
+        canceled.resolve();
+    });
+    const stream = subscribeBlocks(INDEXER, options());
+    assert.equal((await nextBatch(stream)).blocks[0]!.height, 1n);
+    await stream.return();
+    await canceled.promise;
+});
+
+test('abort cancels a pending fetch without reporting a service error', { timeout: 5_000 }, async (context) => {
+    const controller = new AbortController();
+    context.after(() => controller.abort());
+    const started = deferred();
+    const errors: string[] = [];
+    context.mock.method(globalThis, 'fetch', async (_input: RequestInfo | URL, init?: RequestInit) => {
+        started.resolve();
+        await waitForAbort(init!.signal!);
+        throw new Error('fetch canceled');
+    });
+    const pending = subscribeBlocks(INDEXER, {
+        ...options(), signal: controller.signal, onError: (error) => errors.push(error),
+    }).next();
+    await started.promise;
+    controller.abort();
+    assert.deepEqual(await pending, { done: true, value: undefined });
+    assert.deepEqual(errors, []);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('abort interrupts reconnect backoff without opening another RPC', { timeout: 5_000 }, async (context) => {
+    const controller = new AbortController();
+    context.after(() => controller.abort());
+    const failed = deferred();
+    const fetch = serve(context, async function* () { throw new ConnectError('offline', Code.Unavailable); });
+    const pending = subscribeBlocks(INDEXER, {
+        ...options(), signal: controller.signal, reconnectDelayMs: 60_000, onError: () => failed.resolve(),
+    }).next();
+    await failed.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.abort();
+    assert.deepEqual(await pending, { done: true, value: undefined });
+    assert.equal(fetch.mock.callCount(), 1);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('an already aborted subscription opens no RPC', async (context) => {
+    const controller = new AbortController();
+    controller.abort();
+    context.mock.method(globalThis, 'fetch', async () => { assert.fail('aborted feed fetched'); });
+    assert.deepEqual(await subscribeBlocks(INDEXER, {
+        ...options(), signal: controller.signal,
+    }).next(), { done: true, value: undefined });
 });

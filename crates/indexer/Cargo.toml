@@ -22,10 +22,12 @@ constantinople-primitives.workspace = true
 
 # Commonware
 commonware-actor.workspace = true
+commonware-allocator.workspace = true
 commonware-codec.workspace = true
 commonware-macros.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519.workspace = true
 commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-runtime.workspace = true
@@ -49,11 +51,14 @@ cpu-time.workspace = true
 ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true
+buffa.workspace = true
+connectrpc.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
 http-body.workspace = true
-mimalloc.workspace = true
+reqwest = { workspace = true, features = ["rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
@@ -61,11 +66,16 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+[build-dependencies]
+connectrpc-build.workspace = true
+
 [dev-dependencies]
+p256.workspace = true
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-coding.workspace = true
 commonware-glue.workspace = true
 commonware-math.workspace = true
+commonware-runtime = { workspace = true, features = ["test-utils"] }
 exoware-simulator.workspace = true
 rand.workspace = true
 tempfile.workspace = true
@@ -78,12 +88,8 @@ path = "src/main.rs"
 required-features = ["chain-indexer"]
 
 [[bin]]
-name = "metadata-indexer"
-path = "src/bin/sql.rs"
-
-[[bin]]
-name = "qmdb-indexer"
-path = "src/bin/qmdb.rs"
+name = "explorer-indexer"
+path = "src/bin/explorer.rs"
 
 [lib]
 name = "constantinople_indexer"

@@ -1,12 +1,11 @@
 use crate::{
-    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
-    INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig, LocalArgs,
-    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
-    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
-    absolute_path, default_bootstrappers, ensure_output_dir_missing,
-    generate_local_cluster_material, indexer_enabled, ports::Ports, secondary_roles,
-    secondary_runtime_threads, total_secondaries, validate_generate_args,
-    write_simplex_verification_material, write_yaml_config,
+    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
+    EXPLORER_INDEXER_BINARY_FILE, GenerateArgs, INDEXER_UPLOAD_BUDGET_BYTES,
+    INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig, LocalArgs, PEERS_CONFIG_FILE, PeerEntry,
+    PeersConfig, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path,
+    default_bootstrappers, ensure_output_dir_missing, generate_local_cluster_material,
+    indexer_enabled, ports::Ports, secondary_roles, secondary_runtime_threads, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -89,8 +88,7 @@ fn validate_ports(args: &GenerateArgs, local: &LocalArgs) -> Result<(), String> 
     }
     if indexer_enabled(args) {
         ports.insert("chain-indexer Store", local.chain_indexer_port)?;
-        ports.insert("metadata-indexer", local.metadata_indexer_port)?;
-        ports.insert("qmdb-indexer", local.qmdb_indexer_port)?;
+        ports.insert("explorer-indexer", local.explorer_indexer_port)?;
         ports.insert(
             "chain-indexer metrics",
             local_chain_indexer_metrics_port(args, local)?,
@@ -363,41 +361,25 @@ fn local_run_commands(
             data_dir.display(),
             db_parallelism,
         ));
-        // Adapters probe Store once at startup, but mprocs starts services together.
+        // The explorer server probes Store at startup; mprocs starts services together.
         let wait_for_store = format!(
             "until curl --fail --silent --output /dev/null --max-time 1 http://127.0.0.1:{}/ready; do sleep 1; done;",
             local.chain_indexer_port,
         );
 
-        // `metadata-indexer` exposes Constantinople's `block_meta` and
-        // `tx_meta` tables over `sql.v1.Service`. The explorer
-        // subscribes to this service (not the raw store) for live block
-        // metadata.
+        let admission_port = relayer_http_port(args, local).unwrap_or(local.base_http_port);
         commands.push(format!(
             "{wait_for_store} cargo run --release -p constantinople-indexer --bin {} -- \
-             --store-url http://127.0.0.1:{} --port {}",
-            METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
-        ));
-        commands.push(format!(
-            "{wait_for_store} cargo run --release -p constantinople-indexer --bin {} -- \
-             --store-url http://127.0.0.1:{} --port {}",
-            QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
-        ));
-        // Bring up the React explorer dev server alongside the metadata and
-        // QMDB facades so operators get a live view and browser-verified
-        // submitted-transaction proofs.
-        // The defaults in `explorer/src/App.tsx` match these ports, but pass
-        // both URLs explicitly so non-default deployer ports still work.
-        let relayer_env = relayer_http_port(args, local)
-            .map(|port| format!(" VITE_MEMPOOL_URL=http://127.0.0.1:{port}"))
-            .unwrap_or_default();
-        commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev -- --port {EXPLORER_PORT} --strictPort",
-            local.metadata_indexer_port,
-            local.qmdb_indexer_port,
+             --store-url http://127.0.0.1:{} --relayer-url http://127.0.0.1:{} --port {}",
+            EXPLORER_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
+            admission_port,
+            local.explorer_indexer_port,
+        ));
+        commands.push(format!(
+            "VITE_INDEXER_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={} npm --prefix explorer run dev -- --port {EXPLORER_PORT} --strictPort",
+            local.explorer_indexer_port,
             simplex_verification_material,
-            relayer_env,
         ));
     }
 
@@ -533,8 +515,7 @@ mod tests {
             base_metrics_port: 9090,
             chain_indexer_port: 8090,
             chain_indexer_db_parallelism: None,
-            metadata_indexer_port: 8091,
-            qmdb_indexer_port: 8092,
+            explorer_indexer_port: 8092,
         }
     }
 
@@ -565,8 +546,7 @@ mod tests {
         let args = test_args(false);
         let mut local = test_local_args();
         local.chain_indexer_port = 0;
-        local.metadata_indexer_port = 0;
-        local.qmdb_indexer_port = 0;
+        local.explorer_indexer_port = 0;
         local.base_http_port = EXPLORER_PORT;
         validate_ports(&args, &local).unwrap();
     }
@@ -621,7 +601,7 @@ mod tests {
         let mut args = test_args(true);
         args.indexer = true;
         args.relayer = true;
-        for service in 0..3 {
+        for service in 0..2 {
             for port in [
                 9000,
                 9003,
@@ -636,20 +616,14 @@ mod tests {
                 let mut local = test_local_args();
                 match service {
                     0 => local.chain_indexer_port = port,
-                    1 => local.metadata_indexer_port = port,
-                    _ => local.qmdb_indexer_port = port,
+                    _ => local.explorer_indexer_port = port,
                 }
                 assert_ports_rejected(&args, &local, &format!("port {port} collision"));
             }
         }
-        for (chain, metadata, qmdb) in [(8090, 8090, 8092), (8090, 8091, 8090), (8090, 8091, 8091)]
-        {
-            let mut local = test_local_args();
-            local.chain_indexer_port = chain;
-            local.metadata_indexer_port = metadata;
-            local.qmdb_indexer_port = qmdb;
-            assert_ports_rejected(&args, &local, "collision");
-        }
+        let mut local = test_local_args();
+        local.chain_indexer_port = local.explorer_indexer_port;
+        assert_ports_rejected(&args, &local, "collision");
     }
 
     #[test]
@@ -920,7 +894,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(commands.len(), 8);
+        assert_eq!(commands.len(), 7);
         assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("secondary-1.yaml"));
     }
@@ -946,37 +920,36 @@ mod tests {
     }
 
     #[test]
-    fn local_adapters_wait_for_store_readiness() {
-        for binary in ["metadata-indexer", "qmdb-indexer"] {
-            let listener = readiness_listener();
-            let port = listener.local_addr().expect("Store address").port();
-            let command = local_adapter_command(binary, port);
-            let launcher = TestLauncher::spawn(&command);
+    fn local_explorer_wait_for_store_readiness() {
+        let binary = "explorer-indexer";
+        let listener = readiness_listener();
+        let port = listener.local_addr().expect("Store address").port();
+        let command = local_explorer_command(port);
+        let launcher = TestLauncher::spawn(&command);
 
-            let probe = accept_readiness_probe(&listener);
-            launcher.assert_not_started();
-            respond_to_probe(probe, "503 Service Unavailable");
+        let probe = accept_readiness_probe(&listener);
+        launcher.assert_not_started();
+        respond_to_probe(probe, "503 Service Unavailable");
 
-            let retry = accept_readiness_probe(&listener);
-            launcher.assert_not_started();
-            respond_to_probe(retry, "200 OK");
+        let retry = accept_readiness_probe(&listener);
+        launcher.assert_not_started();
+        respond_to_probe(retry, "200 OK");
 
-            let arguments = launcher.finish();
-            assert!(
-                arguments.contains(&format!("--bin\n{binary}\n")),
-                "{arguments}"
-            );
-            assert!(
-                arguments.contains(&format!("--store-url\nhttp://127.0.0.1:{port}\n")),
-                "{arguments}"
-            );
-        }
+        let arguments = launcher.finish();
+        assert!(
+            arguments.contains(&format!("--bin\n{binary}\n")),
+            "{arguments}"
+        );
+        assert!(
+            arguments.contains(&format!("--store-url\nhttp://127.0.0.1:{port}\n")),
+            "{arguments}"
+        );
     }
 
-    fn local_adapter_command(binary: &str, store_port: u16) -> String {
+    fn local_explorer_command(store_port: u16) -> String {
         let mut args = test_args(false);
         args.indexer = true;
-        set_local_ports(&mut args, store_port, 8091, 8092);
+        set_local_ports(&mut args, store_port, 8092);
         local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -986,7 +959,7 @@ mod tests {
         )
         .expect("local commands")
         .into_iter()
-        .find(|command| command.contains(&format!("--bin {binary}")))
+        .find(|command| command.contains("--bin explorer-indexer"))
         .expect("adapter command")
     }
 
@@ -1095,13 +1068,12 @@ mod tests {
         }
     }
 
-    fn set_local_ports(args: &mut GenerateArgs, chain: u16, metadata: u16, qmdb: u16) {
+    fn set_local_ports(args: &mut GenerateArgs, chain: u16, explorer: u16) {
         let GenerateTarget::Local(ref mut local) = args.target else {
             panic!("test_args must construct a Local target");
         };
         local.chain_indexer_port = chain;
-        local.metadata_indexer_port = metadata;
-        local.qmdb_indexer_port = qmdb;
+        local.explorer_indexer_port = explorer;
     }
 
     #[test]
@@ -1109,7 +1081,7 @@ mod tests {
         let mut args = test_args(false);
         args.indexer = true;
         args.relayer = true;
-        set_local_ports(&mut args, 8090, 8091, 8092);
+        set_local_ports(&mut args, 8090, 8092);
 
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
@@ -1120,8 +1092,8 @@ mod tests {
         )
         .unwrap();
 
-        // 2 validators + 1 indexer secondary + 1 relayer secondary + store/sql/qmdb + explorer.
-        assert_eq!(commands.len(), 8);
+        // 2 validators + 1 indexer secondary + 1 relayer secondary + Store and explorer API + explorer.
+        assert_eq!(commands.len(), 7);
         let indexer_cmd = commands
             .iter()
             .find(|c| c.contains("--bin chain-indexer"))
@@ -1165,57 +1137,10 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_metadata_indexer_when_indexer_enabled() {
-        let mut args = test_args(false);
-        args.indexer = true;
-        set_local_ports(&mut args, 8090, 8091, 8092);
-
-        let commands = local_run_commands(
-            Path::new("/tmp/configs"),
-            &args,
-            local_args(&args),
-            &[],
-            TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        )
-        .unwrap();
-
-        let metadata_cmd = commands
-            .iter()
-            .find(|c| c.contains("--bin metadata-indexer"))
-            .expect("metadata-indexer command should be present");
-        // The metadata service reads from the store and serves on its own port.
-        assert!(metadata_cmd.contains("--store-url http://127.0.0.1:8090"));
-        assert!(metadata_cmd.contains("--port 8091"));
-    }
-
-    #[test]
-    fn local_run_commands_include_qmdb_indexer_when_indexer_enabled() {
-        let mut args = test_args(false);
-        args.indexer = true;
-        set_local_ports(&mut args, 8090, 8091, 8092);
-
-        let commands = local_run_commands(
-            Path::new("/tmp/configs"),
-            &args,
-            local_args(&args),
-            &[],
-            TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        )
-        .unwrap();
-
-        let qmdb_cmd = commands
-            .iter()
-            .find(|c| c.contains("--bin qmdb-indexer"))
-            .expect("qmdb-indexer command should be present");
-        assert!(qmdb_cmd.contains("--store-url http://127.0.0.1:8090"));
-        assert!(qmdb_cmd.contains("--port 8092"));
-    }
-
-    #[test]
     fn local_run_commands_include_explorer_when_indexer_enabled() {
         let mut args = test_args(false);
         args.indexer = true;
-        set_local_ports(&mut args, 18_090, 18_091, 18_092);
+        set_local_ports(&mut args, 18_090, 18_092);
 
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
@@ -1230,11 +1155,9 @@ mod tests {
             .iter()
             .find(|c| c.contains("npm --prefix explorer"))
             .expect("explorer dev server command should be present");
-        assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:18091"));
-        assert!(explorer_cmd.contains("VITE_QMDB_URL=http://127.0.0.1:18092"));
-        assert!(explorer_cmd.contains("VITE_STORE_URL=http://127.0.0.1:18090"));
         assert!(explorer_cmd.contains("VITE_SIMPLEX_VERIFICATION_MATERIAL=abcdef"));
-        assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
+        assert!(explorer_cmd.contains("VITE_INDEXER_URL=http://127.0.0.1:18092"));
+        assert_eq!(explorer_cmd.matches("VITE_").count(), 2);
         assert!(explorer_cmd.contains("run dev"));
         assert!(explorer_cmd.contains("-- --port 5173 --strictPort"));
     }
@@ -1270,7 +1193,7 @@ mod tests {
         args.indexer_worker_threads = std::num::NonZeroUsize::new(8);
         args.indexer_rayon_threads = std::num::NonZeroUsize::new(12);
         args.indexer_publisher_rayon_threads = commonware_utils::NZUsize!(4);
-        set_local_ports(&mut args, 8090, 8091, 8092);
+        set_local_ports(&mut args, 8090, 8092);
 
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
         let validators = build_validators(
@@ -1338,5 +1261,30 @@ mod tests {
     #[test]
     fn startup_mode_defaults_to_marshal_sync() {
         assert_eq!(StartupModeConfig::default(), StartupModeConfig::MarshalSync);
+    }
+
+    #[test]
+    fn local_explorer_submissions_use_relayer_or_first_validator() {
+        for relayer in [false, true] {
+            let mut args = test_args(false);
+            args.indexer = true;
+            args.relayer = relayer;
+            let commands = local_run_commands(
+                Path::new("/tmp/configs"),
+                &args,
+                local_args(&args),
+                &[],
+                TEST_SIMPLEX_VERIFICATION_MATERIAL,
+            )
+            .unwrap();
+            let command = commands
+                .iter()
+                .find(|command| command.contains("--bin explorer-indexer"))
+                .unwrap();
+            let port = if relayer { 8083 } else { 8080 };
+            assert!(command.contains(&format!("--relayer-url http://127.0.0.1:{port}")));
+            assert!(command.contains("--store-url http://127.0.0.1:8090"));
+            assert!(command.contains("--port 8092"));
+        }
     }
 }

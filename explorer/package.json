@@ -7,15 +7,15 @@
         "dev": "vite",
         "test": "rm -rf dist-test && tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
         "build": "tsc -b && vite build",
+        "generate": "buf generate",
         "preview": "vite preview"
     },
     "dependencies": {
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
+        "@connectrpc/connect-web": "2.1.1",
         "@exowarexyz/qmdb": "2026.9.0",
-        "@exowarexyz/sdk": "2026.9.0",
         "@exowarexyz/simplex": "2026.9.0",
-        "@exowarexyz/sql": "2026.9.0",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"
     },
@@ -24,6 +24,7 @@
         "@connectrpc/connect-web": "2.1.1"
     },
     "devDependencies": {
+        "@bufbuild/protoc-gen-es": "2.11.0",
         "@types/node": "^20.19.41",
         "@types/react": "^19.2.14",
         "@types/react-dom": "^19.2.3",

@@ -22,19 +22,21 @@ constantinople-application.workspace = true
 
 # Commonware
 commonware-actor.workspace = true
+commonware-allocator.workspace = true
 commonware-p2p.workspace = true
 commonware-glue.workspace = true
 commonware-codec.workspace = true
 commonware-formatting.workspace = true
 commonware-utils.workspace = true
 commonware-macros.workspace = true
-commonware-runtime.workspace = true
+commonware-runtime = { workspace = true, features = ["mimalloc"] }
 commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-storage.workspace = true
 commonware-stream.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519.workspace = true
 
 # Other
 ahash.workspace = true
@@ -51,7 +53,6 @@ tracing.workspace = true
 serde_yaml.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
-mimalloc.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

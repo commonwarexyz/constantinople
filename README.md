@@ -40,12 +40,12 @@ Constantinople is a high-throughput account-model blockchain example built on to
 | Package                                               | Description                                                       |
 |-------------------------------------------------------|-------------------------------------------------------------------|
 | [`constantinople-indexer`](./crates/indexer/README.md) | Publishes finalized block artifacts and SQL metadata to exoware.  |
-| [`constantinople-explorer`](./explorer/README.md)      | Streams indexer metadata into a live React block explorer.        |
+| [`constantinople-explorer`](./explorer/README.md)      | Browses blocks, accounts, and transactions with local proof verification.        |
 
 ## Demo
 
 Generate a local four-validator network with the indexer secondary, relayer,
-spammer, metadata indexer, QMDB indexer, and explorer:
+spammer, explorer indexer, and explorer:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \

@@ -4,10 +4,11 @@ Publishes consensus artifacts from secondary (non-voting) Constantinople
 validators into an [exoware](https://exoware.xyz) store via
 [`exoware-sdk::StoreClient`](https://docs.rs/exoware-sdk).
 
-The validator-side indexer is **publish-only**. Querying is served by the
-`chain-indexer` Store, by the
-[`exoware-sql`](https://docs.rs/exoware-sql) SQL server for metadata tables,
-and by `qmdb-indexer` for QMDB operation-log proofs.
+The validator-side indexer is **publish-only**. `chain-indexer` serves the
+Store. `explorer-indexer` reads that Store with the SQL and QMDB libraries and
+serves the explorer's ConnectRPC API, including transaction submission through a
+configured relayer. The browser needs only this application endpoint and its
+committee verification material.
 
 ## Storage paths
 
@@ -19,7 +20,7 @@ that fits.
 | ---- | ------- | ------- |
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
 | **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or account proof locations without paying full-block decode cost. |
-| **QMDB operation logs** | Account-state operations under Store prefix `0x00`. Transaction-hash operations under Store prefix `0x01`. | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges. `/transactions` serves transaction-hash operation ranges and proofs. |
+| **QMDB operation logs** | Account-state operations under Store prefix `0x00`. Transaction-hash operations under Store prefix `0x01`. | `explorer-indexer` reads these logs to assemble account, block, and transaction proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 | **Provable targets** | Height-ordered block digests under Store prefix `0x04` | Proof clients that need the newest finalized block covered by both QMDB publication boundaries. |
 
@@ -63,8 +64,9 @@ The digest-keyed `tx_meta` row contract is:
 
 A transaction proof needs the finalized height that contains the transaction
 and its QMDB location. `tx_meta` carries both, so a digest lookup is one point
-read. Each `tx_activity` row also carries its transaction's `qmdb_location`, so
-account pages prove their rows without reading `tx_meta`.
+read. Each `tx_activity` row also carries its transaction's `qmdb_location`.
+Combined account reads use those locations for one multi-proof and fetch the
+signed transaction bodies with a batch of digest-keyed `tx_meta` lookups.
 
 Proofs become queryable once a grouped publication barrier covers the upload
 that carried the transaction. The publisher writes append-only publication
@@ -72,26 +74,28 @@ targets in the same Store batch that establishes coverage in both QMDB
 families. Their big-endian height keys make one reverse range read return the
 newest covered block digest.
 
-The explorer uses that range read only to initialize or recover its direct
-Store subscription. Each target update includes the atomic Store batch
-sequence. Related SQL, Simplex, and QMDB reads use that sequence as their
-freshness floor.
+The explorer server uses bounded height ranges to serve its block stream.
+Each target read supplies a Store sequence floor for the corresponding SQL
+summary. Combined explorer reads select a certified target covered by the
+publication boundary, then use its sequence as the minimum visibility floor
+for related SQL, Simplex, and QMDB reads. The certificate's digest, roots, and
+tips identify the snapshot independently of that floor.
 
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate. Height/latest reads start from a
 finalization certificate, verify the commitment/header relationship, and fetch
 the full body only when requested. A height finalized through a descendant
 certificate, or backfilled after downtime, may have no certificate available at
-capture. Explorer can authenticate that height using a verified descendant
-certificate and the parent-header chain. It batches header reads using SQL
-digest hints and verifies every link. Missing proof inputs remain retryable
-while their uploads catch up.
+capture. Combined explorer reads assemble a descendant certificate and the
+parent-header chain using batched SQL digest lookups. The browser verifies
+every link and proves the requested transactions against the certified QMDB
+root. Missing proof inputs remain retryable while their uploads catch up.
 
 [kvschema]: https://docs.rs/exoware-sql/latest/exoware_sql/struct.KvSchema.html
 
 ## Crate contents
 
-- [`sql_schema::build_meta_schema`](src/sql_schema.rs) — the canonical
+- [`sql_schema::build_meta_schema`](src/sql_schema.rs) is the canonical
   source of truth for the live `block_meta`, `tx_meta`, `tx_activity`, and
   `account_meta` table layouts. The explorer's column-name strings live here
   too, so a schema change is a one-place edit.
@@ -113,13 +117,107 @@ while their uploads catch up.
   Latest-finalized-height is derived from the Simplex finalization height index.
 - `[[bin]] chain-indexer` requires `--features chain-indexer`. It wraps
   `exoware_simulator::server::run` for local development and deployer-managed remote bundles.
-- `[[bin]] metadata-indexer` — thin wrapper that registers
-  [`build_meta_schema`](src/sql_schema.rs) onto an
-  [`exoware_sql::SqlServer`](https://docs.rs/exoware-sql/latest/exoware_sql/struct.SqlServer.html)
-  so the explorer can reach the `sql.v1.Service` `Subscribe` RPC.
-- `[[bin]] qmdb-indexer` — QMDB Connect facade over the same Store. It mounts
-  account-state operation logs at `/state` and transaction-hash operation logs
-  at `/transactions`.
+- `[[bin]] explorer-indexer` serves certified block ancestry, indexed search,
+  transaction submission, and the combined proof reads below. SQL, QMDB,
+  and Store protocols remain internal to the service.
+
+## Explorer service
+
+Run `explorer-indexer --store-url http://127.0.0.1:8090
+--relayer-url http://127.0.0.1:8080`. It listens on `0.0.0.0:8092` by default.
+`--host`, `--port`, and `--metrics-port` configure its listeners. `/health`
+and `/ready` report successful startup; `/metrics` shares the application
+listener unless a separate metrics port is configured.
+
+Deployer mode accepts `--hosts hosts.yaml --config config.yaml` with:
+
+```yaml
+port: 8092
+metrics_port: 9090
+store_url: http://chain-indexer:8090
+api_key: store-read-key
+relayer_url: http://relayer:8080
+```
+
+Named HTTP hosts in both service URLs resolve through the hosts file. A CLI
+`--store-url` override drops the YAML Store credential. `relayer_url` is
+optional; submission returns `unavailable` without it. The Store key is used
+only for Store requests.
+
+The service is `constantinople.explorer.v1.ExplorerService`. Its authoritative
+schema is [`explorer.proto`](proto/constantinople/explorer/v1/explorer.proto).
+Rust bindings are generated during the build with `connectrpc-build`; `protoc`
+must be installed. Browser clients use generated TypeScript bindings.
+
+| Method | Request | Result |
+| ------ | ------- | ------ |
+| `GetAccount` | 32-byte account; activity mode; optional 24-byte cursor, paired snapshot height and digest, or activity selection | Account update proof when indexed, plus up to ten transactions under one certified snapshot. |
+| `GetBlock` | Positive height and optional offset | Up to 50 consecutive transactions, with a certificate and ancestry proving the block's own transaction interval. |
+| `GetTransaction` | 32-byte transaction digest | One transaction with its exact inclusion height and proof. |
+| `Search` | One 32-byte identity | One indexed account or transaction navigation hint. |
+| `WatchBlocks` | Optional verified height to resume after | A server stream of published certificates and encoded ancestor headers. |
+| `SubmitTransaction` | Encoded transaction batch | A complete relayer reply or explicit ambiguous outcome. |
+
+A new `WatchBlocks` call without `after` returns the newest published certificate
+and its block's parent header, when present. An explicit `after` returns a newer
+certificate and every ancestor through that previously verified height. Clients
+verify the certificate and parent links, require the final overlap digest to
+match their retained digest, then publish all new rows together. `after = 0`
+includes ancestry through block 1; no genesis header is required. The sequence
+number records Store visibility and is not an authenticated chain fact.
+
+The server prefers the newest certificate within the next 64 heights. If none
+exists there, it selects the nearest later certificate, allowing sparse
+certification to cover multiple blocks. A gap exceeding 4096 heights returns
+`resource_exhausted`; it never resets the cursor. Encoded headers are limited to
+512 bytes each, certificates to 16 KiB, and each response to 3 MiB. SQL supplies
+only header lookup hints under the publication sequence floor. Clients derive
+block counts and proposal timestamps from authenticated headers. Caught-up
+streams poll every 250 ms; each read attempt times out after 10 seconds. An
+upstream failure ends the stream, and dropping the response cancels pending
+reads.
+
+`Search` returns `invalid_argument` for a malformed identity, `not_found` for no
+indexed match, and `unavailable` for transient Store failures. Search results
+are navigation hints; destination views verify their certificates and proofs.
+
+`SubmitTransaction` forwards exactly one opaque batch to the configured relayer's
+`/transactions` endpoint, without redirects or retries. A complete upstream reply
+retains its HTTP status, body, and content type, and recognized outcomes have typed
+fields. An incomplete reply or transport failure carries an ambiguous outcome:
+the transaction may have reached the relayer. Batch size is limited to 4 MiB plus
+the five-byte batch prefix, and upstream replies to 64 KiB. The transport bounds
+encoded request bodies and messages to 8 MiB and decoder element memory to 256 KiB.
+Its 11-second deadline includes request receipt and handler execution. A transport
+deadline or client cancellation may end the RPC before an ambiguous reply can be
+sent; callers must treat that error as uncertain delivery too.
+
+## Combined explorer reads
+
+Proof responses use protobuf bytes for certificates, headers, transaction bodies,
+and QMDB proofs; heights, locations, and sequence numbers use `uint64`. The schema
+represents account cursors and block offsets separately. All application requests
+use ConnectRPC; health, readiness, and metrics remain ordinary HTTP endpoints.
+
+Block reads discover transaction digests from consecutive QMDB operations,
+then fetch bodies through the digest primary key. A later certificate can cover
+a block that has no certificate of its own. Account pagination supplies both the
+snapshot height and digest to retain the same view while publication advances.
+
+All-activity pages seek directly from the cursor and read at most 11 activity
+rows, one more than a page. Sent and received filters apply the role as a row
+filter over the same key ranges, so they may scan additional history before
+filling a page when matches are sparse.
+
+Limits are 4096 ancestry headers, 1 MiB per proof, and 8 MiB per protobuf
+response. Malformed requests return `invalid_argument`, temporarily unavailable
+publication or evidence returns `unavailable`, contradictory stored evidence
+returns `internal`, and work exceeding supported bounds returns
+`resource_exhausted`.
+
+Account proofs establish historical membership, and a missing update is not a
+nonexistence proof. Account transaction lists carry membership proofs for their
+returned rows without a claim of completeness.
 
 ## Back-pressure model
 

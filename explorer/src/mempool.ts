@@ -1,32 +1,9 @@
-import { toArrayBuffer } from './codec.ts';
 import {
     TransactionSubmissionError,
-    classifySubmissionResponse,
-    parseTxStatus,
     type SubmissionResult,
 } from './submissionResponse.ts';
 import { boundedSubmissionSignal, SUBMISSION_TIMEOUT_MS } from './submissionRequest.ts';
-
-export interface AccountView {
-    readonly balance: number;
-    readonly nonce: NonceView;
-}
-
-export interface NonceView {
-    readonly base: number;
-    readonly bitmap: number;
-}
-
-export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
-    const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);
-    if (response.status === 404) {
-        return null;
-    }
-    if (!response.ok) {
-        throw new Error(`account lookup failed with HTTP ${response.status}`);
-    }
-    return response.json();
-}
+import { createExplorerClient } from './rpc.ts';
 
 export async function submitTransactions(
     baseUrl: string,
@@ -34,38 +11,44 @@ export async function submitTransactions(
     signal?: AbortSignal,
     timeoutMs = SUBMISSION_TIMEOUT_MS,
 ): Promise<SubmissionResult> {
+    if (batch.byteLength > 4 * 1024 * 1024 + 5) {
+        throw new TransactionSubmissionError('rejected', 'transaction batch exceeds size limit');
+    }
     const request = boundedSubmissionSignal(signal, timeoutMs);
     try {
-        const response = await fetch(`${trimTrailingSlash(baseUrl)}/transactions`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/octet-stream' },
-            body: toArrayBuffer(batch),
-            signal: request.signal,
+        const response = await createExplorerClient(baseUrl).submitTransaction({ batch }, {
+            signal: request.signal, timeoutMs,
         });
-
-        const kind = classifySubmissionResponse(response.status);
-        if (kind === 'status') {
-            try {
-                return parseTxStatus(await response.json());
-            } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
-                throw new TransactionSubmissionError(
-                    'ambiguous',
-                    `transaction submission returned an invalid status. ${detail}`,
-                );
-            }
+        if (response.outcome.case === 'ambiguous') {
+            throw new TransactionSubmissionError('ambiguous', response.outcome.value.reason || 'transaction delivery is uncertain');
         }
-        if (kind === 'pending') return { status: 'pending' };
-
-        throw new TransactionSubmissionError(
-            kind,
-            `transaction submission failed with HTTP ${response.status}`,
-        );
+        if (response.outcome.case !== 'completed') throw new TransactionSubmissionError('ambiguous', 'transaction response is missing its outcome');
+        const completed = response.outcome.value;
+        const result = completed.result;
+        if (completed.body.length > 64 * 1024) throw new TransactionSubmissionError('ambiguous', 'transaction response exceeds size limit');
+        if ((completed.httpStatus === 400 || completed.httpStatus === 413) && result.case === 'rejected') {
+            throw new TransactionSubmissionError('ambiguous', `indexer reported rejection (HTTP ${completed.httpStatus}); transaction inclusion is unknown`);
+        }
+        if (completed.httpStatus === 202 && result.case === 'pending') return { status: 'pending' };
+        if (completed.httpStatus !== 200) throw new TransactionSubmissionError('ambiguous', `transaction returned HTTP ${completed.httpStatus}`);
+        if (result.case === 'dropped') return { status: 'dropped' };
+        if (result.case === 'finalized') return { status: 'finalized', height: safeNumber(result.value.height) };
+        if (result.case === 'partiallyFinalized') return {
+            status: 'partially_finalized', height: safeNumber(result.value.height),
+            included: safeNumber(result.value.included), filtered: safeNumber(result.value.filtered),
+        };
+        throw new TransactionSubmissionError('ambiguous', 'transaction response has no valid status');
+    } catch (error) {
+        if (error instanceof TransactionSubmissionError && error.kind === 'ambiguous') throw error;
+        throw new TransactionSubmissionError('ambiguous', error instanceof Error ? error.message : String(error));
     } finally {
         request.dispose();
     }
 }
 
-function trimTrailingSlash(value: string): string {
-    return value.replace(/\/+$/, '');
+function safeNumber(value: bigint): number {
+    if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new TransactionSubmissionError('ambiguous', 'transaction status exceeds safe integer range');
+    }
+    return Number(value);
 }

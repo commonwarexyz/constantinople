@@ -1,12 +1,9 @@
 export interface HistoryScope {
     readonly indexerUrl: string;
-    readonly qmdbUrl: string;
-    readonly storeUrl: string;
-    readonly mempoolUrl: string;
     readonly simplexVerificationMaterial: string;
 }
 
-const HISTORY_KEY_PREFIX = 'constantinople.submitted-transactions.v3';
+const HISTORY_KEY_PREFIX = 'constantinople.submitted-transactions.v4';
 
 export function submittedTransactionHistoryKey(
     scope: HistoryScope,
@@ -17,9 +14,6 @@ export function submittedTransactionHistoryKey(
     return [
         HISTORY_KEY_PREFIX,
         normalizeScopeValue(scope.indexerUrl),
-        normalizeScopeValue(scope.qmdbUrl),
-        normalizeScopeValue(scope.storeUrl),
-        normalizeScopeValue(scope.mempoolUrl),
         normalizeScopeValue(scope.simplexVerificationMaterial),
         normalizeScopeValue(walletAccountKeyHex),
     ].join(':');
