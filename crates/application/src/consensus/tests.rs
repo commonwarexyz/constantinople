@@ -1140,7 +1140,7 @@ impl
         parent: &Header<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>,
         round: Round,
         filled: usize,
-    ) -> Vec<constantinople_primitives::VerifiedTransaction<sha256::Sha256>> {
+    ) -> Vec<constantinople_primitives::LazySignedTransaction<sha256::Sha256>> {
         self.context.sleep(self.delay).await;
         self.inner.propose(parent, round, filled).await
     }

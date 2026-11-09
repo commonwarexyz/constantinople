@@ -112,8 +112,14 @@ where
             transactions_root: execution.block.transactions.root(),
             transactions_range: execution.block.transactions_range.clone(),
         };
-        let block = Block::new(header, execution.body);
-        let encoded_size = block.encode_size();
+        let block = Block {
+            header,
+            body: execution.body,
+        };
+
+        // Selection summed the body's encoded size as it accepted each transaction.
+        let encoded_size = block.header.encode_size() + execution.body_size;
+        debug_assert_eq!(encoded_size, block.encode_size());
 
         // A transaction source may exceed its budget. Trimming here would
         // invalidate the execution commitments.

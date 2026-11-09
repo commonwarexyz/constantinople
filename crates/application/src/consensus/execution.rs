@@ -77,12 +77,12 @@ use super::{
     reject_verify,
 };
 use crate::executor::{self, PreparedTransfer, TransferAccount};
-use commonware_codec::EncodeSize as _;
+use commonware_codec::EncodeSize;
 use commonware_consensus::types::Round;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::{
     stateful::db::Merkleized as _,
-    transfers::{Plan, Selection},
+    transfers::{Account, Change, Plan, Selection, Transfer},
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage, telemetry::traces::TracedExt as _};
@@ -110,7 +110,29 @@ where
     S: Strategy,
 {
     pub(super) block: BlockExecution<E, H, S>,
-    pub(super) body: Vec<SignedTransaction<H>>,
+    pub(super) body: Arc<Vec<LazySignedTransaction<H>>>,
+    /// The encoded size of `body`.
+    pub(super) body_size: usize,
+}
+
+/// A proposal candidate's transfer, message digest and encoded size, or `None` if it does not
+/// decode or prepare.
+///
+/// A candidate that does not prepare changes no account, so selection applies it without effect
+/// and the proposer leaves it out of the body.
+struct Candidate<D>(Option<(PreparedTransfer, D, usize)>);
+
+impl<D> Transfer for Candidate<D> {
+    type Key = AccountKey;
+    type Account = TransferAccount;
+
+    fn changes(
+        &self,
+    ) -> impl Iterator<Item = (&AccountKey, Change<<TransferAccount as Account>::Effect>)> {
+        self.0
+            .iter()
+            .flat_map(|(transfer, _, _)| transfer.changes())
+    }
 }
 
 pub(super) struct BlockExecution<E, H, S>
@@ -289,7 +311,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     parent_floor: mmr::Location,
     parent_header: &Header<C, H::Digest, P>,
     round: Round,
-    candidates: Vec<SignedTransaction<H>>,
+    candidates: Vec<LazySignedTransaction<H>>,
     input: &mut I,
 ) -> ProposalExecution<E, H, S>
 where
@@ -303,8 +325,12 @@ where
     let mut unstaged = Some(state_batch);
     let mut staged: Option<StateStaged<E, H, EightCap, S>> = None;
     let mut selection: Selection<AccountKey, TransferAccount> = Selection::new();
-    let mut body: Vec<SignedTransaction<H>> = Vec::new();
+    let mut body: Vec<LazySignedTransaction<H>> = Vec::new();
     let mut included_bytes = 0usize;
+
+    // Each accepted transaction adds its length-prefixed encoding to the body's encoded size, so
+    // the block's size needs no pass over the body.
+    let mut framed_bytes = 0usize;
     let mut candidates = candidates;
 
     // Rounds share one history batch, so each append is joined before the
@@ -318,9 +344,9 @@ where
             break;
         }
 
-        // A proposer chooses its body, so candidates that fail preparation
-        // can be excluded. Keep results aligned with the candidate vector
-        // while compacting valid transfers and recording first-touched accounts.
+        // A proposer chooses its body, so candidates that fail to decode or
+        // prepare can be excluded. Keep one prepared candidate per transaction
+        // while recording first-touched accounts.
         let prepare_span = info_span!(
             "application.execute.prepare",
             txs = candidates.len().traced()
@@ -328,26 +354,22 @@ where
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
         let work_size = candidates.len();
-        let (candidates_back, prepared, transfers, selection_back, touched) = strategy
+        let (candidates_back, prepared, selection_back, touched) = strategy
             .spawn(work_size, {
                 let accounts_span = accounts_span.clone();
                 let mut selection = selection;
                 move |s: S| {
-                    let (prepared, transfers) = prepare_span.in_scope(|| {
-                        let prepared: Vec<Option<(PreparedTransfer, H::Digest)>> = s
-                            .map_collect_vec(&candidates, |tx| {
-                                executor::prepare_transfer(tx)
-                                    .map(|transfer| (transfer, *tx.message_digest()))
-                            });
-                        let transfers: Vec<PreparedTransfer> = prepared
-                            .iter()
-                            .flatten()
-                            .map(|(transfer, _)| *transfer)
-                            .collect();
-                        (prepared, transfers)
+                    let prepared: Vec<Candidate<H::Digest>> = prepare_span.in_scope(|| {
+                        s.map_collect_vec(&candidates, |lazy| {
+                            Candidate(lazy.get().and_then(|tx| {
+                                executor::prepare_transfer(tx).map(|transfer| {
+                                    (transfer, *tx.message_digest(), tx.encode_size())
+                                })
+                            }))
+                        })
                     });
-                    let touched = accounts_span.in_scope(|| selection.touch(&transfers));
-                    (candidates, prepared, transfers, selection, touched)
+                    let touched = accounts_span.in_scope(|| selection.touch(&prepared));
+                    (candidates, prepared, selection, touched)
                 }
             })
             .await;
@@ -391,42 +413,48 @@ where
         // straight into the body.
         let select_span = info_span!(
             "application.execute.select",
-            txs = transfers.len().traced(),
+            txs = prepared.len().traced(),
             dropped = tracing::field::Empty,
         );
-        let work_size = transfers.len();
-        let (selection_back, body_back, chunk, included_delta, dropped_bytes) = strategy
-            .spawn(work_size, {
-                let span = select_span.clone();
-                let mut selection = selection;
-                let mut body = body;
-                move |_: S| {
-                    span.in_scope(|| {
-                        let applied = selection.apply(&transfers);
-                        let mut flags = applied.into_iter();
-                        let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
-                        let mut included = 0usize;
-                        let mut dropped = 0usize;
-                        for (transaction, prepared) in candidates.into_iter().zip(prepared) {
-                            let Some((_, digest)) = prepared else {
-                                continue;
-                            };
-                            if flags.next().expect("one flag per prepared transfer") {
-                                included += transaction.encode_size();
-                                chunk.push(digest);
-                                body.push(transaction);
-                            } else {
-                                dropped += transaction.encode_size();
+        let work_size = prepared.len();
+        let (selection_back, body_back, chunk, included_delta, framed_delta, dropped_bytes) =
+            strategy
+                .spawn(work_size, {
+                    let span = select_span.clone();
+                    let mut selection = selection;
+                    let mut body = body;
+                    move |_: S| {
+                        span.in_scope(|| {
+                            let applied = selection.apply(&prepared);
+                            let mut chunk: Vec<H::Digest> = Vec::with_capacity(prepared.len());
+                            let mut included = 0usize;
+                            let mut framed = 0usize;
+                            let mut dropped = 0usize;
+                            let mut candidates = candidates.into_iter();
+                            for (prepared, &accepted) in prepared.iter().zip(&applied) {
+                                let transaction =
+                                    candidates.next().expect("one candidate per transaction");
+                                let Candidate(Some((_, digest, size))) = prepared else {
+                                    continue;
+                                };
+                                if accepted {
+                                    included += size;
+                                    framed += size.encode_size() + size;
+                                    chunk.push(*digest);
+                                    body.push(transaction);
+                                } else {
+                                    dropped += size;
+                                }
                             }
-                        }
-                        (selection, body, chunk, included, dropped)
-                    })
-                }
-            })
-            .await;
+                            (selection, body, chunk, included, framed, dropped)
+                        })
+                    }
+                })
+                .await;
         selection = selection_back;
         body = body_back;
         included_bytes += included_delta;
+        framed_bytes += framed_delta;
         select_span.record("dropped", dropped_bytes.traced());
 
         // Start this round's history append before refilling so it can
@@ -493,17 +521,20 @@ where
     }
     .instrument(info_span!("application.execute.apply_wait"));
 
+    let body_size = body.len().encode_size() + framed_bytes;
+    let block = finalize_child(
+        staged,
+        slots,
+        transaction_batch,
+        parent_floor,
+        body.len(),
+        "database merkleization must succeed",
+    )
+    .await;
     ProposalExecution {
-        block: finalize_child(
-            staged,
-            slots,
-            transaction_batch,
-            parent_floor,
-            body.len(),
-            "database merkleization must succeed",
-        )
-        .await,
-        body,
+        block,
+        body: Arc::new(body),
+        body_size,
     }
 }
 

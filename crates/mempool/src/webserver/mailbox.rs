@@ -6,7 +6,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::channel::fallible::AsyncFallibleExt;
-use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
+use constantinople_primitives::{Header, LazySignedTransaction, SealedBlock, VerifiedTransaction};
 use tokio::sync::{
     mpsc::{self, error::TrySendError},
     oneshot,
@@ -55,7 +55,7 @@ where
     Propose {
         height: u64,
         filled: usize,
-        response: oneshot::Sender<Vec<VerifiedTransaction<H>>>,
+        response: oneshot::Sender<Vec<LazySignedTransaction<H>>>,
     },
     /// Consensus reports a finalized or tip block.
     Report(Update<SealedBlock<C, P, H>>),
@@ -186,7 +186,7 @@ where
         parent: &Header<C, H::Digest, P>,
         _round: Round,
         filled: usize,
-    ) -> Vec<VerifiedTransaction<H>> {
+    ) -> Vec<LazySignedTransaction<H>> {
         let height = parent.height + 1;
         self.sender
             .request(|response| Message::Propose {

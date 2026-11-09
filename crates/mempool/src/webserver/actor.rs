@@ -15,7 +15,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
-use constantinople_primitives::{PublicKeyCache, VerifiedTransaction};
+use constantinople_primitives::{LazySignedTransaction, PublicKeyCache, VerifiedTransaction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -145,8 +145,13 @@ pub struct Config<St: Strategy> {
 }
 
 /// A batch of transactions waiting in the pool.
+///
+/// Each transaction is held behind a shared handle, the element type of a block body, so serving
+/// a proposal moves handles rather than transactions.
 struct PoolEntry<H: Hasher> {
-    transactions: Vec<VerifiedTransaction<H>>,
+    transactions: Vec<LazySignedTransaction<H>>,
+    /// The message digest of each transaction, in order.
+    digests: Vec<H::Digest>,
     total_bytes: usize,
 }
 
@@ -413,7 +418,7 @@ fn pop_lane_proposal<H>(
     height: u64,
     filled: usize,
     max_propose_bytes: usize,
-) -> (Vec<VerifiedTransaction<H>>, usize)
+) -> (Vec<LazySignedTransaction<H>>, usize)
 where
     H: Hasher,
 {
@@ -428,11 +433,10 @@ where
         let entry = pool.entries.pop_front().expect("front was Some");
         pool.bytes -= entry.total_bytes;
         batch_bytes += entry.total_bytes;
-        let mut digests = Vec::with_capacity(entry.transactions.len());
-        for tx in &entry.transactions {
-            digests.push(*tx.message_digest());
-        }
-        proposed.push_back(ProposedBatch { height, digests });
+        proposed.push_back(ProposedBatch {
+            height,
+            digests: entry.digests,
+        });
         batch_txs.extend(entry.transactions);
     }
     (batch_txs, batch_bytes)
@@ -445,7 +449,7 @@ fn pop_proposal<H>(
     height: u64,
     filled: usize,
     max_propose_bytes: usize,
-) -> Vec<VerifiedTransaction<H>>
+) -> Vec<LazySignedTransaction<H>>
 where
     H: Hasher,
 {
@@ -560,41 +564,42 @@ fn resolve_batch_if_terminal<D>(
     );
 }
 
-fn new_transactions<H>(
+/// Builds the pool entry of a submission's transactions not already known, recording their
+/// digests as known.
+fn new_entry<H>(
     transactions: Vec<VerifiedTransaction<H>>,
     known_digests: &mut AHashSet<H::Digest>,
-) -> Vec<VerifiedTransaction<H>>
+) -> PoolEntry<H>
 where
     H: Hasher,
     H::Digest: Copy + Eq + Hash,
 {
-    let mut accepted = Vec::with_capacity(transactions.len());
+    let mut entry = PoolEntry {
+        transactions: Vec::with_capacity(transactions.len()),
+        digests: Vec::with_capacity(transactions.len()),
+        total_bytes: 0,
+    };
     for transaction in transactions {
-        if !known_digests.insert(*transaction.message_digest()) {
+        let digest = *transaction.message_digest();
+        if !known_digests.insert(digest) {
             continue;
         }
-        accepted.push(transaction);
+        entry.total_bytes += transaction.encode_size();
+        entry.digests.push(digest);
+        entry
+            .transactions
+            .push(LazySignedTransaction::new(transaction));
     }
-    accepted
+    entry
 }
 
-fn remove_known_digests<H>(
-    transactions: &[VerifiedTransaction<H>],
-    known_digests: &mut AHashSet<H::Digest>,
-) where
-    H: Hasher,
-    H::Digest: Eq + Hash,
-{
-    for transaction in transactions {
-        known_digests.remove(transaction.message_digest());
-    }
-}
-
-fn total_bytes_for<H>(transactions: &[VerifiedTransaction<H>]) -> usize
+fn remove_known_digests<D>(digests: &[D], known_digests: &mut AHashSet<D>)
 where
-    H: Hasher,
+    D: Eq + Hash,
 {
-    transactions.iter().map(EncodeSize::encode_size).sum()
+    for digest in digests {
+        known_digests.remove(digest);
+    }
 }
 
 fn can_admit_submission(
@@ -768,19 +773,18 @@ where
                         continue;
                     }
 
-                    let transactions = new_transactions(transactions, &mut known_digests);
-                    let total_bytes = total_bytes_for(&transactions);
-                    if !transactions.is_empty()
+                    let entry = new_entry(transactions, &mut known_digests);
+                    if !entry.transactions.is_empty()
                         && !can_admit_submission(
                             lane,
                             foreground_pool.bytes,
                             background_pool.bytes,
-                            total_bytes,
+                            entry.total_bytes,
                             max_pool_bytes,
                             max_propose_bytes,
                         )
                     {
-                        remove_known_digests(&transactions, &mut known_digests);
+                        remove_known_digests(&entry.digests, &mut known_digests);
                         if let Some(result) = result {
                             let _ = result.send(TxStatus::Dropped);
                         }
@@ -814,16 +818,12 @@ where
                     if let Some(ingest_result) = ingest_result {
                         let _ = ingest_result.send(IngestStatus::Accepted);
                     }
-                    if !transactions.is_empty() {
-                        let entry = PoolEntry {
-                            transactions,
-                            total_bytes,
-                        };
+                    if !entry.transactions.is_empty() {
                         let pool = match lane {
                             SubmissionLane::Foreground => &mut foreground_pool,
                             SubmissionLane::Background => &mut background_pool,
                         };
-                        pool.bytes += total_bytes;
+                        pool.bytes += entry.total_bytes;
                         pool.entries.push_back(entry);
                     }
                 }
@@ -910,11 +910,11 @@ mod tests {
     use super::{
         Actor, ActorReceiver, Config, DigestOutcome, IngestStatus, Mailbox, Message, PoolEntry,
         PoolLane, ProposedBatch, StoredBatchStatus, SubmissionLane, TxStatus,
-        batch_status_from_outcomes, can_admit_submission, ingest_status_from_batch,
-        new_transactions, pop_lane_proposal, pop_proposal, resolve_proposed_batches,
-        status_for_finalized_block, total_bytes_for,
+        batch_status_from_outcomes, can_admit_submission, ingest_status_from_batch, new_entry,
+        pop_lane_proposal, pop_proposal, resolve_proposed_batches, status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
+    use commonware_codec::EncodeSize as _;
     use commonware_cryptography::{Signer, sha256};
     use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
@@ -922,7 +922,8 @@ mod tests {
     use commonware_runtime::{Runner as _, Supervisor as _};
     use commonware_utils::NZUsize;
     use constantinople_primitives::{
-        PublicKeyCache, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+        LazySignedTransaction, PublicKeyCache, TRANSACTION_NAMESPACE, Transaction,
+        TransactionPublicKey, VerifiedTransaction,
     };
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
@@ -1036,9 +1037,10 @@ mod tests {
         let duplicate = transaction.clone();
         let mut known: AHashSet<_> = AHashSet::new();
 
-        let accepted = new_transactions(vec![transaction, duplicate], &mut known);
+        let entry = new_entry(vec![transaction, duplicate], &mut known);
 
-        assert_eq!(accepted.len(), 1);
+        assert_eq!(entry.transactions.len(), 1);
+        assert_eq!(entry.digests.len(), 1);
         assert_eq!(known.len(), 1);
     }
 
@@ -1251,10 +1253,17 @@ mod tests {
         );
     }
 
-    fn pool_entry(seed: u64, txs: usize, total_bytes: usize) -> PoolEntry<sha256::Sha256> {
+    fn total_bytes_for(transactions: &[VerifiedTransaction<sha256::Sha256>]) -> usize {
+        transactions
+            .iter()
+            .map(|transaction| transaction.encode_size())
+            .sum()
+    }
+
+    fn signed_transactions(seed: u64, txs: usize) -> Vec<VerifiedTransaction<sha256::Sha256>> {
         let signer = ed25519::SigningKey::from_seed(seed);
         let recipient = ed25519::SigningKey::from_seed(seed + 100).public_key();
-        let transactions = (0..txs as u64)
+        (0..txs as u64)
             .map(|nonce| {
                 Transaction::new(
                     TransactionPublicKey::ed25519(signer.public_key()),
@@ -1268,11 +1277,26 @@ mod tests {
                     &mut sha256::Sha256::default(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    fn pool_entry(seed: u64, txs: usize, total_bytes: usize) -> PoolEntry<sha256::Sha256> {
+        let transactions = signed_transactions(seed, txs);
         PoolEntry {
-            transactions,
+            digests: transactions.iter().map(|tx| *tx.message_digest()).collect(),
+            transactions: transactions
+                .into_iter()
+                .map(LazySignedTransaction::new)
+                .collect(),
             total_bytes,
         }
+    }
+
+    fn digest_of(transaction: &LazySignedTransaction<sha256::Sha256>) -> sha256::Digest {
+        *transaction
+            .get()
+            .expect("pooled transactions are decoded")
+            .message_digest()
     }
 
     #[test]
@@ -1347,7 +1371,7 @@ mod tests {
     #[test]
     fn actor_drops_oversized_batches_without_retaining_digests() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let transactions = pool_entry(1, 2, 0).transactions;
+            let transactions = signed_transactions(1, 2);
             let digests: Vec<_> = transactions.iter().map(|tx| *tx.message_digest()).collect();
             let max_propose_bytes = total_bytes_for(&transactions[..1]);
             let (sender, rx) = mpsc::channel(8);
@@ -1409,15 +1433,18 @@ mod tests {
                 .unwrap();
             let proposal = result.await.unwrap();
             assert_eq!(proposal.len(), 1);
-            assert_eq!(*proposal[0].message_digest(), digests[0]);
-            assert_eq!(total_bytes_for(&proposal), max_propose_bytes);
+            assert_eq!(digest_of(&proposal[0]), digests[0]);
+            assert_eq!(
+                proposal[0].get().expect("decoded").encode_size(),
+                max_propose_bytes
+            );
         });
     }
 
     #[test]
     fn foreground_consumes_proposal_before_background() {
         let foreground_entry = pool_entry(4, 1, 1_000);
-        let foreground_digest = *foreground_entry.transactions[0].message_digest();
+        let foreground_digest = foreground_entry.digests[0];
         let mut foreground_pool = PoolLane {
             entries: VecDeque::from([foreground_entry]),
             bytes: 1_000,
@@ -1438,7 +1465,7 @@ mod tests {
         );
 
         assert_eq!(transactions.len(), 1);
-        assert_eq!(*transactions[0].message_digest(), foreground_digest);
+        assert_eq!(digest_of(&transactions[0]), foreground_digest);
         assert!(foreground_pool.entries.is_empty());
         assert_eq!(foreground_pool.bytes, 0);
         assert_eq!(background_pool.entries.len(), 1);

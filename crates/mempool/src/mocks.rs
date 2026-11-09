@@ -5,7 +5,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
-use constantinople_primitives::{Header, VerifiedTransaction};
+use constantinople_primitives::{Header, LazySignedTransaction, VerifiedTransaction};
 use core::{
     future::{Future, ready},
     marker::PhantomData,
@@ -22,7 +22,7 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    proposals: Arc<Mutex<VecDeque<Vec<VerifiedTransaction<H>>>>>,
+    proposals: Arc<Mutex<VecDeque<Vec<LazySignedTransaction<H>>>>>,
     _marker: PhantomData<(C, P)>,
 }
 
@@ -48,7 +48,7 @@ where
     /// Creates a new static source from queued proposal batches.
     pub fn new(proposals: Vec<Vec<VerifiedTransaction<H>>>) -> Self {
         Self {
-            proposals: Arc::new(Mutex::new(proposals.into())),
+            proposals: Arc::new(Mutex::new(proposals.into_iter().map(handles).collect())),
             _marker: PhantomData,
         }
     }
@@ -58,8 +58,15 @@ where
         self.proposals
             .lock()
             .expect("static transaction source lock poisoned")
-            .push_back(transactions);
+            .push_back(handles(transactions));
     }
+}
+
+fn handles<H: Hasher>(transactions: Vec<VerifiedTransaction<H>>) -> Vec<LazySignedTransaction<H>> {
+    transactions
+        .into_iter()
+        .map(LazySignedTransaction::new)
+        .collect()
 }
 
 impl<C, P, H> TransactionSource<C, P, H> for StaticTransactionSource<C, P, H>
@@ -75,7 +82,7 @@ where
         _parent: &Header<C, H::Digest, P>,
         _round: Round,
         _filled: usize,
-    ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
+    ) -> impl Future<Output = Vec<LazySignedTransaction<H>>> + Send {
         let transactions = self
             .proposals
             .lock()
@@ -171,9 +178,9 @@ mod tests {
         let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].value().nonce, tx1.value().nonce);
+        assert_eq!(first[0].get(), Some(&tx1));
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].value().nonce, 1);
+        assert_eq!(second[0].get().map(|tx| tx.value().nonce), Some(1));
         assert!(third.is_empty());
     }
 }
