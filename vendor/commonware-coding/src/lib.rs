@@ -1,0 +1,430 @@
+//! Encode data to enable recovery from a subset of fragments.
+//!
+//! # Status
+//!
+//! Stability varies by primitive. See [README](https://github.com/commonwarexyz/monorepo#stability) for details.
+
+#![doc(
+    html_logo_url = "https://commonware.xyz/imgs/rustdoc_logo.svg",
+    html_favicon_url = "https://commonware.xyz/favicon.ico"
+)]
+
+commonware_macros::stability_scope!(ALPHA {
+    use commonware_codec::{Buf, Codec, FixedSize, Read, Write};
+    use commonware_cryptography::Digest;
+    use commonware_parallel::Strategy;
+    use std::{fmt::Debug, num::NonZeroU16};
+
+    mod reed_solomon;
+    pub use reed_solomon::{Error as ReedSolomonError, ReedSolomon};
+    mod segmented;
+    pub use segmented::{
+        CheckedSegmentChunk, EncodedSegment, Error as SegmentedError, SegmentChunk, SegmentEncoder,
+        Segmentable, Segmented, SegmentedShard,
+    };
+
+    /// Configuration common to all encoding schemes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Config {
+        /// The minimum number of shards needed to encode the data.
+        pub minimum_shards: NonZeroU16,
+        /// Extra shards beyond the minimum number.
+        ///
+        /// Alternatively, one can think of the configuration as having a total number
+        /// `N = extra_shards + minimum_shards`, but by specifying the `extra_shards`
+        /// rather than `N`, we avoid needing to check that `minimum_shards <= N`.
+        pub extra_shards: NonZeroU16,
+    }
+
+    impl Config {
+        /// Returns the total number of shards produced by this configuration.
+        pub fn total_shards(&self) -> u32 {
+            u32::from(self.minimum_shards.get()) + u32::from(self.extra_shards.get())
+        }
+    }
+
+    impl FixedSize for Config {
+        const SIZE: usize = 2 * <NonZeroU16 as FixedSize>::SIZE;
+    }
+
+    impl Write for Config {
+        fn write(&self, buf: &mut impl bytes::BufMut) {
+            self.minimum_shards.write(buf);
+            self.extra_shards.write(buf);
+        }
+    }
+
+    impl Read for Config {
+        type Cfg = ();
+
+        fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
+            Ok(Self {
+                minimum_shards: NonZeroU16::read_cfg(buf, cfg)?,
+                extra_shards: NonZeroU16::read_cfg(buf, cfg)?,
+            })
+        }
+    }
+
+    #[cfg(feature = "arbitrary")]
+    impl<'a> arbitrary::Arbitrary<'a> for Config {
+        fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+            let minimum_shards = commonware_utils::NZU16!(u.int_in_range(1..=u16::MAX)?);
+            let extra_shards = commonware_utils::NZU16!(u.int_in_range(1..=u16::MAX)?);
+            Ok(Self {
+                minimum_shards,
+                extra_shards,
+            })
+        }
+    }
+
+    /// A scheme for encoding data into pieces, and recovering the data from those pieces.
+    ///
+    /// # Example
+    /// ```
+    /// use commonware_coding::{Config, ReedSolomon, Scheme as _};
+    /// use commonware_cryptography::Sha256;
+    /// use commonware_parallel::Sequential;
+    /// use commonware_utils::NZU16;
+    ///
+    /// const STRATEGY: Sequential = Sequential;
+    ///
+    /// type RS = ReedSolomon<Sha256>;
+    ///
+    /// let config = Config {
+    ///     minimum_shards: NZU16!(2),
+    ///     extra_shards: NZU16!(1),
+    /// };
+    /// let data = b"Hello!";
+    /// // Turn the data into shards, and a commitment to those shards.
+    /// let (commitment, shards) =
+    ///      RS::encode(&config, data.as_slice(), &STRATEGY).unwrap();
+    ///
+    /// // Each participant checks their shard against the commitment.
+    /// let checked_shards: Vec<_> = shards
+    ///         .iter()
+    ///         .enumerate()
+    ///         .map(|(i, shard)| {
+    ///             RS::check(&config, &commitment, i as u16, shard, &STRATEGY).unwrap()
+    ///         })
+    ///         .collect();
+    ///
+    /// // Decode from any minimum_shards-sized subset.
+    /// let data2 = RS::decode(&config, &commitment, checked_shards[..2].iter(), &STRATEGY).unwrap();
+    /// assert_eq!(&data[..], &data2[..]);
+    ///
+    /// // Decoding works with different shards, with a guarantee to get the same result.
+    /// let data3 = RS::decode(&config, &commitment, checked_shards[1..].iter(), &STRATEGY).unwrap();
+    /// assert_eq!(&data[..], &data3[..]);
+    /// ```
+    ///
+    /// # Guarantees
+    ///
+    /// Here are additional properties that implementors of this trait need to
+    /// consider, and that users of this trait can rely on.
+    ///
+    /// ## Check Agreement
+    ///
+    /// [`Scheme::check`] should agree across honest parties, even for malicious
+    /// encoders.
+    ///
+    /// It should not be possible for parties A and B to both call `check`
+    /// successfully on their own shards, but then have either of them fail
+    /// when calling `check` on the other's shard.
+    ///
+    /// In other words, if an honest party considers their shard to be correctly
+    /// formed, then other honest parties which have also successfully checked
+    /// their own shards will agree with that shard being correct.
+    ///
+    /// A violation of this property would be, for example, if a malicious
+    /// payload could convince two parties that they both have valid shards, but
+    /// then checking each other's shards reports issues with those shards.
+    ///
+    /// ## Unique Commitments
+    ///
+    /// [`Scheme::encode`] MUST be deterministic.
+    ///
+    /// For a given [`Config`] and `data`, the only [`Scheme::Commitment`] which
+    /// should pass [`Scheme::decode`] MUST be that produced by [`Scheme::encode`].
+    ///
+    /// In other words, a data has a unique valid commitment associated with it.
+    pub trait Scheme: Debug + Clone + Send + Sync + 'static {
+        /// A commitment attesting to the shards of data.
+        type Commitment: Digest;
+        /// A shard of data, to be received by a participant.
+        ///
+        /// Shards decode with a [`Config`] and the maximum number of input data bytes. Their data
+        /// portion must be no wider than [`Self::encode`] produces for those inputs.
+        type Shard: Clone + Debug + Eq + Codec<Cfg = (Config, usize)> + Send + Sync + 'static;
+        /// A shard that has been checked for inclusion in the commitment.
+        ///
+        /// This allows excluding invalid shards from the function signature of [`Self::decode`].
+        type CheckedShard: Clone + Send + Sync;
+        /// The type of errors that can occur during encoding, checking, and decoding.
+        type Error: std::fmt::Debug + Send;
+
+        /// Returns an upper bound on the encoded size of any shard [`Self::encode`] produces under
+        /// `config` from at most `data` bytes, using each encoded type's maximum width.
+        fn max_shard_size(config: &Config, data: usize) -> usize;
+
+        /// Encode a piece of data, returning a commitment, along with shards, and proofs.
+        ///
+        /// The input is a stream of bytes and may borrow its storage.
+        ///
+        /// Each shard and proof is intended for exactly one participant. The number of shards returned
+        /// should equal `config.minimum_shards + config.extra_shards`.
+        #[allow(clippy::type_complexity)]
+        fn encode(
+            config: &Config,
+            data: impl bytes::Buf,
+            strategy: &impl Strategy,
+        ) -> Result<(Self::Commitment, Vec<Self::Shard>), Self::Error>;
+
+        /// Check the integrity of a shard, producing a checked shard.
+        ///
+        /// This takes in an index, to make sure that the shard you're checking
+        /// is associated with the participant you expect it to be.
+        fn check(
+            config: &Config,
+            commitment: &Self::Commitment,
+            index: u16,
+            shard: &Self::Shard,
+            strategy: &impl Strategy,
+        ) -> Result<Self::CheckedShard, Self::Error>;
+
+        /// Check the integrity of multiple shards.
+        ///
+        /// Returns one result per input in the same order. Each result is equivalent
+        /// to calling [`Self::check`] independently with that input's index and shard.
+        fn check_many(
+            config: &Config,
+            commitment: &Self::Commitment,
+            shards: &[(u16, &Self::Shard)],
+            strategy: &impl Strategy,
+        ) -> Vec<Result<Self::CheckedShard, Self::Error>> {
+            strategy.map_collect_vec(shards, |&(index, shard)| {
+                Self::check(config, commitment, index, shard, strategy)
+            })
+        }
+
+        /// Decode the data from shards received from other participants.
+        ///
+        /// The data must be decodeable with as few as `config.minimum_shards`,
+        /// including your own shard.
+        ///
+        /// Calls to this function with the same commitment, but with different shards,
+        /// or shards in a different order should also result in the same output data,
+        /// or in failure. In other words, when using the decoding function in a broader
+        /// system, you get a guarantee that every participant decoding will see the same
+        /// final data, even if they receive different shards, or receive them in a
+        /// different order.
+        ///
+        /// ## Commitment Binding
+        ///
+        /// Implementations must reject shards that were checked against a different
+        /// commitment than the one passed to `decode`. Mixing checked shards from
+        /// separate `encode` calls (and thus different commitments) must return an
+        /// error.
+        fn decode<'a>(
+            config: &Config,
+            commitment: &Self::Commitment,
+            shards: impl Iterator<Item = &'a Self::CheckedShard>,
+            strategy: &impl Strategy,
+        ) -> Result<Vec<u8>, Self::Error>;
+    }
+});
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arbitrary::Unstructured;
+    use commonware_cryptography::Sha256;
+    use commonware_invariants::minifuzz;
+    use commonware_utils::NZU16;
+
+    const MAX_SHARDS: u16 = 32;
+    const MAX_DATA: usize = 1024;
+    const MIN_EXTRA_SHARDS: u16 = 1;
+
+    fn generate_case(u: &mut Unstructured<'_>) -> arbitrary::Result<(Config, Vec<u8>, Vec<u16>)> {
+        let minimum_shards = (u.arbitrary::<u16>()? % MAX_SHARDS) + 1;
+        let extra_shards =
+            MIN_EXTRA_SHARDS + (u.arbitrary::<u16>()? % (MAX_SHARDS - MIN_EXTRA_SHARDS + 1));
+        let total_shards = minimum_shards + extra_shards;
+
+        let data_len = usize::from(u.arbitrary::<u16>()?) % (MAX_DATA + 1);
+        let data = u.bytes(data_len)?.to_vec();
+
+        let selected_len = usize::from(minimum_shards)
+            + (usize::from(u.arbitrary::<u16>()?) % (usize::from(extra_shards) + 1));
+        let mut selected: Vec<u16> = (0..total_shards).collect();
+        for i in 0..selected_len {
+            let remaining = usize::from(total_shards) - i;
+            let j = i + (usize::from(u.arbitrary::<u16>()?) % remaining);
+            selected.swap(i, j);
+        }
+        selected.truncate(selected_len);
+
+        Ok((
+            Config {
+                minimum_shards: NZU16!(minimum_shards),
+                extra_shards: NZU16!(extra_shards),
+            },
+            data,
+            selected,
+        ))
+    }
+
+    mod scheme {
+        use super::*;
+        use crate::{Scheme, Segmented, reed_solomon::ReedSolomon};
+        use commonware_codec::Encode;
+        use commonware_parallel::Sequential;
+
+        /// Small segments, so the generic cases cover data spanning many segments.
+        type Seg = Segmented<Sha256, 64>;
+
+        fn roundtrip<S: Scheme>(config: &Config, data: &[u8], selected: &[u16]) {
+            let (commitment, shards) = S::encode(config, data, &Sequential).unwrap();
+            let read_cfg = (*config, data.len().max(MAX_DATA));
+            for shard in &shards {
+                let decoded_shard = S::Shard::read_cfg(&mut shard.encode(), &read_cfg).unwrap();
+                assert_eq!(decoded_shard, *shard);
+            }
+
+            let mut checked_shards = Vec::new();
+            for (i, shard) in shards.into_iter().enumerate() {
+                if !selected.contains(&(i as u16)) {
+                    continue;
+                }
+                let checked = S::check(config, &commitment, i as u16, &shard, &Sequential).unwrap();
+                checked_shards.push(checked);
+            }
+
+            checked_shards.reverse();
+            let decoded =
+                S::decode(config, &commitment, checked_shards.iter(), &Sequential).unwrap();
+            assert_eq!(decoded, data);
+        }
+
+        fn decode_rejects_mixed_commitments<S: Scheme>(
+            config: &Config,
+            data_a: &[u8],
+            data_b: &[u8],
+        ) {
+            let (commitment_a, shards_a) = S::encode(config, data_a, &Sequential).unwrap();
+            let (commitment_b, shards_b) = S::encode(config, data_b, &Sequential).unwrap();
+
+            let checked_a = S::check(config, &commitment_a, 0, &shards_a[0], &Sequential).unwrap();
+            let checked_b = S::check(config, &commitment_b, 1, &shards_b[1], &Sequential).unwrap();
+
+            let result = S::decode(
+                config,
+                &commitment_a,
+                [checked_a, checked_b].iter(),
+                &Sequential,
+            );
+            assert!(
+                result.is_err(),
+                "decode must reject shards checked against different commitments"
+            );
+        }
+
+        fn decode_rejects_empty_checked_shards<S: Scheme>(config: &Config, data: &[u8]) {
+            let (commitment, _) = S::encode(config, data, &Sequential).unwrap();
+            let result = S::decode(config, &commitment, core::iter::empty(), &Sequential);
+            assert!(
+                result.is_err(),
+                "decode must reject empty checked shard sets"
+            );
+        }
+
+        /// Decoding rejects shards checked against different commitments and empty shard sets.
+        #[test]
+        fn decode_rejects_mixed_commitment_shards() {
+            // Any two of three shards decode.
+            let config = Config {
+                minimum_shards: NZU16!(2),
+                extra_shards: NZU16!(1),
+            };
+
+            // Reed-Solomon rejects both on unrelated payloads.
+            decode_rejects_mixed_commitments::<ReedSolomon<Sha256>>(
+                &config,
+                b"alpha payload",
+                b"bravo payload",
+            );
+            decode_rejects_empty_checked_shards::<ReedSolomon<Sha256>>(&config, b"alpha payload");
+
+            // So does the segmented scheme, on single-segment payloads with different roots.
+            decode_rejects_mixed_commitments::<Seg>(&config, b"alpha payload", b"bravo payload");
+            decode_rejects_empty_checked_shards::<Seg>(&config, b"alpha payload");
+
+            // Payloads that differ only in their last segment share every other segment root, so
+            // decoding must catch the mismatch in the last segment alone.
+            let alpha = [0x11; 200];
+            let mut bravo = alpha;
+            bravo[199] = 0x22;
+            decode_rejects_mixed_commitments::<Seg>(&config, &alpha, &bravo);
+            decode_rejects_empty_checked_shards::<Seg>(&config, &alpha);
+        }
+
+        /// Empty data roundtrips through each scheme.
+        #[test]
+        fn roundtrip_empty_data() {
+            // Decode empty data from the first 30 of 100 shards under each scheme.
+            let config = Config {
+                minimum_shards: NZU16!(30),
+                extra_shards: NZU16!(70),
+            };
+            let selected: Vec<u16> = (0..30).collect();
+
+            roundtrip::<ReedSolomon<Sha256>>(&config, b"", &selected);
+            roundtrip::<Seg>(&config, b"", &selected);
+        }
+
+        /// A 64 KiB payload roundtrips through each scheme across 25 shards.
+        #[test]
+        fn roundtrip_2_pow_16_25_total_shards() {
+            // Decode the payload from the first 8 of 25 shards under each scheme.
+            let config = Config {
+                minimum_shards: NZU16!(8),
+                extra_shards: NZU16!(17),
+            };
+            let data = vec![0x67; 1 << 16];
+            let selected: Vec<u16> = (0..8).collect();
+
+            roundtrip::<ReedSolomon<Sha256>>(&config, &data, &selected);
+            roundtrip::<Seg>(&config, &data, &selected);
+        }
+
+        #[test]
+        fn minifuzz_roundtrip_reed_solomon() {
+            minifuzz::test(|u| {
+                let (config, data, selected) = generate_case(u)?;
+                roundtrip::<ReedSolomon<Sha256>>(&config, &data, &selected);
+                Ok(())
+            });
+        }
+
+        /// Random segmented encodings roundtrip from random shard subsets.
+        #[test]
+        fn minifuzz_roundtrip_segmented() {
+            minifuzz::test(|u| {
+                // Each case draws a config, a payload, and the shards to decode from.
+                let (config, data, selected) = generate_case(u)?;
+                roundtrip::<Seg>(&config, &data, &selected);
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(feature = "arbitrary")]
+    mod conformance {
+        use super::*;
+        use commonware_codec::conformance::CodecConformance;
+
+        commonware_conformance::conformance_tests! {
+            CodecConformance<Config>,
+        }
+    }
+}
