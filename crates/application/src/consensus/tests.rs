@@ -1460,3 +1460,84 @@ fn build_timeout_bounds_refill_rounds() {
         );
     });
 }
+
+/// With the final refill skipped, a round that keeps every candidate ends the build without
+/// another mempool request, while a round that drops a candidate still refills.
+#[test]
+fn skip_final_refill_ends_after_a_round_without_drops() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            alt_sender,
+            recipient,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+        context.sleep(Duration::from_millis(10)).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let keep = transfer(&sender, &recipient, 1);
+        let duplicate = transfer(&sender, &recipient, 2);
+        let refill = transfer(&alt_sender, &recipient, 3);
+        let unrequested = transfer(&recipient, &sender, 4);
+
+        for skip in [true, false] {
+            // The seed round drops the duplicate, so the build refills. The refill round keeps
+            // its only candidate.
+            app.skip_final_refill = skip;
+            let mut input = StaticTransactionSource::new(vec![
+                vec![keep.clone(), duplicate.clone()],
+                vec![refill.clone()],
+                vec![unrequested.clone()],
+            ]);
+            let mut leftover = input.clone();
+            let proposed = app
+                .propose_child(
+                    (context.child("propose"), consensus_context.clone()),
+                    Arc::new(parent.clone()),
+                    dbs.new_batches().await,
+                    &mut input,
+                )
+                .await
+                .expect("best-effort proposal must succeed");
+            let body = body_digests(&proposed.block);
+            assert_eq!(
+                body[..2],
+                [*keep.message_digest(), *refill.message_digest()],
+                "skip_final_refill = {skip}"
+            );
+            if skip {
+                assert_eq!(body.len(), 2);
+            }
+
+            // Only the skipping build leaves the third response unrequested.
+            let remaining = constantinople_mempool::TransactionSource::propose(
+                &mut leftover,
+                &parent.header,
+                consensus_context.round,
+                0,
+            )
+            .await;
+            let expected = if skip {
+                vec![*unrequested.message_digest()]
+            } else {
+                Vec::new()
+            };
+            let remaining: Vec<_> = remaining
+                .iter()
+                .map(|tx| {
+                    *tx.get()
+                        .expect("remaining transaction must decode")
+                        .message_digest()
+                })
+                .collect();
+            assert_eq!(remaining, expected, "skip_final_refill = {skip}");
+        }
+    });
+}

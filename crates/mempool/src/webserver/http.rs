@@ -54,6 +54,15 @@ const MIN_U64_VARINT_BYTES: usize = 1;
 /// cannot release it while the job runs.
 pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
 
+/// Ingress batches admitted to verification at once, when overridden at startup.
+pub(super) static INGRESS_PERMITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_CONCURRENT_INGRESS);
+
+/// Whether the actor serves proposal requests ahead of other queued messages and between bounded
+/// slices of block-report bookkeeping.
+pub(super) static PROPOSE_PRIORITY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, St>
 where

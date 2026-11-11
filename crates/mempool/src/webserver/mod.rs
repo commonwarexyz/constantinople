@@ -26,6 +26,18 @@ pub use mailbox::{ActorReceiver, Mailbox};
 
 mod http;
 
+/// Sets how many ingress batches are admitted to verification at once. Call before the actor
+/// starts.
+pub fn set_ingress_permits(permits: usize) {
+    http::INGRESS_PERMITS.store(permits.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Sets whether proposal requests are served ahead of other queued messages and between bounded
+/// slices of block-report bookkeeping. Call before the actor starts.
+pub fn set_propose_priority(enabled: bool) {
+    http::PROPOSE_PRIORITY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Error returned by mempool submission calls.
 #[derive(Debug, Display)]
 pub enum SubmitError {

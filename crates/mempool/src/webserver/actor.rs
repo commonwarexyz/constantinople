@@ -16,17 +16,27 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::{LazySignedTransaction, PublicKeyCache, VerifiedTransaction};
+use futures::future::{Either, select};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fmt::Display,
     hash::Hash,
+    pin::pin,
     sync::{Arc, OnceLock},
 };
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::warn;
 
 const MAX_STATUS_ENTRIES: usize = 1_000_000;
+
+/// Most messages pulled from the mailbox ahead of the one being served when proposal priority
+/// is on.
+const MAX_BACKLOG: usize = 4096;
+
+/// Digests of block-report bookkeeping between chances to serve a queued proposal request when
+/// proposal priority is on. A few thousand digests take on the order of a millisecond.
+const REPORT_SLICE_DIGESTS: usize = 4096;
 
 /// Shared cell that lets the mempool answer account lookups once the
 /// validator's state database is attached. The cell is populated after engine
@@ -175,7 +185,7 @@ struct ProposedBatch<D> {
     digests: Vec<D>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DigestOutcome {
     Finalized { height: u64 },
     Dropped,
@@ -469,14 +479,9 @@ where
 /// Applies one finalized block's digest set to the outstanding proposed
 /// batches, recording per-digest outcomes and pruning `known_digests`.
 ///
-/// A partial match does not prove the unmatched digests are dead: a
-/// speculative reuse can split one selection across two finalized blocks (the
-/// filtered digests land in the parent, the remainder in the next block this
-/// node proposes). Matched digests finalize immediately; the remainder stays
-/// outstanding until its own block is reported or the grace window expires.
-///
 /// Returns the batch ids whose digests gained outcomes, for terminal-status
 /// resolution by the caller.
+#[cfg(test)]
 fn resolve_proposed_batches<D>(
     proposed: &mut VecDeque<ProposedBatch<D>>,
     finalized: &AHashSet<D>,
@@ -485,45 +490,226 @@ fn resolve_proposed_batches<D>(
     known_digests: &mut AHashSet<D>,
     digest_outcomes: &mut AHashMap<D, DigestOutcome>,
     digest_watchers: &AHashMap<D, Vec<Arc<str>>>,
-) -> AHashSet<Arc<str>>
+) -> Vec<Arc<str>>
 where
     D: Copy + Eq + Hash,
 {
-    let mut affected: AHashSet<Arc<str>> = AHashSet::new();
-    let mut remaining = VecDeque::new();
-    for batch in proposed.drain(..) {
-        let expired = height >= batch.height + drop_grace_blocks;
-        let any_finalized = batch
-            .digests
-            .iter()
-            .any(|digest| finalized.contains(digest));
-        if !any_finalized && !expired {
-            remaining.push_back(batch);
-            continue;
-        }
+    let mut resolution = ReportResolution::new(height, drop_grace_blocks, proposed.len());
+    resolution.examine(
+        proposed,
+        finalized,
+        usize::MAX,
+        known_digests,
+        digest_outcomes,
+        digest_watchers,
+    );
+    resolution.unsettled
+}
 
-        affected.extend(watched_batches_for(&batch.digests, digest_watchers));
-        let mut outstanding = Vec::new();
-        for digest in &batch.digests {
-            if finalized.contains(digest) {
-                digest_outcomes.insert(*digest, DigestOutcome::Finalized { height });
-                known_digests.remove(digest);
-            } else if expired {
-                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
-                known_digests.remove(digest);
-            } else {
-                outstanding.push(*digest);
-            }
-        }
-        if !outstanding.is_empty() {
-            remaining.push_back(ProposedBatch {
-                height: batch.height,
-                digests: outstanding,
-            });
+/// One finalized block's effect on this node's proposed batches, applied in
+/// bounded slices.
+///
+/// The block resolves exactly the batches proposed before it was reported.
+/// They are the first `unexamined` entries of `proposed`.
+///
+/// Between slices the actor may serve proposal requests and nothing else.
+/// Serving a request only pops pool entries and appends to `proposed` behind
+/// the batches this block resolves. Resolution never touches the pools and
+/// never examines those appended batches, so every result matches serving the
+/// requests after the whole report.
+///
+/// A partial match does not prove the unmatched digests are dead. A
+/// speculative reuse can split one selection across two finalized blocks,
+/// with the filtered digests in the parent and the remainder in the next
+/// block this node proposes. Matched digests finalize immediately. The
+/// remainder stays outstanding until its own block is reported or the grace
+/// window expires.
+struct ReportResolution<D> {
+    height: u64,
+    drop_grace_blocks: u64,
+    /// Batches at the front of `proposed` this block has yet to examine.
+    unexamined: usize,
+    /// Examined batches still outstanding, in proposal order.
+    retained: VecDeque<ProposedBatch<D>>,
+    /// Submitted batches whose digests gained outcomes.
+    affected: AHashSet<Arc<str>>,
+    /// Affected batches to check for a terminal status once every proposed
+    /// batch is examined, and how many of them are checked.
+    unsettled: Vec<Arc<str>>,
+    settled: usize,
+}
+
+impl<D> ReportResolution<D>
+where
+    D: Copy + Eq + Hash,
+{
+    /// Starts resolving a block at `height` against the first `unexamined`
+    /// proposed batches.
+    fn new(height: u64, drop_grace_blocks: u64, unexamined: usize) -> Self {
+        Self {
+            height,
+            drop_grace_blocks,
+            unexamined,
+            retained: VecDeque::new(),
+            affected: AHashSet::new(),
+            unsettled: Vec::new(),
+            settled: 0,
         }
     }
-    *proposed = remaining;
-    affected
+
+    /// Records outcomes for whole batches from the front of `proposed` until
+    /// `budget` digests are spent, returning whether every batch is examined.
+    fn examine(
+        &mut self,
+        proposed: &mut VecDeque<ProposedBatch<D>>,
+        finalized: &AHashSet<D>,
+        budget: usize,
+        known_digests: &mut AHashSet<D>,
+        digest_outcomes: &mut AHashMap<D, DigestOutcome>,
+        digest_watchers: &AHashMap<D, Vec<Arc<str>>>,
+    ) -> bool {
+        let mut spent = 0usize;
+        while self.unexamined > 0 && spent < budget {
+            let batch = proposed
+                .pop_front()
+                .expect("unexamined batches must stay at the front");
+            self.unexamined -= 1;
+            spent = spent.saturating_add(batch.digests.len().max(1));
+
+            let expired = self.height >= batch.height + self.drop_grace_blocks;
+            let any_finalized = batch
+                .digests
+                .iter()
+                .any(|digest| finalized.contains(digest));
+            if !any_finalized && !expired {
+                self.retained.push_back(batch);
+                continue;
+            }
+
+            self.affected
+                .extend(watched_batches_for(&batch.digests, digest_watchers));
+            let mut outstanding = Vec::new();
+            for digest in &batch.digests {
+                if finalized.contains(digest) {
+                    digest_outcomes.insert(
+                        *digest,
+                        DigestOutcome::Finalized {
+                            height: self.height,
+                        },
+                    );
+                    known_digests.remove(digest);
+                } else if expired {
+                    digest_outcomes.insert(*digest, DigestOutcome::Dropped);
+                    known_digests.remove(digest);
+                } else {
+                    outstanding.push(*digest);
+                }
+            }
+            if !outstanding.is_empty() {
+                self.retained.push_back(ProposedBatch {
+                    height: batch.height,
+                    digests: outstanding,
+                });
+            }
+        }
+        if self.unexamined > 0 {
+            return false;
+        }
+
+        // Batches proposed during the report follow the retained ones, as
+        // they would had they been proposed after it.
+        self.retained.append(proposed);
+        std::mem::swap(proposed, &mut self.retained);
+        self.unsettled.extend(self.affected.drain());
+        true
+    }
+
+    /// Resolves terminal statuses for affected batches until `budget` digests
+    /// are spent, returning whether every affected batch is checked. Call
+    /// only after [`Self::examine`] has returned `true`.
+    #[allow(clippy::too_many_arguments)]
+    fn settle(
+        &mut self,
+        budget: usize,
+        statuses: &mut AHashMap<Arc<str>, StoredBatchStatus<D>>,
+        status_order: &mut VecDeque<Arc<str>>,
+        batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+        digest_watchers: &mut AHashMap<D, Vec<Arc<str>>>,
+        digest_outcomes: &mut AHashMap<D, DigestOutcome>,
+        pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
+    ) -> bool {
+        let mut spent = 0usize;
+        while spent < budget {
+            let Some(batch_id) = self.unsettled.get(self.settled) else {
+                return true;
+            };
+            self.settled += 1;
+            spent = spent.saturating_add(
+                batch_digests
+                    .get(batch_id.as_ref())
+                    .map_or(1, |digests| digests.len().max(1)),
+            );
+            resolve_batch_if_terminal(
+                batch_id,
+                statuses,
+                status_order,
+                batch_digests,
+                digest_watchers,
+                digest_outcomes,
+                pending_waiters,
+            );
+        }
+        self.settled == self.unsettled.len()
+    }
+}
+
+/// Moves already queued messages into `backlog`, up to [`MAX_BACKLOG`].
+fn fill_backlog<T>(backlog: &mut VecDeque<T>, rx: &mut mpsc::Receiver<T>) {
+    while backlog.len() < MAX_BACKLOG {
+        let Ok(message) = rx.try_recv() else {
+            break;
+        };
+        backlog.push_back(message);
+    }
+}
+
+/// Serves every proposal request queued in the mailbox or `backlog`, leaving
+/// other messages in `backlog` in arrival order.
+fn serve_queued_proposals<C, P, H>(
+    backlog: &mut VecDeque<Message<C, P, H>>,
+    rx: &mut mpsc::Receiver<Message<C, P, H>>,
+    foreground_pool: &mut PoolLane<H>,
+    background_pool: &mut PoolLane<H>,
+    proposed: &mut VecDeque<ProposedBatch<H::Digest>>,
+    max_propose_bytes: usize,
+) where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fill_backlog(backlog, rx);
+    while let Some(index) = backlog
+        .iter()
+        .position(|message| matches!(message, Message::Propose { .. }))
+    {
+        let Some(Message::Propose {
+            height,
+            filled,
+            response,
+        }) = backlog.remove(index)
+        else {
+            unreachable!("the position must hold a proposal request");
+        };
+        let batch_txs = pop_proposal(
+            foreground_pool,
+            background_pool,
+            proposed,
+            height,
+            filled,
+            max_propose_bytes,
+        );
+        response.send_lossy(batch_txs);
+    }
 }
 
 fn resolve_batch_if_terminal<D>(
@@ -731,7 +917,9 @@ where
             strategy: strategy.clone(),
             public_key_cache,
             account_reader,
-            ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
+            ingress_permits: Arc::new(Semaphore::new(
+                http::INGRESS_PERMITS.load(std::sync::atomic::Ordering::Relaxed),
+            )),
         });
         let app = http::router::<C, P, H, St>(app_state);
         let _http_handle = context.as_present().child("http").spawn(|_| async {
@@ -748,7 +936,37 @@ where
             AHashMap::new();
         let mut known_digests: AHashSet<H::Digest> = AHashSet::new();
 
-        while let Some(message) = rx.recv().await {
+        // With proposal priority on, everything already queued is taken first and a proposal
+        // request among it is served before the rest, and block reports pause between bounded
+        // slices to serve proposal requests that arrive meanwhile.
+        let prioritize = http::PROPOSE_PRIORITY.load(std::sync::atomic::Ordering::Relaxed);
+        let report_slice = if prioritize {
+            REPORT_SLICE_DIGESTS
+        } else {
+            usize::MAX
+        };
+        let mut backlog: VecDeque<Message<C, P, H>> = VecDeque::new();
+        loop {
+            if backlog.is_empty() {
+                let Some(message) = rx.recv().await else {
+                    break;
+                };
+                backlog.push_back(message);
+            }
+            if prioritize {
+                fill_backlog(&mut backlog, &mut rx);
+            }
+            let next = if prioritize {
+                backlog
+                    .iter()
+                    .position(|message| matches!(message, Message::Propose { .. }))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let message = backlog
+                .remove(next)
+                .expect("the backlog must hold a message");
             match message {
                 Message::Submit {
                     lane,
@@ -860,39 +1078,84 @@ where
                     let height = block.inner().header.height;
                     let work_size = block.inner().body.len();
 
+                    // The block resolves the batches proposed so far. Requests served while it
+                    // is in progress propose behind them.
+                    let mut resolution =
+                        ReportResolution::new(height, drop_grace_blocks, proposed.len());
+
                     // Deriving the finalized set decodes any transaction the
                     // application has not already materialized. The strategy
                     // schedules that work and block release together, but may
-                    // run small jobs inline.
-                    let finalized: AHashSet<H::Digest> = strategy
-                        .spawn(work_size, move |_: St| {
-                            block
-                                .inner()
-                                .body
-                                .iter()
-                                .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
-                                .collect()
-                        })
-                        .await;
+                    // run small jobs inline. With proposal priority on, requests
+                    // arriving during an off-task extraction are served at once.
+                    let extraction = strategy.spawn(work_size, move |_: St| {
+                        block
+                            .inner()
+                            .body
+                            .iter()
+                            .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
+                            .collect::<AHashSet<H::Digest>>()
+                    });
+                    let finalized = if prioritize {
+                        let mut extraction = pin!(extraction);
+                        loop {
+                            let received = {
+                                let receive = pin!(rx.recv());
+                                match select(extraction.as_mut(), receive).await {
+                                    Either::Left((finalized, _)) => break finalized,
+                                    Either::Right((received, _)) => received,
+                                }
+                            };
+                            let Some(message) = received else {
+                                break extraction.await;
+                            };
+                            backlog.push_back(message);
+                            serve_queued_proposals(
+                                &mut backlog,
+                                &mut rx,
+                                &mut foreground_pool,
+                                &mut background_pool,
+                                &mut proposed,
+                                max_propose_bytes,
+                            );
+                        }
+                    } else {
+                        extraction.await
+                    };
 
-                    let affected = resolve_proposed_batches(
+                    while !resolution.examine(
                         &mut proposed,
                         &finalized,
-                        height,
-                        drop_grace_blocks,
+                        report_slice,
                         &mut known_digests,
                         &mut digest_outcomes,
                         &digest_watchers,
-                    );
-                    for batch_id in affected {
-                        resolve_batch_if_terminal(
-                            &batch_id,
-                            &mut statuses,
-                            &mut status_order,
-                            &mut batch_digests,
-                            &mut digest_watchers,
-                            &mut digest_outcomes,
-                            &mut pending_waiters,
+                    ) {
+                        serve_queued_proposals(
+                            &mut backlog,
+                            &mut rx,
+                            &mut foreground_pool,
+                            &mut background_pool,
+                            &mut proposed,
+                            max_propose_bytes,
+                        );
+                    }
+                    while !resolution.settle(
+                        report_slice,
+                        &mut statuses,
+                        &mut status_order,
+                        &mut batch_digests,
+                        &mut digest_watchers,
+                        &mut digest_outcomes,
+                        &mut pending_waiters,
+                    ) {
+                        serve_queued_proposals(
+                            &mut backlog,
+                            &mut rx,
+                            &mut foreground_pool,
+                            &mut background_pool,
+                            &mut proposed,
+                            max_propose_bytes,
                         );
                     }
 
@@ -909,9 +1172,10 @@ where
 mod tests {
     use super::{
         Actor, ActorReceiver, Config, DigestOutcome, IngestStatus, Mailbox, Message, PoolEntry,
-        PoolLane, ProposedBatch, StoredBatchStatus, SubmissionLane, TxStatus,
+        PoolLane, ProposedBatch, ReportResolution, StoredBatchStatus, SubmissionLane, TxStatus,
         batch_status_from_outcomes, can_admit_submission, ingest_status_from_batch, new_entry,
-        pop_lane_proposal, pop_proposal, resolve_proposed_batches, status_for_finalized_block,
+        pop_lane_proposal, pop_proposal, remember_status, resolve_proposed_batches,
+        serve_queued_proposals, status_for_finalized_block, watch_batch,
     };
     use ahash::{AHashMap, AHashSet};
     use commonware_codec::EncodeSize as _;
@@ -1572,5 +1836,391 @@ mod tests {
             1_000,
             300,
         ));
+    }
+
+    type TestDigest = sha256::Digest;
+
+    /// Actor bookkeeping just before a block report: six submitted batches, four of them
+    /// proposed and two still pooled, with a waiter on each.
+    struct ReportFixture {
+        foreground: PoolLane<sha256::Sha256>,
+        background: PoolLane<sha256::Sha256>,
+        proposed: VecDeque<ProposedBatch<TestDigest>>,
+        finalized: AHashSet<TestDigest>,
+        known: AHashSet<TestDigest>,
+        outcomes: AHashMap<TestDigest, DigestOutcome>,
+        statuses: AHashMap<Arc<str>, StoredBatchStatus<TestDigest>>,
+        status_order: VecDeque<Arc<str>>,
+        batch_digests: AHashMap<Arc<str>, Vec<TestDigest>>,
+        watchers: AHashMap<TestDigest, Vec<Arc<str>>>,
+        waiters: AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
+        receivers: Vec<(Arc<str>, oneshot::Receiver<TxStatus>)>,
+    }
+
+    /// Height of the reported block.
+    const REPORT_HEIGHT: u64 = 4;
+
+    /// Grace window, after which batches proposed at height 1 drop at the report.
+    const REPORT_GRACE: u64 = 3;
+
+    /// Builds the same [`ReportFixture`] on every call.
+    fn report_fixture() -> ReportFixture {
+        let mut rng = StdRng::from_seed([29; 32]);
+        let [a, b, c, d, e, f] = std::array::from_fn(|_| TestDigest::random(&mut rng));
+        let pooled = pool_entry(7, 2, 300);
+        let pooled_tail = pool_entry(8, 1, 300);
+
+        // The block finalizes one whole proposed batch, half of another, and the first digest
+        // of a still-pooled batch (another validator included the same transaction).
+        let finalized: AHashSet<_> = [a, b, c, pooled.digests[0]].into_iter().collect();
+        let proposed = VecDeque::from([
+            ProposedBatch {
+                height: 2,
+                digests: vec![a, b],
+            },
+            ProposedBatch {
+                height: 2,
+                digests: vec![c, d],
+            },
+            ProposedBatch {
+                height: 1,
+                digests: vec![e],
+            },
+            ProposedBatch {
+                height: 3,
+                digests: vec![f],
+            },
+        ]);
+        let submissions: Vec<(&str, Vec<TestDigest>)> = vec![
+            ("finalized", vec![a, b]),
+            ("partial", vec![c, d]),
+            ("expired", vec![e]),
+            ("pending", vec![f]),
+            ("pooled", pooled.digests.clone()),
+            ("pooled-tail", pooled_tail.digests.clone()),
+        ];
+
+        let mut fixture = ReportFixture {
+            foreground: PoolLane {
+                entries: VecDeque::new(),
+                bytes: 0,
+            },
+            background: PoolLane::new(),
+            proposed,
+            finalized,
+            known: AHashSet::new(),
+            outcomes: AHashMap::new(),
+            statuses: AHashMap::new(),
+            status_order: VecDeque::new(),
+            batch_digests: AHashMap::new(),
+            watchers: AHashMap::new(),
+            waiters: AHashMap::new(),
+            receivers: Vec::new(),
+        };
+        for (batch_id, digests) in submissions {
+            // Record each submission as the actor's Submit handler does.
+            let batch_id: Arc<str> = batch_id.into();
+            remember_status(
+                &mut fixture.statuses,
+                &mut fixture.status_order,
+                Arc::clone(&batch_id),
+                StoredBatchStatus::Accepted,
+            );
+            watch_batch(&batch_id, &digests, &mut fixture.watchers);
+            fixture.known.extend(digests.iter().copied());
+            fixture.batch_digests.insert(Arc::clone(&batch_id), digests);
+            let (waiter, receiver) = oneshot::channel();
+            fixture
+                .waiters
+                .entry(Arc::clone(&batch_id))
+                .or_default()
+                .push(waiter);
+            fixture.receivers.push((batch_id, receiver));
+        }
+        for entry in [pooled, pooled_tail] {
+            fixture.foreground.bytes += entry.total_bytes;
+            fixture.foreground.entries.push_back(entry);
+        }
+        fixture
+    }
+
+    /// Everything a caller can observe of a [`ReportFixture`], in a comparable form. Status
+    /// insertion order among one report's batches follows hash-set order, so it is compared
+    /// as a set.
+    #[derive(Debug, PartialEq)]
+    struct ReportOutcome {
+        proposed: Vec<(u64, Vec<TestDigest>)>,
+        pool: Vec<Vec<TestDigest>>,
+        pool_bytes: usize,
+        known: Vec<TestDigest>,
+        outcomes: Vec<(TestDigest, DigestOutcome)>,
+        statuses: Vec<(String, StoredBatchStatus<TestDigest>)>,
+        status_order: Vec<String>,
+        batch_digests: Vec<(String, Vec<TestDigest>)>,
+        watchers: Vec<(TestDigest, Vec<String>)>,
+        waiting: Vec<String>,
+        notified: Vec<(String, Option<TxStatus>)>,
+        served: Vec<TestDigest>,
+    }
+
+    fn observe(
+        mut fixture: ReportFixture,
+        served: &[LazySignedTransaction<sha256::Sha256>],
+    ) -> ReportOutcome {
+        fn sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+            items.sort();
+            items
+        }
+        ReportOutcome {
+            proposed: fixture
+                .proposed
+                .iter()
+                .map(|batch| (batch.height, batch.digests.clone()))
+                .collect(),
+            pool: fixture
+                .foreground
+                .entries
+                .iter()
+                .map(|entry| entry.digests.clone())
+                .collect(),
+            pool_bytes: fixture.foreground.bytes,
+            known: sorted(fixture.known.iter().copied().collect()),
+            outcomes: {
+                let mut outcomes: Vec<_> = fixture.outcomes.iter().map(|(d, o)| (*d, *o)).collect();
+                outcomes.sort_by_key(|(digest, _)| *digest);
+                outcomes
+            },
+            statuses: {
+                let mut statuses: Vec<_> = fixture
+                    .statuses
+                    .iter()
+                    .map(|(id, status)| (id.to_string(), status.clone()))
+                    .collect();
+                statuses.sort_by(|left, right| left.0.cmp(&right.0));
+                statuses
+            },
+            status_order: sorted(
+                fixture
+                    .status_order
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+            ),
+            batch_digests: sorted(
+                fixture
+                    .batch_digests
+                    .iter()
+                    .map(|(id, digests)| (id.to_string(), digests.clone()))
+                    .collect(),
+            ),
+            watchers: sorted(
+                fixture
+                    .watchers
+                    .iter()
+                    .map(|(digest, ids)| (*digest, ids.iter().map(|id| id.to_string()).collect()))
+                    .collect(),
+            ),
+            waiting: sorted(fixture.waiters.keys().map(|id| id.to_string()).collect()),
+            notified: fixture
+                .receivers
+                .iter_mut()
+                .map(|(id, receiver)| (id.to_string(), receiver.try_recv().ok()))
+                .collect(),
+            served: served.iter().map(digest_of).collect(),
+        }
+    }
+
+    /// Advances a report one slice of `budget` digests, examining before settling. Returns
+    /// whether the report is complete.
+    fn report_slice(
+        fixture: &mut ReportFixture,
+        resolution: &mut ReportResolution<TestDigest>,
+        budget: usize,
+    ) -> bool {
+        if !resolution.examine(
+            &mut fixture.proposed,
+            &fixture.finalized,
+            budget,
+            &mut fixture.known,
+            &mut fixture.outcomes,
+            &fixture.watchers,
+        ) {
+            return false;
+        }
+        resolution.settle(
+            budget,
+            &mut fixture.statuses,
+            &mut fixture.status_order,
+            &mut fixture.batch_digests,
+            &mut fixture.watchers,
+            &mut fixture.outcomes,
+            &mut fixture.waiters,
+        )
+    }
+
+    fn serve_proposal(fixture: &mut ReportFixture) -> Vec<LazySignedTransaction<sha256::Sha256>> {
+        pop_proposal(
+            &mut fixture.foreground,
+            &mut fixture.background,
+            &mut fixture.proposed,
+            REPORT_HEIGHT + 1,
+            0,
+            10_000,
+        )
+    }
+
+    /// A proposal served between any two slices of a block report sees the same pool and
+    /// leaves every status, outcome, waiter, known digest, and proposed batch as serving it
+    /// after the whole report does.
+    #[test]
+    fn proposal_between_report_slices_matches_proposal_after_report() {
+        // Resolve the whole report in one slice, then serve the proposal.
+        let mut fixture = report_fixture();
+        let mut resolution =
+            ReportResolution::new(REPORT_HEIGHT, REPORT_GRACE, fixture.proposed.len());
+        assert!(report_slice(&mut fixture, &mut resolution, usize::MAX));
+        let served = serve_proposal(&mut fixture);
+        let expected = observe(fixture, &served);
+
+        // The serial order resolves the finalized and expired batches, leaves the partial and
+        // pending ones outstanding, and keeps the newly proposed batch whole even though the
+        // block holds one of its digests.
+        let notified: AHashMap<_, _> = expected.notified.iter().cloned().collect();
+        assert_eq!(
+            notified["finalized"],
+            Some(TxStatus::Finalized {
+                height: REPORT_HEIGHT
+            })
+        );
+        assert_eq!(notified["expired"], Some(TxStatus::Dropped));
+        assert_eq!(notified["partial"], None);
+        assert_eq!(notified["pending"], None);
+        assert_eq!(expected.served.len(), 3, "both pooled batches are served");
+        assert_eq!(expected.proposed.len(), 4);
+        assert_eq!(expected.proposed[2].0, REPORT_HEIGHT + 1);
+        assert_eq!(expected.proposed[2].1.len(), 2);
+
+        // Count the slices a report takes at one digest per slice.
+        let total = {
+            let mut fixture = report_fixture();
+            let mut resolution =
+                ReportResolution::new(REPORT_HEIGHT, REPORT_GRACE, fixture.proposed.len());
+            let mut total = 1;
+            while !report_slice(&mut fixture, &mut resolution, 1) {
+                total += 1;
+            }
+            total
+        };
+        assert_eq!(total, 6, "four batches to examine, then three to settle");
+
+        // Serve the proposal after each possible number of slices. Serving before the first
+        // slice is a proposal served while the finalized set is extracted.
+        for serve_at in 0..=total {
+            let mut fixture = report_fixture();
+            let mut resolution =
+                ReportResolution::new(REPORT_HEIGHT, REPORT_GRACE, fixture.proposed.len());
+            let mut served = Vec::new();
+            for slice in 0..=total {
+                if slice == serve_at {
+                    served = serve_proposal(&mut fixture);
+                }
+                if slice < total {
+                    let done = report_slice(&mut fixture, &mut resolution, 1);
+                    assert_eq!(done, slice + 1 == total);
+                }
+            }
+            assert_eq!(
+                observe(fixture, &served),
+                expected,
+                "serving the proposal after {serve_at} slices must not change the result"
+            );
+        }
+    }
+
+    /// Serving queued proposal requests answers every one, from the backlog and the mailbox,
+    /// in arrival order, and leaves the other messages queued in arrival order.
+    #[test]
+    fn queued_proposals_are_served_ahead_of_other_messages() {
+        type TestMessage = Message<TestDigest, ed25519::VerifyingKey, sha256::Sha256>;
+        let query = |batch_id: &str| -> TestMessage {
+            let (response, _) = oneshot::channel();
+            TestMessage::QueryStatus {
+                batch_id: batch_id.into(),
+                response,
+            }
+        };
+        let mut fixture = report_fixture();
+        let pooled: Vec<Vec<TestDigest>> = fixture
+            .foreground
+            .entries
+            .iter()
+            .map(|entry| entry.digests.clone())
+            .collect();
+
+        // Queue a query and a proposal request in the backlog, then a proposal request and a
+        // query in the mailbox.
+        let (first, mut first_result) = oneshot::channel();
+        let (second, mut second_result) = oneshot::channel();
+        let mut backlog = VecDeque::from([
+            query("q1"),
+            TestMessage::Propose {
+                height: 5,
+                filled: 0,
+                response: first,
+            },
+        ]);
+        let (sender, mut rx) = mpsc::channel(8);
+        assert!(
+            sender
+                .try_send(TestMessage::Propose {
+                    height: 6,
+                    filled: 0,
+                    response: second,
+                })
+                .is_ok()
+        );
+        assert!(sender.try_send(query("q2")).is_ok());
+
+        // Each request takes one 300-byte pooled batch, in arrival order.
+        serve_queued_proposals(
+            &mut backlog,
+            &mut rx,
+            &mut fixture.foreground,
+            &mut fixture.background,
+            &mut fixture.proposed,
+            300,
+        );
+        let digests = |served: Vec<LazySignedTransaction<sha256::Sha256>>| -> Vec<TestDigest> {
+            served.iter().map(digest_of).collect()
+        };
+        assert_eq!(
+            digests(
+                first_result
+                    .try_recv()
+                    .expect("first proposal must be served")
+            ),
+            pooled[0]
+        );
+        assert_eq!(
+            digests(
+                second_result
+                    .try_recv()
+                    .expect("second proposal must be served")
+            ),
+            pooled[1]
+        );
+        let heights: Vec<u64> = fixture.proposed.iter().map(|batch| batch.height).collect();
+        assert_eq!(heights, vec![2, 2, 1, 3, 5, 6]);
+
+        // The queries stay queued in arrival order and the mailbox is drained.
+        let queued: Vec<String> = backlog
+            .iter()
+            .map(|message| match message {
+                TestMessage::QueryStatus { batch_id, .. } => batch_id.clone(),
+                _ => panic!("only queries must remain queued"),
+            })
+            .collect();
+        assert_eq!(queued, vec!["q1", "q2"]);
+        assert!(rx.try_recv().is_err());
     }
 }
