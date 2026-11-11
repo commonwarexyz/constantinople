@@ -1068,8 +1068,6 @@ dependencies = [
 [[package]]
 name = "commonware-coding"
 version = "2026.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74bc77ec231a37a5314ca0a2b8dd98cba43d9e44ba0634dc6d7b2de7e3d18fcc"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -1111,8 +1109,6 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca8d109fab117ec237836aa956c9aba0950bf7eeefa5506c4aa4585e7fe235f5"
 dependencies = [
  "arbitrary",
  "bytes",

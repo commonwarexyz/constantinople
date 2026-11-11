@@ -4,7 +4,7 @@ use super::{
     Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
     history::header_range_to_target,
 };
-use commonware_consensus::{Handoff, marshal::ancestry::Ancestry};
+use commonware_consensus::{BodySink, Handoff, marshal::ancestry::Ancestry};
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
     Application as CApplication, Finality, Input as CInput, Proposed, db::DatabaseSet,
@@ -36,7 +36,7 @@ where
     type Databases = Databases<E, H, EightCap, St>;
     type Captured = FinalizedArtifacts<H>;
     type Provider = I;
-    type Input = ();
+    type Input = BodySink;
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
@@ -94,11 +94,16 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: CInput<Self::Input, Self::Provider>,
     ) -> Option<Proposed<Self, E>> {
+        let sink = if self.body_streaming {
+            input.upstream
+        } else {
+            BodySink::noop()
+        };
         let mut input = input.provider;
         let mut ancestry = Box::pin(ancestry);
         let parent = Arc::from(ancestry.next().await?);
         let result = self
-            .propose_child(context, parent, batches, &mut input)
+            .propose_child(context, parent, batches, &mut input, &sink)
             .await;
 
         // propose_child releases the parent on the strategy's pool, so only

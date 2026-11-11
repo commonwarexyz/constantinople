@@ -1,7 +1,7 @@
 use super::EngineApplication;
 use crate::block::{EngineBlock, EngineCommitment};
 use commonware_consensus::{
-    Block as _, CertifiableBlock as _, Handoff, Heightable as _,
+    Block as _, BodySink, CertifiableBlock as _, Handoff, Heightable as _,
     marshal::ancestry,
     simplex::types::Context,
     types::{Epoch, Height, Round, View},
@@ -260,7 +260,7 @@ fn prepare_forwards_the_inner_stage() {
                 ancestry::from_iter([Digested::precomputed(genesis.clone(), genesis.digest())]),
                 dbs.new_batches().await,
                 Input {
-                    upstream: (),
+                    upstream: BodySink::noop(),
                     provider: StaticTransactionSource::new(Vec::new()),
                 },
             )

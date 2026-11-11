@@ -10,7 +10,7 @@ use super::{
     reject_verify, time,
 };
 use commonware_codec::EncodeSize as _;
-use commonware_consensus::simplex::types::Context;
+use commonware_consensus::{BodySink, simplex::types::Context};
 use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
@@ -37,6 +37,9 @@ where
     St: Strategy,
 {
     /// Proposes a child block from an already fetched parent.
+    ///
+    /// The transactions are pushed to `sink` in block order as each selection round keeps them,
+    /// so the pushes together are the coded body of the returned block.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(
@@ -55,6 +58,7 @@ where
         parent: Arc<SealedBlock<C, P, H>>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut I,
+        sink: &BodySink,
     ) -> Option<Proposed<Self, E>>
     where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
@@ -86,6 +90,7 @@ where
             seed,
             input,
             self.skip_final_refill,
+            sink,
         )
         .await;
 

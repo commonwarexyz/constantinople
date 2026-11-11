@@ -4,7 +4,7 @@ use crate::{
 };
 use commonware_actor::Feedback;
 use commonware_consensus::{
-    Handoff, Reporter,
+    BodySink, Handoff, Reporter,
     marshal::{Update, ancestry::Ancestry},
 };
 use commonware_cryptography::{
@@ -216,7 +216,7 @@ where
     type Databases = <InnerApplication<E, H, P, V, I, St> as StatefulApplication<E>>::Databases;
     type Captured = Option<FinalizedArtifacts<H>>;
     type Provider = I;
-    type Input = ();
+    type Input = BodySink;
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         InnerApplication::<E, H, P, V, I, St>::sync_targets(block)

@@ -9,11 +9,13 @@ use crate::{
     Account, AccountKey, LazySignedTransaction, Sealable, Sealed, SignedTransaction,
     proposal::MAXIMUM_BLOCK_SIZE,
 };
+use bytes::Bytes;
 use commonware_codec::{
-    Buf, Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write,
+    Buf, Decode as _, Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write,
 };
 use commonware_consensus::{
-    Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
+    Block as ConsensusBlock, CertifiableBlock, Heightable, marshal::coding::types::CodedLayout,
+    simplex::types::Context, types::Height,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_storage::{
@@ -415,6 +417,53 @@ where
     }
 }
 
+/// Codes the transactions ahead of the header, the state sync proof and the transaction count.
+///
+/// The transactions are final once a proposer selects them, while the header commits to the state
+/// they produce. Placing them first lets a proposer disseminate them while it computes that state.
+/// The body is the transactions exactly as the canonical encoding frames them, and the tail is the
+/// rest of the canonical encoding in its order, so the tail followed by the body is the canonical
+/// encoding.
+impl<C, P, H> CodedLayout for Block<C, P, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fn write_body(&self, buf: &mut impl bytes::BufMut) {
+        for transaction in self.body.iter() {
+            transaction.write(buf);
+        }
+    }
+
+    fn write_tail(&self, buf: &mut impl bytes::BufMut) {
+        self.header.write(buf);
+        self.state_sync.write(buf);
+        self.body.len().write(buf);
+    }
+
+    fn read_coded(body: Bytes, tail: Bytes, cfg: &BlockCfg) -> Result<Self, CodecError> {
+        // The canonical decoder reads the tail followed by the body, so every limit and check it
+        // applies holds here too. Reading through the chained buffers keeps each transaction a
+        // view of the body.
+        let tail_len = tail.len();
+        let block = Self::decode_cfg(bytes::Buf::chain(tail, body), cfg)?;
+
+        // Every cut of the canonical encoding chains back to the same bytes, so only a tail that
+        // ends where the transactions begin is this block's layout.
+        let expected_tail = block.header.encode_size()
+            + block.state_sync.encode_size()
+            + block.body.len().encode_size();
+        if tail_len != expected_tail {
+            return Err(CodecError::Invalid(
+                "Block",
+                "coded body is not the transactions",
+            ));
+        }
+        Ok(block)
+    }
+}
+
 impl<C, P, H> Sealable for Block<C, P, H>
 where
     C: Digest,
@@ -792,5 +841,154 @@ mod tests {
             .expect("block should decode");
 
         assert!(reader.is_empty(), "block decoder left trailing bytes");
+    }
+
+    type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+
+    fn signed_transaction(seed: u8) -> SignedTransaction<sha256::Sha256> {
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let signer = ed25519::SigningKey::random(&mut rng);
+        let key = crate::TransactionPublicKey::ed25519(signer.public_key());
+        crate::Transaction::<sha256::Digest>::new(
+            key.clone(),
+            key,
+            core::num::NonZeroU64::MIN,
+            u64::from(seed),
+        )
+        .seal_and_sign(
+            &signer,
+            crate::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        )
+    }
+
+    fn block_with_transactions(count: u8) -> TestBlock {
+        TestBlock::new(
+            test_header(),
+            (0..count).map(signed_transaction).collect(),
+            StateSyncProof::initial::<sha256::Sha256>(),
+        )
+    }
+
+    /// Returns the block's coded body and tail.
+    fn coded_parts(block: &TestBlock) -> (Bytes, Bytes) {
+        let mut body = Vec::new();
+        block.write_body(&mut body);
+        let mut tail = Vec::new();
+        block.write_tail(&mut tail);
+        (body.into(), tail.into())
+    }
+
+    /// Returns the length of the header, state sync proof and transaction count that open a
+    /// canonical block encoding.
+    fn canonical_tail_len(encoded: &Bytes) -> usize {
+        let mut reader = encoded.clone();
+        Header::<sha256::Digest, sha256::Digest, ed25519::VerifyingKey>::read(&mut reader).unwrap();
+        StateSyncProof::<sha256::Digest>::read(&mut reader).unwrap();
+        usize::read_cfg(&mut reader, &RangeCfg::new(..)).unwrap();
+        encoded.len() - reader.len()
+    }
+
+    /// A block codes as a reordering of its canonical encoding, and no other cut of that encoding
+    /// reads back.
+    #[test]
+    fn coded_layout_is_the_only_cut_of_the_canonical_encoding() {
+        let cfg = BlockCfg::default();
+        for count in [0, 3] {
+            let block = block_with_transactions(count);
+
+            // The transactions move behind the rest of the encoding, and no byte is added.
+            let canonical = block.encode();
+            let (body, tail) = coded_parts(&block);
+            assert_eq!(body.len() + tail.len(), canonical.len());
+            assert_eq!(tail.len(), canonical_tail_len(&canonical));
+            assert_eq!(tail.as_ref(), &canonical[..tail.len()]);
+            assert_eq!(body.as_ref(), &canonical[tail.len()..]);
+            let framed: Vec<u8> = block.body.iter().flat_map(|tx| tx.encode()).collect();
+            assert_eq!(body.as_ref(), framed.as_slice());
+
+            // A block decoded from the canonical encoding writes the same layout, and the layout
+            // reads back as the block.
+            let decoded = TestBlock::decode_cfg(canonical.clone(), &cfg).unwrap();
+            assert_eq!(coded_parts(&decoded), (body.clone(), tail.clone()));
+            let read = TestBlock::read_coded(body.clone(), tail.clone(), &cfg).unwrap();
+            assert_eq!(read, block);
+            assert_eq!(read.encode(), canonical);
+
+            // The read transactions are views of the body, not copies of it.
+            let body_range = body.as_ptr_range();
+            for transaction in read.body.iter() {
+                let bytes = transaction.encoded_signed_transaction();
+                assert!(body_range.contains(&bytes.as_ptr()));
+            }
+
+            // The canonical encoding cut anywhere else holds the same bytes but must not read back.
+            for split in (0..=canonical.len()).filter(|split| *split != body.len()) {
+                let cut = canonical.len() - split;
+                assert!(matches!(
+                    TestBlock::read_coded(canonical.slice(cut..), canonical.slice(..cut), &cfg),
+                    Err(CodecError::Invalid(
+                        "Block",
+                        "coded body is not the transactions"
+                    ))
+                ));
+            }
+        }
+    }
+
+    /// The coded layout rejects every block the canonical decoder rejects under the same config.
+    #[test]
+    fn coded_layout_applies_the_canonical_limits() {
+        let block = block_with_transactions(3);
+        let canonical = block.encode();
+        let (body, tail) = coded_parts(&block);
+        let cfg = BlockCfg::default();
+
+        // The transaction count range applies to both.
+        for max in 0..=4 {
+            let narrow = BlockCfg {
+                max_transactions: RangeCfg::new(0..=max),
+            };
+            let coded = TestBlock::read_coded(body.clone(), tail.clone(), &narrow);
+            assert_eq!(coded.is_ok(), max >= 3);
+            assert_eq!(
+                TestBlock::decode_cfg(canonical.clone(), &narrow).is_ok(),
+                max >= 3
+            );
+        }
+
+        // The state sync proof must open the header's state root.
+        let mut wrong_root = block;
+        wrong_root.header.state_root = sha256::Digest::EMPTY;
+        let (wrong_body, wrong_tail) = coded_parts(&wrong_root);
+        assert!(TestBlock::read_coded(wrong_body, wrong_tail, &cfg).is_err());
+        assert!(TestBlock::decode_cfg(wrong_root.encode(), &cfg).is_err());
+
+        // Truncated and extended parts.
+        for end in 0..body.len() {
+            assert!(TestBlock::read_coded(body.slice(..end), tail.clone(), &cfg).is_err());
+        }
+        for end in 0..tail.len() {
+            assert!(TestBlock::read_coded(body.clone(), tail.slice(..end), &cfg).is_err());
+        }
+        let extended = |part: &Bytes| Bytes::from([part.as_ref(), &[0]].concat());
+        assert!(TestBlock::read_coded(extended(&body), tail.clone(), &cfg).is_err());
+        assert!(TestBlock::read_coded(body, extended(&tail), &cfg).is_err());
+
+        // The encoded size limit applies to the body and tail together.
+        for size in [
+            MAXIMUM_BLOCK_SIZE - 1,
+            MAXIMUM_BLOCK_SIZE,
+            MAXIMUM_BLOCK_SIZE + 1,
+        ] {
+            let encoded = Bytes::from(encoded_block_with_size(size));
+            let cut = canonical_tail_len(&encoded);
+            let coded = TestBlock::read_coded(encoded.slice(cut..), encoded.slice(..cut), &cfg);
+            assert_eq!(coded.is_ok(), size <= MAXIMUM_BLOCK_SIZE);
+            assert_eq!(
+                TestBlock::decode_cfg(encoded, &cfg).is_ok(),
+                size <= MAXIMUM_BLOCK_SIZE
+            );
+        }
     }
 }
