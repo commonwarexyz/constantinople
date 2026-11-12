@@ -41,6 +41,8 @@ where
         batch_id: String,
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
+        /// Receives the batch outcome. A background batch refused for lack of
+        /// room gets no answer and its sender is dropped.
         result: Option<oneshot::Sender<TxStatus>>,
         ingest_result: Option<oneshot::Sender<IngestStatus>>,
     },

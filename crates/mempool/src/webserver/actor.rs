@@ -23,7 +23,10 @@ use std::{
     fmt::Display,
     hash::Hash,
     pin::pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::warn;
@@ -910,15 +913,19 @@ where
             account_reader,
         } = self;
 
+        let background_capacity = max_pool_bytes - max_propose_bytes;
+        let background_bytes = Arc::new(AtomicUsize::new(0));
         let app_state = Arc::new(http::AppState {
             mailbox,
             namespace,
             max_batch_bytes: max_propose_bytes,
+            background_capacity,
+            background_bytes: background_bytes.clone(),
             strategy: strategy.clone(),
             public_key_cache,
             account_reader,
             ingress_permits: Arc::new(Semaphore::new(
-                http::INGRESS_PERMITS.load(std::sync::atomic::Ordering::Relaxed),
+                http::INGRESS_PERMITS.load(Ordering::Relaxed),
             )),
         });
         let app = http::router::<C, P, H, St>(app_state);
@@ -939,7 +946,7 @@ where
         // With proposal priority on, everything already queued is taken first and a proposal
         // request among it is served before the rest, and block reports pause between bounded
         // slices to serve proposal requests that arrive meanwhile.
-        let prioritize = http::PROPOSE_PRIORITY.load(std::sync::atomic::Ordering::Relaxed);
+        let prioritize = http::PROPOSE_PRIORITY.load(Ordering::Relaxed);
         let report_slice = if prioritize {
             REPORT_SLICE_DIGESTS
         } else {
@@ -947,6 +954,7 @@ where
         };
         let mut backlog: VecDeque<Message<C, P, H>> = VecDeque::new();
         loop {
+            background_bytes.store(background_pool.bytes, Ordering::Relaxed);
             if backlog.is_empty() {
                 let Some(message) = rx.recv().await else {
                     break;
@@ -1003,7 +1011,21 @@ where
                         )
                     {
                         remove_known_digests(&entry.digests, &mut known_digests);
-                        if let Some(result) = result {
+
+                        // A background batch that would fit the empty pool is refused only for
+                        // lack of room right now. Its waiter is closed without an answer, which
+                        // tells the submitter to retry the identical batch. Other refusals are
+                        // final.
+                        let retryable = lane == SubmissionLane::Background
+                            && can_admit_submission(
+                                lane,
+                                0,
+                                0,
+                                entry.total_bytes,
+                                max_pool_bytes,
+                                max_propose_bytes,
+                            );
+                        if let Some(result) = result.filter(|_| !retryable) {
                             let _ = result.send(TxStatus::Dropped);
                         }
                         if let Some(ingest_result) = ingest_result {
@@ -1632,31 +1654,60 @@ mod tests {
         }
     }
 
+    type TestMailbox = Mailbox<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+    type ActorMessage = Message<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+
+    /// Starts an actor with the given pool and proposal budgets.
+    async fn start_test_actor(
+        context: commonware_runtime::tokio::Context,
+        max_pool_bytes: usize,
+        max_propose_bytes: usize,
+    ) -> (TestMailbox, mpsc::Sender<ActorMessage>, super::Handle<()>) {
+        let (sender, rx) = mpsc::channel(8);
+        let mailbox = Mailbox::new(sender.clone());
+        let public_key_cache = PublicKeyCache::new(context.child("cache"), NZUsize!(16));
+        let actor = Actor::new(
+            context,
+            Config {
+                max_pool_bytes,
+                max_propose_bytes,
+                namespace: TRANSACTION_NAMESPACE,
+                drop_grace_blocks: 3,
+                strategy: Sequential,
+                public_key_cache,
+            },
+            mailbox.clone(),
+            ActorReceiver { rx },
+            Arc::new(OnceLock::new()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        (mailbox, sender, actor.start(listener))
+    }
+
+    async fn propose(
+        sender: &mpsc::Sender<ActorMessage>,
+        height: u64,
+    ) -> Vec<LazySignedTransaction<sha256::Sha256>> {
+        let (response, result) = oneshot::channel();
+        sender
+            .send(Message::Propose {
+                height,
+                filled: 0,
+                response,
+            })
+            .await
+            .unwrap();
+        result.await.unwrap()
+    }
+
     #[test]
     fn actor_drops_oversized_batches_without_retaining_digests() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let transactions = signed_transactions(1, 2);
             let digests: Vec<_> = transactions.iter().map(|tx| *tx.message_digest()).collect();
             let max_propose_bytes = total_bytes_for(&transactions[..1]);
-            let (sender, rx) = mpsc::channel(8);
-            let mailbox = Mailbox::new(sender.clone());
-            let public_key_cache = PublicKeyCache::new(context.child("cache"), NZUsize!(16));
-            let actor = Actor::<_, sha256::Digest, ed25519::VerifyingKey, sha256::Sha256, _>::new(
-                context,
-                Config {
-                    max_pool_bytes: total_bytes_for(&transactions),
-                    max_propose_bytes,
-                    namespace: TRANSACTION_NAMESPACE,
-                    drop_grace_blocks: 3,
-                    strategy: Sequential,
-                    public_key_cache,
-                },
-                mailbox.clone(),
-                ActorReceiver { rx },
-                Arc::new(OnceLock::new()),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let _handle = actor.start(listener);
+            let (mailbox, sender, _handle) =
+                start_test_actor(context, total_bytes_for(&transactions), max_propose_bytes).await;
 
             let result = mailbox
                 .try_submit(
@@ -1686,22 +1737,92 @@ mod tests {
                 .unwrap();
             assert!(matches!(result.await.unwrap(), IngestStatus::Accepted));
 
-            let (response, result) = oneshot::channel();
-            sender
-                .send(Message::Propose {
-                    height: 1,
-                    filled: 0,
-                    response,
-                })
-                .await
-                .unwrap();
-            let proposal = result.await.unwrap();
+            let proposal = propose(&sender, 1).await;
             assert_eq!(proposal.len(), 1);
             assert_eq!(digest_of(&proposal[0]), digests[0]);
             assert_eq!(
                 proposal[0].get().expect("decoded").encode_size(),
                 max_propose_bytes
             );
+        });
+    }
+
+    fn digests_of(transactions: &[VerifiedTransaction<sha256::Sha256>]) -> Vec<sha256::Digest> {
+        transactions
+            .iter()
+            .map(|transaction| *transaction.message_digest())
+            .collect()
+    }
+
+    fn submit(
+        mailbox: &TestMailbox,
+        lane: SubmissionLane,
+        batch_id: &str,
+        transactions: &[VerifiedTransaction<sha256::Sha256>],
+    ) -> oneshot::Receiver<TxStatus> {
+        mailbox
+            .try_submit_in_lane(
+                lane,
+                batch_id.into(),
+                digests_of(transactions),
+                transactions.to_vec(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn background_refused_for_room_is_retryable_without_residue() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let batches: Vec<_> = (1..=3).map(|seed| signed_transactions(seed, 2)).collect();
+            let batch_bytes = total_bytes_for(&batches[0]);
+            let background = SubmissionLane::Background;
+
+            // The background lane holds two batches beside the foreground reserve.
+            let (mailbox, sender, _handle) =
+                start_test_actor(context, 3 * batch_bytes, batch_bytes).await;
+            let _first = submit(&mailbox, background, "first", &batches[0]);
+            let _second = submit(&mailbox, background, "second", &batches[1]);
+            assert!(
+                submit(&mailbox, background, "third", &batches[2])
+                    .await
+                    .is_err(),
+                "a batch refused for lack of room gets no answer"
+            );
+
+            // A proposal frees room, and the identical batch is then admitted whole.
+            let proposed = |proposal: Vec<LazySignedTransaction<sha256::Sha256>>| {
+                proposal.iter().map(digest_of).collect::<Vec<_>>()
+            };
+            assert_eq!(proposed(propose(&sender, 1).await), digests_of(&batches[0]));
+            let _third = submit(&mailbox, background, "third", &batches[2]);
+            assert_eq!(proposed(propose(&sender, 2).await), digests_of(&batches[1]));
+            assert_eq!(proposed(propose(&sender, 3).await), digests_of(&batches[2]));
+        });
+    }
+
+    #[test]
+    fn final_refusals_answer_dropped() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let batches: Vec<_> = (1..=4).map(|seed| signed_transactions(seed, 2)).collect();
+            let batch_bytes = total_bytes_for(&batches[0]);
+            let (mailbox, _sender, _handle) =
+                start_test_actor(context, 3 * batch_bytes, batch_bytes).await;
+            let _first = submit(&mailbox, SubmissionLane::Background, "first", &batches[0]);
+            let _second = submit(&mailbox, SubmissionLane::Background, "second", &batches[1]);
+            let _third = submit(&mailbox, SubmissionLane::Foreground, "third", &batches[2]);
+
+            // A foreground batch without room and a background batch that cannot fit the empty
+            // lane are both refused for good.
+            let fourth = submit(&mailbox, SubmissionLane::Foreground, "fourth", &batches[3]);
+            let oversized = submit(
+                &mailbox,
+                SubmissionLane::Background,
+                "oversized",
+                &signed_transactions(5, 4),
+            );
+
+            assert_eq!(fourth.await.unwrap(), TxStatus::Dropped);
+            assert_eq!(oversized.await.unwrap(), TxStatus::Dropped);
         });
     }
 

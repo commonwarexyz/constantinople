@@ -22,6 +22,7 @@ struct Metrics {
     filtered_transactions: Counter,
     dropped_transactions: Counter,
     submit_errors: Counter,
+    unavailable_responses: Counter,
 }
 
 impl Metrics {
@@ -37,6 +38,10 @@ impl Metrics {
                 .counter("filtered_transactions", "Filtered transactions"),
             dropped_transactions: context.counter("dropped_transactions", "Dropped transactions"),
             submit_errors: context.counter("submit_errors", "Relayer submit errors"),
+            unavailable_responses: context.counter(
+                "unavailable_responses",
+                "Relayer 503 responses, each retried with the same batch",
+            ),
         }
     }
 }
@@ -53,6 +58,7 @@ pub struct Totals {
     pub filtered: u64,
     pub dropped: u64,
     pub errors: u64,
+    pub unavailable: u64,
 }
 
 impl Stats {
@@ -68,6 +74,7 @@ impl Stats {
             filtered: self.metrics.filtered_transactions.get(),
             dropped: self.metrics.dropped_transactions.get(),
             errors: self.metrics.submit_errors.get(),
+            unavailable: self.metrics.unavailable_responses.get(),
         }
     }
 
@@ -90,6 +97,10 @@ impl Stats {
 
     fn record_error(&self) {
         self.metrics.submit_errors.inc();
+    }
+
+    fn record_unavailable(&self) {
+        self.metrics.unavailable_responses.inc();
     }
 }
 
@@ -152,14 +163,26 @@ impl RelayerSubmitter {
                     return;
                 }
                 Err(error) => {
-                    self.stats.record_error();
                     failures += 1;
                     let backoff = retry_backoff(failures);
-                    warn!(
-                        error = %error,
-                        backoff_ms = backoff.as_millis(),
-                        "relayer submit error, retrying same batch"
-                    );
+
+                    // A 503 is the relayer or its leader asking for the batch again later, as
+                    // a full pool does under sustained load, so it is counted apart from errors
+                    // and logged quietly.
+                    if matches!(error, SubmitError::ServiceUnavailable) {
+                        self.stats.record_unavailable();
+                        debug!(
+                            backoff_ms = backoff.as_millis(),
+                            "relayer unavailable, retrying same batch"
+                        );
+                    } else {
+                        self.stats.record_error();
+                        warn!(
+                            error = %error,
+                            backoff_ms = backoff.as_millis(),
+                            "relayer submit error, retrying same batch"
+                        );
+                    }
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -249,22 +272,29 @@ mod tests {
 
     #[tokio::test]
     async fn transient_error_retries_same_batch() {
-        let stats = test_stats();
-        let finalized = json_response(r#"{"status":"finalized","height":7}"#);
-        let (url, requests) =
-            spawn_response_server(vec![empty_response("503 Service Unavailable"), finalized]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
-        let count = test_batch().len() as u64;
+        for (status, unavailable, errors) in [
+            ("503 Service Unavailable", 1, 0),
+            ("500 Internal Server Error", 0, 1),
+        ] {
+            let stats = test_stats();
+            let finalized = json_response(r#"{"status":"finalized","height":7}"#);
+            let (url, requests) =
+                spawn_response_server(vec![empty_response(status), finalized]).await;
+            let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
+            let count = test_batch().len() as u64;
 
-        tokio::time::timeout(Duration::from_secs(2), submitter.submit(test_batch()))
-            .await
-            .expect("transient error should be retried");
+            tokio::time::timeout(Duration::from_secs(2), submitter.submit(test_batch()))
+                .await
+                .expect("transient error should be retried");
 
-        assert_eq!(stats.totals().errors, 1);
-        assert_eq!(stats.totals().finalized, count);
-        let requests = requests.lock().expect("requests lock");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0], requests[1]);
+            let totals = stats.totals();
+            assert_eq!(totals.unavailable, unavailable, "{status}");
+            assert_eq!(totals.errors, errors, "{status}");
+            assert_eq!(totals.finalized, count);
+            let requests = requests.lock().expect("requests lock");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0], requests[1]);
+        }
     }
 
     #[tokio::test]
