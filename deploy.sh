@@ -16,8 +16,8 @@ usage() {
     echo "      stable: one leader per 1000000-view term with mempool proposal priority" >&2
     echo "  --bandwidth-weighting <default|vpc-1|ebs-1>" >&2
     echo "                                          default vpc-1 on validators, relayer, and spammer" >&2
-    echo "  --max-propose-bytes <bytes>             default 16777216" >&2
-    echo "  --spammer-accounts <count>              default derived from --max-propose-bytes, 12700 at 16 MiB" >&2
+    echo "  --max-propose-bytes <bytes>             default 16777216 rotating, 8388608 stable" >&2
+    echo "  --spammer-accounts <count>              default derived from the block cap, 12700 at 16 MiB" >&2
     echo "  --spammer-submitters <count>            default 500 rotating, 200 stable" >&2
     echo "  --max-pool-bytes <bytes>                default deploy CLI value rotating, 536870912 stable" >&2
     echo "  --storage-size <gib>                    default 300" >&2
@@ -32,7 +32,7 @@ reset_options() {
     REGIONS=us-east-1,us-west-2
     LEADER=rotating
     BANDWIDTH_WEIGHTING=vpc-1
-    MAX_PROPOSE_BYTES=16777216
+    MAX_PROPOSE_BYTES=
     SPAMMER_ACCOUNTS=
     SPAMMER_SUBMITTERS=
     MAX_POOL_BYTES=
@@ -123,11 +123,13 @@ prepare_deployment() {
     # the spammer runtime allows 512, so the defaults stay below that.
     local leader_args
     local default_submitters
+    local default_max_propose_bytes
     local default_max_pool_bytes=
     case "$LEADER" in
         rotating)
             leader_args=(--leader-term-length 1)
             default_submitters=500
+            default_max_propose_bytes=16777216
             ;;
         stable)
             leader_args=(
@@ -137,6 +139,9 @@ prepare_deployment() {
                 --propose-skip-final-refill
             )
             default_submitters=200
+            # A stable leader gains no throughput from larger blocks, and
+            # smaller ones finalize sooner.
+            default_max_propose_bytes=8388608
             # Every stream sends to the one leader, whose pool must hold a
             # batch from each stream or it drops the rest on arrival.
             default_max_pool_bytes=536870912
@@ -158,7 +163,8 @@ prepare_deployment() {
             ;;
     esac
 
-    if ! [[ "$MAX_PROPOSE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
+    local max_propose_bytes=${MAX_PROPOSE_BYTES:-$default_max_propose_bytes}
+    if ! [[ "$max_propose_bytes" =~ ^[1-9][0-9]*$ ]]; then
         echo "--max-propose-bytes must be a positive integer" >&2
         return 2
     fi
@@ -167,7 +173,7 @@ prepare_deployment() {
     # default batch is the largest multiple of 100 accounts for which eight
     # batches at their largest jittered size, the accounts plus a tenth, fit in
     # one block.
-    local block_transfers=$((MAX_PROPOSE_BYTES / 150))
+    local block_transfers=$((max_propose_bytes / 150))
     local default_accounts=$((block_transfers / 8 * 10 / 11 / 100 * 100))
 
     # Two signed batches per stream bound the spammer's memory at these stream
@@ -189,7 +195,7 @@ prepare_deployment() {
         --indexer-rayon-threads 12
         --indexer-publisher-rayon-threads 4
         --public-key-cache-size 5000000
-        --max-propose-bytes "$MAX_PROPOSE_BYTES"
+        --max-propose-bytes "$max_propose_bytes"
     )
 
     local max_pool_bytes=${MAX_POOL_BYTES:-$default_max_pool_bytes}

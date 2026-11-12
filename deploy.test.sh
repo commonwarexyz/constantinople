@@ -93,6 +93,11 @@ assert_pair --leader-optimistic-views 16 "${GENERATE_ARGS[@]}"
 assert_contains --mempool-propose-priority "${GENERATE_ARGS[@]}"
 assert_contains --propose-skip-final-refill "${GENERATE_ARGS[@]}"
 assert_pair --spammer-submitters 200 "${GENERATE_ARGS[@]}"
+assert_pair --spammer-accounts 6300 "${GENERATE_ARGS[@]}"
+assert_pair --max-propose-bytes 8388608 "${GENERATE_ARGS[@]}"
+
+prepare_case --leader stable --max-propose-bytes 16777216
+assert_pair --max-propose-bytes 16777216 "${GENERATE_ARGS[@]}"
 assert_pair --spammer-accounts 12700 "${GENERATE_ARGS[@]}"
 assert_pair --max-pool-bytes 536870912 "${GENERATE_ARGS[@]}"
 
