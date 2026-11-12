@@ -16,10 +16,11 @@ usage() {
     echo "      stable: one leader per 1000000-view term with mempool proposal priority" >&2
     echo "  --bandwidth-weighting <default|vpc-1|ebs-1>" >&2
     echo "                                          default vpc-1 on validators, relayer, and spammer" >&2
-    echo "  --spammer-accounts <count>              default 12700" >&2
+    echo "  --max-propose-bytes <bytes>             default 16777216" >&2
+    echo "  --spammer-accounts <count>              default derived from --max-propose-bytes, 12700 at 16 MiB" >&2
     echo "  --spammer-submitters <count>            default 500 rotating, 200 stable" >&2
     echo "  --max-pool-bytes <bytes>                default deploy CLI value rotating, 536870912 stable" >&2
-    echo "  --storage-size <gib>                    default 150" >&2
+    echo "  --storage-size <gib>                    default 300" >&2
 }
 
 reset_options() {
@@ -31,12 +32,13 @@ reset_options() {
     REGIONS=us-east-1,us-west-2
     LEADER=rotating
     BANDWIDTH_WEIGHTING=vpc-1
-    # The largest multiple of 100 for which eight batches at their maximum
-    # jittered size fit the 16 MiB block configured below.
-    SPAMMER_ACCOUNTS=12700
+    MAX_PROPOSE_BYTES=16777216
+    SPAMMER_ACCOUNTS=
     SPAMMER_SUBMITTERS=
     MAX_POOL_BYTES=
-    STORAGE_SIZE=150
+    # Validators retain up to about 10,500 blocks, which is 164 GiB of full
+    # 16 MiB blocks, beside their state.
+    STORAGE_SIZE=300
     GENERATE_ARGS=()
     # The indexer runs the validator binary, which is built for the validators'
     # CPU model (see docker/docker-bake.hcl). Keep it on the same vendor.
@@ -78,6 +80,9 @@ parse_options() {
                 ;;
             --spammer-accounts)
                 target=SPAMMER_ACCOUNTS
+                ;;
+            --max-propose-bytes)
+                target=MAX_PROPOSE_BYTES
                 ;;
             --spammer-submitters)
                 target=SPAMMER_SUBMITTERS
@@ -153,6 +158,18 @@ prepare_deployment() {
             ;;
     esac
 
+    if ! [[ "$MAX_PROPOSE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
+        echo "--max-propose-bytes must be a positive integer" >&2
+        return 2
+    fi
+
+    # A block holds at least one spammer transfer per 150 bytes of its cap. The
+    # default batch is the largest multiple of 100 accounts for which eight
+    # batches at their largest jittered size, the accounts plus a tenth, fit in
+    # one block.
+    local block_transfers=$((MAX_PROPOSE_BYTES / 150))
+    local default_accounts=$((block_transfers / 8 * 10 / 11 / 100 * 100))
+
     # Two signed batches per stream bound the spammer's memory at these stream
     # counts.
     GENERATE_ARGS=(
@@ -161,7 +178,7 @@ prepare_deployment() {
         --spammer
         --indexer
         "${leader_args[@]}"
-        --spammer-accounts "$SPAMMER_ACCOUNTS"
+        --spammer-accounts "${SPAMMER_ACCOUNTS:-$default_accounts}"
         --spammer-submitters "${SPAMMER_SUBMITTERS:-$default_submitters}"
         --spammer-accounts-jitter 0.1
         --spammer-presigned-batches 2
@@ -172,7 +189,7 @@ prepare_deployment() {
         --indexer-rayon-threads 12
         --indexer-publisher-rayon-threads 4
         --public-key-cache-size 5000000
-        --max-propose-bytes 16777216
+        --max-propose-bytes "$MAX_PROPOSE_BYTES"
     )
 
     local max_pool_bytes=${MAX_POOL_BYTES:-$default_max_pool_bytes}

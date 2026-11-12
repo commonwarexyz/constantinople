@@ -79,6 +79,7 @@ assert_pair --indexer-publisher-rayon-threads 4 "${GENERATE_ARGS[@]}"
 assert_pair --leader-term-length 1 "${GENERATE_ARGS[@]}"
 assert_pair --spammer-submitters 500 "${GENERATE_ARGS[@]}"
 assert_pair --spammer-accounts 12700 "${GENERATE_ARGS[@]}"
+assert_pair --max-propose-bytes 16777216 "${GENERATE_ARGS[@]}"
 assert_excludes --leader-optimistic-views "${GENERATE_ARGS[@]}"
 assert_excludes --mempool-propose-priority "${GENERATE_ARGS[@]}"
 assert_excludes --propose-skip-final-refill "${GENERATE_ARGS[@]}"
@@ -104,6 +105,23 @@ for leader in rotating stable; do
     assert_pair --spammer-submitters 90 "${GENERATE_ARGS[@]}"
     assert_count --spammer-submitters 1 "${GENERATE_ARGS[@]}"
     assert_pair --spammer-accounts 2048 "${GENERATE_ARGS[@]}"
+done
+
+for mapping in "1048576 700" "2097152 1500" "4194304 3100" "8388608 6300" "16777216 12700"; do
+    read -r cap accounts <<< "$mapping"
+    prepare_case --max-propose-bytes "$cap"
+    assert_pair --max-propose-bytes "$cap" "${GENERATE_ARGS[@]}"
+    assert_pair --spammer-accounts "$accounts" "${GENERATE_ARGS[@]}"
+done
+
+prepare_case --max-propose-bytes 4194304 --spammer-accounts 9000
+assert_pair --spammer-accounts 9000 "${GENERATE_ARGS[@]}"
+assert_count --spammer-accounts 1 "${GENERATE_ARGS[@]}"
+
+for cap in 0 4MiB -1; do
+    if (prepare_case --max-propose-bytes "$cap") >/dev/null 2>&1; then
+        fail "--max-propose-bytes $cap should fail"
+    fi
 done
 
 if (prepare_case --leader sticky) >/dev/null 2>&1; then
@@ -176,6 +194,7 @@ for option in \
     --leader \
     --bandwidth-weighting \
     --spammer-accounts \
+    --max-propose-bytes \
     --spammer-submitters \
     --max-pool-bytes \
     --storage-size
@@ -198,6 +217,7 @@ for mapping in \
     "--leader LEADER" \
     "--bandwidth-weighting BANDWIDTH_WEIGHTING" \
     "--spammer-accounts SPAMMER_ACCOUNTS" \
+    "--max-propose-bytes MAX_PROPOSE_BYTES" \
     "--spammer-submitters SPAMMER_SUBMITTERS" \
     "--max-pool-bytes MAX_POOL_BYTES" \
     "--storage-size STORAGE_SIZE"
