@@ -49,6 +49,18 @@ assert_pair() {
     fail "expected arguments to contain $flag"
 }
 
+assert_count() {
+    local needle=$1
+    local expected=$2
+    shift 2
+    local count=0
+    local value
+    for value in "$@"; do
+        [ "$value" != "$needle" ] || count=$((count + 1))
+    done
+    assert_equal "$expected" "$count" "occurrences of $needle"
+}
+
 prepare_case() {
     reset_options
     parse_options "$@" || return $?
@@ -64,6 +76,47 @@ assert_pair --rayon-threads 13 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-worker-threads 8 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-rayon-threads 12 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-publisher-rayon-threads 4 "${GENERATE_ARGS[@]}"
+assert_pair --leader-term-length 1 "${GENERATE_ARGS[@]}"
+assert_pair --spammer-submitters 500 "${GENERATE_ARGS[@]}"
+assert_pair --spammer-accounts 12700 "${GENERATE_ARGS[@]}"
+assert_excludes --leader-optimistic-views "${GENERATE_ARGS[@]}"
+assert_excludes --mempool-propose-priority "${GENERATE_ARGS[@]}"
+assert_excludes --propose-skip-final-refill "${GENERATE_ARGS[@]}"
+assert_excludes --max-pool-bytes "${GENERATE_ARGS[@]}"
+assert_pair --spammer-presigned-batches 2 "${GENERATE_ARGS[@]}"
+assert_pair --bandwidth-weighting vpc-1 "${REMOTE_ARGS[@]}"
+
+prepare_case --leader stable
+assert_pair --leader-term-length 1000000 "${GENERATE_ARGS[@]}"
+assert_pair --leader-optimistic-views 16 "${GENERATE_ARGS[@]}"
+assert_contains --mempool-propose-priority "${GENERATE_ARGS[@]}"
+assert_contains --propose-skip-final-refill "${GENERATE_ARGS[@]}"
+assert_pair --spammer-submitters 200 "${GENERATE_ARGS[@]}"
+assert_pair --spammer-accounts 12700 "${GENERATE_ARGS[@]}"
+assert_pair --max-pool-bytes 536870912 "${GENERATE_ARGS[@]}"
+
+prepare_case --leader stable --max-pool-bytes 1073741824
+assert_pair --max-pool-bytes 1073741824 "${GENERATE_ARGS[@]}"
+assert_count --max-pool-bytes 1 "${GENERATE_ARGS[@]}"
+
+for leader in rotating stable; do
+    prepare_case --leader "$leader" --spammer-submitters 90 --spammer-accounts 2048
+    assert_pair --spammer-submitters 90 "${GENERATE_ARGS[@]}"
+    assert_count --spammer-submitters 1 "${GENERATE_ARGS[@]}"
+    assert_pair --spammer-accounts 2048 "${GENERATE_ARGS[@]}"
+done
+
+if (prepare_case --leader sticky) >/dev/null 2>&1; then
+    fail "unknown leader mode should fail"
+fi
+
+for weighting in default vpc-1 ebs-1; do
+    prepare_case --bandwidth-weighting "$weighting"
+    assert_pair --bandwidth-weighting "$weighting" "${REMOTE_ARGS[@]}"
+done
+if (prepare_case --bandwidth-weighting vpc-2) >/dev/null 2>&1; then
+    fail "unknown bandwidth weighting should fail"
+fi
 
 prepare_case --store-url https://store.example.com/base
 assert_pair --store-url https://store.example.com/base "${REMOTE_ARGS[@]}"
@@ -120,6 +173,8 @@ for option in \
     --adapter-store-api-key \
     --validators \
     --regions \
+    --leader \
+    --bandwidth-weighting \
     --spammer-accounts \
     --spammer-submitters \
     --max-pool-bytes \
@@ -140,6 +195,8 @@ for mapping in \
     "--adapter-store-api-key ADAPTER_STORE_API_KEY" \
     "--validators VALIDATORS" \
     "--regions REGIONS" \
+    "--leader LEADER" \
+    "--bandwidth-weighting BANDWIDTH_WEIGHTING" \
     "--spammer-accounts SPAMMER_ACCOUNTS" \
     "--spammer-submitters SPAMMER_SUBMITTERS" \
     "--max-pool-bytes MAX_POOL_BYTES" \

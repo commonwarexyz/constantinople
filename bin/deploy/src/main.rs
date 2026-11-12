@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -64,6 +64,7 @@ const CHAIN_INDEXER_HOST: &str = "chain-indexer";
 const EXPLORER_INDEXER_BINARY_FILE: &str = "explorer-indexer";
 const EXPLORER_INDEXER_CONFIG_FILE: &str = "explorer-indexer.yaml";
 const EXPLORER_INDEXER_HOST: &str = "explorer-indexer";
+const SPAMMER_HOST: &str = "spammer";
 const SIMPLEX_VERIFICATION_MATERIAL_FILE: &str = "simplex-verification-material.hex";
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_EXPLORER_INDEXER_PORT: u16 = 8092;
@@ -80,6 +81,20 @@ pub(crate) enum StartupModeConfig {
     #[default]
     MarshalSync,
     StateSync,
+}
+
+/// EC2 bandwidth weighting, which shifts an instance's bandwidth between
+/// network traffic and EBS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum BandwidthWeighting {
+    /// The instance type's standard split.
+    Default,
+    /// Network bandwidth at the expense of EBS bandwidth.
+    #[value(name = "vpc-1")]
+    Vpc1,
+    /// EBS bandwidth at the expense of network bandwidth.
+    #[value(name = "ebs-1")]
+    Ebs1,
 }
 
 #[derive(Parser)]
@@ -156,6 +171,18 @@ pub(crate) struct GenerateArgs {
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
+    /// Views per leader term. One rotates the leader every view.
+    #[arg(long, default_value_t = NZU32!(1))]
+    leader_term_length: NonZeroU32,
+    /// Views a stable leader may run ahead of certified ancestry.
+    #[arg(long, default_value_t = 16)]
+    leader_optimistic_views: u64,
+    /// Serve mempool proposal requests ahead of other queued messages.
+    #[arg(long, default_value_t = false)]
+    mempool_propose_priority: bool,
+    /// End a proposal build after a selection round that drops nothing.
+    #[arg(long, default_value_t = false)]
+    propose_skip_final_refill: bool,
 
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
@@ -322,6 +349,10 @@ pub(crate) struct RemoteArgs {
     /// Storage size (GiB) for the spammer instance.
     #[arg(long, default_value_t = 25)]
     spammer_storage_size: i32,
+    /// EC2 bandwidth weighting for the primary validators, the relayer, and the
+    /// spammer. Other instances keep the instance type's standard split.
+    #[arg(long, value_enum, default_value_t = BandwidthWeighting::Default)]
+    bandwidth_weighting: BandwidthWeighting,
 }
 
 /// Spammer configuration, written as YAML by deploy and read by the spammer binary.
@@ -476,6 +507,16 @@ pub(crate) struct ValidatorConfig {
     metrics_port: u16,
     /// Maximum encoded block bytes, including framing. At most 16 MiB.
     max_propose_bytes: usize,
+    /// Views per leader term. One rotates the leader every view.
+    leader_term_length: NonZeroU32,
+    /// Views a stable leader may run ahead of certified ancestry.
+    leader_optimistic_views: u64,
+    /// Whether the mempool serves proposal requests ahead of other queued
+    /// messages.
+    mempool_propose_priority: bool,
+    /// Whether a proposal build ends after a selection round that drops
+    /// nothing.
+    propose_skip_final_refill: bool,
     /// Maximum mempool size in bytes.
     max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
@@ -897,9 +938,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, DEPLOYER_CONFIG_FILE, EXPLORER_INDEXER_CONFIG_FILE, ExplorerIndexerConfig,
-        GenerateTarget, IndexerConfig, SIMPLEX_VERIFICATION_MATERIAL_FILE, VALIDATOR_BINARY_FILE,
-        ValidatorConfig, generate_local_cluster_material, remote,
+        BandwidthWeighting, Cli, Command, DEPLOYER_CONFIG_FILE, EXPLORER_INDEXER_CONFIG_FILE,
+        ExplorerIndexerConfig, GenerateTarget, IndexerConfig, SIMPLEX_VERIFICATION_MATERIAL_FILE,
+        VALIDATOR_BINARY_FILE, ValidatorConfig, generate_local_cluster_material, remote,
         simplex_verification_material_from_config, write_simplex_verification_material,
     };
     use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
@@ -978,6 +1019,42 @@ mod tests {
         };
         assert_eq!(generate.state_page_cache_bytes, 64 * 1024 * 1024);
         assert_eq!(generate.history_page_cache_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn remote_parses_bandwidth_weighting() {
+        for (options, expected) in [
+            (&[][..], BandwidthWeighting::Default),
+            (
+                &["--bandwidth-weighting", "default"][..],
+                BandwidthWeighting::Default,
+            ),
+            (
+                &["--bandwidth-weighting", "vpc-1"][..],
+                BandwidthWeighting::Vpc1,
+            ),
+            (
+                &["--bandwidth-weighting", "ebs-1"][..],
+                BandwidthWeighting::Ebs1,
+            ),
+        ] {
+            let mut args = remote_cli_args();
+            args.extend_from_slice(options);
+            let Command::Generate(generate) = parse_cli(args).unwrap().command else {
+                panic!("expected generate command");
+            };
+            let GenerateTarget::Remote(remote) = generate.target else {
+                panic!("expected remote target");
+            };
+            assert_eq!(remote.bandwidth_weighting, expected);
+        }
+
+        let mut args = remote_cli_args();
+        args.extend_from_slice(&["--bandwidth-weighting", "vpc-2"]);
+        let error = parse_cli(args)
+            .err()
+            .expect("unknown weighting should be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]
@@ -1477,6 +1554,79 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
+    }
+
+    fn local_generate_args(options: &[&str]) -> Result<super::GenerateArgs, clap::Error> {
+        let mut args = vec![
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+        ];
+        args.extend_from_slice(options);
+        args.push("local");
+        let Command::Generate(generate) = parse_cli(args)?.command else {
+            panic!("expected generate command");
+        };
+        Ok(*generate)
+    }
+
+    #[test]
+    fn leader_options_default_to_rotation() {
+        let generate = local_generate_args(&[]).expect("local invocation should parse");
+
+        assert_eq!(generate.leader_term_length.get(), 1);
+        assert_eq!(generate.leader_optimistic_views, 16);
+        assert!(!generate.mempool_propose_priority);
+        assert!(!generate.propose_skip_final_refill);
+    }
+
+    #[test]
+    fn parses_stable_leader_options() {
+        let generate = local_generate_args(&[
+            "--leader-term-length",
+            "1000000",
+            "--leader-optimistic-views",
+            "8",
+            "--mempool-propose-priority",
+            "--propose-skip-final-refill",
+        ])
+        .expect("local invocation should parse");
+
+        assert_eq!(generate.leader_term_length.get(), 1_000_000);
+        assert_eq!(generate.leader_optimistic_views, 8);
+        assert!(generate.mempool_propose_priority);
+        assert!(generate.propose_skip_final_refill);
+    }
+
+    #[test]
+    fn rejects_zero_leader_term_length() {
+        let error = local_generate_args(&["--leader-term-length", "0"])
+            .err()
+            .expect("zero term length should be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    /// Sets the stable-leader options that [`assert_stable_leader_config`] expects.
+    pub(crate) fn set_stable_leader_args(args: &mut super::GenerateArgs) {
+        args.leader_term_length = commonware_utils::NZU32!(1_000_000);
+        args.leader_optimistic_views = 8;
+        args.mempool_propose_priority = true;
+        args.propose_skip_final_refill = true;
+    }
+
+    /// Asserts that a generated config carries [`set_stable_leader_args`] under
+    /// the key names the validator reads.
+    pub(crate) fn assert_stable_leader_config(config: &ValidatorConfig) {
+        let yaml = serde_yaml::to_value(config).expect("config should serialize");
+
+        assert_eq!(yaml["leader_term_length"].as_u64(), Some(1_000_000));
+        assert_eq!(yaml["leader_optimistic_views"].as_u64(), Some(8));
+        assert_eq!(yaml["mempool_propose_priority"].as_bool(), Some(true));
+        assert_eq!(yaml["propose_skip_final_refill"].as_bool(), Some(true));
     }
 
     #[test]

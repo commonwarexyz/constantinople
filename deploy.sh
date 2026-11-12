@@ -11,9 +11,14 @@ usage() {
     echo "  Credentials may also use CONSTANTINOPLE_STORE_API_KEY and CONSTANTINOPLE_ADAPTER_STORE_API_KEY." >&2
     echo "  --validators <count>                    default 50" >&2
     echo "  --regions <comma-separated-regions>     default us-east-1,us-west-2" >&2
-    echo "  --spammer-accounts <count>              default 4096" >&2
-    echo "  --spammer-submitters <count>            default validator count" >&2
-    echo "  --max-pool-bytes <bytes>                default deploy CLI value" >&2
+    echo "  --leader <rotating|stable>              default rotating" >&2
+    echo "      rotating: a new leader every view" >&2
+    echo "      stable: one leader per 1000000-view term with mempool proposal priority" >&2
+    echo "  --bandwidth-weighting <default|vpc-1|ebs-1>" >&2
+    echo "                                          default vpc-1 on validators, relayer, and spammer" >&2
+    echo "  --spammer-accounts <count>              default 12700" >&2
+    echo "  --spammer-submitters <count>            default 500 rotating, 200 stable" >&2
+    echo "  --max-pool-bytes <bytes>                default deploy CLI value rotating, 536870912 stable" >&2
     echo "  --storage-size <gib>                    default 150" >&2
 }
 
@@ -24,7 +29,11 @@ reset_options() {
     ADAPTER_STORE_API_KEY=${CONSTANTINOPLE_ADAPTER_STORE_API_KEY:-}
     VALIDATORS=50
     REGIONS=us-east-1,us-west-2
-    SPAMMER_ACCOUNTS=4096
+    LEADER=rotating
+    BANDWIDTH_WEIGHTING=vpc-1
+    # The largest multiple of 100 for which eight batches at their maximum
+    # jittered size fit the 16 MiB block configured below.
+    SPAMMER_ACCOUNTS=12700
     SPAMMER_SUBMITTERS=
     MAX_POOL_BYTES=
     STORAGE_SIZE=150
@@ -60,6 +69,12 @@ parse_options() {
                 ;;
             --regions)
                 target=REGIONS
+                ;;
+            --leader)
+                target=LEADER
+                ;;
+            --bandwidth-weighting)
+                target=BANDWIDTH_WEIGHTING
                 ;;
             --spammer-accounts)
                 target=SPAMMER_ACCOUNTS
@@ -99,13 +114,57 @@ prepare_deployment() {
         return 2
     fi
 
+    # Each spammer stream holds one Tokio blocking thread for its presigner, and
+    # the spammer runtime allows 512, so the defaults stay below that.
+    local leader_args
+    local default_submitters
+    local default_max_pool_bytes=
+    case "$LEADER" in
+        rotating)
+            leader_args=(--leader-term-length 1)
+            default_submitters=500
+            ;;
+        stable)
+            leader_args=(
+                --leader-term-length 1000000
+                --leader-optimistic-views 16
+                --mempool-propose-priority
+                --propose-skip-final-refill
+            )
+            default_submitters=200
+            # Every stream sends to the one leader, whose pool must hold a
+            # batch from each stream or it drops the rest on arrival.
+            default_max_pool_bytes=536870912
+            ;;
+        *)
+            echo "--leader must be rotating or stable" >&2
+            usage
+            return 2
+            ;;
+    esac
+
+    case "$BANDWIDTH_WEIGHTING" in
+        default|vpc-1|ebs-1)
+            ;;
+        *)
+            echo "--bandwidth-weighting must be default, vpc-1, or ebs-1" >&2
+            usage
+            return 2
+            ;;
+    esac
+
+    # Two signed batches per stream bound the spammer's memory at these stream
+    # counts.
     GENERATE_ARGS=(
         --validators "$VALIDATORS"
         --relayer
         --spammer
         --indexer
+        "${leader_args[@]}"
         --spammer-accounts "$SPAMMER_ACCOUNTS"
+        --spammer-submitters "${SPAMMER_SUBMITTERS:-$default_submitters}"
         --spammer-accounts-jitter 0.1
+        --spammer-presigned-batches 2
         --spammer-rayon-threads 14
         --worker-threads 3
         --rayon-threads 13
@@ -116,13 +175,12 @@ prepare_deployment() {
         --max-propose-bytes 16777216
     )
 
-    if [ -n "$SPAMMER_SUBMITTERS" ]; then
-        GENERATE_ARGS+=(--spammer-submitters "$SPAMMER_SUBMITTERS")
+    local max_pool_bytes=${MAX_POOL_BYTES:-$default_max_pool_bytes}
+    if [ -n "$max_pool_bytes" ]; then
+        GENERATE_ARGS+=(--max-pool-bytes "$max_pool_bytes")
     fi
 
-    if [ -n "$MAX_POOL_BYTES" ]; then
-        GENERATE_ARGS+=(--max-pool-bytes "$MAX_POOL_BYTES")
-    fi
+    REMOTE_ARGS+=(--bandwidth-weighting "$BANDWIDTH_WEIGHTING")
 
     if [ -n "$STORE_URL" ]; then
         REMOTE_ARGS+=(--store-url "$STORE_URL")
