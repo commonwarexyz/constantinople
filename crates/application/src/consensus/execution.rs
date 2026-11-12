@@ -53,9 +53,8 @@ use super::{
     history, reject_verify,
 };
 use crate::executor::{self, PreparedTransfer, TransferAccount};
-use bytes::BytesMut;
-use commonware_codec::{EncodeSize, Write as _};
-use commonware_consensus::{BodySink, types::Round};
+use commonware_codec::EncodeSize;
+use commonware_consensus::types::Round;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::{
     stateful::db::Merkleized as _,
@@ -256,21 +255,12 @@ where
 }
 
 /// Wall-clock budget for building one proposal. Refill rounds keep running
-/// while block headroom remains and this deadline has not passed. A mempool
-/// response in flight is always selected through its last round (popped
-/// transactions must be executed or they would strand), so the deadline gates
-/// starting another refill, not finishing one. Transactions dropped in the
-/// final response age out of the mempool like any unfinalized proposal.
+/// while block headroom remains and this deadline has not passed; a round in
+/// flight always completes (popped transactions must be executed or they
+/// would strand), so the deadline gates starting another refill, not
+/// finishing one. Transactions dropped in the final round age out of the
+/// mempool like any unfinalized proposal.
 const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
-
-/// Candidate bytes in the first selection round of a build that streams its body. The second
-/// round takes the rest of the first mempool response.
-///
-/// A streaming marshal codes the body in segments of about this size, so the first round bounds
-/// how far into the build the first segment can leave. Every round adds an account staging read,
-/// and the leader's link sends a segment far slower than selection produces one, so one small
-/// first round releases the first segment early and the rest is selected before the link needs it.
-pub(super) const FIRST_SLICE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Executes a proposal's candidate transactions best effort.
 ///
@@ -287,20 +277,11 @@ pub(super) const FIRST_SLICE_BYTES: usize = 2 * 1024 * 1024;
 /// candidates for the headroom left under the proposal budget, so the block
 /// fills toward the budget even when the seed was small. The loop ends when
 /// the mempool has nothing left that fits or the build deadline passes. With
-/// `skip_final_refill`, it also ends after a response that drops nothing.
+/// `skip_final_refill`, it also ends after a round that drops nothing.
 ///
-/// Each mempool response is selected in one round, except that a build
-/// streaming to an active `sink` splits its first response after
-/// [`FIRST_SLICE_BYTES`]. Each round reads only the accounts it touches for
-/// the first time, through `stage` for the first round and `expand` after, in
-/// the selection's key order, so the staged slots line up with the selection's
-/// keys.
-///
-/// Selection never revisits a transaction it kept and later rounds only append,
-/// so a transaction is final once its round keeps it. Each round's kept
-/// transactions are pushed to `sink` exactly as the block body frames them, so
-/// the pushes together equal the block's coded body and the marshal can code
-/// and send them while later rounds, settlement and merkleization run.
+/// Each round reads only the accounts it touches for the first time, through
+/// `stage` for the first round and `expand` after, in the selection's key
+/// order, so the staged slots line up with the selection's keys.
 ///
 /// After settlement, history entries take their indices from the final account
 /// counts and append in block order while state merkleization runs. An empty
@@ -318,7 +299,6 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     candidates: Vec<LazySignedTransaction<H>>,
     input: &mut I,
     skip_final_refill: bool,
-    sink: &BodySink,
 ) -> ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
@@ -338,44 +318,32 @@ where
     // Each accepted transaction adds its length-prefixed encoding to the body's encoded size, so
     // the block's size needs no pass over the body.
     let mut framed_bytes = 0usize;
-
-    // The candidates of the current mempool response that no round has selected yet, and the
-    // bytes the response's rounds dropped so far.
-    let mut pending = candidates.into_iter();
-    let mut response_dropped = 0usize;
-    let mut slice_budget = if sink.is_active() {
-        FIRST_SLICE_BYTES
-    } else {
-        usize::MAX
-    };
+    let mut candidates = candidates;
 
     let deadline = clock.current() + BUILD_TIMEOUT;
 
-    while !pending.as_slice().is_empty() {
-        let mut slice_bytes = 0usize;
-        let slice_len = pending
-            .as_slice()
-            .iter()
-            .position(|transaction| {
-                slice_bytes += transaction.encode_size();
-                slice_bytes >= slice_budget
-            })
-            .map_or(pending.len(), |last| last + 1);
-        slice_budget = usize::MAX;
+    loop {
+        if candidates.is_empty() {
+            break;
+        }
 
         // A proposer chooses its body, so candidates that fail to decode or
         // prepare can be excluded. Keep one prepared candidate per transaction
         // while recording first-touched accounts.
-        let prepare_span = info_span!("application.execute.prepare", txs = slice_len.traced());
+        let prepare_span = info_span!(
+            "application.execute.prepare",
+            txs = candidates.len().traced()
+        );
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
-        let (pending_back, prepared, selection_back, touched) = strategy
-            .spawn(slice_len, {
+        let work_size = candidates.len();
+        let (candidates_back, prepared, selection_back, touched) = strategy
+            .spawn(work_size, {
                 let accounts_span = accounts_span.clone();
                 let mut selection = selection;
                 move |s: S| {
                     let prepared: Vec<Candidate<H::Digest>> = prepare_span.in_scope(|| {
-                        s.map_collect_vec(&pending.as_slice()[..slice_len], |lazy| {
+                        s.map_collect_vec(&candidates, |lazy| {
                             Candidate(lazy.get().and_then(|tx| {
                                 executor::prepare_transfer(tx).map(|transfer| {
                                     (transfer, *tx.message_digest(), tx.encode_size())
@@ -384,11 +352,11 @@ where
                         })
                     });
                     let touched = accounts_span.in_scope(|| selection.touch(&prepared));
-                    (pending, prepared, selection, touched)
+                    (candidates, prepared, selection, touched)
                 }
             })
             .await;
-        pending = pending_back;
+        candidates = candidates_back;
         selection = selection_back;
         accounts_span.record("keys", touched.len().traced());
 
@@ -425,102 +393,72 @@ where
 
         // Apply in block order and fold the survivors into the body, all in
         // one job so the split is attributed and the candidates move
-        // straight into the body. The survivors' framed bytes go to the sink
-        // in the same order before the round ends.
+        // straight into the body.
         let select_span = info_span!(
             "application.execute.select",
             txs = prepared.len().traced(),
             dropped = tracing::field::Empty,
         );
         let work_size = prepared.len();
-        let (
-            pending_back,
-            selection_back,
-            body_back,
-            accepted_back,
-            included_delta,
-            framed_delta,
-            dropped_bytes,
-        ) = strategy
-            .spawn(work_size, {
-                let span = select_span.clone();
-                let mut pending = pending;
-                let mut selection = selection;
-                let mut body = body;
-                let mut accepted = accepted;
-                let sink = sink.clone();
-                move |_: S| {
-                    span.in_scope(|| {
-                        let applied = selection.apply(&prepared);
-                        let mut included = 0usize;
-                        let mut framed = 0usize;
-                        let mut dropped = 0usize;
-                        let mut pushed = sink
-                            .is_active()
-                            .then(|| BytesMut::with_capacity(slice_bytes));
-                        let mut candidates = pending.by_ref().take(slice_len);
-                        for (prepared, &kept) in prepared.iter().zip(&applied) {
-                            let transaction = candidates
-                                .next()
-                                .expect("each prepared transaction must have a candidate");
-                            let Candidate(Some((transfer, digest, size))) = prepared else {
-                                continue;
-                            };
-                            if kept {
-                                included += size;
-                                framed += size.encode_size() + size;
-                                accepted.push((*transfer, *digest));
-                                if let Some(pushed) = &mut pushed {
-                                    transaction.write(pushed);
+        let (selection_back, body_back, accepted_back, included_delta, framed_delta, dropped_bytes) =
+            strategy
+                .spawn(work_size, {
+                    let span = select_span.clone();
+                    let mut selection = selection;
+                    let mut body = body;
+                    let mut accepted = accepted;
+                    move |_: S| {
+                        span.in_scope(|| {
+                            let applied = selection.apply(&prepared);
+                            let mut included = 0usize;
+                            let mut framed = 0usize;
+                            let mut dropped = 0usize;
+                            let mut candidates = candidates.into_iter();
+                            for (prepared, &kept) in prepared.iter().zip(&applied) {
+                                let transaction =
+                                    candidates.next().expect("one candidate per transaction");
+                                let Candidate(Some((transfer, digest, size))) = prepared else {
+                                    continue;
+                                };
+                                if kept {
+                                    included += size;
+                                    framed += size.encode_size() + size;
+                                    accepted.push((*transfer, *digest));
+                                    body.push(transaction);
+                                } else {
+                                    dropped += size;
                                 }
-                                body.push(transaction);
-                            } else {
-                                dropped += size;
                             }
-                        }
-                        if let Some(pushed) = pushed.filter(|pushed| !pushed.is_empty()) {
-                            sink.push(pushed.freeze());
-                        }
-                        (
-                            pending, selection, body, accepted, included, framed, dropped,
-                        )
-                    })
-                }
-            })
-            .await;
-        pending = pending_back;
+                            (selection, body, accepted, included, framed, dropped)
+                        })
+                    }
+                })
+                .await;
         selection = selection_back;
         body = body_back;
         accepted = accepted_back;
         included_bytes += included_delta;
         framed_bytes += framed_delta;
-        response_dropped += dropped_bytes;
         select_span.record("dropped", dropped_bytes.traced());
 
-        // A response is selected through its last round before the build can end.
-        if !pending.as_slice().is_empty() {
-            continue;
-        }
         if clock.current() >= deadline {
             break;
         }
 
         // The mempool serves whole batches while they fit the headroom it is told about, so a
-        // non-empty response that kept every candidate left less headroom than its next batch and
+        // non-empty round that kept every candidate left less headroom than its next batch and
         // another request would come back empty unless the pool was dry and refilled meanwhile.
-        if skip_final_refill && response_dropped == 0 {
+        if skip_final_refill && dropped_bytes == 0 {
             break;
         }
-        response_dropped = 0;
 
         // Top the block up toward the mempool's proposal budget; an empty
         // response means nothing fits in the remaining headroom (or the pool
         // is dry) and ends the loop.
-        pending = input
+        candidates = input
             .propose(parent_header, round, included_bytes)
             .instrument(info_span!("application.execute.refill"))
-            .await
-            .into_iter();
+            .await;
     }
 
     // A proposal that touched no account still merkleizes through a staged

@@ -1,11 +1,11 @@
 use super::{
-    Application, Databases, StateSyncTarget, TransactionHistoryTarget,
-    execution::FIRST_SLICE_BYTES, genesis_block, history::parent_transactions_inactivity_floor,
+    Application, Databases, StateSyncTarget, TransactionHistoryTarget, genesis_block,
+    history::parent_transactions_inactivity_floor,
 };
 use commonware_codec::{DecodeExt as _, Encode, EncodeSize as _, Write as _};
 use commonware_consensus::{
-    BodySink, Handoff,
-    marshal::{ancestry, coding::types::CodedLayout as _},
+    Handoff,
+    marshal::ancestry,
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
     },
@@ -32,7 +32,7 @@ use commonware_storage::{
     qmdb::{current::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, channel::mpsc::UnboundedReceiver, non_empty_range};
+use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
     Account, AccountKey, Block, Header, LazySignedTransaction, Nonce, PublicKeyCache, Sealable,
@@ -365,7 +365,6 @@ fn propose_rejects_oversized_transaction_source_output() {
                 Arc::new(parent),
                 dbs.new_batches().await,
                 &mut input,
-                &BodySink::noop(),
             )
             .await;
 
@@ -394,7 +393,6 @@ fn verify_and_replay_reject_invalid_constructed_state_witness() {
                 Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut TestSource::new(Vec::new()),
-                &BodySink::noop(),
             )
             .await
             .expect("empty child proposes");
@@ -687,7 +685,6 @@ fn propose_drops_inapplicable_and_refills() {
                 Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut input,
-                &BodySink::noop(),
             )
             .await
             .expect("best-effort proposal must succeed");
@@ -784,7 +781,7 @@ fn prepare_stages_the_block_propose_builds() {
         let ancestry =
             || ancestry::from_iter([Digested::precomputed(parent.clone(), parent.digest())]);
         let input = || Input {
-            upstream: BodySink::noop(),
+            upstream: (),
             provider: TestSource::new(vec![vec![transaction.clone()]]),
         };
 
@@ -857,7 +854,6 @@ fn prepare_restages_on_a_replacement_parent() {
                 Arc::new(genesis.clone()),
                 dbs.new_batches().await,
                 &mut TestSource::new(vec![vec![transfer(&sender, &recipient, 1)]]),
-                &BodySink::noop(),
             )
             .await
             .expect("P1 must build");
@@ -867,7 +863,6 @@ fn prepare_restages_on_a_replacement_parent() {
                 Arc::new(genesis),
                 dbs.new_batches().await,
                 &mut TestSource::new(vec![vec![transfer(&alt_sender, &recipient, 1)]]),
-                &BodySink::noop(),
             )
             .await
             .expect("P2 must build");
@@ -899,7 +894,7 @@ fn prepare_restages_on_a_replacement_parent() {
             ancestry::from_iter([Digested::precomputed(parent.clone(), parent.digest())])
         };
         let input = || Input {
-            upstream: BodySink::noop(),
+            upstream: (),
             provider: TestSource::new(vec![vec![transaction.clone()]]),
         };
 
@@ -1018,7 +1013,7 @@ fn prepare_waits_without_a_parent() {
             ancestry::from_iter(std::iter::empty::<Digested<TestBlock>>()),
             dbs.new_batches().await,
             Input {
-                upstream: BodySink::noop(),
+                upstream: (),
                 provider: TestSource::new(Vec::new()),
             },
         )
@@ -1082,7 +1077,6 @@ fn finalized_capture_preserves_both_authenticated_ranges() {
                     Arc::new(parent),
                     dbs.new_batches().await,
                     &mut input,
-                    &BodySink::noop(),
                 )
                 .await
                 .expect("proposal succeeds");
@@ -1177,7 +1171,6 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
                 Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut input,
-                &BodySink::noop(),
             )
             .await
             .expect("empty proposal must succeed");
@@ -1456,7 +1449,6 @@ fn build_timeout_bounds_refill_rounds() {
                 Arc::new(harness.parent.clone()),
                 harness.dbs.new_batches().await,
                 &mut input,
-                &BodySink::noop(),
             )
             .await
             .expect("proposal must succeed");
@@ -1511,7 +1503,6 @@ fn skip_final_refill_ends_after_a_round_without_drops() {
                     Arc::new(parent.clone()),
                     dbs.new_batches().await,
                     &mut input,
-                    &BodySink::noop(),
                 )
                 .await
                 .expect("best-effort proposal must succeed");
@@ -1547,168 +1538,6 @@ fn skip_final_refill_ends_after_a_round_without_drops() {
                 })
                 .collect();
             assert_eq!(remaining, expected, "skip_final_refill = {skip}");
-        }
-    });
-}
-
-/// A transfer from `sender` at an explicit nonce.
-fn transfer_at(
-    sender: &ed25519::SigningKey,
-    recipient: &ed25519::SigningKey,
-    value: u64,
-    nonce: u64,
-) -> SignedTransaction<sha256::Sha256> {
-    Transaction::new(
-        TransactionPublicKey::ed25519(sender.public_key()),
-        TransactionPublicKey::ed25519(recipient.public_key()),
-        NonZeroU64::new(value).expect("test value must be non-zero"),
-        nonce,
-    )
-    .seal_and_sign(sender, TEST_TX_NS, &mut sha256::Sha256::default())
-}
-
-/// Returns every piece pushed to a body sink so far, in push order.
-fn drain_pushes(pushes: &mut UnboundedReceiver<bytes::Bytes>) -> Vec<bytes::Bytes> {
-    std::iter::from_fn(|| pushes.try_recv().ok()).collect()
-}
-
-/// The bytes a block codes ahead of its tail.
-fn coded_body(block: &TestBlock) -> Vec<u8> {
-    let mut body = Vec::new();
-    block.write_body(&mut body);
-    body
-}
-
-/// The bytes a build pushes to its body sink are the sealed block's coded body, across a first
-/// response selected in two rounds, refill rounds, and candidates each round drops.
-#[test]
-fn pushed_body_matches_the_sealed_body() {
-    deterministic::Runner::default().start(|context| async move {
-        let VerifyHarness {
-            mut app,
-            dbs,
-            parent,
-            leader,
-            sender,
-            alt_sender,
-            recipient,
-            ..
-        } = Box::pin(verify_harness(&context)).await;
-        context.sleep(Duration::from_millis(10)).await;
-        let consensus_context = SimplexContext {
-            round: Round::new(Epoch::zero(), View::new(1)),
-            leader: leader.public_key(),
-            parent: (View::zero(), *parent.seal()),
-        };
-
-        // The first response holds more than the first round takes, so it is selected in two
-        // rounds, and each round drops a second transfer at a nonce the round already used. The
-        // first refill drops one too, and a second refill keeps its only transfer.
-        let framed =
-            LazySignedTransaction::new(transfer_at(&sender, &recipient, 1, 0)).encode_size();
-        let count = FIRST_SLICE_BYTES / framed + 2;
-        let mut first: Vec<_> = (0..count as u64)
-            .map(|nonce| transfer_at(&sender, &recipient, 1, nonce))
-            .collect();
-        first.insert(1, transfer_at(&sender, &recipient, 2, 0));
-        first.push(transfer_at(&sender, &recipient, 2, count as u64 - 1));
-        let responses = vec![
-            first,
-            vec![
-                transfer_at(&alt_sender, &recipient, 1, 0),
-                transfer_at(&alt_sender, &recipient, 2, 0),
-            ],
-            vec![transfer_at(&alt_sender, &recipient, 1, 1)],
-        ];
-
-        let (sink, mut pushes) = BodySink::channel();
-        let streamed = app
-            .propose_child(
-                (context.child("propose_streamed"), consensus_context.clone()),
-                Arc::new(parent.clone()),
-                dbs.new_batches().await,
-                &mut TestSource::new(responses.clone()),
-                &sink,
-            )
-            .await
-            .expect("best-effort proposal must succeed");
-        assert_eq!(streamed.block.body.len(), count + 2);
-
-        // Each round that keeps a transaction pushes once: two for the first response and one
-        // for each refill. Together the pushes are the coded body, and the body with the tail is
-        // the whole block.
-        let pushed = drain_pushes(&mut pushes);
-        assert_eq!(pushed.len(), 4);
-        let pushed = pushed.concat();
-        assert!(
-            pushed == coded_body(&streamed.block),
-            "the pushes differ from the sealed body"
-        );
-        let mut tail = Vec::new();
-        streamed.block.write_tail(&mut tail);
-        assert_eq!(pushed.len() + tail.len(), streamed.block.encode_size());
-
-        // A build without a sink selects each response in one round and keeps the same body.
-        let unstreamed = app
-            .propose_child(
-                (context.child("propose_unstreamed"), consensus_context),
-                Arc::new(parent),
-                dbs.new_batches().await,
-                &mut TestSource::new(responses),
-                &BodySink::noop(),
-            )
-            .await
-            .expect("best-effort proposal must succeed");
-        assert_eq!(
-            body_digests(&unstreamed.block),
-            body_digests(&streamed.block)
-        );
-    });
-}
-
-/// A build pushes its body to the sink its caller provides unless body streaming is off.
-#[test]
-fn body_streaming_controls_pushes() {
-    deterministic::Runner::default().start(|context| async move {
-        let VerifyHarness {
-            mut app,
-            dbs,
-            parent,
-            leader,
-            sender,
-            recipient,
-            ..
-        } = Box::pin(verify_harness(&context)).await;
-        let consensus_context = SimplexContext {
-            round: Round::new(Epoch::zero(), View::new(1)),
-            leader: leader.public_key(),
-            parent: (View::zero(), *parent.seal()),
-        };
-        let transaction = transfer(&sender, &recipient, 1);
-
-        for streaming in [true, false] {
-            app = app.with_body_streaming(streaming);
-            let (sink, mut pushes) = BodySink::channel();
-            let proposed = StatefulApplication::propose(
-                &mut app,
-                (context.child("propose"), consensus_context.clone()),
-                ancestry::from_iter([Digested::precomputed(parent.clone(), parent.digest())]),
-                dbs.new_batches().await,
-                Input {
-                    upstream: sink,
-                    provider: TestSource::new(vec![vec![transaction.clone()]]),
-                },
-            )
-            .await
-            .expect("propose must build a block");
-            assert_eq!(proposed.block.body.len(), 1);
-
-            let pushed = drain_pushes(&mut pushes).concat();
-            if streaming {
-                assert_eq!(pushed, coded_body(&proposed.block));
-            } else {
-                assert!(pushed.is_empty());
-            }
         }
     });
 }

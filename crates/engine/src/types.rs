@@ -4,12 +4,13 @@
 //! coding, marshal, probe, and finalization types that appear throughout the
 //! engine and test modules.
 
-pub use crate::block::{EngineBlock, EngineCommitment, EngineScheme, SEGMENT_BYTES};
+pub use crate::block::{EngineBlock, EngineCommitment};
 use crate::{
     ThresholdScheme,
     application::{EngineApplication, EngineReporter},
 };
 use commonware_actor::Feedback;
+use commonware_coding::ReedSolomon;
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
@@ -39,10 +40,10 @@ use std::marker::PhantomData;
 pub type EngineHeader<H, P> = Sealed<Header<EngineCommitment<H, P>, <H as Hasher>::Digest, P>, H>;
 
 /// The erasure-coding variant used by the marshal for block availability.
-pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, EngineScheme<H>, H, P>;
+pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
 /// A marshal-coded engine block.
-pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, EngineScheme<H>, H>;
+pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
 pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
@@ -118,7 +119,7 @@ where
     }
 }
 
-pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, EngineScheme<H>, H>;
+pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
 pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, 32, T>;
 
@@ -173,17 +174,17 @@ pub(crate) type MarshaledApp<E, H, P, V, I, St> = Marshaled<
     E,
     AppMailbox<E, H, P, V, I, St>,
     EngineBlock<H, P>,
-    EngineScheme<H>,
+    ReedSolomon<H>,
     H,
     SchemeProvider<P, V>,
     St,
     FixedEpocher,
 >;
 
-pub(crate) type ShardsEngine<E, B, M, H, P, V, T, L> =
-    shards::Engine<E, SchemeProvider<P, V>, B, M, EngineScheme<H>, H, EngineBlock<H, P>, P, T, L>;
+pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
+    shards::Engine<E, SchemeProvider<P, V>, B, M, ReedSolomon<H>, H, EngineBlock<H, P>, P, T>;
 
-pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, EngineScheme<H>, H, P>;
+pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
 /// Reporter combinator that fans simplex activity to the marshaled
 /// application and an optional external observer.

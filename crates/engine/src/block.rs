@@ -1,29 +1,18 @@
-use bytes::Bytes;
 use commonware_codec::{Buf, EncodeSize, Error, Read, Write};
-use commonware_coding::Segmented;
+use commonware_coding::ReedSolomon;
 use commonware_consensus::{
     Block as ConsensusBlock, BoundedBlock, CertifiableBlock, Heightable,
-    marshal::coding::types::CodedLayout,
     simplex::types::Context,
     types::{Height, coding::Commitment},
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey};
 use constantinople_primitives::{
-    Block, BlockCfg, Sealable, Sealed, SealedBlock, proposal::MAXIMUM_BLOCK_SIZE,
+    Block, BlockCfg, Sealed, SealedBlock, proposal::MAXIMUM_BLOCK_SIZE,
 };
 use std::{fmt, ops::Deref, sync::Arc};
 
-/// Bytes of block data erasure coded as one segment.
-///
-/// A validator checks and relays each segment's chunk of its shard as it arrives, so smaller
-/// segments start the relay sooner while adding a proof per segment to every shard.
-pub const SEGMENT_BYTES: usize = 2 * 1024 * 1024;
-
-/// The erasure coding scheme for block availability.
-pub type EngineScheme<H> = Segmented<H, SEGMENT_BYTES>;
-
 /// The coding commitment carried by Constantinople blocks.
-pub type EngineCommitment<H, P> = Commitment<EngineBlock<H, P>, EngineScheme<H>, H>;
+pub type EngineCommitment<H, P> = Commitment<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
 type InnerBlock<H, P> = SealedBlock<EngineCommitment<H, P>, P, H>;
 
@@ -155,27 +144,6 @@ where
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         InnerBlock::read_cfg(buf, cfg).map(Self::from)
-    }
-}
-
-/// Codes the inner block's layout. The transactions come first so a proposer can disseminate
-/// them while it computes the state the header commits to.
-impl<H, P> CodedLayout for EngineBlock<H, P>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    fn write_body(&self, buf: &mut impl bytes::BufMut) {
-        self.0.write_body(buf);
-    }
-
-    fn write_tail(&self, buf: &mut impl bytes::BufMut) {
-        self.0.write_tail(buf);
-    }
-
-    fn read_coded(body: Bytes, tail: Bytes, cfg: &BlockCfg) -> Result<Self, Error> {
-        // Sealing hashes the header as the canonical decoder of a sealed block does.
-        Block::read_coded(body, tail, cfg).map(|block| Self::from(block.seal(&mut H::default())))
     }
 }
 

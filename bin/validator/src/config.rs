@@ -52,14 +52,6 @@ pub(crate) const fn default_ingress_permits() -> usize {
     1
 }
 
-pub(crate) const fn default_early_forward() -> bool {
-    true
-}
-
-pub(crate) const fn default_body_streaming() -> bool {
-    true
-}
-
 pub(crate) const fn default_max_propose_bytes() -> usize {
     MAXIMUM_BLOCK_SIZE
 }
@@ -187,14 +179,6 @@ pub struct ValidatorConfig {
     /// otherwise asks the mempool once more.
     #[serde(default)]
     pub propose_skip_final_refill: bool,
-    /// Whether this validator relays the scheduled leader's shard chunks before consensus names
-    /// the round's proposal.
-    #[serde(default = "default_early_forward")]
-    pub early_forward: bool,
-    /// Whether a proposer streams its block's transactions to the marshal while it builds the
-    /// block. When false the marshal codes each block once it is built.
-    #[serde(default = "default_body_streaming")]
-    pub body_streaming: bool,
     /// Maximum mempool size in bytes.
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
@@ -320,10 +304,6 @@ pub struct LoadedConfig {
     pub mempool_propose_priority: bool,
     /// Whether a proposal build ends after a selection round that drops nothing.
     pub propose_skip_final_refill: bool,
-    /// Whether this validator relays the scheduled leader's shard chunks before naming.
-    pub early_forward: bool,
-    /// Whether a proposer streams its block's transactions to the marshal while it builds.
-    pub body_streaming: bool,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
@@ -483,8 +463,6 @@ fn decode_with_network(
         ingress_permits: config.ingress_permits,
         mempool_propose_priority: config.mempool_propose_priority,
         propose_skip_final_refill: config.propose_skip_final_refill,
-        early_forward: config.early_forward,
-        body_streaming: config.body_streaming,
         state_page_cache_bytes: config.state_page_cache_bytes,
         history_page_cache_bytes: config.history_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
@@ -804,8 +782,6 @@ mod tests {
                 ingress_permits: crate::config::default_ingress_permits(),
                 mempool_propose_priority: false,
                 propose_skip_final_refill: false,
-                early_forward: true,
-                body_streaming: true,
                 state_page_cache_bytes: default_state_page_cache_bytes(),
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
@@ -848,8 +824,6 @@ mod tests {
                 ingress_permits: crate::config::default_ingress_permits(),
                 mempool_propose_priority: false,
                 propose_skip_final_refill: false,
-                early_forward: true,
-                body_streaming: true,
                 state_page_cache_bytes: default_state_page_cache_bytes(),
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
@@ -958,26 +932,6 @@ mod tests {
         let config: ValidatorConfig = serde_yaml::from_value(value).unwrap();
         assert_eq!(config.state_page_cache_bytes, 6 * 1024 * 1024 * 1024);
         assert_eq!(config.history_page_cache_bytes, 2 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn streaming_switches_default_on_and_can_be_turned_off() {
-        let cluster = Cluster::new(2, 0);
-        let config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
-        let mut value = serde_yaml::to_value(config).unwrap();
-        let mapping = value.as_mapping_mut().unwrap();
-        mapping.remove("early_forward");
-        mapping.remove("body_streaming");
-        let config: ValidatorConfig = serde_yaml::from_value(value.clone()).unwrap();
-        assert!(config.early_forward);
-        assert!(config.body_streaming);
-
-        let mapping = value.as_mapping_mut().unwrap();
-        mapping.insert("early_forward".into(), false.into());
-        mapping.insert("body_streaming".into(), false.into());
-        let config: ValidatorConfig = serde_yaml::from_value(value).unwrap();
-        assert!(!config.early_forward);
-        assert!(!config.body_streaming);
     }
 
     #[test]

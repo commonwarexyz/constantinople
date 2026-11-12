@@ -64,12 +64,6 @@ const NUM_VALIDATORS: u32 = 4;
 const ENGINE_NAMESPACE: &[u8] = b"constantinople-engine-test";
 const MAX_PROBE_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
 
-/// Reads an engine feature switch from the environment so the suite can run with that feature
-/// turned off. A switch that is unset, or set to anything but `0` or `false`, is on.
-fn feature_enabled(name: &str) -> bool {
-    std::env::var(name).map_or(true, |value| value != "0" && value != "false")
-}
-
 const fn default_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
@@ -428,8 +422,6 @@ impl EngineDefinition for TestEngineDefinition {
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
-                    early_forward: feature_enabled("CONSTANTINOPLE_TEST_EARLY_FORWARD"),
-                    body_streaming: feature_enabled("CONSTANTINOPLE_TEST_BODY_STREAMING"),
                 },
             )
             .await;

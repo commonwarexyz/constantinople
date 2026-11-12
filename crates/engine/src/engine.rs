@@ -95,13 +95,7 @@ const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
-
-/// Chunk and roots messages the shards engine keeps per peer.
-///
-/// A block at the size limit codes into 16 segments, so an honest sender sends a peer at most 17
-/// messages per candidate and 34 per round, where a prepared build can be replaced by a proposal.
-/// Relaying before naming needs room for 34 more. This holds two rounds and that relay.
-const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(128);
+const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
@@ -214,13 +208,6 @@ where
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
     pub finalized_hook: Option<EngineFinalizedHook<H, C::PublicKey>>,
-    /// Whether the shards engine relays the scheduled leader's chunks before consensus names the
-    /// round's commitment. When false it is given no elector and holds every chunk until the
-    /// commitment's roots bind.
-    pub early_forward: bool,
-    /// Whether a proposer streams its block's transactions to the marshal while it builds the
-    /// block. When false the marshal codes each block once it is built.
-    pub body_streaming: bool,
 }
 
 /// Fully assembled validator engine.
@@ -245,7 +232,7 @@ where
     transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, St>,
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, St>,
-    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St, L>,
+    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     coding_config: CodingConfig,
     #[expect(
@@ -517,7 +504,6 @@ where
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 records: shard_records,
                 peer_provider: config.manager.clone(),
-                elector: config.early_forward.then(|| elector.clone()),
             },
         );
         let application = EngineApplication::new(
@@ -530,8 +516,7 @@ where
                 config.public_key_cache,
                 application_state_target,
                 application_transactions_target,
-            )
-            .with_body_streaming(config.body_streaming),
+            ),
             config.finalized_hook,
         );
         let (stateful, stateful_mailbox) = Stateful::new(
@@ -888,10 +873,10 @@ where
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use commonware_codec::{Decode, Encode, EncodeSize, FixedSize as _};
-    use commonware_coding::{Config as CodingConfig, Scheme as _, Segmentable as _};
+    use commonware_codec::{Decode, Encode, EncodeSize};
+    use commonware_coding::{Config as CodingConfig, ReedSolomon};
     use commonware_consensus::{
-        marshal::coding::types::{CodedBlock, CodedLayout as _, Shard},
+        marshal::coding::types::Shard,
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
@@ -901,34 +886,15 @@ mod unit_tests {
     use commonware_parallel::Sequential;
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_primitives::{
-        Block, Header, Sealable, SignedTransaction, Transaction, TransactionPublicKey,
+        Block, Header, Sealable, Transaction, TransactionPublicKey,
         proposal::{MAXIMUM_BLOCK_SIZE, MAXIMUM_MESSAGE_SIZE, max_transaction_bytes},
     };
     use futures::FutureExt;
     use rand::{SeedableRng, rngs::StdRng};
     use std::num::NonZeroU64;
 
-    type TestBlock = EngineBlock<sha256::Sha256, ed25519::VerifyingKey>;
-
-    /// A signed transfer from a key derived from `seed` to itself.
-    fn signed_transaction(seed: u64) -> SignedTransaction<sha256::Sha256> {
-        let signer = ed25519::SigningKey::from_seed(seed);
-        let public_key = TransactionPublicKey::ed25519(signer.public_key());
-        Transaction::<sha256::Digest>::new(
-            public_key.clone(),
-            public_key,
-            NonZeroU64::new(1).unwrap(),
-            0,
-        )
-        .seal_and_sign(
-            &signer,
-            constantinople_primitives::TRANSACTION_NAMESPACE,
-            &mut sha256::Sha256::default(),
-        )
-    }
-
-    /// A genesis-height block holding `transactions`.
-    fn block_with(transactions: Vec<SignedTransaction<sha256::Sha256>>) -> TestBlock {
+    #[test]
+    fn engine_block_preserves_inner_wire_encoding() {
         let mut rng = StdRng::from_seed([17u8; 32]);
         let signer = ed25519::SigningKey::random(&mut rng);
         let coding_config = CodingConfig {
@@ -956,77 +922,42 @@ mod unit_tests {
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
         };
-        Block::new(
+        let inner = Block::new(
             header,
-            transactions,
+            Vec::new(),
             constantinople_primitives::StateSyncProof::initial::<sha256::Sha256>(),
         )
-        .seal(&mut sha256::Sha256::default())
-        .into()
-    }
-
-    #[test]
-    fn engine_block_preserves_inner_wire_encoding() {
-        let block = block_with(vec![signed_transaction(1)]);
-        let encoded = block.inner_shared().encode();
+        .seal(&mut sha256::Sha256::default());
+        let encoded = inner.encode();
+        let block: EngineBlock<sha256::Sha256, ed25519::VerifyingKey> = inner.into();
 
         assert_eq!(block.encode(), encoded);
         assert_eq!(
-            TestBlock::decode_cfg(encoded.clone(), &BlockCfg::default())
-                .expect("typed block encoding must decode")
-                .encode(),
+            EngineBlock::<sha256::Sha256, ed25519::VerifyingKey>::decode_cfg(
+                encoded.clone(),
+                &BlockCfg::default(),
+            )
+            .expect("typed block encoding should decode")
+            .encode(),
             encoded,
         );
-
-        // The coded layout carries the same bytes and reads back as the same block.
-        let mut body = Vec::new();
-        block.write_body(&mut body);
-        let mut tail = Vec::new();
-        block.write_tail(&mut tail);
-        assert!(!body.is_empty());
-        assert_eq!(body.len() + tail.len(), encoded.len());
-        let decoded = TestBlock::read_coded(body.into(), tail.into(), &BlockCfg::default())
-            .expect("the coded layout must decode");
-        assert!(decoded == block);
-        assert_eq!(decoded.digest(), block.digest());
-    }
-
-    /// The marshal codes a block's body, then its tail, then the body length and the coding
-    /// config, so the coded payload is the encoded block plus that trailer.
-    #[test]
-    fn coded_payload_is_the_layout_and_its_trailer() {
-        let block = block_with((1..=3).map(signed_transaction).collect());
-        let config = coding_config_for_participants(4);
-
-        let mut payload = Vec::new();
-        block.write_body(&mut payload);
-        let body_len = payload.len();
-        block.write_tail(&mut payload);
-        payload.extend_from_slice(&u32::try_from(body_len).unwrap().to_le_bytes());
-        payload.extend_from_slice(&config.encode());
-        assert_eq!(
-            payload.len(),
-            block.encode_size() + u32::SIZE + CodingConfig::SIZE
-        );
-        assert!(
-            payload.len() <= CodedBlock::<TestBlock, EngineScheme<sha256::Sha256>, sha256::Sha256>::max_coded_size(block.encode_size())
-        );
-
-        // The marshal's coding of the block commits to exactly this payload.
-        let (root, _) =
-            EngineScheme::<sha256::Sha256>::encode(&config, payload.as_slice(), &Sequential)
-                .expect("the payload must code");
-        let digested = Digested::precomputed(block.clone(), block.digest());
-        let coded = EngineCodedBlock::encode(digested, config, &Sequential)
-            .now_or_never()
-            .expect("sequential encoding must complete inline");
-        assert_eq!(coded.commitment().root(), root);
     }
 
     #[test]
     fn shard_limit_accepts_maximum_proposals() {
         let signer = ed25519::SigningKey::from_seed(13);
-        let transaction = signed_transaction(13);
+        let public_key = TransactionPublicKey::ed25519(signer.public_key());
+        let transaction = Transaction::<sha256::Digest>::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).unwrap(),
+            0,
+        )
+        .seal_and_sign(
+            &signer,
+            constantinople_primitives::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
         let proposal_bytes = max_transaction_bytes(MAXIMUM_BLOCK_SIZE).unwrap();
         let transaction_count = proposal_bytes / transaction.encode_size();
         let header = Header {
@@ -1059,20 +990,14 @@ mod unit_tests {
         // The budget reserves framing for minimum-size transactions, so the slack a maximum
         // proposal leaves grows with the block size.
         assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < MAXIMUM_BLOCK_SIZE / 4096);
-        type TestShard = Shard<TestBlock, EngineScheme<sha256::Sha256>, sha256::Sha256>;
-
-        // A maximum proposal codes into the segment count the per-peer shard buffer is sized for.
-        let segments = EngineScheme::<sha256::Sha256>::segments(CodedBlock::<
-            TestBlock,
-            EngineScheme<sha256::Sha256>,
+        type TestShard = Shard<
+            EngineBlock<sha256::Sha256, ed25519::VerifyingKey>,
+            ReedSolomon<sha256::Sha256>,
             sha256::Sha256,
-        >::max_coded_size(
-            MAXIMUM_BLOCK_SIZE
-        ));
-        assert_eq!(segments, 16);
-        assert!(SHARD_PEER_BUFFER_SIZE.get() >= 3 * 2 * (usize::from(segments) + 1));
+        >;
         for validators in [4, 7, 50] {
             let coding_config = coding_config_for_participants(validators);
+            let shards = usize::from(coding_config.minimum_shards.get());
 
             // Sequential runs the coding job inline, so the future is already ready.
             let digested = Digested::precomputed(block.clone(), block.digest());
@@ -1087,9 +1012,8 @@ mod unit_tests {
             TestShard::decode_cfg(encoded.clone(), &block.encode_size())
                 .expect("the exact block budget should accept its shard");
 
-            // The limit is granular to one segment. A budget one segment short admits one fewer
-            // segment per shard, so the full-size proposal's shard must be rejected.
-            let smaller_budget = block.encode_size() - SEGMENT_BYTES;
+            // Removing one coding word per original shard must reject the same proposal.
+            let smaller_budget = block.encode_size() - 2 * shards;
             assert!(TestShard::decode_cfg(encoded, &smaller_budget).is_err());
         }
     }

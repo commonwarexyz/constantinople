@@ -118,5 +118,3 @@ debug = true
 
 [patch.crates-io]
 commonware-storage = { path = "vendor/commonware-storage" }
-commonware-coding = { path = "vendor/commonware-coding" }
-commonware-consensus = { path = "vendor/commonware-consensus" }

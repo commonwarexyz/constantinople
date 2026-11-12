@@ -137,8 +137,6 @@ where
     proposed_transactions: Counter,
     /// Whether a proposal build ends after a selection round that keeps every candidate.
     skip_final_refill: bool,
-    /// Whether a proposal build pushes its transactions to the marshal's body sink.
-    body_streaming: bool,
     _marker: PhantomData<(E, C, S, I)>,
 }
 
@@ -162,7 +160,6 @@ where
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             skip_final_refill: self.skip_final_refill,
-            body_streaming: self.body_streaming,
             _marker: PhantomData,
         }
     }
@@ -206,16 +203,8 @@ where
             genesis_transactions_target,
             proposed_transactions,
             skip_final_refill: PROPOSE_SKIP_FINAL_REFILL.load(Ordering::Relaxed),
-            body_streaming: true,
             _marker: PhantomData,
         }
-    }
-
-    /// Sets whether proposal builds push their transactions to the marshal's body sink. Without
-    /// pushes the marshal codes each block once it is built.
-    pub const fn with_body_streaming(mut self, enabled: bool) -> Self {
-        self.body_streaming = enabled;
-        self
     }
 }
 

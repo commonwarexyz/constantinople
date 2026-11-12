@@ -185,8 +185,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         ingress_permits,
         mempool_propose_priority,
         propose_skip_final_refill,
-        early_forward,
-        body_streaming,
         max_pool_bytes,
         state_page_cache_bytes,
         history_page_cache_bytes,
@@ -256,8 +254,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             ingress_permits,
             mempool_propose_priority,
             propose_skip_final_refill,
-            early_forward,
-            body_streaming,
             "experiment knobs"
         );
         let public_key_cache = PublicKeyCache::new(
@@ -464,8 +460,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer,
                 finalized_hook,
-                early_forward,
-                body_streaming,
             },
         )
         .await;
