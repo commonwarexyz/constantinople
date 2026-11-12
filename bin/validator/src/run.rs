@@ -346,7 +346,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
         let network_handle = network.start();
 
-        let relayer_view = relayer.as_ref().map(|_| crate::relayer::Observer::new());
+        let relayer_view = relayer
+            .as_ref()
+            .map(|_| crate::relayer::Observer::new(TermLength::new(leader_term_length)));
         let relayer_view_clock = relayer_view
             .as_ref()
             .map(|(_, view_clock)| view_clock.clone());
