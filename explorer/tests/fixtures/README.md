@@ -11,7 +11,8 @@ EXPLORER_FIXTURE_DIR=/absolute/path/to/fixtures just explorer-test
 
 An override is strict: missing or malformed files fail, as do proof fixtures
 without `writeHeight`, current account update operations, participant indices, the
-oldest/exhausted account bundles, or the complete 48-byte history values. The override never falls back to
+oldest/exhausted account bundles, the default account balance, or the complete 48-byte history
+values. The override never falls back to
 the checked-in files.
 
 The checked-in proof fixtures predate account counts: their account values are
@@ -22,22 +23,23 @@ skips with the incompatible field in the reason. Pure account-page, wire/transpo
 header and certified block-feed tests continue running. A passing run with those
 skips does not establish native account/history proof compatibility.
 
-Generate exports from the matching native source using the repository's test
-recipes. Create the output directory before running these commands:
+`just explorer-fixtures <dir>` exports all three from this checkout's indexer tests,
+the same way CI does before it runs the explorer tests:
 
 ```sh
-EXPLORER_FIXTURE_PATH=/absolute/path/to/fixtures/proofBundle.json \
-  just test -p constantinople-indexer -E 'test(publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages)'
-
-EXPLORER_ACTIVITY_FIXTURE_PATH=/absolute/path/to/fixtures/transactionActivityProof.json \
-  just test -p constantinople-indexer -E 'test(historical_transactions_below_inactivity_floor_remain_available)'
-
-EXPLORER_FEED_FIXTURE_PATH=/absolute/path/to/fixtures/blockFeed.json \
-  just test -p constantinople-indexer -E 'test(bootstrap_and_resume_ignore_sql_counts_and_preserve_advancing_floors)'
+just explorer-fixtures /absolute/path/to/fixtures
 ```
 
+It runs `publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages`,
+`historical_transactions_below_inactivity_floor_remain_available`, and
+`bootstrap_and_resume_ignore_sql_counts_and_preserve_advancing_floors` with
+`EXPLORER_FIXTURE_PATH`, `EXPLORER_ACTIVITY_FIXTURE_PATH`, and
+`EXPLORER_FEED_FIXTURE_PATH` pointing into the directory.
+
 `proofBundle.json` preserves real publisher/indexer certificates, headers, proofs,
-and signed transaction bodies. Each account update has `location`, `proof`, and
+and signed transaction bodies. It also carries the chain's `defaultAccountBalance` as a decimal
+string, which the wallet shows for an account with no stored state. A test asserts the explorer's
+constant against it. Each account update has `location`, `proof`, and
 `writeHeight`, plus the `encodedOperation` its proof authenticates: the account's
 active fixed unordered update at the certified root. Transaction rows carry decimal-string `senderIndex` and
 `recipientIndex` values; the proof commits to the transaction digest followed by

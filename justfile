@@ -55,9 +55,28 @@ explorer-test:
 explorer-build:
   npm --prefix explorer run build
 
-# Install Explorer dependencies.
-explorer-install *args='':
-  npm --prefix explorer install $@
+# Build the Exoware TypeScript packages the Explorer links, at the revision Cargo.toml pins.
+explorer-exoware:
+  bash explorer/scripts/build-exoware.sh
+
+# Install the locked Explorer dependencies, including the Exoware packages they link.
+explorer-install: explorer-exoware
+  npm --prefix explorer ci
+
+# Export native Explorer fixtures from the indexer tests into a directory.
+explorer-fixtures out:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p "$1"
+  out="$(cd "$1" && pwd)"
+  EXPLORER_FIXTURE_PATH="$out/proofBundle.json" \
+  EXPLORER_ACTIVITY_FIXTURE_PATH="$out/transactionActivityProof.json" \
+  EXPLORER_FEED_FIXTURE_PATH="$out/blockFeed.json" \
+    cargo nextest run --locked -p constantinople-indexer --all-features -E \
+    'test(publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages) | test(historical_transactions_below_inactivity_floor_remain_available) | test(bootstrap_and_resume_ignore_sql_counts_and_preserve_advancing_floors)'
+  for name in proofBundle transactionActivityProof blockFeed; do
+    test -s "$out/$name.json" || { echo "missing $out/$name.json" >&2; exit 1; }
+  done
 
 # Test the native fixed-account proof verifier.
 account-proof-test *args='':

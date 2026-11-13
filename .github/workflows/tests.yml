@@ -57,6 +57,47 @@ jobs:
           fi
           echo "All tests passed successfully!"
 
+  explorer:
+    name: Explorer
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Clear disk space
+        uses: ./.github/actions/disk
+      - name: Run setup
+        uses: ./.github/actions/setup
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install just, nextest and wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.43.0,cargo-nextest,wasm-pack@0.13.1
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: explorer/.nvmrc
+          cache: npm
+          cache-dependency-path: explorer/package-lock.json
+      - name: Restore Exoware TypeScript packages
+        uses: actions/cache@v4
+        with:
+          path: .exoware
+          key: exoware-ts-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'explorer/scripts/build-exoware.sh', 'explorer/.nvmrc') }}
+      - name: Build Exoware packages and install Explorer dependencies
+        run: just explorer-install
+      - name: Export native Explorer fixtures
+        run: just explorer-fixtures "$RUNNER_TEMP/explorer-fixtures"
+      - name: Type check and test the Explorer against native fixtures
+        run: just explorer-test
+        env:
+          EXPLORER_FIXTURE_DIR: ${{ runner.temp }}/explorer-fixtures
+      - name: Build the Explorer
+        run: just explorer-build
+
   build:
     name: Build
     runs-on: ubuntu-latest

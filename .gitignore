@@ -9,3 +9,6 @@
 # Dust
 mprocs.log
 .DS_Store
+
+# Exoware TypeScript packages built by explorer/scripts/build-exoware.sh
+/.exoware

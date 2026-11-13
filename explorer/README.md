@@ -124,18 +124,22 @@ cd explorer
 npm run dev
 ```
 
-The `@exowarexyz` browser verifier packages must support the indexer's proof APIs.
-Their `2026.9.0` npm release lacks the standalone verifier required by the
-explorer. Until matching packages are published and pinned, use the Exoware
-revision pinned in the root [`Cargo.toml`](../Cargo.toml). Build `sdk/ts`,
-`qmdb/ts`, and `simplex/ts` in that checkout, then install them together
-from this repository's root:
+The explorer uses the Node.js major version in [`.nvmrc`](.nvmrc).
 
-```sh
-just explorer-install --no-save --package-lock=false \
-  /path/to/exoware/sdk/ts /path/to/exoware/qmdb/ts \
-  /path/to/exoware/simplex/ts
-```
+The `@exowarexyz/qmdb` and `@exowarexyz/simplex` browser verifiers must match the
+Exoware crates the indexer runs, so they come from the Exoware revision pinned in
+the root [`Cargo.toml`](../Cargo.toml) rather than from npm. `just explorer-install`
+runs [`scripts/build-exoware.sh`](scripts/build-exoware.sh), which checks out that
+revision into `.exoware/` at the repository root and builds its `sdk/ts`,
+`qmdb/ts`, and `simplex/ts` packages, then installs the locked dependencies with
+`npm ci`. `package.json` links the two verifier packages from `.exoware/`. The
+build runs again only when the pinned revision changes.
+
+Building the verifiers needs `git`, `wasm-pack`, the Rust
+`wasm32-unknown-unknown` target, and a C compiler that targets wasm32. On macOS,
+put Homebrew LLVM first on `PATH` (`export PATH=/opt/homebrew/opt/llvm/bin:$PATH`)
+because Apple's clang has no wasm32 target. The script installs the matching
+`wasm-bindgen` CLI into `.exoware/bin` when `PATH` lacks it.
 
 The dev server defaults to <http://localhost:5173>. To get live data,
 point a secondary validator at the simulator and start the spammer:
@@ -165,11 +169,13 @@ just explorer-build
 Native fixture exports can be tested without copying them into this checkout:
 
 ```sh
-EXPLORER_FIXTURE_DIR=/absolute/path/to/native/fixtures just explorer-test
+just explorer-fixtures /tmp/explorer-fixtures
+EXPLORER_FIXTURE_DIR=/tmp/explorer-fixtures just explorer-test
 ```
 
-The directory must contain `proofBundle.json`, `blockFeed.json`, and
-`transactionActivityProof.json` from the matching native producer. The count
+`just explorer-fixtures` exports `proofBundle.json`, `blockFeed.json`, and
+`transactionActivityProof.json` from the indexer tests of this checkout. CI runs
+the same commands on every pull request and push to `main`. The count
 variant uses 32-byte account values and 48-byte transaction-history values.
 The tests identify incompatible older fixtures and report the affected crypto
 checks as skipped; an explicitly supplied directory must use the matching format.
