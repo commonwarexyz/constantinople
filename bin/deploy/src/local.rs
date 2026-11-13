@@ -148,6 +148,10 @@ fn build_validators(
             http_port,
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
+            leader_term_length: args.leader_term_length,
+            leader_optimistic_views: args.leader_optimistic_views,
+            mempool_propose_priority: args.mempool_propose_priority,
+            propose_skip_final_refill: args.propose_skip_final_refill,
             max_pool_bytes: args.max_pool_bytes,
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
@@ -225,6 +229,10 @@ fn build_secondaries(
             http_port,
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
+            leader_term_length: args.leader_term_length,
+            leader_optimistic_views: args.leader_optimistic_views,
+            mempool_propose_priority: args.mempool_propose_priority,
+            propose_skip_final_refill: args.propose_skip_final_refill,
             max_pool_bytes: args.max_pool_bytes,
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
@@ -496,6 +504,10 @@ mod tests {
             state_page_cache_bytes: default_state_page_cache_bytes(),
             history_page_cache_bytes: default_history_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            leader_term_length: commonware_utils::NZU32!(1),
+            leader_optimistic_views: 16,
+            mempool_propose_priority: false,
+            propose_skip_final_refill: false,
             spammer,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -1256,6 +1268,24 @@ mod tests {
         );
 
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+    }
+
+    #[test]
+    fn leader_options_reach_every_local_config() {
+        let mut args = test_args(false);
+        args.indexer = true;
+        args.relayer = true;
+        crate::tests::set_stable_leader_args(&mut args);
+
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let output_dir = Path::new("/tmp/configs");
+        let validators = build_validators(&args, local_args(&args), output_dir, &material);
+        let secondaries = build_secondaries(&args, local_args(&args), output_dir, &material);
+
+        assert_eq!(secondaries.len(), 2);
+        for generated in validators.iter().chain(&secondaries) {
+            crate::tests::assert_stable_leader_config(&generated.config);
+        }
     }
 
     #[test]

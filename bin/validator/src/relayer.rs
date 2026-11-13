@@ -10,7 +10,10 @@ use axum::{
 };
 use commonware_actor::Feedback;
 use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
-use commonware_consensus::{Reporter, Viewable};
+use commonware_consensus::{
+    Reporter, Viewable,
+    types::{TermLength, View},
+};
 use commonware_cryptography::{bls12381::primitives::variant::MinSig, sha256};
 use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_formatting::from_hex;
@@ -56,21 +59,27 @@ type Activity = EngineActivity<ed25519::VerifyingKey, MinSig>;
 #[derive(Clone)]
 pub struct Observer {
     current_view: watch::Sender<u64>,
+    term_length: TermLength,
 }
 
 #[derive(Clone)]
 pub struct ViewClock {
     current_view: watch::Sender<u64>,
+    term_length: TermLength,
 }
 
 impl Observer {
-    pub fn new() -> (Self, ViewClock) {
+    pub fn new(term_length: TermLength) -> (Self, ViewClock) {
         let (current_view, _) = watch::channel(0);
         (
             Self {
                 current_view: current_view.clone(),
+                term_length,
             },
-            ViewClock { current_view },
+            ViewClock {
+                current_view,
+                term_length,
+            },
         )
     }
 }
@@ -79,7 +88,7 @@ impl Reporter for Observer {
     type Activity = Activity;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        let view = activity_view(&activity);
+        let view = activity_view(&activity, self.term_length);
         self.current_view.send_if_modified(|current| {
             if view <= *current {
                 return false;
@@ -91,14 +100,16 @@ impl Reporter for Observer {
     }
 }
 
-fn activity_view(activity: &Activity) -> u64 {
+/// Returns the view the activity reports. A nullification abandons the rest of
+/// its view's term, so it reports the last view of that term.
+fn activity_view(activity: &Activity, term_length: TermLength) -> u64 {
     match activity {
         Activity::Notarize(activity) => activity.view().get(),
         Activity::Notarization(activity) | Activity::Certification(activity) => {
             activity.view().get()
         }
         Activity::Nullify(activity) => activity.view().get(),
-        Activity::Nullification(activity) => activity.view().get(),
+        Activity::Nullification(activity) => activity.view().term_end(term_length).get(),
         Activity::Finalize(activity) => activity.view().get(),
         Activity::Finalization(activity) => activity.view().get(),
         Activity::ConflictingNotarize(activity) => activity.view().get(),
@@ -240,10 +251,32 @@ async fn submit_to_pinned_leader<St: Strategy>(
     body: Bytes,
     target: &str,
 ) -> (StatusCode, String) {
-    let Some(leader) = leader_by_id(&state.leaders, target).cloned() else {
+    let Some(named) = leader_by_id(&state.leaders, target) else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
-    submit_background_to_leader(&state.http, &leader, body).await
+    let term_length = state.view_clock.term_length;
+    if term_length == TermLength::ONE {
+        return submit_background_to_leader(&state.http, named, body).await;
+    }
+
+    // A pinned batch waits on one validator until it resolves. Under a term
+    // longer than one view the named validator may not lead for a long time,
+    // so the batch goes to the leader of the term containing the next view,
+    // whatever validator the client named.
+    //
+    // If consensus leaves that term before the batch resolves, that leader may
+    // never propose it. The relayer then stops waiting and answers 503, and
+    // the client's retry reaches the leader of the new term.
+    let mut current_view = state.view_clock.current_view.subscribe();
+    let view = *current_view.borrow_and_update();
+    let term = next_term(view, term_length);
+    let leader = next_leaders(&state.leaders, view, term_length, 1).swap_remove(0);
+    tokio::select! {
+        response = submit_background_to_leader(&state.http, &leader, body) => response,
+        Ok(_) = current_view.wait_for(|view| next_term(*view, term_length) != term) => {
+            (StatusCode::SERVICE_UNAVAILABLE, String::new())
+        }
+    }
 }
 
 async fn submit_to_public_leaders<St: Strategy>(
@@ -256,7 +289,7 @@ async fn submit_to_public_leaders<St: Strategy>(
     }
 
     let view = *state.view_clock.current_view.borrow();
-    let targets = next_leaders(&state.leaders, view, fanout);
+    let targets = next_leaders(&state.leaders, view, state.view_clock.term_length, fanout);
     let http = state.http.clone();
     let leader_response_timeout = state.leader_response_timeout;
     let (response_tx, response_rx) = oneshot::channel();
@@ -562,13 +595,26 @@ fn normalize_leaders(leaders: Vec<RelayerLeaderConfig>) -> Vec<Leader> {
     leaders
 }
 
-fn next_leaders(leaders: &[Leader], observed_view: u64, fanout: usize) -> Vec<Leader> {
+/// Returns the index of the term containing the view after `observed_view`.
+const fn next_term(observed_view: u64, term_length: TermLength) -> u64 {
+    View::new(observed_view.saturating_add(1)).term_index(term_length)
+}
+
+/// Returns the leader of the term containing the view after `observed_view`,
+/// followed by the leaders of the terms after it, as the round-robin elector
+/// assigns them at epoch zero.
+fn next_leaders(
+    leaders: &[Leader],
+    observed_view: u64,
+    term_length: TermLength,
+    fanout: usize,
+) -> Vec<Leader> {
     if leaders.is_empty() {
         return Vec::new();
     }
-    let observed = (observed_view % leaders.len() as u64) as usize;
+    let first = (next_term(observed_view, term_length) % leaders.len() as u64) as usize;
     (0..fanout.min(leaders.len()))
-        .map(|offset| leaders[(observed + 1 + offset) % leaders.len()].clone())
+        .map(|offset| leaders[(first + offset) % leaders.len()].clone())
         .collect()
 }
 
@@ -583,10 +629,16 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use commonware_codec::Encode as _;
+    use commonware_consensus::{
+        simplex::types::Nullification,
+        types::{Epoch, Round},
+    };
+    use commonware_cryptography::bls12381::{certificate::threshold::Certificate, primitives::ops};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+    const STABLE_TERM: TermLength = TermLength::new(std::num::NonZeroU32::new(1_000_000).unwrap());
 
     fn leader(key: &str) -> Leader {
         Leader {
@@ -594,6 +646,13 @@ mod tests {
             sort_key: from_hex(key).expect("hex key"),
             url: format!("http://{key}"),
         }
+    }
+
+    fn leader_keys(leaders: Vec<Leader>) -> Vec<String> {
+        leaders
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect()
     }
 
     fn signed_transfer(seed: u64, nonce: u64) -> SignedTransaction<sha256::Sha256> {
@@ -637,7 +696,7 @@ mod tests {
         client_response_timeout: Duration,
         leader_response_timeout: Duration,
     ) -> AppState<commonware_parallel::Sequential> {
-        let (_, view_clock) = Observer::new();
+        let (_, view_clock) = Observer::new(TermLength::ONE);
         AppState {
             leaders: Arc::new(leaders),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
@@ -680,14 +739,17 @@ mod tests {
         )
     }
 
-    async fn counted_leaders(count: usize) -> (Vec<Leader>, Vec<Arc<AtomicUsize>>) {
+    async fn counted_leaders(
+        count: usize,
+        route: &'static str,
+    ) -> (Vec<Leader>, Vec<Arc<AtomicUsize>>) {
         let mut leaders = Vec::with_capacity(count);
         let mut requests = Vec::with_capacity(count);
         for index in 0..count {
             let request_count = Arc::new(AtomicUsize::new(0));
             let request_count_for_handler = request_count.clone();
             let router = Router::new().route(
-                "/transactions",
+                route,
                 post(move || {
                     let request_count = request_count_for_handler.clone();
                     async move {
@@ -701,6 +763,37 @@ mod tests {
             requests.push(request_count);
         }
         (leaders, requests)
+    }
+
+    fn request_counts(requests: &[Arc<AtomicUsize>]) -> Vec<usize> {
+        requests
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Signals `received` when a background submission arrives and answers it
+    /// as finalized only once `release` is notified.
+    fn held_background_router(received: Arc<Notify>, release: Arc<Notify>) -> Router {
+        Router::new().route(
+            "/transactions/background",
+            post(move || {
+                let received = received.clone();
+                let release = release.clone();
+                async move {
+                    received.notify_one();
+                    release.notified().await;
+                    status_response(TxStatus::Finalized { height: 3 })
+                }
+            }),
+        )
+    }
+
+    fn nullification(view: u64) -> Activity {
+        Activity::Nullification(Nullification {
+            round: Round::new(Epoch::zero(), View::new(view)),
+            certificate: Certificate::new(ops::hash::<MinSig>(b"relayer-test", b"nullification")),
+        })
     }
 
     #[test]
@@ -722,10 +815,7 @@ mod tests {
     fn targets_next_two_views() {
         let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
 
-        let targets = next_leaders(&leaders, 0, 2)
-            .into_iter()
-            .map(|leader| leader.public_key)
-            .collect::<Vec<_>>();
+        let targets = leader_keys(next_leaders(&leaders, 0, TermLength::ONE, 2));
 
         assert_eq!(targets, vec!["01", "02"]);
     }
@@ -734,12 +824,112 @@ mod tests {
     fn targets_cap_fanout_at_network_size() {
         let leaders = vec![leader("00"), leader("01"), leader("02")];
 
-        let targets = next_leaders(&leaders, 1, 4)
-            .into_iter()
-            .map(|leader| leader.public_key)
-            .collect::<Vec<_>>();
+        let targets = leader_keys(next_leaders(&leaders, 1, TermLength::ONE, 4));
 
         assert_eq!(targets, vec!["02", "00", "01"]);
+    }
+
+    #[test]
+    fn single_view_terms_target_the_leaders_of_the_following_views() {
+        let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
+
+        for view in 0..12 {
+            for fanout in 1..=leaders.len() {
+                let expected = (0..fanout)
+                    .map(|offset| {
+                        leaders[(view + 1 + offset) % leaders.len()]
+                            .public_key
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                let targets =
+                    leader_keys(next_leaders(&leaders, view as u64, TermLength::ONE, fanout));
+                assert_eq!(targets, expected, "view {view}, fanout {fanout}");
+            }
+        }
+    }
+
+    #[test]
+    fn stable_term_targets_one_leader_until_the_next_term() {
+        let leaders = vec![leader("00"), leader("01"), leader("02")];
+
+        for view in [0, 1, 500_000, 999_999] {
+            assert_eq!(
+                leader_keys(next_leaders(&leaders, view, STABLE_TERM, 2)),
+                vec!["01", "02"],
+                "view {view}"
+            );
+        }
+        assert_eq!(
+            leader_keys(next_leaders(&leaders, 1_000_000, STABLE_TERM, 2)),
+            vec!["02", "00"]
+        );
+    }
+
+    #[test]
+    fn schedule_matches_the_round_robin_elector() {
+        use commonware_consensus::{
+            simplex::elector::{Config as ElectorConfig, Elector as _, RoundRobin},
+            types::ViewDelta,
+        };
+        use commonware_cryptography::Signer as _;
+        use commonware_formatting::hex;
+        use commonware_utils::{TryCollect as _, ordered::Set};
+        type Scheme = constantinople_engine::ThresholdScheme<ed25519::VerifyingKey, MinSig>;
+
+        let keys = (0..5)
+            .map(|seed| ed25519::SigningKey::from_seed(seed).public_key())
+            .collect::<Vec<_>>();
+        let participants: Set<ed25519::VerifyingKey> = keys.iter().cloned().try_collect().unwrap();
+        let leaders = normalize_leaders(
+            keys.iter()
+                .map(|key| RelayerLeaderConfig {
+                    public_key: hex(&key.encode()),
+                    url: "http://leader".to_string(),
+                })
+                .collect(),
+        );
+        let term_length = TermLength::new(std::num::NonZeroU32::new(3).unwrap());
+        let configs = [
+            (TermLength::ONE, RoundRobin::<sha256::Sha256>::default()),
+            (
+                term_length,
+                RoundRobin::default().with_term(
+                    term_length,
+                    Duration::from_secs(1),
+                    ViewDelta::new(0),
+                ),
+            ),
+        ];
+
+        for (term_length, config) in configs {
+            let elector = ElectorConfig::<Scheme>::build(config, &participants);
+            for view in 0..20 {
+                let elected = elector.elect(Round::new(Epoch::zero(), View::new(view + 1)), ());
+                assert_eq!(
+                    next_leaders(&leaders, view, term_length, 1)[0].public_key,
+                    hex(&participants[usize::from(elected)].encode()),
+                    "term length {term_length}, view {view}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nullification_advances_to_the_next_term_leader() {
+        let leaders = vec![leader("00"), leader("01"), leader("02")];
+
+        for (term_length, expected) in [(TermLength::ONE, "01"), (STABLE_TERM, "02")] {
+            let (mut observer, view_clock) = Observer::new(term_length);
+            let _ = observer.report(nullification(3));
+            let view = *view_clock.current_view.borrow();
+
+            assert_eq!(
+                leader_keys(next_leaders(&leaders, view, term_length, 1)),
+                vec![expected],
+                "term length {term_length}"
+            );
+        }
     }
 
     #[test]
@@ -809,6 +999,134 @@ mod tests {
         );
         assert_eq!(background_count.load(Ordering::Relaxed), 1);
         assert_eq!(foreground_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_target_follows_the_term_leader_only_under_long_terms() {
+        for (term_length, expected) in [(TermLength::ONE, [1, 0]), (STABLE_TERM, [0, 1])] {
+            let (leaders, requests) = counted_leaders(2, "/transactions/background").await;
+            let mut state = test_state(
+                leaders,
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            );
+            state.view_clock = Observer::new(term_length).1;
+
+            let response = submit_transactions(
+                State(state),
+                pinned_headers(),
+                Bytes::from_static(b"not a codec batch"),
+            )
+            .await;
+
+            assert_eq!(response, status_response(TxStatus::Dropped));
+            assert_eq!(
+                request_counts(&requests),
+                expected,
+                "term length {term_length}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_unknown_target_is_rejected_under_long_terms() {
+        let mut state = test_state(
+            vec![leader("01")],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        state.view_clock = Observer::new(STABLE_TERM).1;
+
+        let response = submit_transactions(
+            State(state),
+            pinned_headers(),
+            Bytes::from_static(b"not a codec batch"),
+        )
+        .await;
+
+        assert_eq!(response, (StatusCode::BAD_REQUEST, String::new()));
+    }
+
+    #[tokio::test]
+    async fn pinned_batch_is_released_when_its_term_ends() {
+        for nullify in [true, false] {
+            let (mut leaders, requests) = counted_leaders(3, "/transactions/background").await;
+            let received = Arc::new(Notify::new());
+            let held = held_background_router(received.clone(), Arc::new(Notify::new()));
+            leaders[1] = mock_leader("01", spawn_mock_leader(held).await);
+            let mut state = test_state(
+                leaders,
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            );
+            let (mut observer, view_clock) = Observer::new(STABLE_TERM);
+            state.view_clock = view_clock.clone();
+            let body = Bytes::from_static(b"not a codec batch");
+
+            let submission = tokio::spawn(submit_transactions(
+                State(state.clone()),
+                pinned_headers(),
+                body.clone(),
+            ));
+            tokio::time::timeout(Duration::from_secs(1), received.notified())
+                .await
+                .expect("the first-term leader should receive the batch");
+            if nullify {
+                let _ = observer.report(nullification(3));
+            } else {
+                view_clock.current_view.send_replace(STABLE_TERM.get());
+            }
+            let response = tokio::time::timeout(Duration::from_secs(1), submission)
+                .await
+                .expect("leaving the term should release the pinned batch")
+                .expect("submission task should not panic");
+            assert_eq!(response, (StatusCode::SERVICE_UNAVAILABLE, String::new()));
+
+            let response = submit_transactions(State(state), pinned_headers(), body).await;
+
+            assert_eq!(response, status_response(TxStatus::Dropped));
+            assert_eq!(
+                request_counts(&requests),
+                vec![0, 0, 1],
+                "nullify {nullify}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_view_terms_do_not_interrupt_a_pinned_batch() {
+        let received = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let held = held_background_router(received.clone(), release.clone());
+        let state = test_state(
+            vec![mock_leader("00", spawn_mock_leader(held).await)],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let view_clock = state.view_clock.clone();
+
+        let mut submission = tokio::spawn(submit_transactions(
+            State(state),
+            pinned_headers(),
+            Bytes::from_static(b"not a codec batch"),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), received.notified())
+            .await
+            .expect("the named leader should receive the batch");
+        view_clock.current_view.send_replace(5);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut submission)
+                .await
+                .is_err(),
+            "a view change must not release the pinned batch"
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(1), submission)
+            .await
+            .expect("the pinned batch should resolve once the leader answers")
+            .expect("submission task should not panic");
+
+        assert_eq!(response, status_response(TxStatus::Finalized { height: 3 }));
     }
 
     #[tokio::test]
@@ -944,7 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn unpinned_single_transaction_fans_out_to_four_leaders() {
-        let (leaders, requests) = counted_leaders(5).await;
+        let (leaders, requests) = counted_leaders(5, "/transactions").await;
         let state = test_state(
             leaders,
             Duration::from_millis(100),
@@ -953,18 +1271,14 @@ mod tests {
         let body: Bytes = vec![signed_transfer(1, 0)].encode();
 
         let response = submit_transactions(State(state), HeaderMap::new(), body).await;
-        let requests = requests
-            .iter()
-            .map(|count| count.load(Ordering::Relaxed))
-            .collect::<Vec<_>>();
 
         assert_eq!(response, status_response(TxStatus::Dropped));
-        assert_eq!(requests, vec![0, 1, 1, 1, 1]);
+        assert_eq!(request_counts(&requests), vec![0, 1, 1, 1, 1]);
     }
 
     #[tokio::test]
     async fn unpinned_multi_transaction_batch_fans_out_to_two_leaders() {
-        let (leaders, requests) = counted_leaders(5).await;
+        let (leaders, requests) = counted_leaders(5, "/transactions").await;
         let state = test_state(
             leaders,
             Duration::from_millis(100),
@@ -973,13 +1287,9 @@ mod tests {
         let body: Bytes = vec![signed_transfer(1, 0), signed_transfer(2, 0)].encode();
 
         let response = submit_transactions(State(state), HeaderMap::new(), body).await;
-        let requests = requests
-            .iter()
-            .map(|count| count.load(Ordering::Relaxed))
-            .collect::<Vec<_>>();
 
         assert_eq!(response, status_response(TxStatus::Dropped));
-        assert_eq!(requests, vec![0, 1, 1, 0, 0]);
+        assert_eq!(request_counts(&requests), vec![0, 1, 1, 0, 0]);
     }
 
     #[tokio::test]

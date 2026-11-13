@@ -236,6 +236,7 @@ async fn run_relayer_mode(
             filtered = totals.filtered,
             dropped = totals.dropped,
             errors = totals.errors,
+            unavailable = totals.unavailable,
             finalization_tps = format!("{finalization_tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"

@@ -1,16 +1,17 @@
 use crate::{
-    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
-    CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
-    DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP,
+    BandwidthWeighting, CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE,
+    CHAIN_INDEXER_DATA_DIR, CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig,
+    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP,
     EXPLORER_INDEXER_BINARY_FILE, EXPLORER_INDEXER_CONFIG_FILE, EXPLORER_INDEXER_HOST,
     ExplorerIndexerConfig, GenerateArgs, INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT,
     IndexerConfig, RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE,
-    SPAMMER_CONFIG_FILE, STORAGE_CLASS, SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE,
-    ValidatorConfig, absolute_path, default_bootstrappers, ensure_output_dir_missing,
-    generate_deployer_tag, generate_remote_cluster_material, indexer_enabled, ports::Ports,
-    secondary_roles, secondary_runtime_threads, total_secondaries, validate_generate_args,
-    write_simplex_verification_material, write_yaml_config,
+    SPAMMER_CONFIG_FILE, SPAMMER_HOST, STORAGE_CLASS, SecondaryRole, SpammerConfig,
+    VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
+    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
+    indexer_enabled, ports::Ports, secondary_roles, secondary_runtime_threads, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
+use clap::ValueEnum as _;
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
 use commonware_formatting::hex;
@@ -77,7 +78,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) -> Result<(), S
         &secondaries,
     );
     let config_path = output_dir.join(DEPLOYER_CONFIG_FILE);
-    let raw = serde_yaml::to_string(&deployer_config).expect("failed to serialize deployer config");
+    let raw = deployer_config_yaml(&deployer_config, remote, &validators, &secondaries);
     fs::write(&config_path, raw).expect("failed to write deployer config");
 
     info!(
@@ -176,6 +177,10 @@ fn build_validators(
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
             max_propose_bytes: args.max_propose_bytes,
+            leader_term_length: args.leader_term_length,
+            leader_optimistic_views: args.leader_optimistic_views,
+            mempool_propose_priority: args.mempool_propose_priority,
+            propose_skip_final_refill: args.propose_skip_final_refill,
             max_pool_bytes: args.max_pool_bytes,
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
@@ -233,6 +238,10 @@ fn build_secondaries(
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
             max_propose_bytes: args.max_propose_bytes,
+            leader_term_length: args.leader_term_length,
+            leader_optimistic_views: args.leader_optimistic_views,
+            mempool_propose_priority: args.mempool_propose_priority,
+            propose_skip_final_refill: args.propose_skip_final_refill,
             max_pool_bytes: args.max_pool_bytes,
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
@@ -454,7 +463,7 @@ fn build_deployer_config(
 
     if args.spammer {
         instances.push(aws::InstanceConfig {
-            name: "spammer".to_string(),
+            name: SPAMMER_HOST.to_string(),
             region: regions[0].clone(),
             availability_zone_group: None,
             instance_type: remote
@@ -484,6 +493,52 @@ fn build_deployer_config(
         instances,
         ports: port_configs(args, remote),
     }
+}
+
+/// Serializes the deployer config, adding `bandwidth_weighting` to the primary
+/// validators, the relayer, and the spammer, which carry consensus and
+/// transaction traffic.
+///
+/// The pinned deployer crate has no field for the key, so it is added to the
+/// serialized config.
+fn deployer_config_yaml(
+    config: &aws::Config,
+    remote: &RemoteArgs,
+    validators: &[GeneratedValidator],
+    secondaries: &[GeneratedValidator],
+) -> String {
+    let mut yaml = serde_yaml::to_value(config).expect("failed to serialize deployer config");
+    if remote.bandwidth_weighting != BandwidthWeighting::Default {
+        let weighting = remote
+            .bandwidth_weighting
+            .to_possible_value()
+            .expect("every bandwidth weighting has a value");
+        let weighted = validators
+            .iter()
+            .chain(
+                secondaries
+                    .iter()
+                    .filter(|secondary| secondary.config.relayer.is_some()),
+            )
+            .map(|generated| generated.public_key_hex.as_str())
+            .chain([SPAMMER_HOST])
+            .collect::<Vec<_>>();
+        for instance in yaml["instances"]
+            .as_sequence_mut()
+            .expect("deployer config lists instances")
+        {
+            if instance["name"]
+                .as_str()
+                .is_some_and(|name| weighted.contains(&name))
+            {
+                instance
+                    .as_mapping_mut()
+                    .expect("deployer instance is a mapping")
+                    .insert("bandwidth_weighting".into(), weighting.get_name().into());
+            }
+        }
+    }
+    serde_yaml::to_string(&yaml).expect("failed to serialize deployer config")
 }
 
 fn port_configs(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<aws::PortConfig> {
@@ -523,15 +578,15 @@ fn port_configs(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<aws::PortConfig
 #[cfg(test)]
 mod tests {
     use super::{
-        build_deployer_config, build_secondaries, expected_binary_files, explorer_indexer_config,
-        port_configs, remote_spammer_config, validate_ports,
+        build_deployer_config, build_secondaries, deployer_config_yaml, expected_binary_files,
+        explorer_indexer_config, port_configs, remote_spammer_config, validate_ports,
     };
     use crate::{
-        CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
+        BandwidthWeighting, CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP,
         EXPLORER_INDEXER_BINARY_FILE, GenerateArgs, GenerateTarget, LocalArgs, RemoteArgs,
-        STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
+        SPAMMER_HOST, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
         default_history_page_cache_bytes, default_max_pool_bytes, default_max_propose_bytes,
         default_public_key_cache_size, default_publisher_rayon_threads,
         default_state_page_cache_bytes, generate_local_cluster_material, total_secondaries,
@@ -559,6 +614,10 @@ mod tests {
             state_page_cache_bytes: default_state_page_cache_bytes(),
             history_page_cache_bytes: default_history_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            leader_term_length: commonware_utils::NZU32!(1),
+            leader_optimistic_views: 16,
+            mempool_propose_priority: false,
+            propose_skip_final_refill: false,
             spammer: false,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -606,6 +665,7 @@ mod tests {
             traces: 0.0,
             spammer_instance_type: None,
             spammer_storage_size: 25,
+            bandwidth_weighting: BandwidthWeighting::Default,
         }
     }
 
@@ -715,6 +775,10 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                leader_term_length: commonware_utils::NZU32!(1),
+                leader_optimistic_views: 16,
+                mempool_propose_priority: false,
+                propose_skip_final_refill: false,
                 max_pool_bytes: default_max_pool_bytes(),
                 state_page_cache_bytes: default_state_page_cache_bytes(),
                 history_page_cache_bytes: default_history_page_cache_bytes(),
@@ -908,6 +972,87 @@ mod tests {
 
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, 9000);
+    }
+
+    #[test]
+    fn leader_options_reach_every_remote_config() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.relayer = true;
+        crate::tests::set_stable_leader_args(&mut args);
+        let remote = remote_args();
+
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let output_dir = Path::new("/tmp/configs");
+        let validators = super::build_validators(&args, &remote, output_dir, &material);
+        let secondaries = build_secondaries(&args, &remote, output_dir, &material);
+
+        assert_eq!(secondaries.len(), 2);
+        for generated in validators.iter().chain(&secondaries) {
+            crate::tests::assert_stable_leader_config(&generated.config);
+        }
+    }
+
+    #[test]
+    fn bandwidth_weighting_applies_only_to_traffic_instances() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.relayer = true;
+        args.spammer = true;
+        let mut remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let output_dir = Path::new("/tmp/configs");
+        let validators = super::build_validators(&args, &remote, output_dir, &material);
+        let secondaries = build_secondaries(&args, &remote, output_dir, &material);
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &secondaries,
+        );
+
+        let raw = deployer_config_yaml(&config, &remote, &validators, &secondaries);
+        assert_eq!(raw, serde_yaml::to_string(&config).unwrap());
+        assert!(!raw.contains("bandwidth_weighting"));
+
+        let relayer = secondaries
+            .iter()
+            .find(|secondary| secondary.config.relayer.is_some())
+            .expect("relayer secondary should be present");
+        let mut expected = validators
+            .iter()
+            .map(|validator| validator.public_key_hex.as_str())
+            .collect::<Vec<_>>();
+        expected.extend([relayer.public_key_hex.as_str(), SPAMMER_HOST]);
+        for (weighting, value) in [
+            (BandwidthWeighting::Vpc1, "vpc-1"),
+            (BandwidthWeighting::Ebs1, "ebs-1"),
+        ] {
+            remote.bandwidth_weighting = weighting;
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&deployer_config_yaml(
+                &config,
+                &remote,
+                &validators,
+                &secondaries,
+            ))
+            .unwrap();
+            let weighted = yaml["instances"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|instance| {
+                    let weighting = instance.get("bandwidth_weighting")?;
+                    assert_eq!(weighting.as_str(), Some(value));
+                    instance["name"].as_str()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(weighted, expected);
+            assert_eq!(config.instances.len(), expected.len() + 3);
+            assert!(yaml["monitoring"].get("bandwidth_weighting").is_none());
+        }
     }
 
     #[test]

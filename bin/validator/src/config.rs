@@ -40,6 +40,18 @@ pub(crate) const fn default_upload_budget_bytes() -> u64 {
 
 // A proposal fills the whole block the protocol accepts, and the pool holds several blocks of
 // candidates so a full block is always available under load.
+pub(crate) const fn default_leader_term_length() -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::MIN
+}
+
+pub(crate) const fn default_leader_optimistic_views() -> u64 {
+    16
+}
+
+pub(crate) const fn default_ingress_permits() -> usize {
+    1
+}
+
 pub(crate) const fn default_max_propose_bytes() -> usize {
     MAXIMUM_BLOCK_SIZE
 }
@@ -147,6 +159,26 @@ pub struct ValidatorConfig {
     /// Maximum encoded block bytes, including framing. At most 16 MiB.
     #[serde(default = "default_max_propose_bytes")]
     pub max_propose_bytes: usize,
+    /// Views per leader term. One rotates the leader every view.
+    #[serde(default = "default_leader_term_length")]
+    pub leader_term_length: std::num::NonZeroU32,
+    /// Views a stable leader may run ahead of certified ancestry.
+    #[serde(default = "default_leader_optimistic_views")]
+    pub leader_optimistic_views: u64,
+    /// Threads of a pool used only for ingress verification. Zero shares the main pool.
+    #[serde(default)]
+    pub ingress_rayon_threads: usize,
+    /// Ingress batches admitted to verification at once.
+    #[serde(default = "default_ingress_permits")]
+    pub ingress_permits: usize,
+    /// Whether the mempool serves proposal requests ahead of other queued messages and between
+    /// bounded slices of block-report bookkeeping.
+    #[serde(default)]
+    pub mempool_propose_priority: bool,
+    /// Whether a proposal build ends after a selection round that drops nothing. A build
+    /// otherwise asks the mempool once more.
+    #[serde(default)]
+    pub propose_skip_final_refill: bool,
     /// Maximum mempool size in bytes.
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
@@ -260,6 +292,18 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     /// Maximum encoded block bytes, including framing. At most 16 MiB.
     pub max_propose_bytes: usize,
+    /// Views per leader term. One rotates the leader every view.
+    pub leader_term_length: std::num::NonZeroU32,
+    /// Views a stable leader may run ahead of certified ancestry.
+    pub leader_optimistic_views: u64,
+    /// Threads of a pool used only for ingress verification. Zero shares the main pool.
+    pub ingress_rayon_threads: usize,
+    /// Ingress batches admitted to verification at once.
+    pub ingress_permits: usize,
+    /// Whether the mempool serves proposal requests ahead of other queued messages.
+    pub mempool_propose_priority: bool,
+    /// Whether a proposal build ends after a selection round that drops nothing.
+    pub propose_skip_final_refill: bool,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
@@ -413,6 +457,12 @@ fn decode_with_network(
         http_listen,
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
+        leader_term_length: config.leader_term_length,
+        leader_optimistic_views: config.leader_optimistic_views,
+        ingress_rayon_threads: config.ingress_rayon_threads,
+        ingress_permits: config.ingress_permits,
+        mempool_propose_priority: config.mempool_propose_priority,
+        propose_skip_final_refill: config.propose_skip_final_refill,
         state_page_cache_bytes: config.state_page_cache_bytes,
         history_page_cache_bytes: config.history_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
@@ -726,6 +776,12 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                leader_term_length: crate::config::default_leader_term_length(),
+                leader_optimistic_views: crate::config::default_leader_optimistic_views(),
+                ingress_rayon_threads: 0,
+                ingress_permits: crate::config::default_ingress_permits(),
+                mempool_propose_priority: false,
+                propose_skip_final_refill: false,
                 state_page_cache_bytes: default_state_page_cache_bytes(),
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
@@ -762,6 +818,12 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                leader_term_length: crate::config::default_leader_term_length(),
+                leader_optimistic_views: crate::config::default_leader_optimistic_views(),
+                ingress_rayon_threads: 0,
+                ingress_permits: crate::config::default_ingress_permits(),
+                mempool_propose_priority: false,
+                propose_skip_final_refill: false,
                 state_page_cache_bytes: default_state_page_cache_bytes(),
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),

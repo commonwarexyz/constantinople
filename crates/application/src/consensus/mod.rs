@@ -37,7 +37,15 @@ use commonware_runtime::{
 };
 use commonware_storage::{mmr, qmdb::current::batch::Boundary};
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
-use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 mod body;
 mod db;
@@ -59,6 +67,16 @@ pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Whether a proposal build ends after a selection round that keeps every candidate. A build
+/// otherwise asks the mempool once more. Each application reads this when it is created.
+static PROPOSE_SKIP_FINAL_REFILL: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether proposal builds skip the refill after a round that drops nothing. Call before
+/// the engine creates its application.
+pub fn set_propose_skip_final_refill(enabled: bool) {
+    PROPOSE_SKIP_FINAL_REFILL.store(enabled, Ordering::Relaxed);
+}
 
 /// Exact operation range captured from one finalized QMDB batch.
 pub struct FinalizedRange<D, Op>
@@ -117,6 +135,8 @@ where
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     proposed_transactions: Counter,
+    /// Whether a proposal build ends after a selection round that keeps every candidate.
+    skip_final_refill: bool,
     _marker: PhantomData<(E, C, S, I)>,
 }
 
@@ -139,6 +159,7 @@ where
             genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
+            skip_final_refill: self.skip_final_refill,
             _marker: PhantomData,
         }
     }
@@ -181,6 +202,7 @@ where
             genesis_state_target,
             genesis_transactions_target,
             proposed_transactions,
+            skip_final_refill: PROPOSE_SKIP_FINAL_REFILL.load(Ordering::Relaxed),
             _marker: PhantomData,
         }
     }

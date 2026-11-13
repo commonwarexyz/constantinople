@@ -275,11 +275,13 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 ///
 /// Each refill reports the bytes already included, and the mempool returns
 /// candidates for the headroom left under the proposal budget, so the block
-/// fills toward the budget even when the seed was small. Each round reads only
-/// the accounts it touches for the first time, through `stage` for the first
-/// round and `expand` after, in the selection's key order, so the staged slots
-/// line up with the selection's keys. The loop ends when the mempool has
-/// nothing left that fits or the build deadline passes.
+/// fills toward the budget even when the seed was small. The loop ends when
+/// the mempool has nothing left that fits or the build deadline passes. With
+/// `skip_final_refill`, it also ends after a round that drops nothing.
+///
+/// Each round reads only the accounts it touches for the first time, through
+/// `stage` for the first round and `expand` after, in the selection's key
+/// order, so the staged slots line up with the selection's keys.
 ///
 /// After settlement, history entries take their indices from the final account
 /// counts and append in block order while state merkleization runs. An empty
@@ -296,6 +298,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     round: Round,
     candidates: Vec<LazySignedTransaction<H>>,
     input: &mut I,
+    skip_final_refill: bool,
 ) -> ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
@@ -439,6 +442,13 @@ where
         select_span.record("dropped", dropped_bytes.traced());
 
         if clock.current() >= deadline {
+            break;
+        }
+
+        // The mempool serves whole batches while they fit the headroom it is told about, so a
+        // non-empty round that kept every candidate left less headroom than its next batch and
+        // another request would come back empty unless the pool was dry and refilled meanwhile.
+        if skip_final_refill && dropped_bytes == 0 {
             break;
         }
 

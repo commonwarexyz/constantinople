@@ -22,7 +22,13 @@ use constantinople_primitives::{
     Account, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey, TransactionSignature,
     VerifiedTransaction, verify_transactions,
 };
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::{Semaphore, oneshot};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info_span;
@@ -54,6 +60,15 @@ const MIN_U64_VARINT_BYTES: usize = 1;
 /// cannot release it while the job runs.
 pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
 
+/// Ingress batches admitted to verification at once, when overridden at startup.
+pub(super) static INGRESS_PERMITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_CONCURRENT_INGRESS);
+
+/// Whether the actor serves proposal requests ahead of other queued messages and between bounded
+/// slices of block-report bookkeeping.
+pub(super) static PROPOSE_PRIORITY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, St>
 where
@@ -65,6 +80,12 @@ where
     pub mailbox: Mailbox<C, P, H>,
     pub namespace: &'static [u8],
     pub max_batch_bytes: usize,
+    /// Bytes the background lane may hold, with one maximum proposal reserved
+    /// for foreground submissions.
+    pub background_capacity: usize,
+    /// Bytes queued in the background lane, as of the actor's last processed
+    /// message.
+    pub background_bytes: Arc<AtomicUsize>,
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub account_reader: AccountReaderCell,
@@ -136,12 +157,13 @@ fn ok_json<T: serde::Serialize>(value: &T) -> (StatusCode, String) {
 /// Blocks until the batch is fully finalized, partially finalized, or dropped.
 ///
 /// Returns:
-/// - `200 OK` with JSON status on finalization or drop.
+/// - `200 OK` with JSON status on finalization or drop. A batch the pool has
+///   no room for is dropped.
 /// - `400 Bad Request` if the body is empty, any transaction fails to decode,
 ///   or any signature is invalid.
 /// - `413 Payload Too Large` if the batch exceeds the transaction byte budget
 ///   derived from the server's encoded-block limit.
-/// - `503 Service Unavailable` if the pool is full.
+/// - `503 Service Unavailable` if the actor's mailbox is full.
 async fn submit_batch<C, P, H, St>(
     State(state): State<SharedState<C, P, H, St>>,
     body: Bytes,
@@ -192,6 +214,10 @@ where
 }
 
 /// Accepts a batch through the background lane and waits for its outcome.
+///
+/// Answers like [`submit_batch`], except that a batch refused because the
+/// lane has no room right now gets `503 Service Unavailable` so the client
+/// retries it. A batch that cannot fit the empty lane is still dropped.
 async fn submit_background_batch<C, P, H, St>(
     State(state): State<SharedState<C, P, H, St>>,
     body: Bytes,
@@ -202,6 +228,15 @@ where
     H: Hasher,
     St: Strategy,
 {
+    // A batch that would fit the empty lane but not the bytes left in it is
+    // refused before its signatures are verified. The reading may be stale, so
+    // the actor still decides admission for every batch that passes.
+    let queued = state.background_bytes.load(Ordering::Relaxed);
+    if body.len() <= state.background_capacity
+        && body.len() > state.background_capacity.saturating_sub(queued)
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    }
     submit_in_lane(state, body, SubmissionLane::Background).await
 }
 
@@ -229,10 +264,16 @@ where
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
 
-    result_rx.await.map_or_else(
-        |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-        |status| ok_json(&status),
-    )
+    // A background waiter closed without an answer means the actor holds
+    // nothing for it, most often because it refused the batch for lack of
+    // room, so the client retries the batch.
+    match result_rx.await {
+        Ok(status) => ok_json(&status),
+        Err(_) if lane == SubmissionLane::Background => {
+            (StatusCode::SERVICE_UNAVAILABLE, String::new())
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+    }
 }
 
 struct VerifiedBatch<H>
@@ -447,7 +488,7 @@ mod tests {
             TxStatus,
             mailbox::{Message, SubmissionLane},
         },
-        AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router,
+        AppState, AtomicUsize, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router,
     };
     use axum::{
         body::Body,
@@ -473,11 +514,22 @@ mod tests {
         context: impl Metrics,
         max_batch_bytes: usize,
     ) -> (axum::Router, mpsc::Receiver<TestMessage>) {
+        test_router_with_background(context, max_batch_bytes, usize::MAX, 0)
+    }
+
+    fn test_router_with_background(
+        context: impl Metrics,
+        max_batch_bytes: usize,
+        background_capacity: usize,
+        background_bytes: usize,
+    ) -> (axum::Router, mpsc::Receiver<TestMessage>) {
         let (sender, receiver) = mpsc::channel(1);
         let state = Arc::new(AppState {
             mailbox: super::super::mailbox::Mailbox::new(sender),
             namespace: HTTP_TEST_NAMESPACE,
             max_batch_bytes,
+            background_capacity,
+            background_bytes: Arc::new(AtomicUsize::new(background_bytes)),
             strategy: Sequential,
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -617,6 +669,97 @@ mod tests {
             }
 
             let response = request_task.await.expect("request task should finish");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn unanswered_submission_status_depends_on_lane() {
+        for (uri, expected) in [
+            ("/transactions/background", StatusCode::SERVICE_UNAVAILABLE),
+            ("/transactions", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            commonware_runtime::tokio::Runner::default().start(|context| async move {
+                let (app, mut receiver) = test_router_with_receiver(context, 4 * 1024 * 1024);
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::from(signed_body(1)))
+                    .expect("request should build");
+                let request_task = tokio::spawn(async move {
+                    app.oneshot(request).await.expect("router should respond")
+                });
+
+                // The actor closes a waiter without an answer when it keeps nothing for it.
+                let Message::Submit { result, .. } =
+                    receiver.recv().await.expect("submission should arrive")
+                else {
+                    panic!("expected submission");
+                };
+                drop(result);
+                let response = request_task.await.expect("request task should finish");
+
+                assert_eq!(response.status(), expected, "{uri}");
+            });
+        }
+    }
+
+    #[test]
+    fn full_background_lane_refuses_before_verification() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let body = signed_body(4);
+            let capacity = 2 * body.len();
+            let (app, mut receiver) = test_router_with_background(
+                context,
+                4 * 1024 * 1024,
+                capacity,
+                capacity - body.len() + 1,
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions/background")
+                .body(Body::from(body))
+                .expect("request should build");
+
+            let response = app.oneshot(request).await.expect("router should respond");
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                receiver.try_recv().is_err(),
+                "a refused batch must not reach the actor"
+            );
+        });
+    }
+
+    #[test]
+    fn batch_larger_than_background_lane_reaches_actor() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let body = signed_body(4);
+            let capacity = body.len() - 1;
+            let (app, mut receiver) =
+                test_router_with_background(context, 4 * 1024 * 1024, capacity, capacity);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions/background")
+                .body(Body::from(body))
+                .expect("request should build");
+            let request_task =
+                tokio::spawn(
+                    async move { app.oneshot(request).await.expect("router should respond") },
+                );
+
+            // The actor, not the early check, decides a batch the empty lane cannot hold.
+            let Message::Submit { result, .. } =
+                receiver.recv().await.expect("submission should arrive")
+            else {
+                panic!("expected submission");
+            };
+            result
+                .expect("blocking submission should have a waiter")
+                .send(TxStatus::Dropped)
+                .expect("handler should await the result");
+            let response = request_task.await.expect("request task should finish");
+
             assert_eq!(response.status(), StatusCode::OK);
         });
     }

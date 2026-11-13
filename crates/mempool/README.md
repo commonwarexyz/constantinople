@@ -13,7 +13,7 @@ from the background queue. Each queue preserves arrival order.
 | Endpoint | Queue | Response |
 | --- | --- | --- |
 | `POST /transactions` | Foreground | Waits for a terminal transaction status. |
-| `POST /transactions/background` | Background | Waits for a terminal transaction status. |
+| `POST /transactions/background` | Background | Waits for a terminal transaction status. Answers 503 while the queue has no room for the batch. |
 | `POST /transactions/ingest` | Foreground | Returns after admission. |
 
 The relayer sends normal user submissions to the foreground endpoint and pinned

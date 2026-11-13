@@ -11,10 +11,16 @@ usage() {
     echo "  Credentials may also use CONSTANTINOPLE_STORE_API_KEY and CONSTANTINOPLE_ADAPTER_STORE_API_KEY." >&2
     echo "  --validators <count>                    default 50" >&2
     echo "  --regions <comma-separated-regions>     default us-east-1,us-west-2" >&2
-    echo "  --spammer-accounts <count>              default 4096" >&2
-    echo "  --spammer-submitters <count>            default validator count" >&2
-    echo "  --max-pool-bytes <bytes>                default deploy CLI value" >&2
-    echo "  --storage-size <gib>                    default 150" >&2
+    echo "  --leader <rotating|stable>              default rotating" >&2
+    echo "      rotating: a new leader every view" >&2
+    echo "      stable: one leader per 1000000-view term with mempool proposal priority" >&2
+    echo "  --bandwidth-weighting <default|vpc-1|ebs-1>" >&2
+    echo "                                          default vpc-1 on validators, relayer, and spammer" >&2
+    echo "  --max-propose-bytes <bytes>             default 16777216 rotating, 8388608 stable" >&2
+    echo "  --spammer-accounts <count>              default derived from the block cap, 12700 at 16 MiB" >&2
+    echo "  --spammer-submitters <count>            default 500 rotating, 200 stable" >&2
+    echo "  --max-pool-bytes <bytes>                default deploy CLI value rotating, 536870912 stable" >&2
+    echo "  --storage-size <gib>                    default 300" >&2
 }
 
 reset_options() {
@@ -24,10 +30,15 @@ reset_options() {
     ADAPTER_STORE_API_KEY=${CONSTANTINOPLE_ADAPTER_STORE_API_KEY:-}
     VALIDATORS=50
     REGIONS=us-east-1,us-west-2
-    SPAMMER_ACCOUNTS=4096
+    LEADER=rotating
+    BANDWIDTH_WEIGHTING=vpc-1
+    MAX_PROPOSE_BYTES=
+    SPAMMER_ACCOUNTS=
     SPAMMER_SUBMITTERS=
     MAX_POOL_BYTES=
-    STORAGE_SIZE=150
+    # Validators retain up to about 10,500 blocks, which is 164 GiB of full
+    # 16 MiB blocks, beside their state.
+    STORAGE_SIZE=300
     GENERATE_ARGS=()
     # The indexer runs the validator binary, which is built for the validators'
     # CPU model (see docker/docker-bake.hcl). Keep it on the same vendor.
@@ -61,8 +72,17 @@ parse_options() {
             --regions)
                 target=REGIONS
                 ;;
+            --leader)
+                target=LEADER
+                ;;
+            --bandwidth-weighting)
+                target=BANDWIDTH_WEIGHTING
+                ;;
             --spammer-accounts)
                 target=SPAMMER_ACCOUNTS
+                ;;
+            --max-propose-bytes)
+                target=MAX_PROPOSE_BYTES
                 ;;
             --spammer-submitters)
                 target=SPAMMER_SUBMITTERS
@@ -99,13 +119,75 @@ prepare_deployment() {
         return 2
     fi
 
+    # Each spammer stream holds one Tokio blocking thread for its presigner, and
+    # the spammer runtime allows 512, so the defaults stay below that.
+    local leader_args
+    local default_submitters
+    local default_max_propose_bytes
+    local default_max_pool_bytes=
+    case "$LEADER" in
+        rotating)
+            leader_args=(--leader-term-length 1)
+            default_submitters=500
+            default_max_propose_bytes=16777216
+            ;;
+        stable)
+            leader_args=(
+                --leader-term-length 1000000
+                --leader-optimistic-views 16
+                --mempool-propose-priority
+                --propose-skip-final-refill
+            )
+            default_submitters=200
+            # A stable leader gains no throughput from larger blocks, and
+            # smaller ones finalize sooner.
+            default_max_propose_bytes=8388608
+            # Every stream sends to the one leader, whose pool must hold a
+            # batch from each stream or it drops the rest on arrival.
+            default_max_pool_bytes=536870912
+            ;;
+        *)
+            echo "--leader must be rotating or stable" >&2
+            usage
+            return 2
+            ;;
+    esac
+
+    case "$BANDWIDTH_WEIGHTING" in
+        default|vpc-1|ebs-1)
+            ;;
+        *)
+            echo "--bandwidth-weighting must be default, vpc-1, or ebs-1" >&2
+            usage
+            return 2
+            ;;
+    esac
+
+    local max_propose_bytes=${MAX_PROPOSE_BYTES:-$default_max_propose_bytes}
+    if ! [[ "$max_propose_bytes" =~ ^[1-9][0-9]*$ ]]; then
+        echo "--max-propose-bytes must be a positive integer" >&2
+        return 2
+    fi
+
+    # A block holds at least one spammer transfer per 150 bytes of its cap. The
+    # default batch is the largest multiple of 100 accounts for which eight
+    # batches at their largest jittered size, the accounts plus a tenth, fit in
+    # one block.
+    local block_transfers=$((max_propose_bytes / 150))
+    local default_accounts=$((block_transfers / 8 * 10 / 11 / 100 * 100))
+
+    # Two signed batches per stream bound the spammer's memory at these stream
+    # counts.
     GENERATE_ARGS=(
         --validators "$VALIDATORS"
         --relayer
         --spammer
         --indexer
-        --spammer-accounts "$SPAMMER_ACCOUNTS"
+        "${leader_args[@]}"
+        --spammer-accounts "${SPAMMER_ACCOUNTS:-$default_accounts}"
+        --spammer-submitters "${SPAMMER_SUBMITTERS:-$default_submitters}"
         --spammer-accounts-jitter 0.1
+        --spammer-presigned-batches 2
         --spammer-rayon-threads 14
         --worker-threads 3
         --rayon-threads 13
@@ -113,16 +195,15 @@ prepare_deployment() {
         --indexer-rayon-threads 12
         --indexer-publisher-rayon-threads 4
         --public-key-cache-size 5000000
-        --max-propose-bytes 16777216
+        --max-propose-bytes "$max_propose_bytes"
     )
 
-    if [ -n "$SPAMMER_SUBMITTERS" ]; then
-        GENERATE_ARGS+=(--spammer-submitters "$SPAMMER_SUBMITTERS")
+    local max_pool_bytes=${MAX_POOL_BYTES:-$default_max_pool_bytes}
+    if [ -n "$max_pool_bytes" ]; then
+        GENERATE_ARGS+=(--max-pool-bytes "$max_pool_bytes")
     fi
 
-    if [ -n "$MAX_POOL_BYTES" ]; then
-        GENERATE_ARGS+=(--max-pool-bytes "$MAX_POOL_BYTES")
-    fi
+    REMOTE_ARGS+=(--bandwidth-weighting "$BANDWIDTH_WEIGHTING")
 
     if [ -n "$STORE_URL" ]; then
         REMOTE_ARGS+=(--store-url "$STORE_URL")

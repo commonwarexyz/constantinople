@@ -85,6 +85,7 @@ where
             context.round,
             seed,
             input,
+            self.skip_final_refill,
         )
         .await;
 

@@ -6,7 +6,10 @@ use crate::{
     state_reader::StateDbReader,
 };
 use commonware_codec::Encode;
-use commonware_consensus::{simplex::elector::RoundRobin, types::Epoch};
+use commonware_consensus::{
+    simplex::elector::{Config as ElectorConfig, RoundRobin},
+    types::{Epoch, TermLength, ViewDelta},
+};
 use commonware_cryptography::{
     ChaCha20Poly1305, bls12381::primitives::variant::MinSig, certificate::ConstantProvider,
     sha256::Sha256,
@@ -56,6 +59,39 @@ use std::{
 use tracing::info;
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
+
+/// Views per leader term and the optimistic lookahead, set from the validator config before the
+/// engine starts.
+static LEADER_TERMS: OnceLock<(NonZeroU32, u64)> = OnceLock::new();
+
+/// A round-robin elector whose term structure comes from the validator config.
+#[derive(Clone)]
+struct TermedRoundRobin(RoundRobin<Sha256>);
+
+impl Default for TermedRoundRobin {
+    fn default() -> Self {
+        let (length, optimistic_views) = LEADER_TERMS
+            .get()
+            .copied()
+            .expect("leader terms must be set before the engine starts");
+        if length.get() == 1 {
+            return Self(RoundRobin::default());
+        }
+        Self(RoundRobin::default().with_term(
+            TermLength::new(length),
+            Duration::from_secs(12),
+            ViewDelta::new(optimistic_views),
+        ))
+    }
+}
+
+impl<S: commonware_cryptography::certificate::Scheme> ElectorConfig<S> for TermedRoundRobin {
+    type Elector = <RoundRobin<Sha256> as ElectorConfig<S>>::Elector;
+
+    fn build(self, participants: &Set<S::PublicKey>) -> Self::Elector {
+        self.0.build(participants)
+    }
+}
 
 const STATE_SYNC_APPLY_BATCH_SIZE: NonZeroU64 = NZU64!(1024);
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
@@ -143,6 +179,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         http_listen,
         metrics_listen,
         max_propose_bytes,
+        leader_term_length,
+        leader_optimistic_views,
+        ingress_rayon_threads,
+        ingress_permits,
+        mempool_propose_priority,
+        propose_skip_final_refill,
         max_pool_bytes,
         state_page_cache_bytes,
         history_page_cache_bytes,
@@ -153,6 +195,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         indexer,
         relayer,
     } = config;
+
+    LEADER_TERMS
+        .set((leader_term_length, leader_optimistic_views))
+        .expect("leader terms must be set once");
+    webserver::set_ingress_permits(ingress_permits);
+    webserver::set_propose_priority(mempool_propose_priority);
+    constantinople_application::consensus::set_propose_skip_final_refill(propose_skip_final_refill);
 
     let transaction_budget = max_transaction_bytes(max_propose_bytes)
         .expect("configured encoded block budget must be valid");
@@ -190,6 +239,23 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             "starting validator"
         );
         let strategy = context.strategy(NZUsize!(rayon_threads));
+        let ingress_strategy = if ingress_rayon_threads > 0 {
+            context.child("ingress_pool").strategy(
+                NonZeroUsize::new(ingress_rayon_threads)
+                    .expect("ingress pool must have at least one thread"),
+            )
+        } else {
+            strategy.clone()
+        };
+        info!(
+            leader_term_length,
+            leader_optimistic_views,
+            ingress_rayon_threads,
+            ingress_permits,
+            mempool_propose_priority,
+            propose_skip_final_refill,
+            "experiment knobs"
+        );
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),
             NonZeroUsize::new(public_key_cache_size)
@@ -280,7 +346,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
         let network_handle = network.start();
 
-        let relayer_view = relayer.as_ref().map(|_| crate::relayer::Observer::new());
+        let relayer_view = relayer
+            .as_ref()
+            .map(|_| crate::relayer::Observer::new(TermLength::new(leader_term_length)));
         let relayer_view_clock = relayer_view
             .as_ref()
             .map(|(_, view_clock)| view_clock.clone());
@@ -295,7 +363,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes: transaction_budget,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: mempool_drop_grace_blocks,
-                strategy: strategy.clone(),
+                strategy: ingress_strategy,
                 public_key_cache: public_key_cache.clone(),
             },
             mempool_mailbox.clone(),
@@ -364,7 +432,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             _,
             Sha256,
             MinSig,
-            RoundRobin<Sha256>,
+            TermedRoundRobin,
             Rayon,
             _,
             crate::relayer::Observer,
