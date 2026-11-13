@@ -2228,21 +2228,27 @@ function formatObservedTxPerSecond(
  * enters all three in the same frame.
  */
 function HomeFeed({ feed, onOpenBlock }: { feed: FeedState; onOpenBlock: (height: bigint) => void }) {
-    const [now, setNow] = useState(Date.now);
+    // Blocks released by the last frame that released any. A frame that releases none leaves the
+    // count unchanged and renders nothing.
+    const [released, setReleased] = useState(() => shownCount(feed, Date.now()));
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const shown = reducedMotion ? feed.totalBlocksObserved : shownCount(feed, now);
+
+    // A batch that has just arrived shows what its pace releases on arrival before any frame runs.
+    const shown = reducedMotion
+        ? feed.totalBlocksObserved
+        : Math.min(feed.totalBlocksObserved, Math.max(released, shownCount(feed, feed.pace.at ?? 0)));
     const { blocks, totalTxObserved, totalBlocksObserved } = useMemo(() => shownFeed(feed, shown), [feed, shown]);
 
-    // The clock runs only while blocks wait to be released.
+    // Frames run only while blocks wait to be released.
     const releasing = shown < feed.totalBlocksObserved;
     useEffect(() => {
         if (!releasing) return;
         let frame = requestAnimationFrame(function step() {
-            setNow(Date.now());
+            setReleased(shownCount(feed, Date.now()));
             frame = requestAnimationFrame(step);
         });
         return () => cancelAnimationFrame(frame);
-    }, [releasing]);
+    }, [releasing, feed]);
 
     // A row's fade lasts at most two arrivals, so quick blocks do not leave the top rows dim.
     const twoArrivalsMs = feed.pace.rate > 0 ? 2 / feed.pace.rate : null;
