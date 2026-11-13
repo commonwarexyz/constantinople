@@ -746,7 +746,8 @@ export default function App() {
             // Read again when a finalization arrived during the previous read.
             do {
                 refresh.again = false;
-                if (behind === 0) setAccountMessage('loading account proof');
+                // A wallet that is behind already reads `updating` under its balance.
+                if (accountFloorRef.current === 0n) setAccountMessage('loading account proof');
 
                 // A snapshot certified below the floor, or no account at all, predates a
                 // transaction this wallet has already verified, so the indexer has not
