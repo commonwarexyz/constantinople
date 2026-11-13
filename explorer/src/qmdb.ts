@@ -13,6 +13,9 @@ const MAX_BLOCK_TIMESTAMP_MS = 7_258_118_400_000n;
 
 export const MAX_ANCESTRY_HEADERS = 4096;
 export const MAX_EXECUTION_HEADER_BYTES = 512;
+
+/** Most transactions the indexer returns on one account or block page. */
+export const TRANSACTION_PAGE = 50n;
 export const MAX_FINALIZATION_CERTIFICATE_BYTES = 16 * 1024;
 
 export interface VerifiedTransactionProof {

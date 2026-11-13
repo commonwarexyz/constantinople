@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { accountCursor, accountHistoryPage, type AccountHistoryTransaction } from '../src/accountPage.ts';
 import { fromHex } from '../src/codec.ts';
-import { decodeAccountValue } from '../src/qmdb.ts';
+import { decodeAccountValue, TRANSACTION_PAGE } from '../src/qmdb.ts';
 
 const account = '11'.repeat(32);
 const other = '22'.repeat(32);
@@ -17,7 +17,7 @@ test('account values authenticate four exact big-endian u64 fields', () => {
     }
 });
 
-function transactions(end: bigint, count = Number(end > 10n ? 10n : end)): AccountHistoryTransaction[] {
+function transactions(end: bigint, count = Number(end > TRANSACTION_PAGE ? TRANSACTION_PAGE : end)): AccountHistoryTransaction[] {
     return Array.from({ length: count }, (_, offset) => {
         const index = end - 1n - BigInt(offset);
         const sent = offset % 2 === 0;
@@ -38,14 +38,14 @@ test('account cursors encode the exclusive account index as an eight-byte big-en
 });
 
 test('a complete page derives its descending indices and next boundary from the account count', () => {
-    const input = transactions(58n);
-    const page = accountHistoryPage(account, 58n, null, accountCursor(48n), input);
-    assert.deepEqual(page.rows.map((row) => row.accountIndex), Array.from({ length: 10 }, (_, i) => 57n - BigInt(i)));
-    assert.deepEqual(page.nextCursor, accountCursor(48n));
+    const input = transactions(108n);
+    const page = accountHistoryPage(account, 108n, null, accountCursor(58n), input);
+    assert.deepEqual(page.rows.map((row) => row.accountIndex), Array.from({ length: 50 }, (_, i) => 107n - BigInt(i)));
+    assert.deepEqual(page.nextCursor, accountCursor(58n));
     assert.deepEqual(page.rows.map((row) => [row.senderIndex, row.recipientIndex]), input.map((row) => [row.senderIndex, row.recipientIndex]));
     assert.ok(page.rows.every((row) => !('height' in row) && !('blockIndex' in row)));
-    const next = accountHistoryPage(account, 58n, page.nextCursor, accountCursor(38n), transactions(48n));
-    assert.equal(next.rows[0]!.accountIndex, 47n);
+    const next = accountHistoryPage(account, 108n, page.nextCursor, accountCursor(8n), transactions(58n));
+    assert.equal(next.rows[0]!.accountIndex, 57n);
     assert.ok(next.rows.every((row) => !page.rows.some((prior) => prior.digest === row.digest)));
 });
 
@@ -59,14 +59,14 @@ test('short and exhausted pages cover the exact remaining interval', () => {
 
 test('a page of one role is complete verification evidence like any other page', () => {
     const input = transactions(58n).map((row) => ({ ...row, sender: account, recipient: other, senderIndex: row.role === 0 ? row.senderIndex : row.recipientIndex, role: 0 }));
-    const page = accountHistoryPage(account, 58n, null, accountCursor(48n), input);
-    assert.equal(page.rows.length, 10);
+    const page = accountHistoryPage(account, 58n, null, accountCursor(8n), input);
+    assert.equal(page.rows.length, 50);
     assert.ok(page.rows.every((row) => row.direction === 'sent' && row.counterparty === other));
-    assert.deepEqual(page.nextCursor, accountCursor(48n));
+    assert.deepEqual(page.nextCursor, accountCursor(8n));
     const forged = structuredClone(input);
     forged[7]!.senderIndex++;
-    assert.throws(() => accountHistoryPage(account, 58n, null, accountCursor(48n), forged), /exact descending interval/);
-    assert.throws(() => accountHistoryPage(account, 58n, null, accountCursor(48n), input.slice(0, 9)), /cover/);
+    assert.throws(() => accountHistoryPage(account, 58n, null, accountCursor(8n), forged), /exact descending interval/);
+    assert.throws(() => accountHistoryPage(account, 58n, null, accountCursor(8n), input.slice(0, 49)), /cover/);
 });
 
 test('a self-transfer is one sent row with equal participant indices', () => {
@@ -81,7 +81,7 @@ test('a self-transfer is one sent row with equal participant indices', () => {
 
 for (const [name, mutate, expected] of [
     ['omission', (rows: AccountHistoryTransaction[]) => { rows.splice(4, 1); }, /cover/],
-    ['extra row', (rows: AccountHistoryTransaction[]) => { rows.push(rows[9]!); }, /cover/],
+    ['extra row', (rows: AccountHistoryTransaction[]) => { rows.push(rows.at(-1)!); }, /cover/],
     ['repeated digest at a distinct location', (rows: AccountHistoryTransaction[]) => { rows[1] = { ...rows[1]!, digest: rows[0]!.digest }; }, /repeats/],
     ['equal locations', (rows: AccountHistoryTransaction[]) => { rows[1] = { ...rows[1]!, location: rows[0]!.location }; }, /repeats|reorders/],
     ['increasing locations', (rows: AccountHistoryTransaction[]) => { rows[1] = { ...rows[1]!, location: rows[0]!.location + 1n }; }, /reorders/],
@@ -94,13 +94,13 @@ for (const [name, mutate, expected] of [
     test(`account history rejects ${name}`, () => {
         const rows = transactions(58n);
         mutate(rows);
-        assert.throws(() => accountHistoryPage(account, 58n, null, accountCursor(48n), rows), expected);
+        assert.throws(() => accountHistoryPage(account, 58n, null, accountCursor(8n), rows), expected);
     });
 }
 
 test('claimed early end, wrong continuation and out-of-range cursor fail', () => {
     const rows = transactions(58n);
-    for (const claimed of [null, accountCursor(49n), new Uint8Array(24)]) {
+    for (const claimed of [null, accountCursor(9n), new Uint8Array(24)]) {
         assert.throws(() => accountHistoryPage(account, 58n, null, claimed, rows), /next cursor/);
     }
     assert.throws(() => accountHistoryPage(account, 58n, accountCursor(59n), null, rows), /exceeds/);

@@ -62,11 +62,8 @@ use std::{
 mod browse;
 mod rpc;
 
-/// Maximum transactions returned on one account activity page.
-const ACCOUNT_PAGE: usize = 10;
-
-/// Maximum transactions returned on one block page.
-const BLOCK_PAGE: u64 = 50;
+/// Maximum transactions returned on one account activity page or one block page.
+const TRANSACTION_PAGE: u64 = 50;
 
 /// Maximum parent headers linking a certificate to the requested block's parent.
 const MAX_HEADERS: u64 = 4096;
@@ -635,7 +632,7 @@ impl Explorer {
         if end > account.value.tx_count {
             return Err(Failure::bad("cursor exceeds the proven account count"));
         }
-        let lower = end.saturating_sub(ACCOUNT_PAGE as u64);
+        let lower = end.saturating_sub(TRANSACTION_PAGE);
         let expected_count = (end - lower) as usize;
         let next = (lower > 0).then(|| Cursor(lower).encode());
         if expected_count == 0 {
@@ -1027,7 +1024,7 @@ async fn block(explorer: &Explorer, request: proto::GetBlockRequest) -> Result<B
     if offset > count {
         return Err(Failure::bad("block offset exceeds transaction count"));
     }
-    let page_end = offset.saturating_add(BLOCK_PAGE).min(count);
+    let page_end = offset.saturating_add(TRANSACTION_PAGE).min(count);
     if page_end > u64::from(u32::MAX) {
         return Err(Failure::limit("block index exceeds supported range"));
     }

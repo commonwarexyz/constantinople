@@ -182,7 +182,7 @@ must be installed. Browser clients use generated TypeScript bindings.
 
 | Method | Request | Result |
 | ------ | ------- | ------ |
-| `GetAccount` | 32-byte account; optional 8-byte exclusive-end cursor; paired snapshot height/digest and account location for continuation; activity flag | Historical account update proof, inclusion ancestry, and an exact complete page of up to ten transactions. |
+| `GetAccount` | 32-byte account; optional 8-byte exclusive-end cursor; paired snapshot height/digest and account location for continuation; activity flag | Historical account update proof, inclusion ancestry, and an exact complete page of up to fifty transactions. |
 | `GetBlock` | Positive height and optional offset | Up to 50 consecutive transactions, with a certificate and ancestry proving the block's own transaction interval. |
 | `GetTransaction` | 32-byte transaction digest | One transaction with its exact inclusion height and proof. |
 | `Search` | One 32-byte identity | One indexed account or transaction navigation hint. |
@@ -237,7 +237,7 @@ snapshot height, digest, and account operation location to retain the same
 proven account version while publication advances.
 
 Account pages seek directly over their authenticated index interval and read
-at most ten activity rows. Missing, reordered, or mismatched indices fail the
+at most fifty activity rows. Missing, reordered, or mismatched indices fail the
 response. Every page is complete: a sent-only or received-only page could not prove
 that it omitted nothing.
 
