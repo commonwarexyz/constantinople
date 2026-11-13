@@ -2,18 +2,16 @@
 /* eslint-disable */
 
 /**
- * Authenticate one fixed account lookup, returning a hit or miss and throwing on failure.
- *
- * A miss carries the location of the operation whose key span excludes the key and, unless the
- * database was empty, the bracketing `lower` and `upper` active keys.
+ * Authenticate one fixed account update, returning `{location, key, value}` and throwing on
+ * failure.
  */
-export function verify_current_account_lookup(proof: Uint8Array, root: Uint8Array, key: Uint8Array, expected_tip: bigint, encoded_operation: Uint8Array | null | undefined, exclusion: boolean): any;
+export function verify_current_account_lookup(proof: Uint8Array, root: Uint8Array, key: Uint8Array, expected_tip: bigint, encoded_operation: Uint8Array): any;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly verify_current_account_lookup: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => [number, number, number];
+    readonly verify_current_account_lookup: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number) => [number, number, number];
     readonly rust_zstd_wasm_shim_calloc: (a: number, b: number) => number;
     readonly rust_zstd_wasm_shim_free: (a: number) => void;
     readonly rust_zstd_wasm_shim_malloc: (a: number) => number;

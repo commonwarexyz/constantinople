@@ -83,7 +83,7 @@ struct Lookup {
     root: Vec<u8>,
     key: Vec<u8>,
     tip: u64,
-    operation: Option<Vec<u8>>,
+    operation: Vec<u8>,
 }
 
 impl Lookup {
@@ -92,14 +92,7 @@ impl Lookup {
     }
 
     fn verify_bytes(&self, proof: &[u8]) -> Result<VerifiedAccountLookup, Error> {
-        verify_current_account_lookup(
-            proof,
-            &self.root,
-            &self.key,
-            self.tip,
-            self.operation.clone(),
-            self.operation.is_none(),
-        )
+        verify_current_account_lookup(proof, &self.root, &self.key, self.tip, &self.operation)
     }
 }
 
@@ -111,11 +104,9 @@ async fn inclusion(db: &TestDb, requested: AccountKey) -> Lookup {
         root: db.root().as_ref().to_vec(),
         key: requested.as_ref().to_vec(),
         tip: db.bounds().end.as_u64() - 1,
-        operation: Some(
-            AccountOperation::Update(Update(requested, account))
-                .encode()
-                .to_vec(),
-        ),
+        operation: AccountOperation::Update(Update(requested, account))
+            .encode()
+            .to_vec(),
     }
 }
 
@@ -124,12 +115,9 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
     deterministic::Runner::default().start(|context| async move {
         let db = write(database(context).await, &[(key(10), Some(account(7)))]).await;
         let mut lookup = inclusion(&db, key(10)).await;
-        assert!(matches!(
-            lookup.verify().unwrap(),
-            VerifiedAccountLookup::Present { key: found, account: value, .. }
-                if found == key(10) && value == account(7)
-        ));
-        assert_eq!(lookup.operation.as_ref().unwrap().len(), 65);
+        let verified = lookup.verify().unwrap();
+        assert_eq!((verified.key, verified.account), (key(10), account(7)));
+        assert_eq!(lookup.operation.len(), 65);
         for end in 0..lookup.proof.len() {
             assert!(lookup.verify_bytes(&lookup.proof[..end]).is_err());
         }
@@ -156,31 +144,8 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
                 &lookup.proof,
                 &lookup.root,
                 &lookup.key,
-                lookup.tip,
-                lookup.operation.clone(),
-                true
-            ),
-            Err(Error::InvalidClaim)
-        );
-        assert_eq!(
-            verify_current_account_lookup(
-                &lookup.proof,
-                &lookup.root,
-                &lookup.key,
-                lookup.tip,
-                None,
-                false
-            ),
-            Err(Error::InvalidClaim)
-        );
-        assert_eq!(
-            verify_current_account_lookup(
-                &lookup.proof,
-                &lookup.root,
-                &lookup.key,
                 u64::MAX,
-                lookup.operation.clone(),
-                false
+                &lookup.operation,
             ),
             Err(Error::WrongBoundary)
         );
@@ -190,8 +155,7 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
                 &lookup.root[..31],
                 &lookup.key,
                 lookup.tip,
-                lookup.operation.clone(),
-                false
+                &lookup.operation,
             )
             .is_err()
         );
@@ -203,8 +167,7 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
                 &trailing_root,
                 &lookup.key,
                 lookup.tip,
-                lookup.operation.clone(),
-                false
+                &lookup.operation,
             )
             .is_err()
         );
@@ -214,8 +177,7 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
                 &lookup.root,
                 &lookup.key[..31],
                 lookup.tip,
-                lookup.operation.clone(),
-                false
+                &lookup.operation,
             )
             .is_err()
         );
@@ -227,19 +189,17 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
                 &lookup.root,
                 &trailing_key,
                 lookup.tip,
-                lookup.operation.clone(),
-                false
+                &lookup.operation,
             )
             .is_err()
         );
 
-        let operation = lookup.operation.as_mut().unwrap();
-        operation[33] ^= 1;
+        lookup.operation[33] ^= 1;
         assert_eq!(lookup.verify(), Err(Error::VerificationFailed));
-        lookup.operation.as_mut().unwrap()[33] ^= 1;
-        lookup.operation.as_mut().unwrap()[64] ^= 1;
+        lookup.operation[33] ^= 1;
+        lookup.operation[64] ^= 1;
         assert_eq!(lookup.verify(), Err(Error::VerificationFailed));
-        lookup.operation.as_mut().unwrap()[64] ^= 1;
+        lookup.operation[64] ^= 1;
         let mut proof = AccountOperationProof::decode_cfg(Copying(&lookup.proof), &122).unwrap();
         let bit = proof.loc.as_u64() % (ACCOUNT_CHUNK_BYTES as u64 * 8);
         proof.chunk[(bit / 8) as usize] &= !(1 << (bit % 8));
@@ -276,44 +236,16 @@ fn inclusion_rejects_wrong_context_and_malformed_encodings() {
         );
 
         let delete = AccountOperation::Delete(key(10)).encode().to_vec();
-        lookup.operation = Some(delete.clone());
+        lookup.operation = delete.clone();
         assert_eq!(lookup.verify(), Err(Error::WrongAccount));
         let mut bad_padding = delete;
         *bad_padding.last_mut().unwrap() = 1;
-        lookup.operation = Some(bad_padding);
+        lookup.operation = bad_padding;
         assert_eq!(lookup.verify(), Err(Error::InvalidEncoding));
-        lookup.operation = Some(
-            AccountOperation::CommitFloor(None, Location::new(0))
-                .encode()
-                .to_vec(),
-        );
+        lookup.operation = AccountOperation::CommitFloor(None, Location::new(0))
+            .encode()
+            .to_vec();
         assert_eq!(lookup.verify(), Err(Error::WrongAccount));
-        db.destroy().await.unwrap();
-    });
-}
-
-#[test]
-fn exclusion_claims_are_rejected() {
-    deterministic::Runner::default().start(|context| async move {
-        let db = write(database(context).await, &[(key(10), Some(account(1)))]).await;
-        let lookup = inclusion(&db, key(10)).await;
-        for (operation, exclusion) in [
-            (None, true),
-            (None, false),
-            (lookup.operation.clone(), true),
-        ] {
-            assert_eq!(
-                verify_current_account_lookup(
-                    &lookup.proof,
-                    &lookup.root,
-                    key(20).as_ref(),
-                    lookup.tip,
-                    operation,
-                    exclusion
-                ),
-                Err(Error::InvalidClaim)
-            );
-        }
         db.destroy().await.unwrap();
     });
 }
@@ -356,8 +288,7 @@ fn captured_proofs_remain_bound_to_their_historical_root_across_bitmap_chunks() 
                 db.root().as_ref(),
                 key(20).as_ref(),
                 current_tip,
-                Some(operations[0].encode().to_vec()),
-                false,
+                &operations[0].encode(),
             ),
             Err(Error::VerificationFailed)
         );

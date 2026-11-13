@@ -8,8 +8,15 @@ export interface SearchMatch {
     readonly value: string;
 }
 
+/** The search status for input that is neither an address nor a transaction hash. */
+export const SEARCH_INPUT_INVALID = 'not an address or transaction hash';
+
 export function normalizeSearchQuery(value: string): string {
-    return toHex(parseAccountKeyHex(value.trim().replace(/^0x/i, '')));
+    try {
+        return toHex(parseAccountKeyHex(value.trim().replace(/^0x/i, '')));
+    } catch {
+        throw new Error(SEARCH_INPUT_INVALID);
+    }
 }
 
 /** Returns a navigation hint. Destination pages authenticate their own evidence. */

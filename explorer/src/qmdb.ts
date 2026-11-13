@@ -75,16 +75,6 @@ export interface VerifiedAccountProof {
     readonly proofSizeBytes: number;
 }
 
-export interface VerifiedAccountExclusion {
-    readonly accountKey: string;
-    readonly timestampMs: bigint;
-    readonly proofSizeBytes: number;
-    /** Location of the operation whose key span excludes the account. */
-    readonly location: bigint;
-    /** Hex keys of the adjacent active accounts bracketing this one; null for an empty database. */
-    readonly span: { readonly lower: string; readonly upper: string } | null;
-}
-
 // The parent digest authenticates ancestor headers and exact transaction bounds.
 interface AuthenticatedTarget extends FinalizedTransactionTarget {
     readonly parentDigest: Uint8Array;
@@ -270,6 +260,12 @@ function readVarint(bytes: Uint8Array, offset: number): { value: bigint; offset:
     }
     throw new Error('finalized block header varint is too long');
 }
+
+/**
+ * The balance of an account with no stored state, which the chain treats as already holding it.
+ * The native proof fixture exports the Rust value, and a test asserts the two agree.
+ */
+export const DEFAULT_ACCOUNT_BALANCE = 100n;
 
 export function decodeAccountValue(
     value: Uint8Array,

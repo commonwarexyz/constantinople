@@ -242,7 +242,7 @@ End-to-end "spin everything up" with the spammer for live transaction flow:
 
 ```sh
 # 1. install explorer deps once
-npm --prefix explorer install
+just explorer-install
 
 # 2. generate the bundle and run the printed mprocs command
 cargo run --bin constantinople-deploy -- generate \

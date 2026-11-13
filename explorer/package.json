@@ -14,8 +14,8 @@
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
         "@connectrpc/connect-web": "2.1.1",
-        "@exowarexyz/qmdb": "2026.9.0",
-        "@exowarexyz/simplex": "2026.9.0",
+        "@exowarexyz/qmdb": "file:../.exoware/qmdb/ts",
+        "@exowarexyz/simplex": "file:../.exoware/simplex/ts",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"
     },

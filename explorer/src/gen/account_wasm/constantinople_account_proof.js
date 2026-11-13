@@ -1,28 +1,25 @@
 /* @ts-self-types="./constantinople_account_proof.d.ts" */
 
 /**
- * Authenticate one fixed account lookup, returning a hit or miss and throwing on failure.
- *
- * A miss carries the location of the operation whose key span excludes the key and, unless the
- * database was empty, the bracketing `lower` and `upper` active keys.
+ * Authenticate one fixed account update, returning `{location, key, value}` and throwing on
+ * failure.
  * @param {Uint8Array} proof
  * @param {Uint8Array} root
  * @param {Uint8Array} key
  * @param {bigint} expected_tip
- * @param {Uint8Array | null | undefined} encoded_operation
- * @param {boolean} exclusion
+ * @param {Uint8Array} encoded_operation
  * @returns {any}
  */
-export function verify_current_account_lookup(proof, root, key, expected_tip, encoded_operation, exclusion) {
+export function verify_current_account_lookup(proof, root, key, expected_tip, encoded_operation) {
     const ptr0 = passArray8ToWasm0(proof, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passArray8ToWasm0(root, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passArray8ToWasm0(key, wasm.__wbindgen_malloc);
     const len2 = WASM_VECTOR_LEN;
-    var ptr3 = isLikeNone(encoded_operation) ? 0 : passArray8ToWasm0(encoded_operation, wasm.__wbindgen_malloc);
-    var len3 = WASM_VECTOR_LEN;
-    const ret = wasm.verify_current_account_lookup(ptr0, len0, ptr1, len1, ptr2, len2, expected_tip, ptr3, len3, exclusion);
+    const ptr3 = passArray8ToWasm0(encoded_operation, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.verify_current_account_lookup(ptr0, len0, ptr1, len1, ptr2, len2, expected_tip, ptr3, len3);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -102,10 +99,6 @@ function handleError(f, args) {
         const idx = addToExternrefTable0(e);
         wasm.__wbindgen_exn_store(idx);
     }
-}
-
-function isLikeNone(x) {
-    return x === undefined || x === null;
 }
 
 function passArray8ToWasm0(arg, malloc) {

@@ -50,9 +50,9 @@ use constantinople_application::consensus::{
 };
 use constantinople_engine::types::{EngineBlock, EngineCodedBlock, EngineFinalization};
 use constantinople_primitives::{
-    Block, Header as BlockHeader, Nonce, PublicKeyCache, Sealable, StateSyncProof,
-    TRANSACTION_NAMESPACE, Transaction, TransactionHistoryEntry, TransactionPublicKey,
-    TransactionSignature, verify_transactions,
+    Block, DEFAULT_ACCOUNT_BALANCE, Header as BlockHeader, Nonce, PublicKeyCache, Sealable,
+    StateSyncProof, TRANSACTION_NAMESPACE, Transaction, TransactionHistoryEntry,
+    TransactionPublicKey, TransactionSignature, verify_transactions,
 };
 use p256::ecdsa::{SigningKey, signature::Signer as _};
 use rand::{SeedableRng, rngs::StdRng};
@@ -644,21 +644,12 @@ fn bundle_json(bundle: &proto::ProofBundle) -> Value {
         "headers": bundle.headers.iter().map(|header| hex(header)).collect::<Vec<_>>(),
         "sequenceNumber": bundle.sequence_number.to_string(),
         "account": bundle.account.as_option().map(|account| {
-            let mut value = json!({
+            json!({
                 "location": account.location.to_string(),
                 "proof": hex(&account.proof),
                 "writeHeight": account.write_height.to_string(),
-            });
-            match account.claim.as_ref().expect("account proof must carry a claim") {
-                proto::account_proof::Claim::EncodedOperation(operation) => {
-                    value["encodedOperation"] = json!(hex(operation));
-                }
-                proto::account_proof::Claim::Exclusion(exclusion) => {
-                    assert!(*exclusion);
-                    value["exclusion"] = json!(true);
-                }
-            }
-            value
+                "encodedOperation": hex(&account.encoded_operation),
+            })
         }),
         "transactions": transactions,
         "transactionsProof": bundle.transactions_proof.as_ref().map(|proof| hex(proof)),
@@ -789,15 +780,13 @@ fn verify_account_bundle(
     assert_eq!(header.state_range, block.block.header.state_range);
     let account = &bundle["account"];
     let proof = hex_bytes_dynamic(account["proof"].as_str().unwrap());
-    let operation = account["encodedOperation"].as_str().map(hex_bytes_dynamic);
-    let exclusion = account["exclusion"].as_bool().unwrap_or(false);
+    let operation = hex_bytes_dynamic(account["encodedOperation"].as_str().unwrap());
     verify_current_account_lookup(
         &proof,
         header.state_root.as_ref(),
         key.as_ref(),
         header.state_range.end() - 1,
-        operation,
-        exclusion,
+        &operation,
     )
     .unwrap()
 }
@@ -812,82 +801,32 @@ async fn assert_not_found(router: &Router, request: &proto::GetAccountRequest) {
 fn assert_lookup_context_rejected(bundle: &Value, key: AccountKey, block: &FixtureBlock) {
     let account = &bundle["account"];
     let proof = hex_bytes_dynamic(account["proof"].as_str().unwrap());
-    let operation = account["encodedOperation"].as_str().map(hex_bytes_dynamic);
-    let exclusion = account["exclusion"].as_bool().unwrap_or(false);
+    let operation = hex_bytes_dynamic(account["encodedOperation"].as_str().unwrap());
+    assert_eq!(operation.len(), 65);
     let root = block.block.header.state_root.as_ref();
     let tip = block.block.header.state_range.end() - 1;
-    let check = |bytes: &[u8], root: &[u8], key: &[u8], tip, operation, exclusion| {
-        verify_current_account_lookup(bytes, root, key, tip, operation, exclusion).is_err()
+    let check = |bytes: &[u8], root: &[u8], key: &[u8], tip, operation: &[u8]| {
+        verify_current_account_lookup(bytes, root, key, tip, operation).is_err()
     };
     let mut changed_root = root.to_vec();
     changed_root[0] ^= 1;
-    assert!(check(
-        &proof,
-        &changed_root,
-        key.as_ref(),
-        tip,
-        operation.clone(),
-        exclusion
-    ));
-    assert!(check(
-        &proof,
-        root,
-        key.as_ref(),
-        tip + 1,
-        operation.clone(),
-        exclusion
-    ));
+    assert!(check(&proof, &changed_root, key.as_ref(), tip, &operation));
+    assert!(check(&proof, root, key.as_ref(), tip + 1, &operation));
     assert!(check(
         &proof[..proof.len() - 1],
         root,
         key.as_ref(),
         tip,
-        operation.clone(),
-        exclusion
+        &operation
     ));
     let mut trailing = proof.clone();
     trailing.push(0);
-    assert!(check(
-        &trailing,
-        root,
-        key.as_ref(),
-        tip,
-        operation.clone(),
-        exclusion
-    ));
-    if let Some(encoded) = operation.as_ref() {
-        assert_eq!(encoded.len(), 65);
-        assert!(check(
-            &proof,
-            root,
-            &[0; 32],
-            tip,
-            operation.clone(),
-            exclusion
-        ));
-        assert!(check(&proof, root, key.as_ref(), tip, None, true));
-        let mut changed_operation = encoded.clone();
-        changed_operation[33] ^= 1;
-        assert!(check(
-            &proof,
-            root,
-            key.as_ref(),
-            tip,
-            Some(changed_operation),
-            false
-        ));
-        assert!(check(
-            &proof,
-            root,
-            key.as_ref(),
-            tip,
-            Some(encoded[..64].to_vec()),
-            false
-        ));
-        assert!(check(&proof, root, key.as_ref(), tip, operation, true));
-    } else {
-        assert!(check(&proof, root, key.as_ref(), tip, None, false));
-    }
+    assert!(check(&trailing, root, key.as_ref(), tip, &operation));
+    assert!(check(&proof, root, &[0; 32], tip, &operation));
+    let mut changed_operation = operation.clone();
+    changed_operation[33] ^= 1;
+    assert!(check(&proof, root, key.as_ref(), tip, &changed_operation));
+    assert!(check(&proof, root, key.as_ref(), tip, &operation[..64]));
 }
 
 /// Checks the complete descending interval certified by an account's count.
@@ -1444,9 +1383,8 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         let expected_headers = fixture.blocks[account_write_height.saturating_sub(2) as usize..2]
             .iter().rev().map(|block| hex(&block.block.header.encode())).collect::<Vec<_>>();
         assert_eq!(account["headers"], json!(expected_headers));
-        assert!(matches!(verify_account_bundle(&account, fixture.account, &fixture.blocks[2]),
-            VerifiedAccountLookup::Present { location, account: value, .. }
-            if location == account_location && value.tx_count == 58));
+        let verified = verify_account_bundle(&account, fixture.account, &fixture.blocks[2]);
+        assert_eq!((verified.location, verified.account.tx_count), (account_location, 58));
         assert_lookup_context_rejected(&account, fixture.account, &fixture.blocks[2]);
         assert_account_page(&account, 58);
         assert_eq!(account["transactions"][0]["index"], 54);
@@ -1565,8 +1503,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         let future_present = proof_bundle(router, &proto::GetAccountRequest {
             account: future_key.as_ref().to_vec(), activity: Some(false), ..Default::default()
         }).await;
-        assert!(matches!(verify_account_bundle(&future_present, future_key, &fixture.blocks[3]),
-            VerifiedAccountLookup::Present { account: value, .. } if value.tx_count == 1));
+        assert_eq!(verify_account_bundle(&future_present, future_key, &fixture.blocks[3]).account.tx_count, 1);
         let account_with_history = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&account_with_history), 4);
         assert_account_page(&account_with_history, 59);
@@ -1599,6 +1536,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             let (historical_block, historical_transaction) = Box::pin(historical_bundles(context.child("historical_export"), &fixture)).await;
             let export = json!({
                 "verificationMaterial": fixture.verification_material,
+                "defaultAccountBalance": DEFAULT_ACCOUNT_BALANCE.to_string(),
                 "account": hex(fixture.account.as_ref()),
                 "recipient": hex(fixture.recipient.as_ref()),
                 "transactionDigest": digest,
