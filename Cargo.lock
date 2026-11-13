@@ -1753,6 +1753,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-cryptography-curve25519",
  "commonware-deployer",
+ "commonware-formatting",
  "commonware-glue",
  "commonware-macros",
  "commonware-math",

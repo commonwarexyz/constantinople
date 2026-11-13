@@ -27,7 +27,8 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_application::consensus::{
-    Application, Databases, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, Databases, FinalizedHookFn, FinalizedTransactionsHookFn, StateSyncTarget,
+    TransactionHistoryTarget,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
@@ -38,6 +39,8 @@ use std::sync::{Arc, Mutex};
 type TestCommitment = EngineCommitment<sha256::Sha256, ed25519::VerifyingKey>;
 type TestBlock = EngineBlock<sha256::Sha256, ed25519::VerifyingKey>;
 type TestHook = FinalizedHookFn<TestCommitment, sha256::Sha256, ed25519::VerifyingKey>;
+type TestTransactionsHook =
+    FinalizedTransactionsHookFn<TestCommitment, sha256::Sha256, ed25519::VerifyingKey>;
 type TestApp = EngineApplication<
     deterministic::Context,
     sha256::Sha256,
@@ -153,7 +156,7 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
         state_target,
         transaction_target,
     );
-    let app = TestApp::new(inner, None);
+    let app = TestApp::new(inner, None, None);
     (app, dbs, (state, transactions), block)
 }
 
@@ -183,7 +186,7 @@ fn finalized_hook_shares_the_engine_block_allocation() {
                 *observed.lock().expect("observation lock") = Some(wrapped);
             })
         });
-        app = TestApp::new(app.inner, Some(hook));
+        app = TestApp::new(app.inner, Some(hook), None);
         let captured = app
             .capture(
                 (context.child("capture"), block.context()),
@@ -192,7 +195,8 @@ fn finalized_hook_shares_the_engine_block_allocation() {
                 dbs.readers(),
             )
             .await;
-        assert!(captured.is_some());
+        assert!(captured.artifacts.is_some());
+        assert!(captured.transactions.is_none());
         Box::pin(dbs.apply(batches)).await;
         assert!(Box::pin(dbs.finalize()).await.durable().await);
 
@@ -215,7 +219,59 @@ fn finalized_hook_shares_the_engine_block_allocation() {
 }
 
 #[test]
-fn capture_is_disabled_without_a_finalized_hook() {
+fn transactions_hook_observes_only_the_transaction_range() {
+    deterministic::Runner::default().start(|context| async move {
+        let (app, dbs, batches, block) = fixture(&context).await;
+        let observed = Arc::new(Mutex::new(None));
+        let hook_observed = observed.clone();
+        let hook: TestTransactionsHook = Arc::new(move |shared, transactions| {
+            *hook_observed.lock().expect("observation lock") = Some((shared, transactions));
+        });
+        let mut app = TestApp::new(app.inner, None, Some(hook));
+
+        // Without the full hook, no state artifacts are captured.
+        let captured = app
+            .capture(
+                (context.child("capture"), block.context()),
+                &block,
+                &batches,
+                dbs.readers(),
+            )
+            .await;
+        assert!(captured.artifacts.is_none());
+        assert!(captured.transactions.is_some());
+        Box::pin(dbs.apply(batches)).await;
+        assert!(Box::pin(dbs.finalize()).await.durable().await);
+        app.clone()
+            .finalized(
+                (context.child("finalized"), block.context()),
+                &block,
+                captured,
+                dbs.readers(),
+            )
+            .await;
+
+        // The hook receives the shared block and the exact range its header commits to.
+        let (shared, transactions) = observed
+            .lock()
+            .expect("observation lock")
+            .take()
+            .expect("hook ran");
+        assert!(Arc::ptr_eq(&shared, &block.inner_shared()));
+        assert_eq!(transactions.root, shared.header.transactions_root);
+        assert_eq!(
+            transactions.end.as_u64(),
+            shared.header.transactions_range.end()
+        );
+        assert_eq!(
+            transactions.start.as_u64() + transactions.operations.len() as u64,
+            transactions.end.as_u64()
+        );
+    });
+}
+
+#[test]
+fn capture_is_disabled_without_a_hook() {
     deterministic::Runner::default().start(|context| async move {
         let (mut app, dbs, batches, block) = fixture(&context).await;
         let captured = app
@@ -226,7 +282,8 @@ fn capture_is_disabled_without_a_finalized_hook() {
                 dbs.readers(),
             )
             .await;
-        assert!(captured.is_none());
+        assert!(captured.artifacts.is_none());
+        assert!(captured.transactions.is_none());
         Box::pin(dbs.apply(batches)).await;
         assert!(Box::pin(dbs.finalize()).await.durable().await);
         app.finalized(

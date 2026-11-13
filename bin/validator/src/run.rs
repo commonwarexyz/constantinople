@@ -2,6 +2,7 @@
 
 use crate::{
     config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config},
+    evidence::{Evidence, InclusionProver},
     indexer::maybe_build_indexer,
     state_reader::StateDbReader,
 };
@@ -371,6 +372,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             account_reader.clone(),
         );
         let is_primary = decoded.share.is_some();
+
+        // Only a relayer that does not vote records finalized blocks for inclusion evidence.
+        let evidence =
+            (!is_primary && relayer.is_some()).then(|| Evidence::new(&context.child("evidence")));
         let mempool_handle: Pin<Box<dyn Future<Output = ()> + Send>> = if is_primary {
             let listener = tokio::net::TcpListener::bind(http_listen)
                 .await
@@ -388,6 +393,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 listen: http_listen,
                 relayer: relayer_config,
                 account_reader: account_reader.clone(),
+                inclusion_prover: evidence
+                    .clone()
+                    .map(|evidence| evidence as Arc<dyn InclusionProver>),
                 view_clock,
                 strategy: strategy.clone(),
                 max_batch_bytes: transaction_budget,
@@ -462,6 +470,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer,
                 finalized_hook,
+                finalized_transactions_hook: evidence.as_ref().map(Evidence::hook),
             },
         )
         .await;
@@ -475,6 +484,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     .is_ok(),
                 "finalization reader must be installed exactly once"
             );
+        }
+        if let Some(evidence) = &evidence {
+            evidence.attach(engine.finalization_reader());
         }
 
         // Install the account reader as soon as the stateful actor attaches

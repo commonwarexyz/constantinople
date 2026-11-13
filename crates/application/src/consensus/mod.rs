@@ -111,6 +111,17 @@ where
 pub type FinalizedHookFn<C, H, P> = Arc<
     dyn Fn(Arc<SealedBlock<C, P, H>>, FinalizedArtifacts<H>) -> FinalizedHookFuture + Send + Sync,
 >;
+
+/// Transaction-history operation range captured from one finalized block.
+pub type FinalizedTransactions<H> =
+    FinalizedRange<<H as Hasher>::Digest, TransactionHistoryOperation<H>>;
+
+/// Observes a finalized block with the transaction-history range it appended.
+///
+/// The hook runs on the finalization path and must return without waiting. It is skipped for a
+/// block whose range could not be captured.
+pub type FinalizedTransactionsHookFn<C, H, P> =
+    Arc<dyn Fn(Arc<SealedBlock<C, P, H>>, FinalizedTransactions<H>) + Send + Sync>;
 type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";

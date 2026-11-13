@@ -32,7 +32,9 @@ use commonware_storage::{
     qmdb::{current::unordered::fixed, sync::Database},
     translator::EightCap,
 };
-use constantinople_application::consensus::{FinalizedHookFn, TransactionHistoryDb};
+use constantinople_application::consensus::{
+    FinalizedHookFn, FinalizedTransactionsHookFn, TransactionHistoryDb,
+};
 use constantinople_primitives::{Account, AccountKey, Header, Sealed};
 use std::marker::PhantomData;
 
@@ -78,6 +80,9 @@ pub type EngineActivity<P, V, H = commonware_cryptography::sha256::Sha256> =
 type NoopReporterMarker<P, V, H> = fn() -> (P, V, H);
 
 pub(crate) type EngineFinalizedHook<H, P> = FinalizedHookFn<EngineCommitment<H, P>, H, P>;
+
+pub(crate) type EngineFinalizedTransactionsHook<H, P> =
+    FinalizedTransactionsHookFn<EngineCommitment<H, P>, H, P>;
 
 /// A no-op [`Reporter`] over [`EngineActivity`].
 ///

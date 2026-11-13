@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod evidence;
 mod indexer;
 mod relayer;
 mod run;

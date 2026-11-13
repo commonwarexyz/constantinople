@@ -29,6 +29,7 @@ commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-cryptography-curve25519.workspace = true
 commonware-deployer.workspace = true
+commonware-formatting.workspace = true
 commonware-parallel.workspace = true
 commonware-runtime.workspace = true
 prometheus-client.workspace = true

@@ -1,8 +1,8 @@
 //! `commonware_glue::stateful` trait integration.
 
 use super::{
-    Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
-    history::header_range_to_target,
+    Application, FinalizedArtifacts, FinalizedRange, FinalizedTransactions, db::Databases,
+    genesis_block_with_parent, history::header_range_to_target,
 };
 use commonware_consensus::{Handoff, marshal::ancestry::Ancestry};
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
@@ -19,6 +19,37 @@ use futures::{FutureExt, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::sync::Arc;
 use tracing::Instrument as _;
+
+impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
+where
+    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
+    H: Hasher,
+    C: Digest,
+    S: Scheme<PublicKey = P>,
+    P: PublicKey,
+    I: TransactionSource<C, P, H> + Clone + Sync,
+    St: Strategy,
+{
+    /// Captures only the transaction-history range that `batches` appends.
+    ///
+    /// Returns `None` when the frontier before the batch cannot be read, so an observer that can
+    /// do without the range never fails finalization.
+    pub async fn capture_transactions(
+        batches: &<Databases<E, H, EightCap, St> as DatabaseSet<E>>::Merkleized,
+        readers: &<Databases<E, H, EightCap, St> as DatabaseSet<E>>::Readers,
+    ) -> Option<FinalizedTransactions<H>> {
+        let database = readers.1.read().await;
+        let (start, operations) = batches.1.operations();
+        let pinned_nodes = batches.1.pinned_nodes(&database).ok()?;
+        Some(FinalizedRange {
+            start,
+            end: batches.1.bounds().tip.size,
+            root: batches.1.root(),
+            pinned_nodes,
+            operations,
+        })
+    }
+}
 
 impl<E, H, C, S, P, I, St> CApplication<E> for Application<E, H, C, S, P, I, St>
 where

@@ -60,7 +60,10 @@ use std::{
 };
 
 mod browse;
+mod evidence;
 mod rpc;
+
+pub use evidence::{Absence, MAX_EVIDENCE_BYTES, RecentFinalized};
 
 /// Maximum transactions returned on one account activity page or one block page.
 const TRANSACTION_PAGE: u64 = 50;

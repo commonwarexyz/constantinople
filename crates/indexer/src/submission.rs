@@ -2,13 +2,16 @@
 
 use crate::{
     adapter::BoxError,
+    explorer::MAX_EVIDENCE_BYTES,
     proto::{
         AmbiguousSubmission, CompletedSubmission, Empty, Finalized, PartiallyFinalized,
-        SubmitTransactionResponse, completed_submission::Result as SubmissionResult,
+        ProofBundle, SubmitTransactionResponse, completed_submission::Result as SubmissionResult,
         submit_transaction_response::Outcome,
     },
 };
+use buffa::Message;
 use bytes::{Bytes, BytesMut};
+use commonware_formatting::from_hex;
 use connectrpc::ConnectError;
 use reqwest::{StatusCode, header::CONTENT_TYPE};
 use serde::Deserialize;
@@ -195,6 +198,9 @@ async fn forward(
 enum TxStatus {
     Finalized {
         height: u64,
+        /// Hex-encoded transaction evidence bundle.
+        #[serde(default)]
+        evidence: Option<String>,
     },
     PartiallyFinalized {
         height: u64,
@@ -204,12 +210,31 @@ enum TxStatus {
     Dropped,
 }
 
+/// Decodes the evidence a relayer attached to a finalization report.
+///
+/// The evidence is forwarded for the client to verify and is never checked here. Evidence that is
+/// malformed, or that would push the response past the relayer response bound, is omitted so the
+/// report itself is still delivered.
+fn evidence(encoded: &str, body_bytes: usize) -> Option<ProofBundle> {
+    if encoded.len() > 2 * MAX_EVIDENCE_BYTES || body_bytes + encoded.len() / 2 > MAX_RESPONSE_BYTES
+    {
+        return None;
+    }
+    ProofBundle::decode_from_slice(&from_hex(encoded)?).ok()
+}
+
 fn result(status: StatusCode, body: &[u8]) -> Option<SubmissionResult> {
     match status {
         StatusCode::OK => match serde_json::from_slice::<TxStatus>(body).ok()? {
-            TxStatus::Finalized { height } => Some(SubmissionResult::Finalized(
+            TxStatus::Finalized {
+                height,
+                evidence: encoded,
+            } => Some(SubmissionResult::Finalized(
                 Finalized {
                     height,
+                    evidence: encoded
+                        .and_then(|encoded| evidence(&encoded, body.len()))
+                        .into(),
                     ..Default::default()
                 }
                 .into(),
@@ -240,7 +265,7 @@ fn result(status: StatusCode, body: &[u8]) -> Option<SubmissionResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffa::Message;
+    use commonware_formatting::hex;
     use connectrpc::ErrorCode;
     use constantinople_mempool::webserver::TxStatus as RelayerStatus;
     use tokio::{
@@ -431,6 +456,56 @@ mod tests {
             }
             upstream.requests.recv().await.expect("forwarded request");
             assert!(upstream.requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_bounded_evidence_and_keeps_a_report_whose_evidence_is_unusable() {
+        let bundle = ProofBundle {
+            certificate: vec![7; 64],
+            sequence_number: 3,
+            ..Default::default()
+        };
+        let oversized = ProofBundle {
+            certificate: vec![7; MAX_EVIDENCE_BYTES],
+            ..Default::default()
+        };
+        let report = |evidence: String| {
+            format!(r#"{{"status":"finalized","height":7,"evidence":"{evidence}"}}"#).into_bytes()
+        };
+
+        // Evidence fills the response bound together with the body it arrived in.
+        let encoded = hex(&bundle.encode_to_vec());
+        let mut padded = report(encoded.clone());
+        padded.pop();
+        padded.extend_from_slice(br#","padding":""#);
+        padded.resize(MAX_RESPONSE_BYTES - encoded.len() / 2 - 2, b'x');
+        padded.extend_from_slice(br#""}"#);
+        let mut overfull = padded.clone();
+        overfull.insert(overfull.len() - 2, b'x');
+
+        for (name, body, expected) in [
+            ("valid", report(encoded), Some(&bundle)),
+            ("fits the bound", padded, Some(&bundle)),
+            ("exceeds the bound", overfull, None),
+            ("not hex", report("zz".to_owned()), None),
+            ("not a bundle", report("ff".to_owned()), None),
+            ("oversized", report(hex(&oversized.encode_to_vec())), None),
+        ] {
+            let upstream = relayer(wire_response(200, &body), false).await;
+            let submission = Submission::new(Some(&upstream.url)).expect("submission");
+            let response = submission
+                .submit(Bytes::from_static(b"batch"))
+                .await
+                .unwrap();
+            assert!((response.encoded_len() as usize) < 65 * 1024, "{name}");
+            let response = completed(response);
+            assert_eq!(response.body.as_slice(), body.as_slice(), "{name}");
+            let Some(SubmissionResult::Finalized(finalized)) = response.result else {
+                panic!("{name} must stay a finalization report");
+            };
+            assert_eq!(finalized.height, 7, "{name}");
+            assert_eq!(finalized.evidence.as_option(), expected, "{name}");
         }
     }
 

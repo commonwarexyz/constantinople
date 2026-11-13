@@ -215,8 +215,12 @@ are navigation hints; destination views verify their certificates and proofs.
 `SubmitTransaction` forwards exactly one opaque batch to the configured relayer's
 `/transactions` endpoint, without redirects or retries. A complete upstream reply
 retains its HTTP status, body, and content type, and recognized outcomes have typed
-fields. An incomplete reply or transport failure carries an ambiguous outcome:
-the transaction may have reached the relayer. Batch size is limited to 4 MiB plus
+fields. A finalization report for a single transaction may include transaction evidence
+hex-encoded. It is forwarded unverified as a typed `ProofBundle` when it decodes, is at
+most 16 KiB, and fits the 64 KiB reply bound together with the upstream body. Evidence that
+fails these checks is omitted from an otherwise unchanged report.
+An incomplete reply or transport failure carries an ambiguous outcome,
+because the transaction may have reached the relayer. Batch size is limited to 4 MiB plus
 the five-byte batch prefix, and upstream replies to 64 KiB. The transport bounds
 encoded request bodies and messages to 8 MiB and decoder element memory to 256 KiB.
 Its 11-second deadline includes request receipt and handler execution. A transport

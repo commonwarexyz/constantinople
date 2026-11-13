@@ -57,7 +57,7 @@ use constantinople_primitives::{
 use p256::ecdsa::{SigningKey, signature::Signer as _};
 use rand::{SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
-use std::num::NonZeroU64;
+use std::{future::Future, num::NonZeroU64};
 use tower::ServiceExt as _;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -72,10 +72,25 @@ struct FixtureBlock {
     upload: Upload,
     /// Transaction-hash QMDB location of the block's first transaction.
     first_transaction: u64,
+    /// Transaction-history range the block appended, as the finalized hook captures it.
+    transactions_range: FinalizedRange<Digest, TransactionHistoryOperation<Sha256>>,
     transactions: Vec<SignedTransaction<Sha256>>,
     history: Vec<TransactionHistoryEntry<Digest>>,
     account_location: Option<u64>,
     account_write_height: Option<u64>,
+}
+
+impl FixtureBlock {
+    /// Returns the block's transaction-history range as the finalized hook hands it over.
+    fn captured_transactions(&self) -> FinalizedRange<Digest, TransactionHistoryOperation<Sha256>> {
+        FinalizedRange {
+            start: self.transactions_range.start,
+            end: self.transactions_range.end,
+            root: self.transactions_range.root,
+            pinned_nodes: self.transactions_range.pinned_nodes.clone(),
+            operations: self.transactions_range.operations.clone(),
+        }
+    }
 }
 
 /// Chained fixture blocks and the accounts their transactions touch.
@@ -432,6 +447,13 @@ async fn fixture_with_counts(
             transaction_start,
             transaction_floor,
         );
+        let captured_transactions = FinalizedRange {
+            start: transactions_range.start,
+            end: transactions_range.end,
+            root: transactions_range.root,
+            pinned_nodes: transactions_range.pinned_nodes.clone(),
+            operations: transactions_range.operations.clone(),
+        };
         let header = BlockHeader {
             context: SimplexContext {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -487,6 +509,7 @@ async fn fixture_with_counts(
             finalization,
             upload,
             first_transaction,
+            transactions_range: captured_transactions,
             transactions,
             history,
             account_location,
@@ -1112,6 +1135,141 @@ async fn historical_bundles(
     (historical_block, historical_transaction)
 }
 
+/// Resolves to the certificate a node holds for fixture block `height`.
+fn certificate(
+    fixture: &Fixture,
+    height: u64,
+) -> impl Future<Output = Option<TestFinalization>> + Send + 'static {
+    let finalization = fixture.blocks[height as usize - 1].finalization.clone();
+    async move { Some(finalization) }
+}
+
+/// Proves `digest` at `height` with the block's own certificate and decodes the bundle.
+async fn evidence_json(
+    recent: &RecentFinalized,
+    fixture: &Fixture,
+    height: u64,
+    digest: &Digest,
+) -> Value {
+    let encoded = recent
+        .prove(height, *digest, certificate(fixture, height))
+        .await
+        .expect("recorded block must prove its transaction");
+    bundle_json(&proto::ProofBundle::decode_from_slice(&encoded).unwrap())
+}
+
+#[test]
+fn recent_finalized_blocks_prove_inclusion_once_per_block_and_name_each_absence() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        // Two blocks more than the ring retains, so the first two are evicted.
+        let newest = evidence::RETAINED_BLOCKS + 2;
+        let fixture = Arc::new(fixture_with_counts(context, &vec![2; newest]).await);
+        let digest = |height: usize, index: usize| {
+            *fixture.blocks[height - 1].transactions[index].message_digest()
+        };
+        let record = |recent: &RecentFinalized, height: usize| {
+            let block = &fixture.blocks[height - 1];
+            recent.record(block.block.clone(), block.captured_transactions());
+        };
+        let recent = Arc::new(RecentFinalized::default());
+
+        // A request for a block this node has not finalized waits for it, within the bound.
+        assert_eq!(
+            recent
+                .prove(1, digest(1, 0), certificate(&fixture, 1))
+                .await,
+            Err(Absence::Late)
+        );
+        let waiting = tokio::spawn({
+            let (recent, fixture, digest) = (recent.clone(), fixture.clone(), digest(1, 0));
+            async move { recent.prove(1, digest, certificate(&fixture, 1)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        record(&recent, 1);
+        assert!(waiting.await.unwrap().is_ok());
+
+        for height in 2..=newest {
+            record(&recent, height);
+        }
+
+        // Every transaction of a block is proven from one merkleization of that block.
+        let merkleized = recent.merkleized_blocks();
+        let digests = [digest(newest, 0), digest(newest, 1)];
+        let bundles = futures::future::join_all(
+            digests
+                .iter()
+                .map(|digest| evidence_json(&recent, &fixture, newest as u64, digest)),
+        )
+        .await;
+        for (index, bundle) in bundles.iter().enumerate() {
+            assert_eq!(certificate_height(bundle), newest as u64);
+            assert_transactions(bundle, &fixture.blocks[newest - 1], index, 1);
+            assert_eq!(
+                bundle["headers"],
+                json!([hex(&fixture.blocks[newest - 2].block.header.encode())])
+            );
+        }
+        evidence_json(&recent, &fixture, newest as u64, &digests[0]).await;
+        assert_eq!(recent.merkleized_blocks(), merkleized + 1);
+
+        // Each reason a node cannot answer has its own name.
+        for (name, height, transaction, certified, expected) in [
+            ("evicted block", 2, digest(2, 0), Some(2), Absence::NotFound),
+            (
+                "transaction of another block",
+                newest,
+                digest(newest - 1, 0),
+                Some(newest),
+                Absence::NotFound,
+            ),
+            (
+                "oldest retained block",
+                3,
+                digest(3, 0),
+                Some(3),
+                Absence::ParentMissing,
+            ),
+            (
+                "no certificate",
+                newest,
+                digest(newest, 0),
+                None,
+                Absence::NoCertificate,
+            ),
+            (
+                "certificate of another block",
+                newest,
+                digest(newest, 0),
+                Some(newest - 1),
+                Absence::NoCertificate,
+            ),
+        ] {
+            let finalization =
+                certified.map(|height: usize| fixture.blocks[height - 1].finalization.clone());
+            assert_eq!(
+                recent
+                    .prove(height as u64, transaction, async move { finalization })
+                    .await,
+                Err(expected),
+                "{name}"
+            );
+        }
+        let bounded = RecentFinalized::bounded(64);
+        record(&bounded, newest - 1);
+        record(&bounded, newest);
+        assert_eq!(
+            bounded
+                .prove(
+                    newest as u64,
+                    digest(newest, 0),
+                    certificate(&fixture, newest as u64)
+                )
+                .await,
+            Err(Absence::TooLarge)
+        );
+    });
+}
+
 #[test]
 fn historical_transactions_below_inactivity_floor_remain_available() {
     commonware_runtime::tokio::Runner::default().start(|context| async move {
@@ -1534,6 +1692,36 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             MAX_TRANSACTION_BYTES * 2
         );
 
+        // Evidence a node builds from the blocks it finalized is the bundle the route serves
+        // for the same transaction, apart from the Store sequence it cannot observe.
+        let recent = RecentFinalized::default();
+        for block in &fixture.blocks {
+            recent.record(block.block.clone(), block.captured_transactions());
+        }
+        let webauthn = fixture.blocks[3].transactions[1].message_digest();
+        let submission_evidence = evidence_json(&recent, &fixture, 4, webauthn).await;
+        let first = fixture.blocks[0].transactions[0].message_digest();
+        let first_bundle = proof_bundle(router, &proto::GetTransactionRequest {
+            digest: first.as_ref().to_vec(),
+            ..Default::default()
+        }).await;
+        for (built, served) in [
+            (&submission_evidence, &webauthn_bundle),
+            (&evidence_json(&recent, &fixture, 1, first).await, &first_bundle),
+        ] {
+            assert_eq!(built["sequenceNumber"], "0");
+            for field in [
+                "certificate",
+                "headers",
+                "account",
+                "transactions",
+                "transactionsProof",
+                "nextCursor",
+            ] {
+                assert_eq!(built[field], served[field], "evidence field {field}");
+            }
+        }
+
         // Export the bundles for browser verification tests when requested.
         if let Some(path) = std::env::var_os("EXPLORER_FIXTURE_PATH") {
             let (historical_block, historical_transaction) = Box::pin(historical_bundles(context.child("historical_export"), &fixture)).await;
@@ -1557,6 +1745,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
                 "webauthnDigest": webauthn_digest,
                 "webauthnBlock": webauthn_block,
                 "webauthnBundle": webauthn_bundle,
+                "submissionEvidence": submission_evidence,
                 "accountWithHistory": account_with_history,
                 "historicalBlock": historical_block,
                 "historicalTransaction": historical_transaction,

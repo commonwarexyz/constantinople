@@ -16,7 +16,10 @@ use commonware_glue::stateful::{
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
-use constantinople_application::consensus::{Application, FinalizedArtifacts, FinalizedHookFn};
+use constantinople_application::consensus::{
+    Application, FinalizedArtifacts, FinalizedHookFn, FinalizedTransactions,
+    FinalizedTransactionsHookFn,
+};
 use constantinople_mempool::TransactionSource;
 use futures::Stream;
 use rand::{CryptoRng, Rng};
@@ -49,6 +52,13 @@ where
 {
     inner: InnerApplication<E, H, P, V, I, St>,
     finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
+    transactions_hook: Option<FinalizedTransactionsHookFn<EngineCommitment<H, P>, H, P>>,
+}
+
+/// What the installed hooks need from a finalized batch before it is applied.
+pub(crate) struct Captured<H: Hasher> {
+    artifacts: Option<FinalizedArtifacts<H>>,
+    transactions: Option<FinalizedTransactions<H>>,
 }
 
 pub(crate) struct EngineReporter<R, H, P> {
@@ -101,10 +111,12 @@ where
     pub(crate) const fn new(
         inner: InnerApplication<E, H, P, V, I, St>,
         finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
+        transactions_hook: Option<FinalizedTransactionsHookFn<EngineCommitment<H, P>, H, P>>,
     ) -> Self {
         Self {
             inner,
             finalized_hook,
+            transactions_hook,
         }
     }
 }
@@ -121,6 +133,7 @@ where
         Self {
             inner: self.inner.clone(),
             finalized_hook: self.finalized_hook.clone(),
+            transactions_hook: self.transactions_hook.clone(),
         }
     }
 }
@@ -214,7 +227,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, P>, P>;
     type Block = EngineBlock<H, P>;
     type Databases = <InnerApplication<E, H, P, V, I, St> as StatefulApplication<E>>::Databases;
-    type Captured = Option<FinalizedArtifacts<H>>;
+    type Captured = Captured<H>;
     type Provider = I;
     type Input = ();
 
@@ -278,8 +291,31 @@ where
         batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) -> Self::Captured {
-        self.finalized_hook.as_ref()?;
-        Some(self.inner.capture(context, block, batches, readers).await)
+        // Each hook captures only what it observes, so a node without the full hook never
+        // copies state artifacts.
+        let transactions = if self.transactions_hook.is_some() {
+            let transactions =
+                InnerApplication::<E, H, P, V, I, St>::capture_transactions(batches, &readers)
+                    .await;
+            if transactions.is_none() {
+                tracing::warn!(
+                    height = block.header.height,
+                    "transaction-history range was not captured"
+                );
+            }
+            transactions
+        } else {
+            None
+        };
+        let artifacts = if self.finalized_hook.is_some() {
+            Some(self.inner.capture(context, block, batches, readers).await)
+        } else {
+            None
+        };
+        Captured {
+            artifacts,
+            transactions,
+        }
     }
 
     async fn finalized(
@@ -289,8 +325,12 @@ where
         captured: Self::Captured,
         _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
+        if let (Some(hook), Some(transactions)) = (&self.transactions_hook, captured.transactions) {
+            hook(block.inner_shared(), transactions);
+        }
         if let Some(hook) = &self.finalized_hook {
             let artifacts = captured
+                .artifacts
                 .expect("finalized artifact capture was skipped while a hook was installed");
             hook(block.inner_shared(), artifacts).await;
         }
