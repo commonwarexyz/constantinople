@@ -22,7 +22,7 @@ import { AccountHistorySession, accountHistoryContextKey } from './accountHistor
 import { readStoredHistory } from './historyStorage';
 import { buildHistogram, formatAverageTxPerBlock } from './histogram';
 import { type VerifiedBlock, subscribeBlocks } from './indexer';
-import { appendVerifiedBatch, EMPTY_FEED } from './feedState';
+import { appendVerifiedBatch, EMPTY_FEED, shownCount, shownFeed, type FeedState } from './feedState';
 import { submitTransactions } from './mempool';
 import {
     loadAccountBundle,
@@ -89,6 +89,10 @@ const HISTOGRAM_MAX_COLUMNS = 180;
 const BLOCK_LOG_MAX = 80;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
+
+/** Shortest row fade worth showing. A quicker one only blanks the newest row for its first frame. */
+const MIN_ROW_FADE_MS = 64;
+
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 type Status =
@@ -198,7 +202,7 @@ const MAX_CONCURRENT_RECONCILIATIONS = 3;
 
 export default function App() {
     const [feed, setFeed] = useState(EMPTY_FEED);
-    const { blocks, totalTxObserved, totalBlocksObserved, observedRateWindow } = feed;
+    const { blocks } = feed;
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const searchRef = useRef<SearchHandle>(null);
@@ -1212,16 +1216,7 @@ export default function App() {
                                 loading={transactionRequest.key !== lookupTransaction || transactionRequest.loading}
                                 onCopy={copyValue} onOpenAddress={openAccountPage} onOpenBlock={openBlockPage} />
                         ) : (
-                            <>
-                                <Histogram blocks={blocks} />
-                                <ExplorerStats
-                                    blocks={blocks}
-                                    observedRateWindow={observedRateWindow}
-                                    totalBlocksObserved={totalBlocksObserved}
-                                    totalTxObserved={totalTxObserved}
-                                />
-                                <BlockLog blocks={blocks} onOpenBlock={openBlockPage} />
-                            </>
+                            <HomeFeed feed={feed} onOpenBlock={openBlockPage} />
                         )}
                     </section>
                 </main>
@@ -2219,6 +2214,45 @@ function formatObservedTxPerSecond(
     });
 }
 
+/**
+ * The homepage's chart, statistics and block log. They share one view of the feed, so a block
+ * enters all three in the same frame.
+ */
+function HomeFeed({ feed, onOpenBlock }: { feed: FeedState; onOpenBlock: (height: bigint) => void }) {
+    const [now, setNow] = useState(Date.now);
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const shown = reducedMotion ? feed.totalBlocksObserved : shownCount(feed, now);
+    const { blocks, totalTxObserved, totalBlocksObserved } = useMemo(() => shownFeed(feed, shown), [feed, shown]);
+
+    // The clock runs only while blocks wait to be released.
+    const releasing = shown < feed.totalBlocksObserved;
+    useEffect(() => {
+        if (!releasing) return;
+        let frame = requestAnimationFrame(function step() {
+            setNow(Date.now());
+            frame = requestAnimationFrame(step);
+        });
+        return () => cancelAnimationFrame(frame);
+    }, [releasing]);
+
+    // A row's fade lasts at most two arrivals, so quick blocks do not leave the top rows dim.
+    const twoArrivalsMs = feed.pace.rate > 0 ? 2 / feed.pace.rate : null;
+    const rowFadeMs = twoArrivalsMs !== null && twoArrivalsMs < MIN_ROW_FADE_MS ? 0 : twoArrivalsMs;
+
+    return (
+        <>
+            <Histogram blocks={blocks} />
+            <ExplorerStats
+                blocks={blocks}
+                observedRateWindow={feed.observedRateWindow}
+                totalBlocksObserved={totalBlocksObserved}
+                totalTxObserved={totalTxObserved}
+            />
+            <BlockLog blocks={blocks} rowFadeMs={rowFadeMs} onOpenBlock={onOpenBlock} />
+        </>
+    );
+}
+
 const Histogram = memo(function Histogram({ blocks }: { blocks: VerifiedBlock[] }) {
     const frameRef = useRef<HTMLDivElement>(null);
     const [columns, setColumns] = useState(HISTOGRAM_INITIAL_COLUMNS);
@@ -2266,8 +2300,9 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: VerifiedBlock[] 
     );
 });
 
-const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
+const BlockLog = memo(function BlockLog({ blocks, rowFadeMs, onOpenBlock }: {
     blocks: VerifiedBlock[];
+    rowFadeMs: number | null;
     onOpenBlock: (height: bigint) => void;
 }) {
     // Hover and focus freeze the displayed rows so new blocks do not shift a row under the pointer.
@@ -2288,6 +2323,7 @@ const BlockLog = memo(function BlockLog({ blocks, onOpenBlock }: {
             </div>
             <div
                 className="block-log__list"
+                style={rowFadeMs === null ? undefined : { '--block-row-fade': `${rowFadeMs}ms` } as React.CSSProperties}
                 onPointerEnter={(event) => {
                     if (event.pointerType === 'touch') return;
                     pointerInside.current = true;

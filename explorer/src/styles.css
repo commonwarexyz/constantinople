@@ -492,8 +492,8 @@ button:disabled {
 
 /*
  * The histogram is a row of fixed-pixel-width columns, one per observed block, right-aligned so
- * new batches append without sliding. Bars are boxes rather than glyphs so adjacent columns meet
- * without seams. It is exempt from the text tokens.
+ * a new block appends as one whole column. Bars are boxes rather than glyphs so adjacent columns
+ * meet without seams. It is exempt from the text tokens.
  */
 .histogram {
     width: 100%;
@@ -603,7 +603,7 @@ button:disabled {
     padding: 0.7ch 0;
     border-bottom: 1px solid var(--theme-border);
     overflow: hidden;
-    animation: block-row-in 180ms ease-out both;
+    animation: block-row-in min(180ms, var(--block-row-fade, 180ms)) ease-out both;
 }
 
 .block-row:hover,
