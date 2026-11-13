@@ -238,6 +238,15 @@ export async function loadTransactionBundle(options: TransactionBundleOptions): 
     return verifyTransactionBundle(request, await loadEnvelope(request, () => createExplorerClient(request.indexerUrl).getTransaction({ digest: fromHex(request.digest) }, { signal: request.signal }), 'transaction'));
 }
 
+/**
+ * Verifies a transaction bundle that arrived with a submission report. It passes the same bounds
+ * and checks as a fetched bundle, so where the bytes came from does not matter.
+ */
+export async function verifyTransactionEvidence(options: TransactionBundleOptions, evidence: ProofBundle): Promise<VerifiedTransactionBundle> {
+    const request = transactionRequest(options);
+    return verifyTransactionBundle(request, await loadEnvelope(request, async () => evidence, 'transaction'));
+}
+
 export async function verifyAccountBundle(options: AccountBundleOptions, raw: unknown): Promise<VerifiedAccountBundle> {
     const request = accountRequest(options);
     const envelope = parseEnvelope(raw, Number(TRANSACTION_PAGE));

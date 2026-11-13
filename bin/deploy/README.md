@@ -175,6 +175,10 @@ the optional indexer secondary and follows consensus directly. It forwards singl
 user submissions to up to four upcoming leaders and larger batches to up to two.
 It waits up to ten seconds for a terminal result before returning an empty HTTP 202.
 Forwarding continues after that response, with a thirty-second timeout per leader.
+The relayer adds hex-encoded inclusion evidence to the finalization report of a
+single-transaction submission. It builds the evidence from the block its own node finalized,
+waiting up to 150 ms for that block, and reports without evidence otherwise. The `evidence_*`
+metrics count each outcome and the wait.
 Each copy shares its validator's ingress verification capacity with background
 traffic. Copies can remain queued or tracked after another leader finalizes the
 transaction. Resolution can wait for a later proposal and its expiry window.

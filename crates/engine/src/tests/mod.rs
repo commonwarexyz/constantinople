@@ -422,6 +422,7 @@ impl EngineDefinition for TestEngineDefinition {
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
+                    finalized_transactions_hook: None,
                 },
             )
             .await;

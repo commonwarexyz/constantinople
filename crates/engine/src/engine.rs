@@ -208,6 +208,10 @@ where
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
     pub finalized_hook: Option<EngineFinalizedHook<H, C::PublicKey>>,
+    /// Optional hook that observes each finalized block with only the
+    /// transaction-history range it appended. A node that installs it alone
+    /// captures nothing else and never fails finalization over the capture.
+    pub finalized_transactions_hook: Option<EngineFinalizedTransactionsHook<H, C::PublicKey>>,
 }
 
 /// Fully assembled validator engine.
@@ -518,6 +522,7 @@ where
                 application_transactions_target,
             ),
             config.finalized_hook,
+            config.finalized_transactions_hook,
         );
         let (stateful, stateful_mailbox) = Stateful::new(
             context.child("stateful"),

@@ -128,7 +128,13 @@ message CompletedSubmission {
   string content_type = 8;
 }
 
-message Finalized { uint64 height = 1; }
+message Finalized {
+  uint64 height = 1;
+  // Transaction evidence the relayer returned with its report, in the shape
+  // GetTransaction serves. The report is unauthenticated. The evidence
+  // establishes only what the client verifies from it, including its own height.
+  ProofBundle evidence = 2;
+}
 message PartiallyFinalized {
   uint64 height = 1;
   uint64 included = 2;

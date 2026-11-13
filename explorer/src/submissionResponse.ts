@@ -1,6 +1,13 @@
+import type { ProofBundle } from './gen/constantinople/explorer/v1/explorer_pb.ts';
+
 // Relayer reports do not establish transaction inclusion or non-inclusion.
 export type TxStatus =
-    | { readonly status: 'finalized'; readonly height: number }
+    | {
+          readonly status: 'finalized';
+          readonly height: number;
+          /** Transaction evidence delivered with the report. It establishes nothing until verified. */
+          readonly evidence?: ProofBundle;
+      }
     | {
           readonly status: 'partially_finalized';
           readonly height: number;
@@ -12,7 +19,7 @@ export type TxStatus =
 export type SubmissionResult = TxStatus | { readonly status: 'pending' };
 
 export type SingleTransactionOutcome =
-    | { readonly kind: 'finalized'; readonly height: number }
+    | { readonly kind: 'finalized'; readonly height: number; readonly evidence?: ProofBundle }
     | { readonly kind: 'ambiguous'; readonly detail: string };
 
 type SubmissionFailureKind = 'rejected' | 'ambiguous';
@@ -32,7 +39,7 @@ export class TransactionSubmissionError extends Error {
 
 export function singleTransactionOutcome(status: TxStatus): SingleTransactionOutcome {
     if (status.status === 'finalized') {
-        return { kind: 'finalized', height: status.height };
+        return { kind: 'finalized', height: status.height, ...(status.evidence && { evidence: status.evidence }) };
     }
     if (status.status === 'dropped') {
         return {

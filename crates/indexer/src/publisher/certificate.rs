@@ -473,7 +473,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    fn new(commitment: EngineCommitment<H, P>, block: &EngineBlock<H, P>) -> Self {
+    pub(crate) fn new(commitment: EngineCommitment<H, P>, block: &EngineBlock<H, P>) -> Self {
         debug_assert_eq!(commitment.block(), *block.seal());
         let header = EngineHeader::<H, P>::new_unchecked(block.header.clone(), *block.seal());
         Self { commitment, header }

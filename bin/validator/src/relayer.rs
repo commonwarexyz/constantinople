@@ -1,6 +1,9 @@
 //! Consensus-following transaction relayer.
 
-use crate::config::{RelayerConfig, RelayerLeaderConfig};
+use crate::{
+    config::{RelayerConfig, RelayerLeaderConfig},
+    evidence::InclusionProver,
+};
 use axum::{
     Router,
     body::Bytes,
@@ -16,7 +19,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{bls12381::primitives::variant::MinSig, sha256};
 use commonware_cryptography_curve25519::signing as ed25519;
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
 use commonware_parallel::Strategy;
 use constantinople_engine::types::EngineActivity;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
@@ -37,6 +40,7 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
+
 const SINGLE_TRANSACTION_FANOUT: usize = 4;
 const BATCH_FANOUT: usize = 2;
 const LEADER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -123,6 +127,8 @@ pub struct ServerConfig<St: Strategy> {
     pub listen: SocketAddr,
     pub relayer: RelayerConfig,
     pub account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
+    /// Proves inclusion from the blocks this node finalized, for the reports it forwards.
+    pub inclusion_prover: Option<Arc<dyn InclusionProver>>,
     pub view_clock: ViewClock,
     pub strategy: St,
     /// Signed-transaction byte budget derived from the encoded block limit.
@@ -135,6 +141,7 @@ struct AppState<St: Strategy> {
     leaders: Arc<Vec<Leader>>,
     max_batch_bytes: usize,
     account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
+    inclusion_prover: Option<Arc<dyn InclusionProver>>,
     view_clock: ViewClock,
     http: reqwest::Client,
     client_response_timeout: Duration,
@@ -159,11 +166,24 @@ enum LeaderResponse {
 
 type RelayResponse = (StatusCode, String);
 
+/// A finalization report that carries this node's inclusion evidence.
+#[derive(Serialize)]
+struct EvidencedReport {
+    #[serde(flatten)]
+    status: TxStatus,
+    /// Hex-encoded transaction bundle, in the shape the explorer indexer serves.
+    evidence: String,
+}
+
+/// A transaction whose finalization report this node tries to prove.
+type Provable = (sha256::Digest, Arc<dyn InclusionProver>);
+
 pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
     let state = AppState {
         leaders: Arc::new(normalize_leaders(config.relayer.leaders)),
         max_batch_bytes: config.max_batch_bytes,
         account_reader: config.account_reader,
+        inclusion_prover: config.inclusion_prover,
         view_clock: config.view_clock,
         http: reqwest::Client::builder()
             .connect_timeout(LEADER_CONNECT_TIMEOUT)
@@ -233,7 +253,7 @@ async fn submit_transactions<St: Strategy>(
             decode_batch(&body, max_batch_bytes).map(|transactions| (body, transactions))
         })
         .await;
-    let (body, transactions) = match decoded {
+    let (body, (transactions, only)) = match decoded {
         Ok(decoded) => decoded,
         Err(status) => return (status, String::new()),
     };
@@ -243,7 +263,10 @@ async fn submit_transactions<St: Strategy>(
     } else {
         BATCH_FANOUT
     };
-    submit_to_public_leaders(&state, body, fanout).await
+
+    // Evidence covers one transaction, so only a batch of one is proven.
+    let provable = only.zip(state.inclusion_prover.clone());
+    submit_to_public_leaders(&state, body, fanout, provable).await
 }
 
 async fn submit_to_pinned_leader<St: Strategy>(
@@ -283,6 +306,7 @@ async fn submit_to_public_leaders<St: Strategy>(
     state: &AppState<St>,
     body: Bytes,
     fanout: usize,
+    provable: Option<Provable>,
 ) -> RelayResponse {
     if state.leaders.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
@@ -295,7 +319,15 @@ async fn submit_to_public_leaders<St: Strategy>(
     let (response_tx, response_rx) = oneshot::channel();
 
     tokio::spawn(async move {
-        forward_to_targets(http, targets, body, leader_response_timeout, response_tx).await;
+        forward_to_targets(
+            http,
+            targets,
+            body,
+            leader_response_timeout,
+            provable,
+            response_tx,
+        )
+        .await;
     });
 
     match tokio::time::timeout(state.client_response_timeout, response_rx).await {
@@ -309,6 +341,7 @@ async fn forward_to_targets(
     targets: Vec<Leader>,
     body: Bytes,
     leader_response_timeout: Duration,
+    provable: Option<Provable>,
     response_tx: oneshot::Sender<RelayResponse>,
 ) {
     let target_count = targets.len();
@@ -335,8 +368,20 @@ async fn forward_to_targets(
 
     while let Some(result) = sends.next().await {
         match result {
-            LeaderResponse::Terminal(status @ TxStatus::Finalized { .. }) => {
-                send_once(&mut response_tx, status_response(status));
+            LeaderResponse::Terminal(status @ TxStatus::Finalized { height }) => {
+                // Only the first finalization report is answered, with evidence from this
+                // node's own copy of the block when it has one in time. A client that has
+                // stopped waiting is not proven to.
+                if response_tx
+                    .as_ref()
+                    .is_some_and(|response| !response.is_closed())
+                {
+                    let evidence = match &provable {
+                        Some((digest, prover)) => prover.prove(height, *digest).await,
+                        None => None,
+                    };
+                    send_once(&mut response_tx, finalized_response(status, evidence));
+                }
             }
             LeaderResponse::Terminal(TxStatus::PartiallyFinalized {
                 height,
@@ -379,6 +424,21 @@ fn send_once(sender: &mut Option<oneshot::Sender<RelayResponse>>, response: Rela
 
 fn status_response(status: TxStatus) -> RelayResponse {
     serde_json::to_string(&status).map_or_else(
+        |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+        |body| (StatusCode::OK, body),
+    )
+}
+
+/// Serializes a finalization report, with `evidence` when this node proved inclusion.
+fn finalized_response(status: TxStatus, evidence: Option<Vec<u8>>) -> RelayResponse {
+    let Some(evidence) = evidence else {
+        return status_response(status);
+    };
+    serde_json::to_string(&EvidencedReport {
+        status,
+        evidence: hex(&evidence),
+    })
+    .map_or_else(
         |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
         |body| (StatusCode::OK, body),
     )
@@ -509,7 +569,12 @@ async fn submit_background_to_leader(
     )
 }
 
-fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<usize, StatusCode> {
+/// Returns the batch's transaction count, and the digest of its transaction when it holds
+/// exactly one.
+fn decode_batch(
+    body: &Bytes,
+    max_batch_bytes: usize,
+) -> Result<(usize, Option<sha256::Digest>), StatusCode> {
     if body.len() > max_request_bytes(max_batch_bytes) {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -527,7 +592,11 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<usize, StatusCod
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    Ok(transactions.len())
+    let only = match transactions.as_slice() {
+        [transaction] => Some(*transaction.message_digest()),
+        _ => None,
+    };
+    Ok((transactions.len(), only))
 }
 
 const fn max_request_bytes(max_batch_bytes: usize) -> usize {
@@ -701,6 +770,7 @@ mod tests {
             leaders: Arc::new(leaders),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             account_reader: Arc::new(OnceLock::new()),
+            inclusion_prover: None,
             view_clock,
             http: reqwest::Client::builder()
                 .build()
@@ -798,9 +868,16 @@ mod tests {
 
     #[test]
     fn decode_batch_reports_transaction_count() {
-        let body = vec![signed_transfer(1, 0), signed_transfer(2, 0)].encode();
+        let first = signed_transfer(1, 0);
+        let body = vec![first.clone(), signed_transfer(2, 0)].encode();
+        assert_eq!(decode_batch(&body, DEFAULT_MAX_BATCH_BYTES), Ok((2, None)));
 
-        assert_eq!(decode_batch(&body, DEFAULT_MAX_BATCH_BYTES), Ok(2));
+        // A batch of one also names its transaction.
+        let digest = *first.message_digest();
+        assert_eq!(
+            decode_batch(&vec![first].encode(), DEFAULT_MAX_BATCH_BYTES),
+            Ok((1, Some(digest)))
+        );
     }
 
     #[test]
@@ -1150,6 +1227,92 @@ mod tests {
         .expect("finalized response should not wait for other leaders");
 
         assert_eq!(response, status_response(TxStatus::Finalized { height: 9 }));
+    }
+
+    /// Answers every request with fixed evidence and records what it was asked.
+    struct TestProver {
+        evidence: Option<Vec<u8>>,
+        requests: std::sync::Mutex<Vec<(u64, sha256::Digest)>>,
+    }
+
+    impl InclusionProver for TestProver {
+        fn prove(
+            &self,
+            height: u64,
+            digest: sha256::Digest,
+        ) -> futures::future::BoxFuture<'_, Option<Vec<u8>>> {
+            self.requests.lock().unwrap().push((height, digest));
+            Box::pin(std::future::ready(self.evidence.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn single_transaction_report_carries_this_nodes_evidence() {
+        let transfer = signed_transfer(1, 0);
+        let digest = *transfer.message_digest();
+        let single: Bytes = vec![transfer.clone()].encode();
+        let pair: Bytes = vec![transfer, signed_transfer(2, 0)].encode();
+        let plain = r#"{"status":"finalized","height":9}"#;
+        for (name, body, evidence, expected, asked) in [
+            (
+                "proven",
+                single.clone(),
+                Some(vec![0, 127, 255]),
+                r#"{"status":"finalized","height":9,"evidence":"007fff"}"#,
+                vec![(9, digest)],
+            ),
+            ("unproven", single, None, plain, vec![(9, digest)]),
+            ("batch", pair, Some(vec![1]), plain, Vec::new()),
+        ] {
+            let finalized =
+                terminal_router(TxStatus::Finalized { height: 9 }, Duration::ZERO, None);
+            let prover = Arc::new(TestProver {
+                evidence,
+                requests: std::sync::Mutex::new(Vec::new()),
+            });
+            let mut state = test_state(
+                vec![mock_leader("00", spawn_mock_leader(finalized).await)],
+                Duration::from_millis(300),
+                Duration::from_millis(400),
+            );
+            state.inclusion_prover = Some(prover.clone());
+
+            let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+            assert_eq!(response, (StatusCode::OK, expected.to_owned()), "{name}");
+            assert_eq!(*prover.requests.lock().unwrap(), asked, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_report_for_a_client_that_stopped_waiting_is_not_proven() {
+        let completion = Arc::new(Notify::new());
+        let finalized = terminal_router(
+            TxStatus::Finalized { height: 9 },
+            Duration::from_millis(50),
+            Some(completion.clone()),
+        );
+        let prover = Arc::new(TestProver {
+            evidence: Some(vec![1]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = test_state(
+            vec![mock_leader("00", spawn_mock_leader(finalized).await)],
+            Duration::from_millis(5),
+            Duration::from_millis(200),
+        );
+        state.inclusion_prover = Some(prover.clone());
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        // The leader's report arrives after the client has its answer.
+        assert_eq!(response, (StatusCode::ACCEPTED, String::new()));
+        tokio::time::timeout(Duration::from_millis(200), completion.notified())
+            .await
+            .expect("owned request should complete after client timeout");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(prover.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

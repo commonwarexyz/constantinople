@@ -32,7 +32,10 @@ export async function submitTransactions(
         if (completed.httpStatus === 202 && result.case === 'pending') return { status: 'pending' };
         if (completed.httpStatus !== 200) throw new TransactionSubmissionError('ambiguous', `transaction returned HTTP ${completed.httpStatus}`);
         if (result.case === 'dropped') return { status: 'dropped' };
-        if (result.case === 'finalized') return { status: 'finalized', height: safeNumber(result.value.height) };
+        if (result.case === 'finalized') {
+            const { height, evidence } = result.value;
+            return { status: 'finalized', height: safeNumber(height), ...(evidence && { evidence }) };
+        }
         if (result.case === 'partiallyFinalized') return {
             status: 'partially_finalized', height: safeNumber(result.value.height),
             included: safeNumber(result.value.included), filtered: safeNumber(result.value.filtered),
