@@ -205,6 +205,7 @@ export default function App() {
     const { blocks } = feed;
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const [isWalletOpen, setIsWalletOpen] = useState(false);
+    const [isMenuOpen, setIsMenuOpen] = useState(false);
     const searchRef = useRef<SearchHandle>(null);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
 
@@ -225,6 +226,9 @@ export default function App() {
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
     const [lookupBlock, setLookupBlock] = useState(() => blockFromLocation());
     const [lookupTransaction, setLookupTransaction] = useState(() => transactionFromLocation());
+
+    // Opening a page closes the narrow-screen menu that held the search or link used to reach it.
+    useEffect(() => setIsMenuOpen(false), [lookupAccount, lookupBlock, lookupTransaction]);
     const [transactionBundle, setTransactionBundle] = useState<Awaited<ReturnType<typeof loadTransactionBundle>> | null>(null);
     const [transactionRequest, setTransactionRequest] = useState<PageRequest>({ key: '', loading: false, message: '' });
     const [blockOffsets, setBlockOffsets] = useState<bigint[]>([0n]);
@@ -1132,7 +1136,7 @@ export default function App() {
     return (
         <div className="app">
             <div className="app__container">
-                <header className="app__header">
+                <header className={isMenuOpen ? 'app__header app__header--menu-open' : 'app__header'}>
                     <h1 className="app__title">
                         <span className="accent">constantinople</span> /{' '}
                         <button
@@ -1143,6 +1147,10 @@ export default function App() {
                             explorer
                         </button>
                     </h1>
+                    <button className="menu-trigger" type="button" aria-label="menu" aria-expanded={isMenuOpen}
+                        onClick={() => setIsMenuOpen((open) => !open)}>
+                        {isMenuOpen ? '×' : '≡'}
+                    </button>
                     <SearchForm ref={searchRef} endpoint={indexerUrl} onOpenAccount={openAccountPage} onOpenTransaction={openTransactionPage} />
                     <div className="app__header-actions">
                         {(status.kind !== 'live' || lookupAccount !== '' || lookupBlock !== null || lookupTransaction !== '') && (
@@ -1155,6 +1163,7 @@ export default function App() {
                         )}
                         <button className="wallet-trigger" onClick={() => {
                             searchRef.current?.cancel();
+                            setIsMenuOpen(false);
                             setIsWalletOpen(true);
                         }}>
                             wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
@@ -2119,7 +2128,7 @@ function StatusBadge({ status, spinner, height }: { status: Status; spinner: str
         );
     }
     return (
-        <span className="app__status">
+        <span className="app__status app__status--height">
             height <span className="accent">{height?.toString() ?? '—'}</span>
         </span>
     );

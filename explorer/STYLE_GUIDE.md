@@ -83,7 +83,7 @@ Long hashes and addresses either truncate with a middle ellipsis (rows, block lo
 ## Controls
 
 - **Primary action:** accent fill, background-colored text, 1px accent border, `--pad-control`.
-  The header wallet button, popup close, wallet actions, transfer submit, page refresh,
+  The header wallet and menu buttons, popup close, wallet actions, transfer submit, page refresh,
   account and block pagers, and the search submit button.
 - **Links and copy targets:** buttons styled as text with no padding. Identity links that open an
   account or transaction page are accent; copy-only values are text color and turn accent on hover.
@@ -108,10 +108,10 @@ Account, block, and transaction pages show the latest height (dim word, accent
 figure); the homepage hides it because the live block feed already shows activity. Connection
 states take its place: a braille spinner while connecting, or error text with a dot in
 `--theme-error`. At ≤1800px the wallet key is omitted. At ≤1300px search occupies its own centered
-row. At ≤760px the title centers on its own line, the height, separator and wallet actions center
-together on the next, and search takes the last row, so its feedback drops over the page rather
-than the actions. At ≤480px separators hide, and the height or connection status occupies a full
-centered row above the actions.
+row. At ≤760px the header is the title with a menu button at right, `≡` when closed and `×` when
+open. The height is left out, and a connection status keeps a row beneath the title and wraps.
+Opening the menu adds a full-width wallet button and then search, so search feedback drops over the
+page. Opening a page or the wallet closes the menu.
 
 **Datum grid.** Cells separated by 1px border-colored gaps inside a 1px border, `--pad-cell`
 padding, a label above a value. Homepage statistics use 5 equal columns, then 2 at ≤760px (an odd last
