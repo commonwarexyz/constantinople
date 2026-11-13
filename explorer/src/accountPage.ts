@@ -1,5 +1,5 @@
 import { bytesEqual } from './codec.ts';
-import { readU64Be, type AccountTransactionPage } from './qmdb.ts';
+import { readU64Be, TRANSACTION_PAGE, type AccountTransactionPage } from './qmdb.ts';
 
 export interface AccountHistoryTransaction {
     readonly digest: string;
@@ -31,7 +31,7 @@ export function accountHistoryPage(
     if (cursor && cursor.length !== 8) throw new Error('invalid account cursor');
     const end = cursor ? readU64Be(cursor, 0) : count;
     if (end > count) throw new Error('account cursor exceeds authenticated count');
-    const lower = end > 10n ? end - 10n : 0n;
+    const lower = end > TRANSACTION_PAGE ? end - TRANSACTION_PAGE : 0n;
     if (transactions.length !== Number(end - lower)) throw new Error('account page does not cover the authenticated count interval');
     const nextCursor = lower > 0n ? accountCursor(lower) : null;
     if ((nextCursor === null) !== (claimedNext === null) || (nextCursor && !bytesEqual(nextCursor, claimedNext!))) {

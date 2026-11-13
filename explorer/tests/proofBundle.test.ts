@@ -127,7 +127,7 @@ test('hostile wire sizes and noncanonical numbers fail before certificate verifi
         { ...empty(), sequenceNumber: '18446744073709551616' },
         { ...empty(), headers: Array(4097).fill('00') },
         { ...empty(), headers: ['00'.repeat(513)] },
-        { ...empty(), transactions: Array(11).fill(rows[0]) },
+        { ...empty(), transactions: Array(51).fill(rows[0]) },
         { ...empty(), transactions: [{ ...rows[0], body: '00'.repeat(920) }] },
         { ...empty(), transactions: [{ ...rows[0], location: 1 }] },
         ...['-1', '01', '18446744073709551616'].flatMap((value) => [
@@ -578,7 +578,7 @@ nativeTest('canceling one concurrent aggregate load leaves the other caller inde
     for (const release of releases) release();
     await rejected;
     const verified = await surviving;
-    assert.equal(verified.page.rows.length, 10);
+    assert.equal(verified.page.rows.length, 50);
     assert.ok(verified.account);
     assert.equal(second.signal.aborted, false);
     assert.equal(fetch.mock.callCount(), 2);
@@ -593,7 +593,7 @@ nativeTest('account rows derive authenticated indices and pin the account versio
     assert.equal(first.account.txCount, 58n);
     assert.equal(first.account.writeHeight, 3n);
     assert.equal(first.account.timestampMs, 3n);
-    assert.equal(first.page.rows.length, 10);
+    assert.equal(first.page.rows.length, 50);
     assert.equal(first.page.rows[0]!.direction, 'sent');
     assert.equal(first.page.rows[0]!.counterparty, fixture.account);
     assert.equal(first.page.rows[0]!.value, 1n);
@@ -601,11 +601,12 @@ nativeTest('account rows derive authenticated indices and pin the account versio
     assert.equal(first.page.rows[0]!.senderIndex, first.page.rows[0]!.recipientIndex);
     assert.equal(first.page.rows.filter((row) => row.digest === first.page.rows[0]!.digest).length, 1);
     assert.ok(first.page.rows.every((row) => !('height' in row) && !('blockIndex' in row)));
-    assert.deepEqual(first.page.nextCursor, accountCursor(48n));
+    assert.deepEqual(first.page.nextCursor, accountCursor(8n));
     const pinned = { ...opts, at: { height: first.target.height, blockDigest: first.target.blockDigest },
         accountLocation: first.account.location, expectedTxCount: first.account.txCount };
     const next = await verifyAccountBundle({ ...pinned, cursor: first.page.nextCursor }, fixture.accountNext);
-    assert.equal(next.page.rows[0]!.accountIndex, 47n);
+    assert.deepEqual(next.page.rows.map((row) => row.accountIndex), [7n, 6n, 5n, 4n, 3n, 2n, 1n, 0n]);
+    assert.equal(next.page.nextCursor, null);
     assert.ok(next.page.rows.every((row) => !first.page.rows.some((prior) => prior.digest === row.digest)));
     const oldest = await verifyAccountBundle({ ...pinned, cursor: accountCursor(3n) }, fixture.accountOldest);
     assert.deepEqual(oldest.page.rows.map((row) => row.accountIndex), [2n, 1n, 0n]);
@@ -713,7 +714,7 @@ nativeTest('every aggregate view uses one typed RPC with locally verified eviden
     const account = await loadAccountBundle({ ...opts, account: fixture.account });
     const block = await loadBlockBundle({ ...opts, height: 2n });
     const transaction = await loadTransactionBundle({ ...opts, digest: fixture.transactionDigest });
-    assert.equal(account.page.rows.length, 10);
+    assert.equal(account.page.rows.length, 50);
     assert.equal(block.block.height, 2n);
     assert.equal(transaction.transaction.digest, fixture.transactionDigest);
     assert.deepEqual(urls, ['GetAccount', 'GetBlock', 'GetTransaction'].map((method) =>
@@ -737,7 +738,7 @@ nativeTest('typed account continuation sends the first verified account location
     const next = await loadAccountBundle({ ...opts, cursor: first.page.nextCursor,
         at: { height: first.target.height, blockDigest: first.target.blockDigest },
         accountLocation: first.account.location, expectedTxCount: first.account.txCount });
-    assert.equal(next.page.rows[0]!.accountIndex, 47n);
+    assert.equal(next.page.rows[0]!.accountIndex, 7n);
     assert.equal(requests, 1);
 });
 
@@ -796,7 +797,7 @@ nativeTest('native account pages reject missing, repeated, reordered and hidden 
     const fixture = await publisherFixture();
     const opts = { ...fixtureOptions(fixture), account: fixture.account };
     const baseline = await verifyAccountBundle(opts, fixture.accountBundle);
-    assert.equal(baseline.page.rows.length, 10);
+    assert.equal(baseline.page.rows.length, 50);
     for (const mutate of [
         (wire: WireBundle) => { wire.transactions.splice(4, 1); },
         (wire: WireBundle) => { wire.transactions[1] = { ...wire.transactions[0]! }; },
@@ -806,7 +807,7 @@ nativeTest('native account pages reject missing, repeated, reordered and hidden 
         (wire: WireBundle) => { wire.transactions[0]!.recipientIndex = (BigInt(wire.transactions[0]!.recipientIndex) + 1n).toString(); },
         (wire: WireBundle) => { wire.transactions[0]!.role = 1; },
         (wire: WireBundle) => { wire.nextCursor = null; },
-        (wire: WireBundle) => { wire.nextCursor = toHex(accountCursor(47n)); },
+        (wire: WireBundle) => { wire.nextCursor = toHex(accountCursor(7n)); },
     ]) {
         const wire = structuredClone(fixture.accountBundle);
         mutate(wire);

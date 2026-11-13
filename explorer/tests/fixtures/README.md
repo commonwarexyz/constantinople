@@ -49,7 +49,7 @@ bitmap and transaction count as four big-endian u64 values.
 The native account fixture has count 58. Its first page contains the self-transfer
 once, with equal participant indices and the sent role. Participant-based filters
 include that same row once in both sent and received views. `accountNext` continues
-at exclusive index 48, `accountOldest` starts at 3, and `accountExhausted` starts
+at exclusive index 8, `accountOldest` starts at 3, and `accountExhausted` starts
 at 0. Cursors are eight-byte big-endian exclusive indices.
 Continuation requests retain the first page's certified height/digest, account
 location and authenticated transaction count.

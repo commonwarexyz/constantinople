@@ -8,7 +8,7 @@ import { accountKeyFromPublicKey, bytesEqual, fromHex, parseAccountKeyHex, toArr
 import {
     authenticatedHeader, decodeAccountValue, finalizedTargetFromCertificate,
     readU64Be, simplexFinalizationVerifier,
-    MAX_ANCESTRY_HEADERS, MAX_EXECUTION_HEADER_BYTES, MAX_FINALIZATION_CERTIFICATE_BYTES,
+    MAX_ANCESTRY_HEADERS, MAX_EXECUTION_HEADER_BYTES, MAX_FINALIZATION_CERTIFICATE_BYTES, TRANSACTION_PAGE,
     type AccountTransactionPage, type DecodedBlockHeader,
     type LatestProofTarget, type VerifiedAccountProof, type VerifiedFinalizationTarget,
     type VerifiedTransactionProof,
@@ -240,7 +240,7 @@ export async function loadTransactionBundle(options: TransactionBundleOptions): 
 
 export async function verifyAccountBundle(options: AccountBundleOptions, raw: unknown): Promise<VerifiedAccountBundle> {
     const request = accountRequest(options);
-    const envelope = parseEnvelope(raw, 10);
+    const envelope = parseEnvelope(raw, Number(TRANSACTION_PAGE));
     const target = await certifiedTarget(request, envelope);
     if (request.at && (target.height !== request.at.height || !bytesEqual(target.blockDigest, request.at.blockDigest))) {
         throw new Error('account bundle does not match requested snapshot');
@@ -276,7 +276,7 @@ export async function verifyBlockBundle(options: BlockBundleOptions, raw: unknow
     // Authenticate the ancestry from the covering certificate to the block's parent. Those headers
     // fix the block's own append interval.
     const request = blockRequest(options);
-    const envelope = parseEnvelope(raw, 50);
+    const envelope = parseEnvelope(raw, Number(TRANSACTION_PAGE));
     if (envelope.account !== null) throw new Error('block bundle contains account proof');
     const target = await certifiedTarget(request, envelope);
     const { block, blockDigest, start, end } = await owningBlock(target, envelope, request.height, request.signal);
@@ -285,7 +285,7 @@ export async function verifyBlockBundle(options: BlockBundleOptions, raw: unknow
     // The page must fill the interval from the offset, one row per consecutive location, so the
     // indexer cannot omit or reorder transactions.
     if (request.offset > count) throw new Error('block offset exceeds transaction count');
-    const expectedCount = Number(count - request.offset < 50n ? count - request.offset : 50n);
+    const expectedCount = Number(count - request.offset < TRANSACTION_PAGE ? count - request.offset : TRANSACTION_PAGE);
     if (envelope.transactions.length !== expectedCount) throw new Error('block page does not cover the expected append interval');
     for (let index = 0; index < expectedCount; index++) {
         const row = envelope.transactions[index]!;
@@ -356,7 +356,7 @@ export function proofBundleInput(bundle: ProofBundle, kind: BundleKind): unknown
         if (!(value instanceof Uint8Array) || value.length > maximum) throw new Error(`invalid or oversized ${label}`);
         return toHex(value);
     };
-    if (bundle.headers.length > MAX_HEADERS || bundle.transactions.length > 50) throw new Error('oversized proof bundle');
+    if (bundle.headers.length > MAX_HEADERS || bundle.transactions.length > Number(TRANSACTION_PAGE)) throw new Error('oversized proof bundle');
     const next = bundle.nextCursor;
     if (next.case !== undefined && next.case !== (kind === 'account' ? 'activityCursor' : kind === 'block' ? 'blockOffset' : undefined)) {
         throw new Error('proof bundle cursor does not match requested view');

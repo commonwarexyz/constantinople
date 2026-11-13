@@ -61,7 +61,7 @@ delivery when the transport fails.
 
 An account page selects a published, certified snapshot and retains its height,
 digest, account operation location, and transaction count while paging through
-ten transactions at a time. Refreshing selects a new one. Wallet
+fifty transactions at a time. Refreshing selects a new one. Wallet
 balance requests omit activity. A returned account update proves active membership
 under the snapshot's current unordered state root. Authenticated ancestor headers identify the
 block that appended that account operation. The account's count fixes each

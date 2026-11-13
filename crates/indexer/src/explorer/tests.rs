@@ -831,7 +831,7 @@ fn assert_lookup_context_rejected(bundle: &Value, key: AccountKey, block: &Fixtu
 
 /// Checks the complete descending interval certified by an account's count.
 fn assert_account_page(bundle: &Value, end: u64) {
-    let start = end.saturating_sub(ACCOUNT_PAGE as u64);
+    let start = end.saturating_sub(TRANSACTION_PAGE);
     let rows = bundle["transactions"].as_array().unwrap();
     assert_eq!(rows.len() as u64, end - start);
     for (row, expected) in rows.iter().zip((start..end).rev()) {
@@ -948,7 +948,7 @@ fn account_pages_reject_untrusted_sql_hints() {
         ] {
             let target = match case {
                 // The remaining page must stay contiguous to exercise its length check.
-                "omitted" => 45,
+                "omitted" => 5,
                 "duplicate" => 53,
                 _ => 54,
             };
@@ -956,7 +956,7 @@ fn account_pages_reject_untrusted_sql_hints() {
             match case {
                 "omitted" => hint.height = 4,
                 "wrong index" => {
-                    hint = activity_hint(&fixture, 44);
+                    hint = activity_hint(&fixture, 4);
                     hint.account_index = 57;
                 }
                 "wrong role" => hint.role = TxActivityRole::Receiver,
@@ -1372,8 +1372,8 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             json!([hex(&fixture.blocks[1].block.header.encode())])
         );
 
-        // The account view proves the latest update and returns the newest ten
-        // activity rows.
+        // The account view proves the latest update and returns the newest page
+        // of activity rows.
         let account = proof_bundle(router, &account_request).await;
         assert_eq!(certificate_height(&account), 3);
         let account_location = fixture.blocks[2].account_location.unwrap();
@@ -1391,7 +1391,8 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         assert_eq!(account["transactions"][0]["role"], 0);
         assert_transaction_proof(client, &account, &fixture.blocks[2]).await;
 
-        // A cursor on the pinned snapshot continues with the next ten rows.
+        // A cursor on the pinned snapshot continues with the remaining rows,
+        // which end block 2's transactions and cover all of block 1's.
         let pinned = proto::GetAccountRequest {
             cursor: Some(hex_bytes_dynamic(account["nextCursor"].as_str().unwrap())),
             at: Some(3),
@@ -1400,9 +1401,11 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             ..account_request.clone()
         };
         let next = proof_bundle(router, &pinned).await;
-        assert_account_page(&next, 48);
-        assert_eq!(next["transactions"][0]["index"], 44);
-        assert_eq!(next["transactions"][9]["index"], 35);
+        assert_account_page(&next, 8);
+        assert_eq!(next["transactions"][0]["index"], 4);
+        assert_eq!(next["transactions"][4]["index"], 0);
+        assert_eq!(next["transactions"][5]["height"], "1");
+        assert!(next["nextCursor"].is_null());
         let oldest = proof_bundle(router, &proto::GetAccountRequest {
             cursor: Some(3_u64.to_be_bytes().to_vec()),
             ..pinned.clone()

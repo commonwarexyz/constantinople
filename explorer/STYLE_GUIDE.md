@@ -196,9 +196,16 @@ filtered page could not prove that it omitted nothing.
 **Block log.** A sticky, label-styled column header over full-width row buttons (height, dim hash,
 count, dim time). Beneath the height, the shared green check accompanies `cert v<view>` for a direct
 certificate or `via h<height>` for verified ancestry. Rows fade in on arrival unless reduced motion
-is requested; hover and focus use row-alt. At ≤760px each row stacks into two lines, height with the
-transaction count at right, then the dim hash with the time at right. The header labels follow the
-same layout. Hashes and timestamps truncate to fit, and the whole row stays one click target.
+is requested. The fade shortens to two arrivals when blocks are quick, and rows that arrive faster
+than a fade can show enter without one, so the top rows never sit dim or blank. Hover and focus use
+row-alt. At ≤760px each row stacks into two lines, height with the transaction count at right, then
+the dim hash with the time at right. The header labels follow the same layout. Hashes and timestamps
+truncate to fit, and the whole row stays one click target.
+
+**Block arrival.** The indexer delivers blocks in batches. The homepage releases a batch one block
+at a time at the rate blocks have been arriving, so the histogram, statistics and block log advance
+together instead of replacing every visible row at once. A block that arrives with nothing waiting
+appears immediately. With reduced motion each batch appears whole.
 
 ## States
 
@@ -222,8 +229,9 @@ same layout. Hashes and timestamps truncate to fit, and the whole row stays one 
   repeats the `--theme-background` and `--theme-accent` values rather than reading the tokens;
   change them together.
 - **Histogram.** A row of fixed-pixel-width columns (`--histogram-column`: 8px; 4px ≤760px;
-  3px ≤480px), one per observed block, drawn as boxes so adjacent bars meet without seams. New
-  batches append at the right without interpolated sliding. Unobserved history stays blank,
-  actual empty blocks are 2px dim baseline ticks, and positive counts use amber bars scaled to
-  the visible peak. The chart has no visible key. It does not use the text tokens.
+  3px ≤480px), one per observed block, drawn as boxes so adjacent bars meet without seams. A new
+  block appends at the right as one whole column, without interpolated sliding. Unobserved
+  history stays blank, actual empty blocks are 2px dim baseline ticks, and positive counts use
+  amber bars scaled to the visible peak. The chart has no visible key. It does not use the text
+  tokens.
 - **Block-log time column.** On desktop, an 8px right inset keeps it clear of the scrollbar.
