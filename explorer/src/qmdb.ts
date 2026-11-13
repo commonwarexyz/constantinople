@@ -75,16 +75,6 @@ export interface VerifiedAccountProof {
     readonly proofSizeBytes: number;
 }
 
-export interface VerifiedAccountExclusion {
-    readonly accountKey: string;
-    readonly timestampMs: bigint;
-    readonly proofSizeBytes: number;
-    /** Location of the operation whose key span excludes the account. */
-    readonly location: bigint;
-    /** Hex keys of the adjacent active accounts bracketing this one; null for an empty database. */
-    readonly span: { readonly lower: string; readonly upper: string } | null;
-}
-
 // The parent digest authenticates ancestor headers and exact transaction bounds.
 interface AuthenticatedTarget extends FinalizedTransactionTarget {
     readonly parentDigest: Uint8Array;

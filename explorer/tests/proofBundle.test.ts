@@ -9,7 +9,6 @@ import type { VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { fromHex, toArrayBuffer, toHex } from '../src/codec.ts';
 import { authenticatedHeader, finalizedTargetFromCertificate } from '../src/qmdb.ts';
 import { initAccountProofWasm } from '../src/accountProof.ts';
-import { blockRecency } from '../src/blockRecency.ts';
 import {
     loadAccountBundle, loadBlockBundle, loadTransactionBundle,
     verifyAccountBundle, verifyBlockBundle, verifyTransactionBundle, proofBundleInput,
@@ -33,7 +32,7 @@ interface WireRow { location: string; body: string; height: string; index: numbe
 /** Combined indexer response as encoded on the wire. */
 interface WireBundle {
     certificate: string; headers: string[]; sequenceNumber: string;
-    account: { location: string; proof: string; writeHeight: string; encodedOperation?: string; exclusion?: boolean } | null;
+    account: { location: string; proof: string; writeHeight: string; encodedOperation: string } | null;
     transactions: WireRow[]; transactionsProof: string | null; nextCursor: string | null;
 }
 
@@ -45,7 +44,7 @@ interface PublisherFixture {
     accountStateOnly: WireBundle; recipientBundle: WireBundle; transactionBundle: WireBundle;
     webauthnBlock: WireBundle; webauthnBundle: WireBundle; webauthnDigest: string;
     historicalBlock: WireBundle; historicalTransaction: WireBundle; historicalDigest: string;
-    accountWithHistory: WireBundle; accountOldest: WireBundle; accountExhausted: WireBundle; unknownAccount: WireBundle; emptyAccount: WireBundle;
+    accountWithHistory: WireBundle; accountOldest: WireBundle; accountExhausted: WireBundle;
 }
 
 const nativeFixture = await readFixture<PublisherFixture>('proofBundle');
@@ -69,8 +68,7 @@ function rpcBundle(wire: WireBundle): ProofBundle {
         sequenceNumber: BigInt(wire.sequenceNumber),
         account: wire.account === null ? undefined : {
             location: BigInt(wire.account.location), proof: fromHex(wire.account.proof), writeHeight: BigInt(wire.account.writeHeight),
-            claim: wire.account.encodedOperation !== undefined ? { case: 'encodedOperation', value: fromHex(wire.account.encodedOperation) }
-                : wire.account.exclusion !== undefined ? { case: 'exclusion', value: wire.account.exclusion } : { case: undefined },
+            encodedOperation: fromHex(wire.account.encodedOperation),
         },
         transactions: wire.transactions.map((row) => ({
             location: BigInt(row.location), body: fromHex(row.body), height: BigInt(row.height),
@@ -150,14 +148,14 @@ test('typed proof inputs enforce bounds before certificate verification', () => 
         (bundle) => { bundle.transactions[0]!.senderIndex = -1n; },
         (bundle) => { bundle.transactions[0]!.recipientIndex = 1n << 64n; },
         (bundle) => { bundle.account!.writeHeight = -1n; },
-        (bundle) => { bundle.account!.claim = { case: 'encodedOperation', value: new Uint8Array(98) }; },
+        (bundle) => { bundle.account!.encodedOperation = new Uint8Array(66); },
         (bundle) => { bundle.account!.proof = new Uint8Array(1024 * 1024 + 1); },
         (bundle) => { bundle.transactionsProof = new Uint8Array(1024 * 1024 + 1); },
         (bundle) => { bundle.nextCursor = { case: 'activityCursor', value: new Uint8Array(25) }; },
     ];
     for (const mutate of mutations) {
         const bundle = rpcBundle({
-            ...empty(), account: { location: '1', proof: '00', writeHeight: '1', encodedOperation: '00'.repeat(97) },
+            ...empty(), account: { location: '1', proof: '00', writeHeight: '1', encodedOperation: '00'.repeat(65) },
             transactions: [{ location: '1', body: '00', height: '1', index: 0, senderIndex: '0', recipientIndex: '0' }],
         });
         mutate(bundle);
@@ -606,97 +604,27 @@ nativeTest('account rows derive authenticated indices and pin the account versio
     assert.deepEqual(onlyState.page, { rows: [], nextCursor: null });
     assert.deepEqual(onlyState.account, first.account);
     await assert.rejects(verifyAccountBundle(opts, { ...fixture.accountBundle, account: null }), /missing account proof/);
-    const unknown = await verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, fixture.unknownAccount);
-    assert.equal(unknown.kind, 'exclusion');
-    assert.equal(unknown.account, null);
-    assert.equal(unknown.absence?.accountKey, '00'.repeat(32));
-    assert.equal(unknown.absence?.timestampMs, unknown.target.timestampMs);
-    assert.deepEqual(unknown.page, { rows: [], nextCursor: null });
 
     const laterSequence = await verifyAccountBundle(opts, { ...fixture.accountBundle, sequenceNumber: '18446744073709551615' });
     assert.deepEqual(laterSequence.account, first.account);
     assert.deepEqual(laterSequence.page, first.page);
 });
 
-nativeTest('native exclusion authenticates only absence at its exact certified root', async () => {
+nativeTest('native account proofs require the requested account update', async () => {
     const fixture = await publisherFixture();
-    const opts = { ...fixtureOptions(fixture), account: '00'.repeat(32) };
-    const absent = await verifyAccountBundle(opts, fixture.unknownAccount);
-    assert.equal(absent.kind, 'exclusion');
-    assert.ok(absent.absence);
-    assert.equal(absent.absence.accountKey, opts.account);
-    assert.equal(absent.absence.timestampMs, absent.target.timestampMs);
-    assert.ok(absent.absence.proofSizeBytes > 0);
-    assert.equal(absent.account, null);
-    assert.deepEqual(absent.page, { rows: [], nextCursor: null });
-    assert.deepEqual(absent.transactionProofs, []);
-    for (const field of ['balance', 'nonce', 'nonceBitmap', 'txCount', 'writeHeight']) {
-        assert.equal(field in absent.absence, false);
-    }
-    assert.ok(absent.absence.location < absent.target.stateTip);
-    assert.ok(absent.absence.span === null || /^[0-9a-f]{64}$/.test(absent.absence.span.lower + absent.absence.span.upper.slice(64)));
-    assert.equal(blockRecency(absent.target.timestampMs, Number(absent.target.timestampMs)).kind, 'recent');
-    assert.equal(blockRecency(absent.target.timestampMs, Number(absent.target.timestampMs) + 61_000).kind, 'stale');
-
-    await assert.rejects(verifyAccountBundle({ ...opts, account: fixture.account }, fixture.unknownAccount));
-    const otherRoot = structuredClone(fixture.unknownAccount);
-    assert.notEqual(otherRoot.certificate, fixture.directBlock.certificate);
-    otherRoot.certificate = fixture.directBlock.certificate;
-    await assert.rejects(verifyAccountBundle(opts, otherRoot));
-
-    const account = fixture.unknownAccount.account!;
-    for (const proof of ['', account.proof.slice(0, -2), account.proof + '00',
-        (Number.parseInt(account.proof.slice(0, 2), 16) ^ 0xff).toString(16).padStart(2, '0') + account.proof.slice(2)]) {
-        await assert.rejects(verifyAccountBundle(opts, { ...fixture.unknownAccount, account: { ...account, proof } }));
-    }
-    for (const extra of [{ account: null }, { headers: [fixture.descendantBlock.headers[0]!] },
-        { transactions: [fixture.accountBundle.transactions[0]!] }, { transactionsProof: fixture.accountBundle.transactionsProof },
-        { nextCursor: '0000000000000000' }]) {
-        await assert.rejects(verifyAccountBundle(opts, { ...fixture.unknownAccount, ...extra }));
-    }
-    for (const metadata of [{ location: '1' }, { writeHeight: '1' }]) {
-        await assert.rejects(verifyAccountBundle(opts, { ...fixture.unknownAccount, account: { ...account, ...metadata } }), /inclusion metadata/);
-    }
-});
-
-nativeTest('native empty-database proof authenticates absence without account metadata', async () => {
-    const fixture = await publisherFixture();
-    const opts = { ...fixtureOptions(fixture), account: '00'.repeat(32) };
-    const empty = await verifyAccountBundle(opts, fixture.emptyAccount);
-    assert.equal(empty.kind, 'exclusion');
-    assert.equal(empty.account, null);
-    assert.equal(empty.absence?.accountKey, opts.account);
-    assert.deepEqual(empty.page, { rows: [], nextCursor: null });
-    assert.deepEqual(empty.transactionProofs, []);
-    const otherKey = await verifyAccountBundle({ ...opts, account: 'ff'.repeat(32) }, fixture.emptyAccount);
-    assert.equal(otherKey.kind, 'exclusion');
-    const forged = structuredClone(fixture.emptyAccount);
-    forged.certificate = fixture.accountBundle.certificate;
-    await assert.rejects(verifyAccountBundle(opts, forged));
-});
-
-nativeTest('native proof claims cannot exchange inclusion and exclusion', async () => {
-    const fixture = await publisherFixture();
-    const opts = fixtureOptions(fixture);
-    const hit = structuredClone(fixture.accountStateOnly);
-    delete hit.account!.encodedOperation;
-    hit.account!.exclusion = true;
-    hit.account!.location = '0';
-    hit.account!.writeHeight = '0';
-    await assert.rejects(verifyAccountBundle({ ...opts, account: fixture.account, includeTransactions: false }, hit));
-
-    const miss = structuredClone(fixture.unknownAccount);
-    delete miss.account!.exclusion;
-    miss.account!.encodedOperation = fixture.accountBundle.account!.encodedOperation;
-    await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, miss));
-    for (const claim of [{ exclusion: false }, { exclusion: true, encodedOperation: fixture.accountBundle.account!.encodedOperation }]) {
-        await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, {
-            ...fixture.unknownAccount, account: { ...fixture.unknownAccount.account!, ...claim },
-        }), /one inclusion or exclusion claim/);
-    }
-    await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, {
-        ...fixture.unknownAccount, account: { location: '0', writeHeight: '0', proof: fixture.unknownAccount.account!.proof },
-    }), /one inclusion or exclusion claim/);
+    const opts = { ...fixtureOptions(fixture), account: fixture.account, includeTransactions: false };
+    const state = fixture.accountStateOnly;
+    await assert.rejects(verifyAccountBundle({ ...opts, account: '00'.repeat(32) }, state));
+    assert.notEqual(state.certificate, fixture.directBlock.certificate);
+    await assert.rejects(verifyAccountBundle(opts, { ...state, certificate: fixture.directBlock.certificate }));
+    const { encodedOperation: _encodedOperation, ...withoutOperation } = state.account!;
+    await assert.rejects(verifyAccountBundle(opts, { ...state, account: withoutOperation }), /account operation/);
+    await assert.rejects(verifyAccountBundle(opts, {
+        ...state, account: { ...state.account!, encodedOperation: fixture.recipientBundle.account!.encodedOperation },
+    }));
+    await assert.rejects(verifyAccountBundle(opts, {
+        ...state, account: { ...state.account!, encodedOperation: state.account!.encodedOperation.slice(0, -2) },
+    }), /account operation/);
 });
 
 nativeTest('the full supported WebAuthn encoding verifies at the 919-byte boundary', async () => {

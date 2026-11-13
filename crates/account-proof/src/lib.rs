@@ -17,29 +17,20 @@ const MAX_PROOF_BYTES: usize = 16 * 1024;
 type AccountOperation = Operation<mmr::Family, AccountKey, Account>;
 type AccountOperationProof = OperationProof<mmr::Family, Digest, ACCOUNT_CHUNK_BYTES>;
 
-/// A lookup authenticated against the caller's root and exact operation count.
-///
-/// Only inclusion is authenticated: the unordered account database carries no key spans, so an
-/// account without an active update is simply not found.
+/// An active account update authenticated against the caller's root and exact operation count.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifiedAccountLookup {
-    /// The account has this value at the certified boundary.
-    Present {
-        /// Location of the account's active update.
-        location: u64,
-        /// The requested account key.
-        key: AccountKey,
-        /// The authenticated account value.
-        account: Account,
-    },
+pub struct VerifiedAccountLookup {
+    /// Location of the account's active update.
+    pub location: u64,
+    /// The requested account key.
+    pub key: AccountKey,
+    /// The authenticated account value.
+    pub account: Account,
 }
 
 /// Why a lookup could not be authenticated.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {
-    /// The response must contain an inclusion claim, since exclusion is not authenticated.
-    #[error("account lookup must contain an inclusion claim")]
-    InvalidClaim,
     /// The caller supplied an invalid root, key, proof, or operation encoding.
     #[error("invalid account proof encoding")]
     InvalidEncoding,
@@ -49,7 +40,7 @@ pub enum Error {
     /// The proof covers a different certified boundary.
     #[error("account proof does not match the certified operation count")]
     WrongBoundary,
-    /// An inclusion operation names another account or is not an update.
+    /// The operation names another account or is not an update.
     #[error("account proof does not contain the requested account update")]
     WrongAccount,
     /// The proof does not authenticate its claim against the supplied root.
@@ -59,21 +50,18 @@ pub enum Error {
 
 /// Verify one native Commonware account proof.
 ///
-/// `expected_tip` is the inclusive last operation location from the certified header. The lookup
-/// must carry `encoded_operation` with `exclusion == false`, and exclusion claims are rejected. The
-/// caller obtains `root` and `expected_tip` from the same verified certificate. Proofs use MMR,
-/// SHA-256, fixed account encodings, and 32-byte bitmap chunks.
+/// `encoded_operation` is the claimed active update of `key`, and `expected_tip` is the inclusive
+/// last operation location from the certified header. The caller obtains `root` and
+/// `expected_tip` from the same verified certificate. Proofs use MMR, SHA-256, fixed account
+/// encodings, and 32-byte bitmap chunks. The account database authenticates only present
+/// accounts. It has no proof that an account is absent.
 pub fn verify_current_account_lookup(
     proof: &[u8],
     root: &[u8],
     key: &[u8],
     expected_tip: u64,
-    encoded_operation: Option<Vec<u8>>,
-    exclusion: bool,
+    encoded_operation: &[u8],
 ) -> Result<VerifiedAccountLookup, Error> {
-    let Some(encoded_operation) = encoded_operation.filter(|_| !exclusion) else {
-        return Err(Error::InvalidClaim);
-    };
     if proof.len() > MAX_PROOF_BYTES {
         return Err(Error::ProofTooLarge);
     }
@@ -84,8 +72,8 @@ pub fn verify_current_account_lookup(
     if encoded_operation.len() != AccountOperation::SIZE {
         return Err(Error::InvalidEncoding);
     }
-    let operation = AccountOperation::decode(Copying(encoded_operation.as_slice()))
-        .map_err(|_| Error::InvalidEncoding)?;
+    let operation =
+        AccountOperation::decode(Copying(encoded_operation)).map_err(|_| Error::InvalidEncoding)?;
     let AccountOperation::Update(update) = &operation else {
         return Err(Error::WrongAccount);
     };
@@ -101,7 +89,7 @@ pub fn verify_current_account_lookup(
     if !proof.verify::<Sha256, _>(operation, &root) {
         return Err(Error::VerificationFailed);
     }
-    Ok(VerifiedAccountLookup::Present {
+    Ok(VerifiedAccountLookup {
         location: proof.loc.as_u64(),
         key,
         account,

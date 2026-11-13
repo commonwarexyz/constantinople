@@ -134,7 +134,7 @@ their certificate is not a freshness claim. The homepage carries no age: its blo
 each block's timestamp. Age never invalidates a proof: the cell keeps its verified tint and label.
 
 **Verified evidence.** A green check precedes a green label wherever the browser has verified
-a certificate, ancestry, or account inclusion/exclusion proof. Proof panels also use a subtle green background and
+a certificate, ancestry, or account inclusion proof. Proof panels also use a subtle green background and
 green values. Pending and missing evidence stay dim, without a check or tinted panel. Retained
 verified evidence keeps its styling during refresh; request errors remain separate. Green marks
 describe the specific evidence, not the authenticity of the site or the freshness of account state.
@@ -143,9 +143,7 @@ describe the specific evidence, not the authenticity of the site or the freshnes
 beside BLOCK CERT: the authenticated root operation and covered-leaf count written together
 (`op<index> / <n>L`). There are no byte sizes, averages, per-row proof badges, or tooltips. The
 ACCOUNT PROOF cell shows the account update's proven location and writing height
-(`loc <n> / h<height>`). A verified exclusion shows the bracketing active keys and the operation
-proving the gap (`3b9a…c1bf ‹ 3b9a…f48d / loc <n>`, or `empty state / loc <n>`), wrapping only at
-the slash; the covering snapshot is the BLOCK CERT beside it.
+(`loc <n> / h<height>`). The covering snapshot is the BLOCK CERT beside it.
 Empty pages have no multiproof to mark as verified. Proof values never break across lines.
 
 **Transaction rows.** One row design everywhere: a primary line (the accent digest link, dim
@@ -170,8 +168,7 @@ prompt, pending action or error. The address line precedes the grid; the data ro
 next draft nonce; the proven account nonce sits under the balance).
 The balance stays unknown until an account update is verified, then carries the proven nonce
 and transaction count on its secondary line. The evidence row below repeats the account page's
-BLOCK CERT and ACCOUNT PROOF cells, including the certified age. A verified exclusion
-shows the excluding key span with no balance, account nonce or history. Loading and error messages
+BLOCK CERT and ACCOUNT PROOF cells, including the certified age. Loading and error messages
 use the dim status line beneath the grid. Submitted transactions follow under a section heading.
 
 **Header search.** A single field and accent search button sit between the title and wallet

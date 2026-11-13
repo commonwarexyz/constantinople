@@ -53,12 +53,9 @@ message AccountProof {
   bytes proof = 2;
   // Inclusion block of this update, authenticated by the bundle ancestry.
   uint64 write_height = 3;
-  // Both claims use the certified header's current-state root and requested key.
-  oneof claim {
-    bytes encoded_operation = 4;
-    // Must be true. Exclusion has no account value, location, or write height.
-    bool exclusion = 5;
-  }
+  // The account's active update, proven against the certified header's
+  // current-state root and the requested key.
+  bytes encoded_operation = 4;
 }
 
 enum TransactionRole {

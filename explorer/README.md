@@ -42,7 +42,7 @@ backend or verifier repairs.
 
 Wallet state, account pages, and transaction reconciliation each use one
 combined response from `explorer-indexer`. It contains the certificate, account
-inclusion or exclusion proof, signed transaction bodies, and one transaction multi-proof
+inclusion proof, signed transaction bodies, and one transaction multi-proof
 for the page. WebAssembly initialization overlaps the request. The browser
 verifies the certificate and proofs locally, recomputes transaction digests,
 and derives sender, recipient, value, and nonce from their authenticated bodies.
@@ -63,19 +63,19 @@ An account page selects a published, certified snapshot and retains its height,
 digest, account operation location, and transaction count while paging through
 ten transactions at a time. Refreshing selects a new one. Wallet
 balance requests omit activity. A returned account update proves active membership
-under the snapshot's current ordered state root. Authenticated ancestor headers identify the
+under the snapshot's current unordered state root. Authenticated ancestor headers identify the
 block that appended that account operation. The account's count fixes each
 page's exact descending index interval and continuation cursor; omitted,
 repeated, reordered, or foreign transactions fail verification. Pages always show
 the complete interval; a sent-only or received-only page could not prove it omitted
 nothing. Self-transfers occupy one history entry.
 
-The browser verifies both account inclusion and exclusion with the native fixed
-account verifier. Each proof binds the requested key and the exact state root
-and operation tip from the certificate. A missing proof or an indexer lookup miss
-cannot establish absence. An exclusion result contains no balance, account nonce,
-or history. The wallet and account page show authenticated absence with its
-certified height, and the certificate cell's age counts up from the certified
+The browser verifies account inclusion with the native fixed account verifier.
+Each proof binds the requested key and the exact state root and operation tip
+from the certificate. The state database has no absence proofs: the indexer
+reports an account without an update as not found, and the wallet and account
+page show that unauthenticated report as an error. The certificate cell's age
+counts up from the certified
 timestamp: red after 60 seconds, amber for a browser clock mismatch. A recent timestamp
 provides an as-of observation, not a guarantee of the globally newest head.
 The transaction nonce remains a local draft. Persisted proof status is reverified

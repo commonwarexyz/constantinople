@@ -1,6 +1,6 @@
 [package]
 name = "constantinople-account-proof"
-description = "Verify Constantinople current account inclusion and exclusion proofs"
+description = "Verify Constantinople current account inclusion proofs"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

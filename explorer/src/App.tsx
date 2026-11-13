@@ -39,7 +39,6 @@ import {
     type AccountTransactionRow,
     type LatestProofTarget,
     type VerifiedAccountProof,
-    type VerifiedAccountExclusion,
     type VerifiedTransactionProof,
 } from './qmdb';
 import {
@@ -101,7 +100,6 @@ const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MA
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
     | { readonly status: 'fetching'; readonly detail: string }
-    | ({ readonly status: 'excluded' } & VerifiedAccountExclusion)
     | ({
           readonly status: 'verified';
           readonly detail: string;
@@ -115,18 +113,14 @@ interface WalletAccountIdentity {
 }
 
 /** Account state at a certified snapshot, bound to the requesting wallet. */
-type WalletAccountView = WalletAccountIdentity & ({
-    readonly kind: 'inclusion';
+type WalletAccountView = WalletAccountIdentity & {
     readonly balance: bigint;
     readonly nonce: { readonly base: bigint; readonly bitmap: bigint };
     readonly location: bigint;
     readonly txCount: bigint;
     readonly writeHeight: bigint;
     readonly timestampMs: bigint;
-} | {
-    readonly kind: 'exclusion';
-    readonly absence: Pick<VerifiedAccountExclusion, 'location' | 'span'>;
-});
+};
 
 /** A verified block page and its position in the pagination history. */
 type BlockBundle = Awaited<ReturnType<typeof loadBlockBundle>> & {
@@ -454,21 +448,21 @@ export default function App() {
             },
         }).then((bundle) => {
             if (!accountHistorySession.isCurrent(request)) return;
-            if (bundle.account && !accountHistorySession.observe(request, bundle.account)) return;
+            if (!accountHistorySession.observe(request, bundle.account)) return;
 
             // Keep the page, cursor and certificate bound to one verified snapshot.
-            accountSnapshotRef.current = bundle.account ? {
+            accountSnapshotRef.current = {
                 contextKey: accountContextKey, target: bundle.target,
                 accountLocation: bundle.account.location, expectedTxCount: bundle.account.txCount,
-            } : null;
+            };
             setAccountPageData({
                 key: currentAccountViewKey,
                 account: lookupAccount,
                 pageNumber: accountCursorStack.length,
                 target: bundle.target,
-                proof: bundle.kind === 'inclusion' ? {
+                proof: {
                     status: 'verified', detail: `account version included at height ${bundle.account.writeHeight}`, ...bundle.account,
-                } : { status: 'excluded', ...bundle.absence },
+                },
                 transactionProofs: bundle.transactionProofs,
                 transactions: bundle.page.rows,
                 nextCursor: bundle.page.nextCursor,
@@ -720,21 +714,17 @@ export default function App() {
                         includeTransactions: false, signal: controller.signal,
                     }), controller.signal, isRetryableAccountProofError);
                     if (!current()) return;
-                    if (bundle.account && !walletHistorySession.observe(request, bundle.account)) return;
+                    if (!walletHistorySession.observe(request, bundle.account)) return;
                     const snapshot = { height: bundle.target.height, view: bundle.target.view, timestampMs: bundle.target.timestampMs };
-                    const nextAccount: WalletAccountView = bundle.kind === 'inclusion' ? {
-                        kind: 'inclusion',
+                    const nextAccount: WalletAccountView = {
                         balance: bundle.account.balance,
                         nonce: { base: bundle.account.nonce, bitmap: bundle.account.nonceBitmap },
                         wallet, accountKey: walletAccountKey, snapshot, location: bundle.account.location,
                         txCount: bundle.account.txCount, writeHeight: bundle.account.writeHeight,
                         timestampMs: bundle.account.timestampMs,
-                    } : {
-                        kind: 'exclusion', wallet, accountKey: walletAccountKey, snapshot,
-                        absence: { location: bundle.absence.location, span: bundle.absence.span },
                     };
                     setAccount(nextAccount);
-                    if (nextAccount.kind === 'inclusion') setCommittedNonceState(accountNonceState(nextAccount));
+                    setCommittedNonceState(accountNonceState(nextAccount));
                     setAccountMessage('');
                 } catch (error) {
                     if (!current()) return;
@@ -1311,7 +1301,7 @@ function AccountPage({
                     <ProofDatum label="block" pending={!target} value={target ? shortHex(bytesToHex(target.blockDigest)) : '—'} />
                     <ProofDatum
                         label="balance"
-                        pending={proof.status !== 'verified' && proof.status !== 'excluded'}
+                        pending={proof.status !== 'verified'}
                         value={
                             proof.status === 'verified'
                                 ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()} / ${proof.txCount} txs`
@@ -1319,30 +1309,28 @@ function AccountPage({
                         }
                     />
                 </div>
-                <div className={`account-proof-grid__evidence${proof.status === 'excluded' ? '' : ' account-proof-grid__evidence--three'}`}>
+                <div className="account-proof-grid__evidence account-proof-grid__evidence--three">
                     <CertificateDatum target={target} latest />
-                    {proof.status !== 'excluded' && <ProofDatum
+                    <ProofDatum
                         label="transaction proof"
                         verified={!!transactionProof}
                         pending={!target}
                         value={transactionProof
                             ? <span className="proof-badge">op{transactionProof.tip} / {proofItems}L</span>
                             : proof.status === 'verified' && proof.txCount === 0n ? 'empty history' : '—'}
-                    />}
+                    />
                     <ProofDatum
                         label="account proof"
-                        verified={proof.status === 'verified' || proof.status === 'excluded'}
+                        verified={proof.status === 'verified'}
                         pending={proof.status === 'fetching'}
                         value={
                             proof.status === 'verified'
                                 ? <span className="proof-badge">loc {proof.location} / h{proof.writeHeight}</span>
-                                : proof.status === 'excluded' ? <ExclusionValue absence={proof} /> : '—'
+                                : '—'
                         }
                     />
                 </div>
             </div>
-            {proof.status === 'excluded' && <PageStatus message={activityError} />}
-            {proof.status !== 'excluded' && <>
             <div className="account-page__subhead">
                 <h3>page {pageNumber}</h3>
                 <div className="account-page__pager">
@@ -1390,7 +1378,6 @@ function AccountPage({
                     </div>
                 ))}
             </div>
-            </>}
         </section>
     );
 }
@@ -1560,21 +1547,6 @@ function CertificateDatum({ target, latest = false }: {
     );
 }
 
-/**
- * A verified exclusion: the adjacent active keys whose span excludes the account (or an empty
- * state), and the location of the operation proving it. The two parts may wrap at the slash.
- */
-function ExclusionValue({ absence }: { absence: Pick<VerifiedAccountExclusion, 'location' | 'span'> }) {
-    const ends = (key: string) => `${key.slice(0, 4)}…${key.slice(-4)}`;
-    return (
-        <>
-            <span className="proof-badge">{absence.span ? `${ends(absence.span.lower)} ‹ ${ends(absence.span.upper)}` : 'empty state'}</span>
-            {' / '}
-            <span className="proof-badge">loc {absence.location.toString()}</span>
-        </>
-    );
-}
-
 function PageStatus({ message }: { message: string }) {
     return <div className="page-status" role="status">{message || '\u00a0'}</div>;
 }
@@ -1717,8 +1689,8 @@ function WalletPanel({
             <div className="wallet__grid">
                 <div className="wallet__cell">
                     <span>balance</span>
-                    <strong>{account?.kind === 'inclusion' ? account.balance.toString() : account?.kind === 'exclusion' ? '—' : 'unknown'}</strong>
-                    {account?.kind === 'inclusion' && <small>nonce {account.nonce.base.toString()} / {account.txCount.toString()} txs</small>}
+                    <strong>{account ? account.balance.toString() : 'unknown'}</strong>
+                    {account && <small>nonce {account.nonce.base.toString()} / {account.txCount.toString()} txs</small>}
                 </div>
                 <div className="wallet__cell">
                     <span>local nonce</span>
@@ -1731,9 +1703,9 @@ function WalletPanel({
                             label="account proof"
                             verified={!!account}
                             pending={!account}
-                            value={account?.kind === 'inclusion'
+                            value={account
                                 ? <span className="proof-badge">loc {account.location.toString()} / h{account.writeHeight.toString()}</span>
-                                : account?.kind === 'exclusion' ? <ExclusionValue absence={account.absence} /> : '—'}
+                                : '—'}
                         />
                     </div>
                 )}
@@ -2034,7 +2006,7 @@ function normalizeAccountInput(value: string): string | null {
 }
 
 function accountNonceState(account: WalletAccountView | null): NonceState {
-    if (account?.kind !== 'inclusion') {
+    if (!account) {
         return emptyNonceState();
     }
 

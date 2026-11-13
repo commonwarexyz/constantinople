@@ -10,7 +10,7 @@ import {
     readU64Be, simplexFinalizationVerifier,
     MAX_ANCESTRY_HEADERS, MAX_EXECUTION_HEADER_BYTES, MAX_FINALIZATION_CERTIFICATE_BYTES,
     type AccountTransactionPage, type DecodedBlockHeader,
-    type LatestProofTarget, type VerifiedAccountExclusion, type VerifiedAccountProof, type VerifiedFinalizationTarget,
+    type LatestProofTarget, type VerifiedAccountProof, type VerifiedFinalizationTarget,
     type VerifiedTransactionProof,
 } from './qmdb.ts';
 
@@ -24,6 +24,9 @@ const MAX_HEADERS = MAX_ANCESTRY_HEADERS;
 
 /** Size of the unsigned transaction body whose SHA-256 hash is the transaction digest. */
 const TRANSACTION_BODY_BYTES = 82;
+
+/** Size of an encoded fixed account update: tag, 32-byte key and 32-byte account value. */
+const ACCOUNT_OPERATION_BYTES = 65;
 
 /**
  * Maximum signed transaction size. Mirrors `Transaction::SIZE + TransactionSignature::MAX_SIZE` in
@@ -89,7 +92,7 @@ interface Envelope {
     readonly certificate: Uint8Array;
     readonly headers: Uint8Array[];
     readonly sequenceNumber: bigint;
-    readonly account: { readonly location: bigint; readonly proof: Uint8Array; readonly writeHeight: bigint; readonly encodedOperation?: Uint8Array; readonly exclusion?: true } | null;
+    readonly account: { readonly location: bigint; readonly proof: Uint8Array; readonly writeHeight: bigint; readonly encodedOperation: Uint8Array } | null;
     readonly transactions: TransactionRow[];
     readonly transactionsProof: Uint8Array | null;
     readonly nextCursor: string | null;
@@ -187,19 +190,12 @@ interface CanonicalTransaction {
 }
 
 /** Account state and a complete history interval at one certified root. */
-export type VerifiedAccountBundle = {
+export interface VerifiedAccountBundle {
     readonly target: LatestProofTarget;
+    readonly account: VerifiedAccountProof;
     readonly page: AccountTransactionPage;
     readonly transactionProofs: VerifiedTransactionProof[];
-} & ({
-    readonly kind: 'inclusion';
-    readonly account: VerifiedAccountProof;
-    readonly absence: null;
-} | {
-    readonly kind: 'exclusion';
-    readonly account: null;
-    readonly absence: VerifiedAccountExclusion;
-});
+}
 
 export interface VerifiedBlockBundle {
     readonly target: LatestProofTarget;
@@ -255,24 +251,13 @@ export async function verifyAccountBundle(options: AccountBundleOptions, raw: un
     request.signal?.throwIfAborted();
     request.onFinalizationVerified?.({ height: target.height, view: target.view });
     request.signal?.throwIfAborted();
-    const lookup = await verifyAccount(envelope, target, fromHex(request.account), request.signal);
-    const pinned = lookup.kind === 'hit' ? lookup.account : null;
-    if (request.accountLocation !== undefined && pinned?.location !== request.accountLocation) {
+    const account = await verifyAccount(envelope, target, fromHex(request.account), request.signal);
+    if (request.accountLocation !== undefined && account.location !== request.accountLocation) {
         throw new Error('account bundle does not match pinned account location');
     }
-    if (request.expectedTxCount !== undefined && pinned?.txCount !== request.expectedTxCount) {
+    if (request.expectedTxCount !== undefined && account.txCount !== request.expectedTxCount) {
         throw new Error('account bundle does not match pinned transaction count');
     }
-    if (lookup.kind === 'miss') {
-        if (envelope.headers.length || envelope.transactions.length || envelope.transactionsProof !== null || envelope.nextCursor !== null) {
-            throw new Error('account exclusion cannot contain history');
-        }
-        request.signal?.throwIfAborted();
-        return { kind: 'exclusion', target, account: null,
-            absence: { accountKey: request.account, timestampMs: target.timestampMs, ...lookup.absence },
-            page: { rows: [], nextCursor: null }, transactionProofs: [] };
-    }
-    const account = lookup.account;
     const transactions = await verifyTransactions(envelope, target);
     if (transactions.some((transaction) => transaction.location >= account.transactionEnd)) {
         throw new Error('account history is newer than its authenticated account version');
@@ -284,7 +269,7 @@ export async function verifyAccountBundle(options: AccountBundleOptions, raw: un
     ) : { rows: [], nextCursor: null };
     request.signal?.throwIfAborted();
     const { transactionEnd: _transactionEnd, ...verifiedAccount } = account;
-    return { kind: 'inclusion', target, account: verifiedAccount, absence: null, page, transactionProofs: transactions.map((tx) => tx.proof) };
+    return { target, account: verifiedAccount, page, transactionProofs: transactions.map((tx) => tx.proof) };
 }
 
 export async function verifyBlockBundle(options: BlockBundleOptions, raw: unknown): Promise<VerifiedBlockBundle> {
@@ -384,9 +369,7 @@ export function proofBundleInput(bundle: ProofBundle, kind: BundleKind): unknown
             location: u64(bundle.account.location, 'account location').toString(),
             proof: bytes(bundle.account.proof, 'account proof', MAX_PROOF_BYTES),
             writeHeight: u64(bundle.account.writeHeight, 'account write height').toString(),
-            ...(bundle.account.claim.case === 'encodedOperation'
-                ? { encodedOperation: bytes(bundle.account.claim.value, 'account operation', 97) }
-                : bundle.account.claim.case === 'exclusion' ? { exclusion: bundle.account.claim.value } : {}),
+            encodedOperation: bytes(bundle.account.encodedOperation, 'account operation', ACCOUNT_OPERATION_BYTES),
         } : null,
         transactions: bundle.transactions.map((row) => ({
             location: u64(row.location, 'transaction location').toString(),
@@ -488,22 +471,12 @@ function stateAppendInterval(block: DecodedBlockHeader, parent?: DecodedBlockHea
     return { start, end };
 }
 
-/** A verified account lookup: the active update, or the operation and key span excluding it. */
-type AccountLookup =
-    | { readonly kind: 'hit'; readonly account: VerifiedAccountProof & { transactionEnd: bigint } }
-    | { readonly kind: 'miss'; readonly absence: Pick<VerifiedAccountExclusion, 'location' | 'span' | 'proofSizeBytes'> };
-
-async function verifyAccount(envelope: Envelope, target: CertifiedTarget, account: Uint8Array, signal?: AbortSignal): Promise<AccountLookup> {
+/** Verifies the account's active update and the history end of the block that wrote it. */
+async function verifyAccount(envelope: Envelope, target: CertifiedTarget, account: Uint8Array, signal?: AbortSignal): Promise<VerifiedAccountProof & { transactionEnd: bigint }> {
     if (envelope.account === null) throw new Error('missing account proof');
-    const { location, proof, writeHeight, encodedOperation, exclusion } = envelope.account;
-    const verified = await verifyCurrentAccount(proof, target.stateRoot, account, target.stateTip - 1n, encodedOperation, exclusion === true);
+    const { location, proof, writeHeight, encodedOperation } = envelope.account;
+    const verified = await verifyCurrentAccount(proof, target.stateRoot, account, target.stateTip - 1n, encodedOperation);
     signal?.throwIfAborted();
-    if (verified.type === 'miss') {
-        if (location !== 0n || writeHeight !== 0n) throw new Error('account exclusion has inclusion metadata');
-        if (verified.location >= target.stateTip) throw new Error('account exclusion is outside certified state interval');
-        return { kind: 'miss', absence: { location: verified.location, proofSizeBytes: verified.proofSizeBytes,
-            span: verified.lower && verified.upper ? { lower: toHex(verified.lower), upper: toHex(verified.upper) } : null } };
-    }
     if (verified.location !== location) throw new Error('account proof location does not match its operation');
     if (writeHeight === 0n || writeHeight > target.height) throw new Error('invalid account write height');
     if (location < target.stateStart || location >= target.stateTip - 1n) throw new Error('account update is outside certified state interval');
@@ -513,9 +486,9 @@ async function verifyAccount(envelope: Envelope, target: CertifiedTarget, accoun
     const writer = chain[index]!.header;
     const { start, end } = stateAppendInterval(writer, chain[index + 1]?.header);
     if (location < start || location >= end) throw new Error('account location is outside its writing block');
-    return { kind: 'hit', account: { ...decodeAccountValue(verified.value), location, tip: target.stateTip - 1n,
+    return { ...decodeAccountValue(verified.value), location, tip: target.stateTip - 1n,
         writeHeight, timestampMs: writer.timestampMs, transactionEnd: writer.transactionsTip - 1n,
-        proofSizeBytes: verified.proofSizeBytes } };
+        proofSizeBytes: verified.proofSizeBytes };
 }
 
 async function verifyTransactions(envelope: Envelope, target: LatestProofTarget): Promise<Array<CanonicalTransaction & { proof: VerifiedTransactionProof }>> {
@@ -592,16 +565,12 @@ function parseEnvelope(raw: unknown, pageSize: number): Envelope {
         return { location: decimal(row.location, 'transaction location'), body: hex(row.body, 'signed transaction', 1, MAX_TRANSACTION_BYTES), height: decimal(row.height, 'transaction height'), index: row.index as number, role: row.role as number | undefined, senderIndex: decimal(row.senderIndex, 'sender index'), recipientIndex: decimal(row.recipientIndex, 'recipient index') };
     });
     const account = value.account === null ? null : record(value.account, 'account proof');
-    if (account && ((account.encodedOperation !== undefined) === (account.exclusion !== undefined)
-        || (account.exclusion !== undefined && account.exclusion !== true))) {
-        throw new Error('account proof must contain one inclusion or exclusion claim');
-    }
     if (value.nextCursor !== null && (typeof value.nextCursor !== 'string' || value.nextCursor.length > 48)) throw new Error('invalid next cursor');
     return {
         certificate: hex(value.certificate, 'certificate', 1, MAX_FINALIZATION_CERTIFICATE_BYTES), headers,
         sequenceNumber: decimal(value.sequenceNumber, 'Store sequence'),
         account: account === null ? null : { location: decimal(account.location, 'account location'), proof: hex(account.proof, 'account proof', 1, MAX_PROOF_BYTES), writeHeight: decimal(account.writeHeight, 'account write height'),
-            ...(account.encodedOperation === undefined ? { exclusion: true as const } : { encodedOperation: hex(account.encodedOperation, 'account operation', 97, 97) }) },
+            encodedOperation: hex(account.encodedOperation, 'account operation', ACCOUNT_OPERATION_BYTES, ACCOUNT_OPERATION_BYTES) },
         transactions, transactionsProof: value.transactionsProof === null ? null : hex(value.transactionsProof, 'transaction multiproof', 1, MAX_PROOF_BYTES),
         nextCursor: value.nextCursor as string | null,
     };

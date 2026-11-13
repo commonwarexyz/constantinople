@@ -277,11 +277,6 @@ struct AccountEvidence {
     transaction_end: u64,
 }
 
-/// A current account value with its history boundary.
-enum AccountLookup {
-    Present(AccountEvidence),
-}
-
 /// Checks a fixed-width application identity or cursor before reading Store.
 fn fixed_bytes<const N: usize>(value: &[u8]) -> Result<[u8; N], Failure> {
     value
@@ -514,7 +509,7 @@ impl Explorer {
         &self,
         anchor: &Anchor,
         request: &AccountRequest,
-    ) -> Result<AccountLookup, Failure> {
+    ) -> Result<AccountEvidence, Failure> {
         let start = anchor.header.state_range.start();
         let end = anchor.header.state_range.end();
         let tip = end
@@ -613,20 +608,18 @@ impl Explorer {
                 "account update is outside its inclusion block",
             ));
         }
-        Ok(AccountLookup::Present(AccountEvidence {
+        Ok(AccountEvidence {
             proof: AccountProof {
                 location,
                 proof: encoded,
                 write_height,
-                claim: Some(proto::account_proof::Claim::EncodedOperation(
-                    encoded_operation,
-                )),
+                encoded_operation,
                 ..Default::default()
             },
             value,
             headers,
             transaction_end,
-        }))
+        })
     }
 
     /// Proves the complete contiguous page below the account's exclusive end.
@@ -1001,19 +994,15 @@ async fn account(
     let anchor = explorer.anchor(1, request.snapshot, true).await?;
     let mut bundle = anchor.bundle()?;
 
-    match explorer.account_proof(&anchor, &request).await? {
-        AccountLookup::Present(account) => {
-            if request.activity {
-                let (transactions, proof, cursor) =
-                    explorer.activity(&anchor, &request, &account).await?;
-                bundle.transactions = transactions;
-                bundle.transactions_proof = proof;
-                bundle.next_cursor = cursor.map(proto::proof_bundle::NextCursor::ActivityCursor);
-            }
-            bundle.headers = account.headers;
-            bundle.account = Some(account.proof).into();
-        }
+    let account = explorer.account_proof(&anchor, &request).await?;
+    if request.activity {
+        let (transactions, proof, cursor) = explorer.activity(&anchor, &request, &account).await?;
+        bundle.transactions = transactions;
+        bundle.transactions_proof = proof;
+        bundle.next_cursor = cursor.map(proto::proof_bundle::NextCursor::ActivityCursor);
     }
+    bundle.headers = account.headers;
+    bundle.account = Some(account.proof).into();
 
     // Report the floor after every read, since each read can raise it.
     bundle.sequence_number = anchor.floor()?;

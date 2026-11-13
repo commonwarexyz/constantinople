@@ -11,7 +11,7 @@ function record(value: unknown): RecordValue | undefined {
 const bundleNames = [
     'directBlock', 'descendantBlock', 'descendantLastPage', 'emptyBlock', 'accountBundle',
     'accountNext', 'accountOldest', 'accountExhausted', 'accountStateOnly', 'recipientBundle',
-    'unknownAccount', 'emptyAccount', 'transactionBundle', 'webauthnBlock', 'webauthnBundle',
+    'transactionBundle', 'webauthnBlock', 'webauthnBundle',
     'accountWithHistory', 'historicalBlock', 'historicalTransaction',
 ];
 
@@ -22,11 +22,10 @@ export function nativeProofFixtureIssue(value: unknown): string | undefined {
     for (const name of bundleNames) {
         const bundle = record(fixture?.[name]);
         if (!bundle || !Array.isArray(bundle.transactions)) return `missing ${name} bundle`;
-        if ((name === 'unknownAccount' || name === 'emptyAccount') && bundle.account === null) return `${name} lacks an exclusion proof`;
         if (bundle.account !== null) {
             const account = record(bundle.account);
             if (!account || !decimal(account.writeHeight)) return `${name} lacks account writeHeight`;
-            if (typeof account.encodedOperation !== 'string' && account.exclusion !== true) return `${name} lacks a current account inclusion/exclusion claim`;
+            if (typeof account.encodedOperation !== 'string') return `${name} lacks a current account update operation`;
         }
         for (const value of bundle.transactions) {
             const row = record(value);

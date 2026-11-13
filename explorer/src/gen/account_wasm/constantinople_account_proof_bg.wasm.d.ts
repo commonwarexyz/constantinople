@@ -1,7 +1,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
-export const verify_current_account_lookup: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => [number, number, number];
+export const verify_current_account_lookup: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number) => [number, number, number];
 export const rust_zstd_wasm_shim_calloc: (a: number, b: number) => number;
 export const rust_zstd_wasm_shim_free: (a: number) => void;
 export const rust_zstd_wasm_shim_malloc: (a: number) => number;
