@@ -11,7 +11,7 @@ import { DEFAULT_ACCOUNT_BALANCE, authenticatedHeader, finalizedTargetFromCertif
 import { initAccountProofWasm } from '../src/accountProof.ts';
 import {
     loadAccountBundle, loadBlockBundle, loadTransactionBundle,
-    verifyAccountBundle, verifyBlockBundle, verifyTransactionBundle, proofBundleInput,
+    verifyAccountBundle, verifyBlockBundle, verifyTransactionBundle, verifyTransactionEvidence, proofBundleInput,
 } from '../src/proofBundle.ts';
 import { ACCOUNT_NOT_FOUND, accountLookupFailure, isRetryableAccountProofError, isRetryableProofError } from '../src/proofRetry.ts';
 import { ProofBundleSchema, type ProofBundle, type TransactionRole } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
@@ -44,6 +44,7 @@ interface PublisherFixture {
     emptyBlock: WireBundle; accountBundle: WireBundle; accountNext: WireBundle;
     accountStateOnly: WireBundle; recipientBundle: WireBundle; transactionBundle: WireBundle;
     webauthnBlock: WireBundle; webauthnBundle: WireBundle; webauthnDigest: string;
+    submissionEvidence: WireBundle;
     historicalBlock: WireBundle; historicalTransaction: WireBundle; historicalDigest: string;
     accountWithHistory: WireBundle; accountOldest: WireBundle; accountExhausted: WireBundle;
 }
@@ -663,6 +664,38 @@ nativeTest('the full supported WebAuthn encoding verifies at the 919-byte bounda
     const malformed = structuredClone(wire);
     malformed.transactions[0]!.body += '00';
     await assert.rejects(verifyTransactionBundle({ ...opts, digest: fixture.webauthnDigest }, malformed), /oversized signed transaction/);
+});
+
+nativeTest('evidence built from a finalized block verifies exactly as the indexer bundle for the same transaction', async () => {
+    // Evidence from the submission path and the indexer's bundle authenticate the same facts.
+    const fixture = await publisherFixture();
+    const opts = { ...fixtureOptions(fixture), digest: fixture.webauthnDigest };
+    const evidence = fixture.submissionEvidence;
+    assert.equal(evidence.sequenceNumber, '0');
+    const verified = await verifyTransactionEvidence(opts, rpcBundle(evidence));
+    const fetched = await verifyTransactionBundle(opts, fixture.webauthnBundle);
+    assert.deepEqual(verified, { ...fetched, target: { ...fetched.target, sequenceNumber: 0n } });
+    assert.equal(verified.height, 4n);
+    assert.equal(verified.target.height, 4n);
+
+    // Evidence for another transaction, or with any authenticated part changed, proves nothing.
+    await assert.rejects(verifyTransactionEvidence({ ...opts, digest: fixture.transactionDigest }, rpcBundle(evidence)), /requested digest/);
+    const changes: Array<(wire: WireBundle) => void> = [
+        (wire) => { wire.certificate = fixture.transactionBundle.certificate; },
+        (wire) => { wire.headers = []; },
+        (wire) => { wire.headers = fixture.transactionBundle.headers; },
+        (wire) => { wire.transactions[0]!.location = (BigInt(wire.transactions[0]!.location) - 1n).toString(); },
+        (wire) => { wire.transactions[0]!.height = '3'; },
+        (wire) => { wire.transactions[0]!.senderIndex = '1'; },
+        (wire) => { wire.transactions[0]!.body = fixture.webauthnBlock.transactions[0]!.body; },
+        (wire) => { wire.transactionsProof = fixture.webauthnBlock.transactionsProof; },
+        (wire) => { wire.transactionsProof = null; },
+    ];
+    for (const change of changes) {
+        const changed = structuredClone(evidence);
+        change(changed);
+        await assert.rejects(verifyTransactionEvidence(opts, rpcBundle(changed)));
+    }
 });
 
 nativeTest('a self-transfer appears once and untrusted display hints cannot change authenticated fields', async () => {

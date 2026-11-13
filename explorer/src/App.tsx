@@ -29,6 +29,7 @@ import {
     loadBlockBundle,
     loadTransactionBundle,
     prewarmProofVerification,
+    verifyTransactionEvidence,
 } from './proofBundle';
 import {
     TransactionSubmissionError,
@@ -57,6 +58,7 @@ import {
     isRetryableAccountProofError,
     isRetryableProofError,
     retryAccountWork,
+    waitForRetry,
 } from './proofRetry';
 import {
     clearSession,
@@ -215,6 +217,12 @@ export default function App() {
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<WalletAccountState | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
+
+    // Height of the newest block in which the wallet verified a transaction that the shown
+    // account state may predate, or zero. It stands until account state certified at or above it
+    // is shown, and `isAccountBehind` mirrors it for rendering.
+    const accountFloorRef = useRef(0n);
+    const [isAccountBehind, setIsAccountBehind] = useState(false);
     const [toKey, setToKey] = useState('');
     const [value, setValue] = useState('1');
     const [nonce, setNonce] = useState('0');
@@ -260,6 +268,7 @@ export default function App() {
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
         accountMessage === 'loading account proof' ||
+        isAccountBehind ||
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInAccountKey = walletAccountKey;
@@ -700,9 +709,12 @@ export default function App() {
     }, []);
 
     // Reads current account state without activity. Requests for the same wallet share one
-    // read, and a read for a replaced wallet is aborted.
-    const refreshAccount = (afterFinalization = false): Promise<void> => {
+    // read, and a read for a replaced wallet is aborted. `floor` raises the account floor, and
+    // the reads repeat until one is certified at or above it.
+    const refreshAccount = (afterFinalization = false, floor = 0n): Promise<void> => {
         if (!wallet || !walletAccountKey) return Promise.resolve();
+        if (floor > accountFloorRef.current) accountFloorRef.current = floor;
+        if (accountFloorRef.current > 0n) setIsAccountBehind(true);
         const existing = walletRefreshRef.current;
         if (existing?.wallet === wallet && existing.accountKey === walletAccountKey) {
             // A finalization during the read needs one later read to include it.
@@ -724,10 +736,18 @@ export default function App() {
             promise: Promise.resolve(),
         };
         const promise = (async () => {
+            const started = Date.now();
+            let behind = 0;
+
             // Read again when a finalization arrived during the previous read.
             do {
                 refresh.again = false;
-                setAccountMessage('loading account proof');
+                if (behind === 0) setAccountMessage('loading account proof');
+
+                // A snapshot certified below the floor, or no account at all, predates a
+                // transaction this wallet has already verified, so the indexer has not
+                // published that block yet.
+                let stale = false;
                 try {
                     const bundle = await retryAccountWork(() => loadAccountBundle({
                         indexerUrl, simplexVerificationMaterial, account: walletAccountKey,
@@ -747,11 +767,23 @@ export default function App() {
                     setAccount(nextAccount);
                     setCommittedNonceState(accountNonceState(nextAccount));
                     setAccountMessage('');
+                    stale = bundle.target.height < accountFloorRef.current;
+                    if (!stale) {
+                        accountFloorRef.current = 0n;
+                        setIsAccountBehind(false);
+                    }
                 } catch (error) {
                     if (!current()) return;
                     const failure = accountLookupFailure(error);
                     if (failure.notFound) setAccount({ status: 'not-found', wallet, accountKey: walletAccountKey });
                     setAccountMessage(failure.notFound ? '' : failure.message);
+                    stale = failure.notFound && accountFloorRef.current > 0n;
+                }
+                if (stale) {
+                    behind += 1;
+                    refresh.again = await waitForRetry(
+                        reconciliationRetryDelay(behind, Date.now() - started), controller.signal,
+                    );
                 }
             } while (refresh.again && current());
         })().finally(() => {
@@ -765,6 +797,8 @@ export default function App() {
     // A wallet change clears committed account state before the new wallet's first verified read.
     useEffect(() => {
         setAccount(null);
+        accountFloorRef.current = 0n;
+        setIsAccountBehind(false);
         committedNonceRef.current = emptyNonceState();
         applyLocalNonceReservations();
         if (!wallet) {
@@ -1079,6 +1113,24 @@ export default function App() {
                     ),
             );
             setSubmitMessage('');
+
+            // Evidence delivered with the report passes the same verification as a fetched
+            // bundle. A row without verified evidence waits for the indexer's bundle.
+            if (outcome.evidence !== undefined) {
+                const verified = await verifyTransactionEvidence({
+                    indexerUrl, simplexVerificationMaterial, digest: encoded.digestHex,
+                }, outcome.evidence).catch(() => null);
+                const verifiedAt = Date.now();
+                updateSubmittedHistory(
+                    originHistoryKey,
+                    (current) => verified === null
+                        ? markSubmissionReconciling(encoded.digestHex, `reported h${outcome.height}`, current)
+                        : markTransactionFinalized(verified, verifiedAt, current),
+                );
+                if (verified !== null && activeHistoryKeyRef.current === originHistoryKey) {
+                    void refreshAccount(true, verified.height);
+                }
+            }
         } catch (error) {
             const currentSubmission = submitted;
             const rejected =
@@ -1228,6 +1280,7 @@ export default function App() {
                             walletMessage={walletMessage}
                             account={walletAccount}
                             accountMessage={accountMessage}
+                            isAccountBehind={isAccountBehind}
                             toKey={toKey}
                             value={value}
                             nonce={nonce}
@@ -1626,6 +1679,7 @@ function WalletPanel({
     walletMessage,
     account,
     accountMessage,
+    isAccountBehind,
     toKey,
     value,
     nonce,
@@ -1648,6 +1702,7 @@ function WalletPanel({
     walletMessage: string;
     account: WalletAccountState | null;
     accountMessage: string;
+    isAccountBehind: boolean;
     toKey: string;
     value: string;
     nonce: string;
@@ -1711,7 +1766,11 @@ function WalletPanel({
                 <div className="wallet__cell">
                     <span>balance</span>
                     <strong>{verified ? verified.balance.toString() : isNew ? DEFAULT_ACCOUNT_BALANCE.toString() : 'unknown'}</strong>
-                    <small>{verified ? `nonce ${verified.nonce.base.toString()} / ${verified.txCount.toString()} txs` : isNew ? 'new account' : '\u00a0'}</small>
+                    <small>
+                        {isAccountBehind
+                            ? <SpinnerText active spinner={spinner}>updating</SpinnerText>
+                            : verified ? `nonce ${verified.nonce.base.toString()} / ${verified.txCount.toString()} txs` : isNew ? 'new account' : '\u00a0'}
+                    </small>
                 </div>
                 <div className="wallet__cell">
                     <span>local nonce</span>

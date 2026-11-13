@@ -30,7 +30,11 @@ timestamps are old. The homepage block log shows each block's timestamp instead.
 
 When the signed-in account submits a transaction, the explorer treats the
 relayer's reply as a delivery report and verifies inclusion before showing
-finality. An unresolved reply or an ambiguous delivery failure keeps the nonce
+finality. A report may carry transaction evidence in the shape `GetTransaction`
+serves. The explorer verifies it with the same certificate and proof checks, so
+the row can show finality before the indexer has published the block. Evidence
+that is absent or fails verification leaves the row waiting for the indexer.
+An unresolved reply or an ambiguous delivery failure keeps the nonce
 reserved while the explorer reconciles the transaction by digest. Submission history survives reloads so
 those reservations and proof retries can continue. Histories from the earlier
 service configuration migrate by committee and wallet identity before submission

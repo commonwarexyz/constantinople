@@ -175,7 +175,9 @@ next draft nonce; the proven account nonce sits under the balance).
 The balance stays unknown until an account update is verified, then carries the proven nonce
 and transaction count on its secondary line. An account the indexer reports as missing holds the
 chain's default balance, so BALANCE shows it with `new account` on the secondary line; the value
-is not authenticated and carries no check or tint. The evidence row below repeats the account
+is not authenticated and carries no check or tint. While the wallet has verified a transaction
+that the shown account state predates, the secondary line reads `updating` behind a spinner until
+state certified at or above that transaction's block arrives. The evidence row below repeats the account
 page's BLOCK CERT and ACCOUNT PROOF cells, including the certified age, and appears only with a
 verified account update. Loading and error messages
 use the dim status line beneath the grid. Submitted transactions follow under a section heading.

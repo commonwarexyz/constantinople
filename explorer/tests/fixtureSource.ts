@@ -11,7 +11,7 @@ function record(value: unknown): RecordValue | undefined {
 const bundleNames = [
     'directBlock', 'descendantBlock', 'descendantLastPage', 'emptyBlock', 'accountBundle',
     'accountNext', 'accountOldest', 'accountExhausted', 'accountStateOnly', 'recipientBundle',
-    'transactionBundle', 'webauthnBlock', 'webauthnBundle',
+    'transactionBundle', 'webauthnBlock', 'webauthnBundle', 'submissionEvidence',
     'accountWithHistory', 'historicalBlock', 'historicalTransaction',
 ];
 

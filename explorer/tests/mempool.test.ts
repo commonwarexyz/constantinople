@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Code, ConnectError } from '@connectrpc/connect';
-import type { MessageInitShape } from '@bufbuild/protobuf';
-import { CompletedSubmissionSchema, SubmitTransactionResponseSchema } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
+import { create, type MessageInitShape } from '@bufbuild/protobuf';
+import { CompletedSubmissionSchema, ProofBundleSchema, SubmitTransactionResponseSchema } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
 import { submitTransactions } from '../src/mempool.ts';
 import { TransactionSubmissionError, isDeterministicSubmissionRejection, singleTransactionOutcome } from '../src/submissionResponse.ts';
 import { SUBMISSION_TIMEOUT_MS, boundedSubmissionSignal } from '../src/submissionRequest.ts';
@@ -34,6 +34,21 @@ test('typed submission replies retain relayer reports and send only once', async
         assert.equal(fetch.mock.callCount(), 1);
         t.mock.restoreAll();
     }
+});
+
+test('a finalization report delivers its evidence unverified and only for a finalized transaction', async (t) => {
+    const evidence = create(ProofBundleSchema, { certificate: new Uint8Array([1, 2]), headers: [new Uint8Array([3])], sequenceNumber: 0n });
+    t.mock.method(globalThis, 'fetch', explorerFetch({
+        submitTransaction() { return completed(200, { case: 'finalized', value: { height: 7n, evidence } }); },
+    }));
+    const report = await submitTransactions('https://indexer.example', batch);
+    assert.deepEqual(report, { status: 'finalized', height: 7, evidence });
+    if (report.status !== 'finalized') assert.fail('unexpected report');
+    assert.deepEqual(singleTransactionOutcome(report), { kind: 'finalized', height: 7, evidence });
+    assert.deepEqual(
+        singleTransactionOutcome({ status: 'partially_finalized', height: 7, included: 1, filtered: 0 }),
+        { kind: 'finalized', height: 7 },
+    );
 });
 
 test('unsigned admission rejection reports cannot release a nonce reservation', async (t) => {
