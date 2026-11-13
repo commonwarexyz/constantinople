@@ -165,6 +165,7 @@ h3 {
 
 /* Primary action: filled accent. */
 .wallet-trigger,
+.menu-trigger,
 .modal__close,
 .account-page__title button,
 .account-page__pager button,
@@ -403,6 +404,7 @@ button:disabled {
 
 .app__status .dot {
     display: inline-block;
+    flex: none;
     width: 0.7ch;
     height: 0.7ch;
     border-radius: 50%;
@@ -416,6 +418,11 @@ button:disabled {
 
 .wallet-trigger {
     text-align: center;
+}
+
+/* Narrow screens fold the wallet and search behind this button. */
+.menu-trigger {
+    display: none;
 }
 
 .app__main {
@@ -1133,42 +1140,65 @@ button:disabled {
         --text-lg: 1rem;
     }
 
+    /*
+     * The header is the title and a menu button. A connection status, the wallet and search each
+     * take a full row beneath in that order. The wallet and search show only while the menu is
+     * open, and the height is left out.
+     */
     .app__header {
         padding: var(--gutter);
         gap: 0.75rem var(--gutter);
-        grid-template-columns: minmax(0, 1fr);
-        grid-template-areas: "title" "actions" "search";
+        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-areas: none;
+        align-items: center;
     }
 
-    .app__title {
-        text-align: center;
+    .app__title,
+    .menu-trigger {
+        grid-area: auto;
+    }
+
+    .menu-trigger {
+        display: block;
+    }
+
+    .app__header-actions {
+        display: contents;
+    }
+
+    .app__status,
+    .wallet-trigger,
+    .search {
+        grid-area: auto;
+        grid-column: 1 / -1;
+    }
+
+    .app__status {
+        order: 1;
+        justify-content: center;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+
+    .wallet-trigger {
+        order: 2;
     }
 
     .search {
+        order: 3;
         max-width: none;
+    }
+
+    .app__header-separator,
+    .app__status--height,
+    .app__header:not(.app__header--menu-open) .wallet-trigger,
+    .app__header:not(.app__header--menu-open) .search {
+        display: none;
     }
 
     /* Field hints use the hint size so the search hint fits a narrow field. */
     input::placeholder {
         font-size: var(--text-sm);
-    }
-
-    .app__header-actions {
-        justify-self: stretch;
-        flex-wrap: wrap;
-        justify-content: center;
-    }
-
-    .app__status {
-        flex: 0 1 auto;
-    }
-
-    .wallet-trigger {
-        flex: 0 0 auto;
-        max-width: 22ch;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
     }
 
     /* Homepage stacks histogram, statistics, then a scrolling block log. */
@@ -1314,17 +1344,8 @@ button:disabled {
 }
 
 @media (max-width: 480px) {
-    .app__status {
-        flex: 1 1 100%;
-        justify-content: center;
-    }
-
     .wallet__actions {
         grid-template-columns: 1fr;
-    }
-
-    .app__header-separator {
-        display: none;
     }
 
     .histogram-frame {
