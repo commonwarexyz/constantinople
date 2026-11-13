@@ -34,7 +34,7 @@ export function nativeProofFixtureIssue(value: unknown): string | undefined {
             }
         }
     }
-    return undefined;
+    return decimal(fixture?.defaultAccountBalance) ? undefined : 'missing defaultAccountBalance';
 }
 
 export function nativeActivityFixtureIssue(value: unknown): string | undefined {

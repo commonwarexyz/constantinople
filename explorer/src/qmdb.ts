@@ -261,6 +261,12 @@ function readVarint(bytes: Uint8Array, offset: number): { value: bigint; offset:
     throw new Error('finalized block header varint is too long');
 }
 
+/**
+ * The balance of an account with no stored state, which the chain treats as already holding it.
+ * The native proof fixture exports the Rust value, and a test asserts the two agree.
+ */
+export const DEFAULT_ACCOUNT_BALANCE = 100n;
+
 export function decodeAccountValue(
     value: Uint8Array,
 ): Pick<VerifiedAccountProof, 'balance' | 'nonce' | 'nonceBitmap' | 'txCount'> {

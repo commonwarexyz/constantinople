@@ -4,6 +4,8 @@ import test from 'node:test';
 import { Code, ConnectError } from '@connectrpc/connect';
 
 import {
+    ACCOUNT_NOT_FOUND,
+    accountLookupFailure,
     accountRetryReason,
     errorMessage,
     isRetryableAccountProofError,
@@ -46,6 +48,21 @@ test('other service codes remain terminal even when the message resembles an out
         assert.equal(isRetryableProofError(error), false, Code[code]);
         assert.equal(isRetryableAccountProofError(error), false, Code[code]);
         assert.equal(accountRetryReason(error), undefined, Code[code]);
+    }
+});
+
+test('only a typed NotFound, direct or as a cause, reads as a missing account', () => {
+    const notFound = new ConnectError('account has no update at the certified state boundary', Code.NotFound);
+    for (const candidate of [notFound, new Error('account lookup failed', { cause: notFound })]) {
+        assert.deepEqual(accountLookupFailure(candidate), { notFound: true, message: ACCOUNT_NOT_FOUND });
+        assert.equal(isRetryableAccountProofError(candidate), false);
+    }
+    assert.equal(ACCOUNT_NOT_FOUND, 'account not found');
+    for (const candidate of [
+        new ConnectError('not found', Code.Unavailable), new ConnectError('not found', Code.Internal),
+        new Error('[not_found] account not found'), 'not found',
+    ]) {
+        assert.deepEqual(accountLookupFailure(candidate), { notFound: false, message: errorMessage(candidate) });
     }
 });
 

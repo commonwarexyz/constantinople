@@ -70,12 +70,12 @@ Identifiers keep their authored case and are never transformed by styling.
 | Value | `--text-md`, text color | Grid values and row data |
 | Statistic | `--text-lg`, one line with ellipsis | Homepage statistics |
 | Metadata | `--text-md`, dim | Row secondary lines, clock times, inline from/to/value/nonce labels |
+| Hint | `--text-sm`, dim | Keyboard shortcuts and field hints; field placeholders at ≤760px |
+| Status | `--text-md`, dim | Search progress, not-found message, and errors |
 
 **Clock times.** Every time of day uses one format from `src/time.ts`: 24-hour local time with
 milliseconds (`23:19:56.505`), whether it is a block's certified timestamp in the block log or a
 submission's local time in the wallet. Ages (`12s ago`) are the only other time wording.
-| Hint | `--text-sm`, dim | Keyboard shortcuts and field hints |
-| Status | `--text-md`, dim | Search progress, no-match message, and errors |
 
 Long hashes and addresses either truncate with a middle ellipsis (rows, block log) or wrap anywhere
 (grid values, wallet address). They never widen a layout.
@@ -108,20 +108,24 @@ Account, block, and transaction pages show the latest height (dim word, accent
 figure); the homepage hides it because the live block feed already shows activity. Connection
 states take its place: a braille spinner while connecting, or error text with a dot in
 `--theme-error`. At ≤1800px the wallet key is omitted. At ≤1300px search occupies its own centered
-row. At ≤760px the title centers on its own line. At
-≤480px separators hide, and the height or connection status occupies a full row above the actions.
+row. At ≤760px the title centers on its own line, the height, separator and wallet actions center
+together on the next, and search takes the last row, so its feedback drops over the page rather
+than the actions. At ≤480px separators hide, and the height or connection status occupies a full
+centered row above the actions.
 
 **Datum grid.** Cells separated by 1px border-colored gaps inside a 1px border, `--pad-cell`
 padding, a label above a value. Homepage statistics use 5 equal columns, then 2 at ≤760px (an odd last
 cell spans the row) and 1 at ≤360px. The wallet shows its address on the same address line as the account page, then a
-2-column grid (balance and local nonce; certificate and account proof), stacking at ≤760px. Account, block, and transaction summaries show the data row first, with certificates
+2-column grid (balance and local nonce; certificate and account proof once the account is
+verified), stacking at ≤760px. Account, block, and transaction summaries show the data row first, with certificates
 and inclusion proofs grouped in a second row; the wallet's full-width evidence row is the same
 two-cell group. Each row has equal-width
 cells. The account's three proof cells stack when the summary is narrower than 60ch; two-cell rows
 stack below 44ch and in the wallet at ≤760px. Grouping stays the same while evidence loads.
 
 A cell may carry one secondary line: a label-sized dim line that never wraps, such as the
-wallet balance's `nonce <n> / <n> txs`.
+wallet balance's `nonce <n> / <n> txs`. The line keeps its height while empty, so the grid does
+not move when the value it describes arrives.
 
 **Certified age.** Every BLOCK CERT cell shows `h<height> / v<view>` followed by a live
 parenthetical age counting up from the certified timestamp, on the same line: `h202 / v216
@@ -162,18 +166,23 @@ with its address so the two wrap together; a label never ends a line alone. Rows
 addresses in rows truncate at 20ch, or less when a narrow row needs it, keeping the last eight
 characters visible.
 
-**Wallet popup.** Actions sit at the right above the datum grid, followed by the transfer form
+**Wallet popup.** The popup hangs from a fixed top inset (8vh) rather than centering, so evidence
+and submitted transactions that arrive later extend it downward without moving what is already
+shown; at ≤760px it fills the screen. Actions sit at the right above the datum grid, followed by the transfer form
 (recipient, amount, and submit on one row; stacked at ≤760px). The header shows only a sign-in
 prompt, pending action or error. The address line precedes the grid; the data row shows BALANCE and LOCAL NONCE (the browser's
 next draft nonce; the proven account nonce sits under the balance).
 The balance stays unknown until an account update is verified, then carries the proven nonce
-and transaction count on its secondary line. The evidence row below repeats the account page's
-BLOCK CERT and ACCOUNT PROOF cells, including the certified age. Loading and error messages
+and transaction count on its secondary line. An account the indexer reports as missing holds the
+chain's default balance, so BALANCE shows it with `new account` on the secondary line; the value
+is not authenticated and carries no check or tint. The evidence row below repeats the account
+page's BLOCK CERT and ACCOUNT PROOF cells, including the certified age, and appears only with a
+verified account update. Loading and error messages
 use the dim status line beneath the grid. Submitted transactions follow under a section heading.
 
 **Header search.** A single field and accent search button sit between the title and wallet
-actions. The field has an accessible address-or-transaction-hash label. Progress, no match or an
-error appears in a dim popup-styled line dropped beneath the field (bordered, with the popup shadow),
+actions. The field has an accessible address-or-transaction-hash label. Progress or an error
+appears in a dim popup-styled line dropped beneath the field (bordered, with the popup shadow),
 so the header never changes height. At ≤760px the form occupies its own full-width
 row. Enter submits; Escape cancels the pending search and clears its status. Editing the query
 also cancels its request. Page navigation and opening the wallet cancel a pending lookup. The
@@ -195,15 +204,23 @@ same layout. Hashes and timestamps truncate to fit, and the whole row stays one 
 
 - **Loading:** an accent braille spinner before a dim lowercase message (`connecting`, `loading
   certified transactions`). Search shows the dim word `searching` without a spinner.
-- **Empty:** a dim lowercase line in the row position (`no transactions indexed`). Search notices
-  use the dim lowercase message `no indexed match`.
+- **Empty:** a dim lowercase line in the row position (`no transactions in this block`). A search
+  the indexer cannot match as a transaction opens the account page for that key.
+- **Not found:** the account page for an account the indexer reports as missing shows the address
+  and `account not found` in the dim status line, with no balance, certificate, proof or history,
+  because the answer is unauthenticated. The wallet shows such an account as a new account instead.
 - **Error:** connection errors and submission verification failures use `--theme-error`. A
   failed submission verification shows its reason beside an exclamation mark. Page and search
-  errors use the dim status line. Storage warnings sit under the header in accent.
+  errors use the dim status line; input that is neither an address nor a transaction hash reads
+  `not an address or transaction hash`. Storage warnings sit under the header in accent.
 - **Copied:** the bottom toast with an accent `+` prompt.
 
 ## Intended exceptions
 
+- **Favicon.** [`public/favicon.svg`](public/favicon.svg) draws five amber histogram bars on the
+  page background, separated by 1px gaps so they stay distinct at 16px. As a static asset it
+  repeats the `--theme-background` and `--theme-accent` values rather than reading the tokens;
+  change them together.
 - **Histogram.** A row of fixed-pixel-width columns (`--histogram-column`: 8px; 4px ≤760px;
   3px ≤480px), one per observed block, drawn as boxes so adjacent bars meet without seams. New
   batches append at the right without interpolated sliding. Unobserved history stays blank,

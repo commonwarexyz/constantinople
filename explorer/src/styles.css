@@ -443,16 +443,16 @@ button:disabled {
     align-items: center;
 }
 
-/* Popups */
-
+/* Popups hang from a fixed top inset, so content that arrives later extends them downward
+   without moving what is already shown. */
 .modal {
     position: fixed;
     inset: 0;
     z-index: 10;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
-    padding: 2ch;
+    padding: 8vh 2ch 2ch;
     background: rgba(14, 15, 16, 0.72);
 }
 
@@ -1137,7 +1137,7 @@ button:disabled {
         padding: var(--gutter);
         gap: 0.75rem var(--gutter);
         grid-template-columns: minmax(0, 1fr);
-        grid-template-areas: "title" "search" "actions";
+        grid-template-areas: "title" "actions" "search";
     }
 
     .app__title {
@@ -1148,14 +1148,19 @@ button:disabled {
         max-width: none;
     }
 
+    /* Field hints use the hint size so the search hint fits a narrow field. */
+    input::placeholder {
+        font-size: var(--text-sm);
+    }
+
     .app__header-actions {
         justify-self: stretch;
         flex-wrap: wrap;
-        justify-content: space-between;
+        justify-content: center;
     }
 
     .app__status {
-        flex: 1 1 auto;
+        flex: 0 1 auto;
     }
 
     .wallet-trigger {
@@ -1311,6 +1316,7 @@ button:disabled {
 @media (max-width: 480px) {
     .app__status {
         flex: 1 1 100%;
+        justify-content: center;
     }
 
     .wallet__actions {

@@ -96,6 +96,19 @@ export function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
+/** Status for an account the indexer reports as having no update. Absence has no proof. */
+export const ACCOUNT_NOT_FOUND = 'account not found';
+
+/**
+ * The status line for a failed account read. The indexer's not-found answer reads as a plain
+ * state rather than an error, and every other failure keeps its message.
+ */
+export function accountLookupFailure(error: unknown): { readonly notFound: boolean; readonly message: string } {
+    return connectError(error)?.code === Code.NotFound
+        ? { notFound: true, message: ACCOUNT_NOT_FOUND }
+        : { notFound: false, message: errorMessage(error) };
+}
+
 // Proof failures can acquire context while preserving the original transport cause.
 function connectError(error: unknown): ConnectError | undefined {
     let current = error;

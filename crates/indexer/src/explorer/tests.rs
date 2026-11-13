@@ -50,9 +50,9 @@ use constantinople_application::consensus::{
 };
 use constantinople_engine::types::{EngineBlock, EngineCodedBlock, EngineFinalization};
 use constantinople_primitives::{
-    Block, Header as BlockHeader, Nonce, PublicKeyCache, Sealable, StateSyncProof,
-    TRANSACTION_NAMESPACE, Transaction, TransactionHistoryEntry, TransactionPublicKey,
-    TransactionSignature, verify_transactions,
+    Block, DEFAULT_ACCOUNT_BALANCE, Header as BlockHeader, Nonce, PublicKeyCache, Sealable,
+    StateSyncProof, TRANSACTION_NAMESPACE, Transaction, TransactionHistoryEntry,
+    TransactionPublicKey, TransactionSignature, verify_transactions,
 };
 use p256::ecdsa::{SigningKey, signature::Signer as _};
 use rand::{SeedableRng, rngs::StdRng};
@@ -1536,6 +1536,7 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
             let (historical_block, historical_transaction) = Box::pin(historical_bundles(context.child("historical_export"), &fixture)).await;
             let export = json!({
                 "verificationMaterial": fixture.verification_material,
+                "defaultAccountBalance": DEFAULT_ACCOUNT_BALANCE.to_string(),
                 "account": hex(fixture.account.as_ref()),
                 "recipient": hex(fixture.recipient.as_ref()),
                 "transactionDigest": digest,

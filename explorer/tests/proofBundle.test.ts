@@ -7,13 +7,13 @@ import { initQmdbWasm, QmdbProofVerifier } from '@exowarexyz/qmdb';
 import { ensureSimplexWasm } from '@exowarexyz/simplex/wasm';
 import type { VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { fromHex, toArrayBuffer, toHex } from '../src/codec.ts';
-import { authenticatedHeader, finalizedTargetFromCertificate } from '../src/qmdb.ts';
+import { DEFAULT_ACCOUNT_BALANCE, authenticatedHeader, finalizedTargetFromCertificate } from '../src/qmdb.ts';
 import { initAccountProofWasm } from '../src/accountProof.ts';
 import {
     loadAccountBundle, loadBlockBundle, loadTransactionBundle,
     verifyAccountBundle, verifyBlockBundle, verifyTransactionBundle, proofBundleInput,
 } from '../src/proofBundle.ts';
-import { isRetryableAccountProofError, isRetryableProofError } from '../src/proofRetry.ts';
+import { ACCOUNT_NOT_FOUND, accountLookupFailure, isRetryableAccountProofError, isRetryableProofError } from '../src/proofRetry.ts';
 import { ProofBundleSchema, type ProofBundle, type TransactionRole } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
 import { explorerFetch } from './rpcTest.ts';
 import { accountCursor } from '../src/accountPage.ts';
@@ -39,6 +39,7 @@ interface WireBundle {
 /** Responses and verification material produced by a real publisher and indexer. */
 interface PublisherFixture {
     verificationMaterial: string; account: string; recipient: string; transactionDigest: string;
+    defaultAccountBalance: string;
     directBlock: WireBundle; descendantBlock: WireBundle; descendantLastPage: WireBundle;
     emptyBlock: WireBundle; accountBundle: WireBundle; accountNext: WireBundle;
     accountStateOnly: WireBundle; recipientBundle: WireBundle; transactionBundle: WireBundle;
@@ -57,6 +58,10 @@ async function publisherFixture(): Promise<PublisherFixture> {
 function nativeTest(name: string, run: (context: TestContext) => Promise<void>): void {
     test(name, { skip: nativeSkip }, run);
 }
+
+nativeTest('the wallet default balance matches the chain default for an account without state', async () => {
+    assert.equal(DEFAULT_ACCOUNT_BALANCE, BigInt(nativeFixture.defaultAccountBalance));
+});
 
 function rpcBundle(wire: WireBundle): ProofBundle {
     const nextCursor: ProofBundle['nextCursor'] = wire.nextCursor === null ? { case: undefined }
@@ -199,6 +204,18 @@ test('response byte limit applies to a serialized protobuf body', async (t) => {
     await assert.rejects(loadAccountBundle({ ...options, account }), (error: unknown) => {
         assert.ok(error instanceof ConnectError);
         assert.equal(error.code, Code.ResourceExhausted);
+        return true;
+    });
+    assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('an account the indexer reports as missing surfaces as a terminal not-found report', async (t) => {
+    const fetch = t.mock.method(globalThis, 'fetch', explorerFetch({ getAccount: () => {
+        throw new ConnectError('account has no update at the certified state boundary', Code.NotFound);
+    } }));
+    await assert.rejects(loadAccountBundle({ ...options, account }), (error: unknown) => {
+        assert.deepEqual(accountLookupFailure(error), { notFound: true, message: ACCOUNT_NOT_FOUND });
+        assert.equal(isRetryableAccountProofError(error), false);
         return true;
     });
     assert.equal(fetch.mock.callCount(), 1);

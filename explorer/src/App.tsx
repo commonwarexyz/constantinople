@@ -37,6 +37,7 @@ import {
 } from './submissionResponse';
 import {
     type AccountTransactionRow,
+    DEFAULT_ACCOUNT_BALANCE,
     type LatestProofTarget,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
@@ -50,6 +51,7 @@ import {
     type NonceState,
 } from './nonce';
 import {
+    accountLookupFailure,
     accountRetryReason,
     errorMessage,
     isRetryableAccountProofError,
@@ -100,6 +102,7 @@ const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MA
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
     | { readonly status: 'fetching'; readonly detail: string }
+    | { readonly status: 'not-found' }
     | ({
           readonly status: 'verified';
           readonly detail: string;
@@ -114,12 +117,23 @@ interface WalletAccountIdentity {
 
 /** Account state at a certified snapshot, bound to the requesting wallet. */
 type WalletAccountView = WalletAccountIdentity & {
+    readonly status: 'verified';
     readonly balance: bigint;
     readonly nonce: { readonly base: bigint; readonly bitmap: bigint };
     readonly location: bigint;
     readonly txCount: bigint;
     readonly writeHeight: bigint;
     readonly timestampMs: bigint;
+};
+
+/**
+ * The wallet's account as last read, either verified state or the indexer's unauthenticated
+ * answer that the account has no update.
+ */
+type WalletAccountState = WalletAccountView | {
+    readonly status: 'not-found';
+    readonly wallet: ActiveWallet;
+    readonly accountKey: string;
 };
 
 /** A verified block page and its position in the pagination history. */
@@ -162,6 +176,7 @@ interface PageRequest {
     readonly key: string;
     readonly loading: boolean;
     readonly message: string;
+    readonly notFound?: boolean;
 }
 
 interface ObservedRateWindow {
@@ -194,7 +209,7 @@ export default function App() {
     const walletAccountKey = walletAddress && walletAddress.wallet === wallet ? walletAddress.key : null;
 
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
-    const [account, setAccount] = useState<WalletAccountView | null>(null);
+    const [account, setAccount] = useState<WalletAccountState | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
     const [toKey, setToKey] = useState('');
     const [value, setValue] = useState('1');
@@ -278,6 +293,7 @@ export default function App() {
         )
     ) ? accountPageData : null;
     const accountRequestMatches = accountRequest.key === currentAccountViewKey;
+    const accountNotFound = accountRequestMatches && accountRequest.notFound === true;
     const accountLoading = !accountRequestMatches || accountRequest.loading;
     const accountNextCursor = displayedAccount?.nextCursor ?? null;
     const accountPaginationReady = !accountLoading && displayedAccount?.key === currentAccountViewKey &&
@@ -470,7 +486,7 @@ export default function App() {
             setAccountRequest({ key: currentAccountViewKey, loading: false, message: '' });
         }).catch((error) => {
             if (!accountHistorySession.isCurrent(request)) return;
-            setAccountRequest({ key: currentAccountViewKey, loading: false, message: errorMessage(error) });
+            setAccountRequest({ key: currentAccountViewKey, loading: false, ...accountLookupFailure(error) });
         });
         return () => controller.abort();
     }, [currentAccountViewKey, accountRefresh]);
@@ -717,6 +733,7 @@ export default function App() {
                     if (!walletHistorySession.observe(request, bundle.account)) return;
                     const snapshot = { height: bundle.target.height, view: bundle.target.view, timestampMs: bundle.target.timestampMs };
                     const nextAccount: WalletAccountView = {
+                        status: 'verified',
                         balance: bundle.account.balance,
                         nonce: { base: bundle.account.nonce, bitmap: bundle.account.nonceBitmap },
                         wallet, accountKey: walletAccountKey, snapshot, location: bundle.account.location,
@@ -728,7 +745,9 @@ export default function App() {
                     setAccountMessage('');
                 } catch (error) {
                     if (!current()) return;
-                    setAccountMessage(errorMessage(error));
+                    const failure = accountLookupFailure(error);
+                    if (failure.notFound) setAccount({ status: 'not-found', wallet, accountKey: walletAccountKey });
+                    setAccountMessage(failure.notFound ? '' : failure.message);
                 }
             } while (refresh.again && current());
         })().finally(() => {
@@ -1154,7 +1173,8 @@ export default function App() {
                                 pageNumber={displayedAccount?.pageNumber ?? accountCursorStack.length}
                                 pageRequestKey={currentAccountViewKey}
                                 retainingPage={displayedAccount !== null && displayedAccount.key !== currentAccountViewKey}
-                                proof={displayedAccount?.proof ?? { status: 'fetching', detail: 'verifying account evidence' }}
+                                proof={accountNotFound ? { status: 'not-found' }
+                                    : displayedAccount?.proof ?? { status: 'fetching', detail: 'verifying account evidence' }}
                                 target={displayedAccount?.target ?? null}
                                 transactionProofs={displayedAccount?.transactionProofs ?? []}
                                 transactions={displayedAccount?.transactions ?? []}
@@ -1286,6 +1306,7 @@ function AccountPage({
 }) {
     const transactionProof = transactionProofs[0];
     const proofItems = transactionProofs.length;
+    const notFound = proof.status === 'not-found';
     return (
         <section className="account-page" aria-label="account proof" aria-busy={loading}>
             <div className="account-page__title">
@@ -1296,7 +1317,7 @@ function AccountPage({
                 <span className="account-page__prompt">address</span>
                 <CopyableValue value={account} onCopy={onCopy} />
             </div>
-            <div className="account-proof-grid">
+            {!notFound && <div className="account-proof-grid">
                 <div className="account-proof-grid__details">
                     <ProofDatum label="block" pending={!target} value={target ? shortHex(bytesToHex(target.blockDigest)) : '—'} />
                     <ProofDatum
@@ -1330,7 +1351,9 @@ function AccountPage({
                         }
                     />
                 </div>
-            </div>
+            </div>}
+            {notFound && <PageStatus message={activityError} />}
+            {!notFound && <>
             <div className="account-page__subhead">
                 <h3>page {pageNumber}</h3>
                 <div className="account-page__pager">
@@ -1378,6 +1401,7 @@ function AccountPage({
                     </div>
                 ))}
             </div>
+            </>}
         </section>
     );
 }
@@ -1407,8 +1431,8 @@ function BlockPage({
             </div>
             <div className="account-proof-grid">
                 <div className="account-proof-grid__details">
-                    <ProofDatum pending={!bundle} label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '-'} />
-                    <ProofDatum pending={!bundle} label="transactions" value={bundle?.block.transactionCount.toString() ?? '-'} />
+                    <ProofDatum pending={!bundle} label="block" value={bundle ? shortHex(bytesToHex(bundle.block.blockDigest)) : '—'} />
+                    <ProofDatum pending={!bundle} label="transactions" value={bundle?.block.transactionCount.toString() ?? '—'} />
                 </div>
                 <div className="account-proof-grid__evidence">
                     <CertificateDatum target={bundle?.target ?? null} />
@@ -1418,7 +1442,7 @@ function BlockPage({
                         pending={!transactionProof}
                         value={bundle && transactionProof
                             ? <span className="proof-badge">op{transactionProof.tip} / {bundle.transactions.length}L</span>
-                            : '-'}
+                            : '—'}
                     />
                 </div>
             </div>
@@ -1479,12 +1503,12 @@ function TransactionPage({ digest, bundle, message, loading, onCopy, onOpenAddre
             </div>
             <div className="account-proof-grid">
                 <div className="account-proof-grid__details">
-                    <ProofDatum pending={!bundle} label="block" value={bundle ? <button className="account-page__height-link" onClick={() => onOpenBlock(bundle.height)}>h{bundle.height.toString()}:{transaction!.index}</button> : '-'} />
-                    <ProofDatum pending={!bundle} label="location" value={bundle?.location.toString() ?? '-'} />
+                    <ProofDatum pending={!bundle} label="block" value={bundle ? <button className="account-page__height-link" onClick={() => onOpenBlock(bundle.height)}>h{bundle.height.toString()}:{transaction!.index}</button> : '—'} />
+                    <ProofDatum pending={!bundle} label="location" value={bundle?.location.toString() ?? '—'} />
                 </div>
                 <div className="account-proof-grid__evidence">
                     <CertificateDatum target={bundle?.target ?? null} />
-                    <ProofDatum verified={!!bundle} pending={!bundle} label="transaction proof" value={bundle ? <span className="proof-badge">op{bundle.tip} / 1L</span> : '-'} />
+                    <ProofDatum verified={!!bundle} pending={!bundle} label="transaction proof" value={bundle ? <span className="proof-badge">op{bundle.tip} / 1L</span> : '—'} />
                 </div>
             </div>
             <PageStatus message={message || (loading ? 'verifying transaction evidence' : '')} />
@@ -1627,7 +1651,7 @@ function WalletPanel({
     wallet: ActiveWallet | null;
     walletAccountKey: string | null;
     walletMessage: string;
-    account: WalletAccountView | null;
+    account: WalletAccountState | null;
     accountMessage: string;
     toKey: string;
     value: string;
@@ -1650,6 +1674,8 @@ function WalletPanel({
     const showWalletMessage = walletMessage !== '' && walletMessage !== 'signed in';
     const isAccountLoading = accountMessage === 'loading account proof';
     const walletAccountDisplay = walletAccountKey?.toLowerCase() ?? 'not authenticated';
+    const verified = account?.status === 'verified' ? account : null;
+    const isNew = account?.status === 'not-found';
 
     return (
         <section className="wallet">
@@ -1689,23 +1715,20 @@ function WalletPanel({
             <div className="wallet__grid">
                 <div className="wallet__cell">
                     <span>balance</span>
-                    <strong>{account ? account.balance.toString() : 'unknown'}</strong>
-                    {account && <small>nonce {account.nonce.base.toString()} / {account.txCount.toString()} txs</small>}
+                    <strong>{verified ? verified.balance.toString() : isNew ? DEFAULT_ACCOUNT_BALANCE.toString() : 'unknown'}</strong>
+                    <small>{verified ? `nonce ${verified.nonce.base.toString()} / ${verified.txCount.toString()} txs` : isNew ? 'new account' : '\u00a0'}</small>
                 </div>
                 <div className="wallet__cell">
                     <span>local nonce</span>
                     <strong>{nonce}</strong>
                 </div>
-                {wallet && (
+                {verified && (
                     <div className="wallet__evidence account-proof-grid__evidence">
-                        <CertificateDatum target={account?.snapshot ?? null} latest />
+                        <CertificateDatum target={verified.snapshot} latest />
                         <ProofDatum
                             label="account proof"
-                            verified={!!account}
-                            pending={!account}
-                            value={account
-                                ? <span className="proof-badge">loc {account.location.toString()} / h{account.writeHeight.toString()}</span>
-                                : '—'}
+                            verified
+                            value={<span className="proof-badge">loc {verified.location.toString()} / h{verified.writeHeight.toString()}</span>}
                         />
                     </div>
                 )}
@@ -1723,7 +1746,7 @@ function WalletPanel({
                     <input
                         value={toKey}
                         onChange={(event) => onToKeyChange(event.target.value)}
-                        placeholder="Recipient address"
+                        placeholder="recipient address"
                         spellCheck={false}
                         disabled={!wallet}
                     />

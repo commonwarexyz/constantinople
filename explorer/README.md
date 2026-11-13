@@ -72,10 +72,12 @@ nothing. Self-transfers occupy one history entry.
 
 The browser verifies account inclusion with the native fixed account verifier.
 Each proof binds the requested key and the exact state root and operation tip
-from the certificate. The state database has no absence proofs: the indexer
-reports an account without an update as not found, and the wallet and account
-page show that unauthenticated report as an error. The certificate cell's age
-counts up from the certified
+from the certificate. The state database has no absence proofs. The indexer
+reports an account without an update as not found, which is not authenticated.
+The account page then shows the address and a plain `account not found` line.
+The wallet shows the chain's default balance marked `new account`, since such an
+account can spend it at once, and shows no certificate or proof cells until the
+account has an update. The certificate cell's age counts up from the certified
 timestamp: red after 60 seconds, amber for a browser clock mismatch. A recent timestamp
 provides an as-of observation, not a guarantee of the globally newest head.
 The transaction nonce remains a local draft. Persisted proof status is reverified

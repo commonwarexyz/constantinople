@@ -3,7 +3,7 @@ import test from 'node:test';
 import { Code, ConnectError } from '@connectrpc/connect';
 import { fromHex, toHex } from '../src/codec.ts';
 import { SearchKind } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
-import { normalizeSearchQuery, searchIndexer } from '../src/search.ts';
+import { SEARCH_INPUT_INVALID, normalizeSearchQuery, searchIndexer } from '../src/search.ts';
 import { explorerFetch } from './rpcTest.ts';
 
 const digest = 'ab'.repeat(32);
@@ -22,7 +22,8 @@ test('search normalizes one identity and calls its generated RPC', async (t) => 
         return serve(input, init);
     });
     assert.deepEqual(await run(), { kind: 'transaction', value: digest });
-    await assert.rejects(searchIndexer('https://indexer.example', 'invalid', new AbortController().signal));
+    await assert.rejects(searchIndexer('https://indexer.example', 'invalid', new AbortController().signal), { message: SEARCH_INPUT_INVALID });
+    assert.equal(SEARCH_INPUT_INVALID, 'not an address or transaction hash');
     assert.equal(fetch.mock.callCount(), 1);
 });
 
