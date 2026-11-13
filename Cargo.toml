@@ -13,6 +13,7 @@ exclude = ["**/target"]
 [workspace]
 resolver = "2"
 members = [
+  "crates/account-proof",
   "crates/application",
   "crates/engine",
   "crates/indexer",
@@ -21,6 +22,7 @@ members = [
   "bin/deploy",
   "bin/spammer",
   "bin/validator",
+  "vendor/commonware-storage",
 ]
 
 [workspace.lints.rust]
@@ -40,6 +42,7 @@ large_futures = "warn"
 
 [workspace.dependencies]
 # Workspace
+constantinople-account-proof = { path = "crates/account-proof" }
 constantinople-engine = { path = "crates/engine" }
 constantinople-indexer = { path = "crates/indexer" }
 constantinople-mempool = { path = "crates/mempool" }
@@ -69,12 +72,12 @@ commonware-cryptography = { version = "2026.10.0", default-features = false }
 commonware-cryptography-curve25519 = "2026.10.0"
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "120c49ee716e6deeef3246ea97cc3dfbfd3281ec" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "120c49ee716e6deeef3246ea97cc3dfbfd3281ec" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "120c49ee716e6deeef3246ea97cc3dfbfd3281ec" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "120c49ee716e6deeef3246ea97cc3dfbfd3281ec" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "120c49ee716e6deeef3246ea97cc3dfbfd3281ec" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "120c49ee716e6deeef3246ea97cc3dfbfd3281ec" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "b087a0572e908d1c7d03ad685cd9e2f232838e6a" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "b087a0572e908d1c7d03ad685cd9e2f232838e6a" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "b087a0572e908d1c7d03ad685cd9e2f232838e6a" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "b087a0572e908d1c7d03ad685cd9e2f232838e6a" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "b087a0572e908d1c7d03ad685cd9e2f232838e6a" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "b087a0572e908d1c7d03ad685cd9e2f232838e6a" }
 datafusion = "55"
 
 # Other
@@ -112,3 +115,6 @@ url = "2.5.8"
 [profile.samply]
 inherits = "release"
 debug = true
+
+[patch.crates-io]
+commonware-storage = { path = "vendor/commonware-storage" }

@@ -1,0 +1,64 @@
+use commonware_allocator::mimalloc;
+use commonware_cryptography::{Hasher, Sha256};
+use commonware_runtime::{
+    Metrics, Name, Supervisor,
+    telemetry::metrics::{Metric, Registered},
+};
+use criterion::criterion_main;
+
+mod grinding;
+mod hashmap_insert;
+mod hashmap_insert_fixed;
+mod hashmap_iteration;
+mod insert;
+mod insert_and_retain;
+mod lookup;
+mod lookup_miss;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc::new(mimalloc::Config::DEFAULT);
+
+pub(crate) type Digest = <Sha256 as Hasher>::Digest;
+
+#[derive(Clone)]
+pub(crate) struct DummyMetrics;
+
+impl Supervisor for DummyMetrics {
+    fn child(&self, _: &'static str) -> Self {
+        Self
+    }
+
+    fn with_attribute(self, _: &'static str, _: impl std::fmt::Display) -> Self {
+        Self
+    }
+
+    fn name(&self) -> Name {
+        Name::default()
+    }
+}
+
+impl Metrics for DummyMetrics {
+    fn register<N: Into<String>, H: Into<String>, M: Metric>(
+        &self,
+        _: N,
+        _: H,
+        metric: M,
+    ) -> Registered<M> {
+        Registered::detached(metric)
+    }
+
+    fn encode(&self) -> String {
+        "".into()
+    }
+}
+
+criterion_main!(
+    grinding::benches,
+    hashmap_iteration::benches,
+    hashmap_insert_fixed::benches,
+    hashmap_insert::benches,
+    insert::benches,
+    insert_and_retain::benches,
+    lookup::benches,
+    lookup_miss::benches,
+);

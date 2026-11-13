@@ -1,0 +1,2198 @@
+use crate::{
+    Context,
+    index::Ordered as Index,
+    journal::contiguous::Contiguous,
+    merkle::{Family, Location},
+    qmdb::{
+        any::{ValueEncoding, db::Db},
+        operation::{Key, Operation as OperationTrait},
+    },
+};
+use commonware_codec::Codec;
+use commonware_cryptography::Hasher;
+use commonware_parallel::Strategy;
+use commonware_utils::{futures::try_join_all, range::contains_cyclic};
+use core::{
+    future::Future,
+    mem,
+    ops::{
+        Bound::{self, Excluded, Included, Unbounded},
+        RangeBounds,
+    },
+};
+use futures::{
+    TryStreamExt as _,
+    stream::{self, Stream},
+};
+
+pub mod fixed;
+pub mod variable;
+
+pub use crate::qmdb::any::operation::{Ordered as Operation, update::Ordered as Update};
+
+/// Type alias for a location and its associated key data.
+type LocatedKey<F, K, V> = Option<(Location<F>, Update<K, V>)>;
+
+/// Which collision bucket a range scan fetches next.
+enum Cursor<K> {
+    /// The lower bound's bucket.
+    Start,
+    /// The bucket holding this active key, the successor of the pending bucket's largest key.
+    Next(K),
+    /// No further bucket needs fetching.
+    Done,
+}
+
+/// Whether `key` lies beyond the range's upper bound.
+fn past_end<K: Ord>(end: Bound<&K>, key: &K) -> bool {
+    match end {
+        Included(end) => key > end,
+        Excluded(end) => key >= end,
+        Unbounded => false,
+    }
+}
+
+impl<
+    F: Family,
+    E: Context,
+    K: Key,
+    V: ValueEncoding,
+    C: Contiguous<Item = Operation<F, K, V>>,
+    I: Index<Value = Location<F>>,
+    H: Hasher,
+    const N: usize,
+    S: Strategy,
+> Db<F, E, C, I, H, Update<K, V>, N, S>
+where
+    Operation<F, K, V>: Codec,
+{
+    async fn get_update_op(
+        reader: &impl Contiguous<Item = Operation<F, K, V>>,
+        loc: Location<F>,
+    ) -> Result<Update<K, V>, crate::qmdb::Error<F>> {
+        match reader.read(*loc).await? {
+            Operation::Update(key_data) => Ok(key_data),
+            _ => unreachable!("expected update operation at location {}", loc),
+        }
+    }
+
+    /// Find the span produced by the provided locations that contains `key`, if any.
+    async fn find_span(
+        &self,
+        locs: impl Iterator<Item = Location<F>> + Send,
+        key: &K,
+    ) -> Result<LocatedKey<F, K, V>, crate::qmdb::Error<F>> {
+        // Collision order is arbitrary, so check each candidate's cyclic span.
+        for loc in locs {
+            let data = Self::get_update_op(&self.log, loc).await?;
+            if contains_cyclic(&data.key..&data.next_key, key) {
+                return Ok(Some((loc, data)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get the operation that defines the span whose range contains `key`, or None if the DB is
+    /// empty.
+    // Explicit Send avoids the borrowed-iterator inference limitation (rust-lang/rust#100013).
+    #[allow(clippy::manual_async_fn)]
+    pub fn get_span(
+        &self,
+        key: &K,
+    ) -> impl Future<Output = Result<LocatedKey<F, K, V>, crate::qmdb::Error<F>>> + Send {
+        async move {
+            if self.is_empty() {
+                return Ok(None);
+            }
+
+            // If the translated key is in the snapshot, search its conflicts for the span.
+            if let Some(span) = self.find_span(self.snapshot.get(key).copied(), key).await? {
+                return Ok(Some(span));
+            }
+
+            // The remaining span owner is in the previous translated key. Allow wrapping because
+            // spans connect the last active key back to the first.
+            let Some((iter, _)) = self.snapshot.prev_translated_key(key) else {
+                // DB is empty.
+                return Ok(None);
+            };
+
+            let span = self.find_span(iter.copied(), key).await?.expect(
+                "a span that includes any given key should always exist if db is non-empty",
+            );
+
+            Ok(Some(span))
+        }
+    }
+
+    /// Returns the smallest active key strictly greater than `key`, or `None` if there is none.
+    ///
+    /// The query key need not be active. This lookup does not wrap around to the first key.
+    pub async fn get_next_key(&self, key: &K) -> Result<Option<K>, crate::qmdb::Error<F>> {
+        let Some((_, data)) = self.get_span(key).await? else {
+            return Ok(None);
+        };
+        Ok((data.next_key > *key).then_some(data.next_key))
+    }
+
+    /// Returns the largest active key strictly less than `key`, or `None` if there is none.
+    ///
+    /// The query key need not be active. This lookup does not wrap around to the last key.
+    // Explicit Send avoids the borrowed-iterator inference limitation (rust-lang/rust#100013).
+    #[allow(clippy::manual_async_fn)]
+    pub fn get_prev_key(
+        &self,
+        key: &K,
+    ) -> impl Future<Output = Result<Option<K>, crate::qmdb::Error<F>>> + Send {
+        async move {
+            // The strict predecessor can share the query's translated key.
+            if let Some(prev) = self
+                .find_strict_prev_key(self.snapshot.get(key).copied(), key)
+                .await?
+            {
+                return Ok(Some(prev));
+            }
+
+            // The previous translated key is the only remaining candidate. Reject wrapping so
+            // queries at or below the first active key have no predecessor.
+            let Some((iter, false)) = self.snapshot.prev_translated_key(key) else {
+                return Ok(None);
+            };
+
+            self.find_strict_prev_key(iter.copied(), key).await
+        }
+    }
+
+    /// Returns the database's strict predecessor of `key` if it is among these snapshot entries.
+    async fn find_strict_prev_key(
+        &self,
+        locs: impl Iterator<Item = Location<F>> + Send,
+        key: &K,
+    ) -> Result<Option<K>, crate::qmdb::Error<F>> {
+        // Predecessor ownership includes the next key, so an active query finds the prior key.
+        // The owner's key must still be smaller to exclude cyclic wraparound.
+        for loc in locs {
+            let data = Self::get_update_op(&self.log, loc).await?;
+            if data.key < *key
+                && contains_cyclic((Excluded(&data.key), Included(&data.next_key)), key)
+            {
+                return Ok(Some(data.key));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get the (value, next-key) pair of `key` in the db, or None if it has no value.
+    pub async fn get_all(&self, key: &K) -> Result<Option<(V::Value, K)>, crate::qmdb::Error<F>> {
+        self.get_with_loc(key)
+            .await
+            .map(|res| res.map(|(data, _)| (data.value, data.next_key)))
+    }
+
+    /// Returns the key data for `key` with its location, or None if the key is not active.
+    // Explicit Send avoids the borrowed-iterator inference limitation (rust-lang/rust#100013).
+    #[allow(clippy::manual_async_fn, clippy::type_complexity)]
+    pub(crate) fn get_with_loc(
+        &self,
+        key: &K,
+    ) -> impl Future<Output = Result<Option<(Update<K, V>, Location<F>)>, crate::qmdb::Error<F>>> + Send
+    {
+        async move {
+            // Resolve translated-key collisions before returning an update and its location.
+            for loc in self.snapshot.get(key).copied() {
+                let op = self.log.read(*loc).await?;
+                assert!(
+                    op.is_update(),
+                    "location does not reference update operation. loc={loc}"
+                );
+                if op.key().expect("update operation must have key") == key {
+                    let Operation::Update(data) = op else {
+                        unreachable!("expected update operation");
+                    };
+                    return Ok(Some((data, loc)));
+                }
+            }
+
+            Ok(None)
+        }
+    }
+
+    /// Streams active (key, value) pairs in ascending key order within `range`. Read errors are
+    /// yielded in place, and the next poll reads the same bucket again.
+    pub fn stream_range<'a>(
+        &'a self,
+        range: impl RangeBounds<K> + Send + 'a,
+    ) -> impl Stream<Item = Result<(K, V::Value), crate::qmdb::Error<F>>> + Send + 'a {
+        let empty = match (range.start_bound(), range.end_bound()) {
+            (Included(start), Included(end)) => start > end,
+            (Included(start) | Excluded(start), Excluded(end))
+            | (Excluded(start), Included(end)) => start >= end,
+            _ => false,
+        };
+        let cursor = if empty { Cursor::Done } else { Cursor::Start };
+
+        stream::unfold(
+            (range, cursor, Vec::<Update<K, V>>::new()),
+            move |(range, mut cursor, mut pending)| async move {
+                loop {
+                    // Drain each collision bucket in ascending order before fetching another.
+                    if let Some(item) = pending.pop() {
+                        return Some((Ok((item.key, item.value)), (range, cursor, pending)));
+                    }
+
+                    // TODO(https://github.com/commonwarexyz/monorepo/issues/2527): fetch
+                    // the following buckets concurrently with draining this one.
+                    let mut updates =
+                        match self.fetch_scan_bucket(&cursor, range.start_bound()).await {
+                            Ok(Some(updates)) => updates,
+                            Ok(None) => return None,
+                            // Keep the cursor unchanged so a later poll reads this bucket again.
+                            Err(e) => return Some((Err(e), (range, cursor, pending))),
+                        };
+
+                    // Save the largest key's successor before filtering: the starting bucket
+                    // may contain only keys below the lower bound.
+                    let last = updates.first().expect("index bucket has no locations");
+                    cursor = if last.next_key <= last.key
+                        || past_end(range.end_bound(), &last.next_key)
+                    {
+                        Cursor::Done
+                    } else {
+                        Cursor::Next(last.next_key.clone())
+                    };
+                    updates.retain(|item| range.contains(&item.key));
+                    pending = updates;
+                }
+            },
+        )
+    }
+
+    /// Streams active keys in ascending order within `range`.
+    pub fn keys<'a>(
+        &'a self,
+        range: impl RangeBounds<K> + Send + 'a,
+    ) -> impl Stream<Item = Result<K, crate::qmdb::Error<F>>> + Send + 'a {
+        self.stream_range(range).map_ok(|(key, _)| key)
+    }
+
+    /// Fetches the cursor's bucket, or returns `None` when the scan has no further bucket.
+    async fn fetch_scan_bucket(
+        &self,
+        cursor: &Cursor<K>,
+        start: Bound<&K>,
+    ) -> Result<Option<Vec<Update<K, V>>>, crate::qmdb::Error<F>> {
+        let updates = match cursor {
+            Cursor::Done => return Ok(None),
+            Cursor::Next(key) => {
+                self.fetch_all_updates(self.snapshot.get(key).copied())
+                    .await?
+            }
+            Cursor::Start => match start {
+                Unbounded => {
+                    let Some(iter) = self.snapshot.first_translated_key() else {
+                        return Ok(None);
+                    };
+                    self.fetch_all_updates(iter.copied()).await?
+                }
+                Included(start) | Excluded(start) => {
+                    // The bound's own bucket may hold keys below it. When no active key shares
+                    // its translated key, the following bucket starts.
+                    let mut locs = self.snapshot.get(start).copied().peekable();
+                    if locs.peek().is_some() {
+                        self.fetch_all_updates(locs).await?
+                    } else {
+                        let Some((iter, false)) = self.snapshot.next_translated_key(start) else {
+                            return Ok(None);
+                        };
+                        self.fetch_all_updates(iter.copied()).await?
+                    }
+                }
+            },
+        };
+        Ok(Some(updates))
+    }
+
+    /// Fetches all update operations corresponding to the input locations, returning the result in
+    /// reverse order of the keys.
+    async fn fetch_all_updates(
+        &self,
+        locs: impl Iterator<Item = Location<F>> + Send,
+    ) -> Result<Vec<Update<K, V>>, crate::qmdb::Error<F>> {
+        // Conflicting entries are independent, so their journal reads can run concurrently.
+        let futures = locs.map(|loc| Self::get_update_op(&self.log, loc));
+        let mut updates = try_join_all(futures).await?;
+
+        // Descending order lets the stream emit ascending keys with constant-time pops.
+        updates.sort_unstable_by(|a, b| b.key.cmp(&a.key));
+
+        Ok(updates)
+    }
+}
+
+/// The keys around a batch's writes: the candidates for the successor of each written key, and
+/// the candidates for the predecessor of each key that joins or leaves the key set, each with the
+/// source its rewrite takes.
+///
+/// Callers push candidates as they resolve them and sort each list once before the lookups.
+pub(crate) struct Neighbors<K, S> {
+    /// Keys that may follow a written key; sorted and unique after [`Self::finish_next`].
+    pub(crate) next: Vec<K>,
+    /// Keys that may precede a key that joins or leaves, each with the source of its rewrite, or
+    /// `None` for a key whose own update carries its link. Later pushes carry fresher state for
+    /// a key; [`Self::finish_prev`] keeps the last.
+    pub(crate) prev: Vec<(K, Option<S>)>,
+}
+
+impl<K: Key, S: Send> Neighbors<K, S> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next: Vec::new(),
+            prev: Vec::new(),
+        }
+    }
+
+    /// Sort the successor candidates for lookups, dropping the `removed` keys.
+    pub(crate) fn finish_next(&mut self, strategy: &impl Strategy, removed: impl Fn(&K) -> bool) {
+        strategy.sort_by(&mut self.next, |a, b| a.cmp(b));
+        self.next.dedup();
+        self.next.retain(|key| !removed(key));
+    }
+
+    /// Sort the predecessor candidates for claims, keeping the last push per key and dropping the
+    /// `removed` keys.
+    pub(crate) fn finish_prev(&mut self, strategy: &impl Strategy, removed: impl Fn(&K) -> bool) {
+        // The stable sort keeps a key's pushes in order; `dedup_by` keeps the first of each run,
+        // so the swap moves the later push into the kept slot.
+        strategy.sort_by(&mut self.prev, |a, b| a.0.cmp(&b.0));
+        self.prev.dedup_by(|a, b| {
+            if a.0 == b.0 {
+                mem::swap(a, b);
+                true
+            } else {
+                false
+            }
+        });
+        self.prev.retain(|(key, _)| !removed(key));
+    }
+
+    /// Claim the rewrite of `key`'s predecessor: the predecessor, the source taken from it so a
+    /// predecessor shared by several keys is rewritten once, and the predecessor's successor
+    /// among the remaining keys. Returns `None` once the source is taken or absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either candidate list is empty.
+    pub(crate) fn claim(&mut self, key: &K) -> Option<(&K, S, K)> {
+        let (prev, source) = find_prev_key_mut(key, &mut self.prev);
+        let source = source.take()?;
+        let next = find_next_key(prev, &self.next);
+        Some((prev, source, next))
+    }
+}
+
+/// Returns the next key to `key` within `possible_next` (a sorted, deduplicated slice). The
+/// result will "cycle around" to the first key if `key` is the last key.
+///
+/// # Panics
+///
+/// Panics if `possible_next` is empty.
+fn find_next_key<K: Ord + Clone>(key: &K, possible_next: &[K]) -> K {
+    let idx = possible_next.partition_point(|k| k <= key);
+    if idx < possible_next.len() {
+        return possible_next[idx].clone();
+    }
+    possible_next
+        .first()
+        .expect("possible_next should not be empty")
+        .clone()
+}
+
+/// Streaming equivalent of [`find_next_key`] for an ascending sequence of queries: `idx`
+/// advances in a linear merge instead of binary-searching per query. Queries must be
+/// non-decreasing; `idx` must start at 0 and be threaded through every call.
+///
+/// # Panics
+///
+/// Panics if `possible_next` is empty, or on any out-of-order query that would return a
+/// wrong result (`idx` has already advanced past a candidate above the query).
+pub(crate) fn find_next_key_ascending<K: Ord + Clone>(
+    key: &K,
+    possible_next: &[K],
+    idx: &mut usize,
+) -> K {
+    assert!(
+        *idx == 0 || possible_next[*idx - 1] <= *key,
+        "queries must be non-decreasing"
+    );
+    while *idx < possible_next.len() && possible_next[*idx] <= *key {
+        *idx += 1;
+    }
+    if *idx < possible_next.len() {
+        return possible_next[*idx].clone();
+    }
+    possible_next
+        .first()
+        .expect("possible_next should not be empty")
+        .clone()
+}
+
+/// Returns the previous key to `key` and its mutable value within `possible_previous`
+/// (sorted by `.0`, deduplicated).
+/// The result will "cycle around" to the last entry if `key` is the first key.
+///
+/// # Panics
+///
+/// Panics if `possible_previous` is empty.
+fn find_prev_key_mut<'a, K: Ord, V>(
+    key: &K,
+    possible_previous: &'a mut [(K, V)],
+) -> (&'a K, &'a mut V) {
+    let idx = possible_previous.partition_point(|(k, _)| k < key);
+    let (k, v) = if idx > 0 {
+        &mut possible_previous[idx - 1]
+    } else {
+        possible_previous
+            .last_mut()
+            .expect("possible_previous should not be empty")
+    };
+    (k, v)
+}
+
+#[cfg(any(test, feature = "test-traits"))]
+crate::qmdb::any::traits::impl_db_any! {
+    [F, E, K, V, C, I, H, const N: usize, S] Db<F, E, C, I, H, Update<K, V>, N, S>
+    where {
+        F: crate::merkle::Family,
+        E: Context,
+        K: Key,
+        V: ValueEncoding + 'static,
+        C: crate::journal::contiguous::Mutable<Item = Operation<F, K, V>>,
+        I: Index<Value = crate::merkle::Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        Operation<F, K, V>: Codec,
+        V::Value: Send + Sync,
+    }
+    Family = F, Key = K, Value = V::Value, Digest = H::Digest
+}
+
+#[cfg(any(test, feature = "test-traits"))]
+crate::qmdb::any::traits::impl_provable! {
+    [F, E, K, V, C, I, H, const N: usize, S] Db<F, E, C, I, H, Update<K, V>, N, S>
+    where {
+        F: crate::merkle::Family,
+        E: Context,
+        K: Key,
+        V: ValueEncoding + 'static,
+        C: crate::journal::contiguous::Mutable<Item = Operation<F, K, V>>,
+        I: Index<Value = crate::merkle::Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        Operation<F, K, V>: Codec,
+        V::Value: Send + Sync,
+    }
+    Family = F, Operation = Operation<F, K, V>
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::{
+        index::ordered::Index as OrderedIndex,
+        journal::{
+            Error as JournalError, authenticated,
+            contiguous::{self, fixed::Journal},
+        },
+        merkle::Family,
+        mmb, mmr,
+        qmdb::{
+            any::{
+                self, BITMAP_CHUNK_BYTES,
+                traits::{DbAny, UnmerkleizedBatch as _},
+            },
+            current,
+            floor::Proportional,
+        },
+        translator::{OneCap, TwoCap},
+    };
+    use commonware_cryptography::{Sha256, sha256::Digest};
+    use commonware_macros::boxed;
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{
+        Clock as _, ReadOptions, Runner as _, Supervisor as _,
+        deterministic::{self, Context},
+    };
+    use commonware_utils::{
+        channel::oneshot, probability, sequence::FixedBytes, sync::Mutex, test_rng,
+    };
+    use core::{future::Future, pin::Pin};
+    use futures::{StreamExt as _, future::pending, pin_mut};
+    use rand::{RngExt as _, seq::SliceRandom as _};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        num::NonZeroUsize,
+        ops::{Bound, Range},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    /// [`find_next_key_ascending`] must return exactly what [`find_next_key`] returns for any
+    /// ascending query sequence, including queries past the last candidate (cyclic wrap).
+    #[test]
+    fn find_next_key_ascending_matches_binary_search() {
+        let mut rng = test_rng();
+        for _ in 0..50 {
+            let mut candidates: Vec<u64> = (0..rng.random_range(1..40))
+                .map(|_| rng.random_range(0..60u64))
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+
+            let mut queries: Vec<u64> = (0..rng.random_range(1..80))
+                .map(|_| rng.random_range(0..70u64))
+                .collect();
+            queries.sort_unstable();
+
+            let mut idx = 0;
+            for q in queries {
+                assert_eq!(
+                    find_next_key(&q, &candidates),
+                    find_next_key_ascending(&q, &candidates, &mut idx),
+                    "query {q} diverged"
+                );
+            }
+        }
+    }
+
+    /// An out-of-order query that would return a wrong result must panic instead.
+    #[test]
+    #[should_panic(expected = "queries must be non-decreasing")]
+    fn find_next_key_ascending_rejects_out_of_order_query() {
+        let candidates = vec![1u64, 5, 9];
+        let mut idx = 0;
+        assert_eq!(find_next_key_ascending(&5, &candidates, &mut idx), 9);
+        find_next_key_ascending(&1, &candidates, &mut idx);
+    }
+
+    #[boxed]
+    pub(crate) async fn test_ordered_any_db_empty<
+        F: Family,
+        D: DbAny<F, Key = FixedBytes<4>, Value = Digest, Digest = Digest>,
+    >(
+        context: Context,
+        db: D,
+        reopen_db: impl Fn(Context) -> Pin<Box<dyn Future<Output = D> + Send>>,
+    ) {
+        assert!(db.get_metadata().await.unwrap().is_none());
+        let boundary = db.sync_boundary();
+        let db = db.prune(boundary).await.unwrap();
+
+        // Make sure closing/reopening gets us back to the same state, even after adding an
+        // uncommitted op, and even without a clean shutdown.
+        let d1 = FixedBytes::from([1u8; 4]);
+        let d2 = Sha256::fill(2u8);
+        let root = db.root();
+        // Write without applying (unapplied batch should be lost on reopen).
+        {
+            let _batch = db.new_batch().write(d1, Some(d2));
+
+            // Don't merkleize/apply. This simulates an uncommitted write.
+        }
+        drop(db);
+        let db = reopen_db(context.child("reopen").with_attribute("index", 1)).await;
+        assert_eq!(db.root(), root);
+
+        // Test applying an empty batch on an empty db.
+        let metadata = Sha256::fill(3u8);
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, Some(metadata), &mut Proportional)
+            .await
+            .unwrap();
+        let applied_start = db.bounds().end;
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let range = applied_start..db.bounds().end;
+        let db = db.commit().await.unwrap();
+        assert_eq!(range.start, Location::new(1));
+        assert_eq!(db.get_metadata().await.unwrap(), Some(metadata));
+        let root = db.root();
+        let boundary = db.sync_boundary();
+        db.prune(boundary).await.unwrap();
+
+        // Re-opening the DB without a clean shutdown should still recover the correct state.
+        let mut db = reopen_db(context.child("reopen").with_attribute("index", 2)).await;
+        assert_eq!(db.get_metadata().await.unwrap(), Some(metadata));
+        assert_eq!(db.root(), root);
+
+        // Confirm the inactivity floor doesn't fall endlessly behind with multiple commits.
+        for _ in 1..100 {
+            let merkleized = db
+                .new_batch()
+                .merkleize(&db, None, &mut Proportional)
+                .await
+                .unwrap();
+            db = db.apply_batch(merkleized).await.unwrap();
+            db = db.commit().await.unwrap();
+        }
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        db.destroy().await.unwrap();
+    }
+
+    #[boxed]
+    pub(crate) async fn test_ordered_any_db_basic<
+        F: Family,
+        D: DbAny<F, Key = FixedBytes<4>, Value = Digest, Digest = Digest>,
+    >(
+        context: Context,
+        db: D,
+        reopen_db: impl Fn(Context) -> Pin<Box<dyn Future<Output = D> + Send>>,
+    ) {
+        // Build a db with 2 keys and make sure updates and deletions of those keys work as
+        // expected.
+        let key1 = FixedBytes::from([1u8; 4]);
+        let key2 = FixedBytes::from([2u8; 4]);
+        let val1 = Sha256::fill(3u8);
+        let val2 = Sha256::fill(4u8);
+
+        assert!(db.get(&key1).await.unwrap().is_none());
+        assert!(db.get(&key2).await.unwrap().is_none());
+
+        assert!(db.get(&key1).await.unwrap().is_none());
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), Some(val1))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), val1);
+        assert!(db.get(&key2).await.unwrap().is_none());
+
+        assert!(db.get(&key2).await.unwrap().is_none());
+        let merkleized = db
+            .new_batch()
+            .write(key2.clone(), Some(val2))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), val1);
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), val2);
+
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), None)
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert!(db.get(&key1).await.unwrap().is_none());
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), val2);
+
+        let new_val = Sha256::fill(5u8);
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), Some(new_val))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), new_val);
+
+        let merkleized = db
+            .new_batch()
+            .write(key2.clone(), Some(new_val))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), new_val);
+
+        // Empty commit batch (no preceding uncommitted writes).
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        // Make sure key1 is already active.
+        assert!(db.get(&key1).await.unwrap().is_some());
+
+        // Delete all keys.
+        assert!(db.get(&key1).await.unwrap().is_some());
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), None)
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert!(db.get(&key2).await.unwrap().is_some());
+        let merkleized = db
+            .new_batch()
+            .write(key2.clone(), None)
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        assert!(db.get(&key1).await.unwrap().is_none());
+        assert!(db.get(&key2).await.unwrap().is_none());
+
+        // Empty commit batch.
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        // Multiple deletions of the same key should be a no-op.
+        assert!(db.get(&key1).await.unwrap().is_none());
+
+        // Deletions of non-existent keys should be a no-op.
+        let key3 = FixedBytes::from([6u8; 4]);
+        assert!(db.get(&key3).await.unwrap().is_none());
+
+        // Make sure closing/reopening gets us back to the same state.
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        let op_count = db.bounds().end;
+        let root = db.root();
+        drop(db);
+        let db = reopen_db(context.child("reopen").with_attribute("index", 1)).await;
+        assert_eq!(db.bounds().end, op_count);
+        assert_eq!(db.root(), root);
+
+        // Re-activate the keys by updating them.
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), Some(val1))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        let merkleized = db
+            .new_batch()
+            .write(key2.clone(), Some(val2))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), None)
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        let merkleized = db
+            .new_batch()
+            .write(key2.clone(), Some(val1))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), Some(val2))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        // Empty commit batch.
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        // Confirm close/reopen gets us back to the same state.
+        let op_count = db.bounds().end;
+        let root = db.root();
+        drop(db);
+        let db = reopen_db(context.child("reopen").with_attribute("index", 2)).await;
+
+        assert_eq!(db.root(), root);
+        assert_eq!(db.bounds().end, op_count);
+
+        // Commit will raise the inactivity floor, which won't affect state but will affect the
+        // root.
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+
+        assert!(db.root() != root);
+
+        // Pruning inactive ops should not affect current state or root.
+        let root = db.root();
+        let boundary = db.sync_boundary();
+        let db = db.prune(boundary).await.unwrap();
+        assert_eq!(db.root(), root);
+
+        db.destroy().await.unwrap();
+    }
+
+    /// Builds a db with colliding keys to make sure the "cycle around when there are translated
+    /// key collisions" edge case is exercised.
+    #[boxed]
+    pub(crate) async fn test_ordered_any_update_collision_edge_case<
+        F: Family,
+        D: DbAny<F, Key = FixedBytes<4>, Value = Digest, Digest = Digest>,
+    >(
+        db: D,
+    ) {
+        // This DB uses a TwoCap so we use equivalent two byte prefixes for each key to ensure
+        // collisions.
+        let key1 = FixedBytes::from([0xFFu8, 0xFFu8, 5u8, 5u8]);
+        let key2 = FixedBytes::from([0xFFu8, 0xFFu8, 6u8, 6u8]);
+        // Our last must precede the others to trigger previous-key cycle around.
+        let key3 = FixedBytes::from([0xFFu8, 0xFFu8, 0u8, 0u8]);
+        let val = Sha256::fill(1u8);
+
+        let merkleized = db
+            .new_batch()
+            .write(key1.clone(), Some(val))
+            .write(key2.clone(), Some(val))
+            .write(key3.clone(), Some(val))
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+
+        assert_eq!(db.get(&key1).await.unwrap().unwrap(), val);
+        assert_eq!(db.get(&key2).await.unwrap().unwrap(), val);
+        assert_eq!(db.get(&key3).await.unwrap().unwrap(), val);
+
+        let merkleized = db
+            .new_batch()
+            .merkleize(&db, None, &mut Proportional)
+            .await
+            .unwrap();
+        let db = db.apply_batch(merkleized).await.unwrap();
+        let db = db.commit().await.unwrap();
+        db.destroy().await.unwrap();
+    }
+
+    fn neighbor_key(prefix: [u8; 3]) -> Digest {
+        let mut bytes = [0; 32];
+        bytes[..3].copy_from_slice(&prefix);
+        bytes.into()
+    }
+
+    fn require_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    macro_rules! assert_neighbors {
+        ($view:expr, $active:expr, $queries:expr, $stage:expr $(, $db:expr)?) => {
+            for query in $queries {
+                let prev = ($active).range(..query.clone()).next_back().cloned();
+                let next = ($active)
+                    .range((Bound::Excluded(query.clone()), Bound::Unbounded))
+                    .next()
+                    .cloned();
+                assert_eq!(
+                    require_send(($view).get_prev_key(query $(, $db)?)).await.unwrap(),
+                    prev,
+                    "{}, previous query {query:?}",
+                    $stage
+                );
+                assert_eq!(
+                    require_send(($view).get_next_key(query $(, $db)?)).await.unwrap(),
+                    next,
+                    "{}, next query {query:?}",
+                    $stage
+                );
+            }
+        };
+    }
+
+    macro_rules! test_neighbors {
+        ($name:ident, $db:ty, $config:path) => {
+            #[test]
+            fn $name() {
+                deterministic::Runner::default().start(|context| async move {
+                    type TestDb = $db;
+
+                    let config = $config("neighbors");
+                    let mut db = TestDb::init(context.child("db"), config.clone(), None)
+                        .await
+                        .unwrap();
+                    let mut active = BTreeSet::new();
+                    let value = Sha256::fill(1);
+
+                    // Exercise conflicts within a translated key, neighboring index entries, and
+                    // distinct partitions. Insert out of order so conflict order cannot be assumed.
+                    let a = neighbor_key([0x20, 0x20, 0x20]);
+                    let b = neighbor_key([0x20, 0x20, 0x60]);
+                    let c = neighbor_key([0x20, 0x60, 0x20]);
+                    let d = neighbor_key([0x60, 0x20, 0x20]);
+                    let min = Sha256::fill(0);
+                    let max = Sha256::fill(0xFF);
+                    let mut phases = vec![
+                        vec![],
+                        vec![(b, Some(value))],
+                        vec![(d, Some(value)), (a, Some(value)), (c, Some(value))],
+                        vec![(b, None), (a, Some(Sha256::fill(2))), (d, None)],
+                        vec![(min, Some(value)), (max, Some(value)), (b, Some(value))],
+                        vec![(a, None), (b, None), (c, None), (min, None), (max, None)],
+                    ];
+                    let mut queries = vec![max];
+                    for i in [0, 0x20, 0x40, 0x60, 0xFF] {
+                        for j in [0, 0x20, 0x40, 0x60, 0xFF] {
+                            for k in [0, 0x20, 0x40, 0x60, 0xFF] {
+                                queries.push(neighbor_key([i, j, k]));
+                            }
+                        }
+                    }
+
+                    // Flood one translated key and force partitioned indices past their spill
+                    // threshold. Leave gaps between keys and scramble the conflict iteration order.
+                    let mut rng = test_rng();
+                    let mut crowded: Vec<Digest> = (0u16..520)
+                        .map(|i| {
+                            let mut bytes = [0x20; 32];
+                            bytes[30..].copy_from_slice(&(i * 2).to_be_bytes());
+                            bytes.into()
+                        })
+                        .collect();
+                    let survivor = *crowded.last().unwrap();
+                    let probes: Vec<_> = crowded
+                        .iter()
+                        .step_by(31)
+                        .chain(crowded.last())
+                        .copied()
+                        .collect();
+                    for key in &probes {
+                        queries.push(*key);
+                        let mut gap: [u8; 32] = (*key).into();
+                        gap[31] += 1;
+                        queries.push(gap.into());
+                    }
+                    crowded.shuffle(&mut rng);
+                    phases.push(crowded.iter().map(|&key| (key, Some(value))).collect());
+                    phases.push(probes.iter().map(|&key| (key, None)).collect());
+                    phases.push(
+                        probes
+                            .iter()
+                            .rev()
+                            .map(|&key| (key, Some(Sha256::fill(2))))
+                            .collect(),
+                    );
+
+                    // Leave one active collision behind the tombstones before emptying the view.
+                    phases.push(
+                        crowded
+                            .iter()
+                            .filter(|&&key| key != survivor)
+                            .map(|&key| (key, None))
+                            .collect(),
+                    );
+                    phases.push(vec![(survivor, None)]);
+
+                    assert_neighbors!(&db, &active, &queries, "fresh");
+                    for (phase, writes) in phases.into_iter().enumerate() {
+                        let committed = active.clone();
+                        let mut batch = db.new_batch();
+                        for (key, value) in writes {
+                            if value.is_some() {
+                                active.insert(key);
+                            } else {
+                                active.remove(&key);
+                            }
+                            batch = batch.write(key, value);
+                        }
+
+                        let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+                        assert_neighbors!(
+                            batch,
+                            &active,
+                            &queries,
+                            format_args!("phase {phase}, merkleized"),
+                            &db
+                        );
+
+                        if active.len() == 1 && active.contains(&survivor) {
+                            let mut below: [u8; 32] = survivor.into();
+                            below[31] -= 1;
+                            let below = Digest::from(below);
+                            let mut deleted_predecessor: [u8; 32] = survivor.into();
+                            deleted_predecessor[31] -= 2;
+                            let deleted_predecessor = Digest::from(deleted_predecessor);
+                            assert!(committed.contains(&deleted_predecessor));
+                            assert!(!active.contains(&deleted_predecessor));
+                            assert_neighbors!(
+                                batch,
+                                &active,
+                                &[below, survivor],
+                                "singleton after deletions",
+                                &db
+                            );
+                        }
+
+                        // Merkleizing must leave the DB view unchanged.
+                        assert_neighbors!(
+                            &db,
+                            &committed,
+                            &[min, a, max],
+                            format_args!("phase {phase}, merkleized db")
+                        );
+                        db = db.apply_batch(batch).await.unwrap();
+
+                        assert_neighbors!(
+                            &db,
+                            &active,
+                            &queries,
+                            format_args!("phase {phase}, applied")
+                        );
+                        db = db.commit().await.unwrap();
+                        assert_neighbors!(
+                            &db,
+                            &active,
+                            &queries,
+                            format_args!("phase {phase}, committed")
+                        );
+                        let boundary = db.sync_boundary();
+                        db = db.prune(boundary).await.unwrap();
+                        assert_neighbors!(
+                            &db,
+                            &active,
+                            &queries,
+                            format_args!("phase {phase}, pruned")
+                        );
+                        drop(db);
+                        db = TestDb::init(context.child("reopen"), config.clone(), None)
+                            .await
+                            .unwrap();
+                        assert_neighbors!(
+                            &db,
+                            &active,
+                            &queries,
+                            format_args!("phase {phase}, reopened")
+                        );
+                    }
+                    db.destroy().await.unwrap();
+                });
+            }
+        };
+    }
+
+    test_neighbors!(
+        test_neighbors_any_fixed,
+        any::ordered::fixed::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, Sequential>,
+        any::test::fixed_db_config::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_any_variable,
+        any::ordered::variable::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, Sequential>,
+        any::test::variable_db_config::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_any_fixed_partitioned,
+        any::ordered::fixed::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, Sequential>,
+        any::test::fixed_db_config_partitioned::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_any_variable_partitioned,
+        any::ordered::variable::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, Sequential>,
+        any::test::variable_db_config_partitioned::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_current_fixed,
+        current::ordered::fixed::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 32, Sequential>,
+        current::tests::fixed_config::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_current_variable,
+        current::ordered::variable::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 32, Sequential>,
+        current::tests::variable_config::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_current_fixed_partitioned,
+        current::ordered::fixed::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, 32, Sequential>,
+        current::tests::fixed_config_partitioned::<OneCap>
+    );
+    test_neighbors!(
+        test_neighbors_current_variable_partitioned,
+        current::ordered::variable::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, 32, Sequential>,
+        current::tests::variable_config_partitioned::<OneCap>
+    );
+
+    fn layered_neighbor_key(n: u16) -> Digest {
+        let mut bytes = [0; 32];
+        bytes[0] = 0x40;
+        bytes[30..].copy_from_slice(&n.to_be_bytes());
+        bytes.into()
+    }
+
+    macro_rules! any_batch {
+        (any, $batch:expr) => {
+            $batch
+        };
+        (current, $batch:expr) => {
+            $batch.inner
+        };
+    }
+
+    macro_rules! test_layered_batch_neighbors {
+        ($name:ident, $db:ty, $config:path, $layer:ident) => {
+            #[test]
+            fn $name() {
+                for drop_unapplied in [false, true] {
+                    deterministic::Runner::default().start(|context| async move {
+                        type TestDb = $db;
+
+                        let config = $config("layered-neighbors");
+                        let db = TestDb::init(context.child("db"), config, None)
+                            .await
+                            .unwrap();
+                        let value = Sha256::fill(1);
+                        let empty_active: BTreeSet<Digest> = BTreeSet::new();
+                        let empty_queries =
+                            [Sha256::fill(0), layered_neighbor_key(1), Sha256::fill(0xFF)];
+                        let empty_batch = db.to_batch();
+                        assert!(any_batch!($layer, empty_batch).diff.is_empty());
+                        assert_neighbors!(
+                            empty_batch,
+                            &empty_active,
+                            &empty_queries,
+                            "empty to_batch",
+                            &db
+                        );
+
+                        let base_keys: Vec<_> =
+                            (0..64).map(|i| layered_neighbor_key(i * 4)).collect();
+                        let base_active: BTreeSet<_> = base_keys.iter().copied().collect();
+
+                        let mut seed = db.new_batch();
+                        for &key in base_keys.iter().rev() {
+                            seed = seed.write(key, Some(value));
+                        }
+                        let seed = seed.merkleize(&db, None, &mut Proportional).await.unwrap();
+                        let db = db.apply_batch(seed).await.unwrap().commit().await.unwrap();
+
+                        let parent_key = layered_neighbor_key(81);
+                        let parent_deleted = layered_neighbor_key(120);
+                        let parent = db
+                            .new_batch()
+                            .write(layered_neighbor_key(160), Some(Sha256::fill(2)))
+                            .write(parent_deleted, None)
+                            .write(parent_key, Some(Sha256::fill(3)));
+                        let mut parent_active = base_active.clone();
+                        parent_active.remove(&parent_deleted);
+                        parent_active.insert(parent_key);
+                        let queries = [
+                            Sha256::fill(0),
+                            layered_neighbor_key(0),
+                            layered_neighbor_key(1),
+                            layered_neighbor_key(39),
+                            layered_neighbor_key(40),
+                            layered_neighbor_key(41),
+                            layered_neighbor_key(44),
+                            layered_neighbor_key(45),
+                            layered_neighbor_key(48),
+                            layered_neighbor_key(49),
+                            layered_neighbor_key(80),
+                            parent_key,
+                            layered_neighbor_key(82),
+                            layered_neighbor_key(119),
+                            parent_deleted,
+                            layered_neighbor_key(121),
+                            layered_neighbor_key(159),
+                            layered_neighbor_key(160),
+                            layered_neighbor_key(161),
+                            layered_neighbor_key(252),
+                            layered_neighbor_key(253),
+                            Sha256::fill(0xFF),
+                        ];
+                        let base_batch = db.to_batch();
+                        assert!(any_batch!($layer, base_batch).diff.is_empty());
+                        assert_neighbors!(
+                            base_batch,
+                            &base_active,
+                            &queries,
+                            "nonempty to_batch",
+                            &db
+                        );
+
+                        let parent = parent
+                            .merkleize(&db, None, &mut Proportional)
+                            .await
+                            .unwrap();
+                        assert_neighbors!(
+                            parent,
+                            &parent_active,
+                            &queries,
+                            "parent merkleized",
+                            &db
+                        );
+                        assert_neighbors!(&db, &base_active, &queries, "parent pending db");
+
+                        // A floor raise may copy untouched keys into the local diff. Both
+                        // directions need a span owner outside that diff to read the DB.
+                        let parent_diff = any_batch!($layer, parent).diff.as_slice();
+                        assert!(
+                            parent_diff
+                                .iter()
+                                .any(|(key, entry)| key == &parent_key && entry.value().is_some())
+                        );
+                        let (committed_index, &committed_only) = base_keys
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .find(|(_, key)| {
+                                let Some(prev) = parent_active.range(..**key).next_back() else {
+                                    return false;
+                                };
+                                parent_active.contains(*key)
+                                    && parent_diff
+                                        .iter()
+                                        .all(|(diff_key, _)| diff_key != *key && diff_key != prev)
+                            })
+                            .expect("base keys must include a committed-only source");
+                        let committed_n = committed_index as u16 * 4;
+                        let committed_predecessor =
+                            parent_active.range(..committed_only).next_back().unwrap();
+                        assert!(parent_diff.iter().all(|(key, _)| key != &committed_only));
+                        assert!(
+                            parent_diff
+                                .iter()
+                                .all(|(key, _)| key != committed_predecessor),
+                            "the successor's span owner must reside only in the DB"
+                        );
+                        assert_eq!(
+                            parent
+                                .get_prev_key(&layered_neighbor_key(committed_n + 1), &db)
+                                .await
+                                .unwrap(),
+                            Some(committed_only)
+                        );
+                        assert_eq!(
+                            parent
+                                .get_next_key(&layered_neighbor_key(committed_n - 1), &db)
+                                .await
+                                .unwrap(),
+                            Some(committed_only)
+                        );
+                        assert_eq!(
+                            parent
+                                .get_prev_key(&layered_neighbor_key(82), &db)
+                                .await
+                                .unwrap(),
+                            Some(parent_key)
+                        );
+                        assert_eq!(
+                            parent
+                                .get_next_key(&layered_neighbor_key(80), &db)
+                                .await
+                                .unwrap(),
+                            Some(parent_key)
+                        );
+
+                        let child_key = layered_neighbor_key(45);
+                        let child = parent
+                            .new_batch::<Sha256>()
+                            .write(layered_neighbor_key(48), None)
+                            .write(parent_key, None)
+                            .write(layered_neighbor_key(40), None)
+                            .write(child_key, Some(Sha256::fill(4)))
+                            .write(layered_neighbor_key(44), None);
+                        let mut child_active = parent_active.clone();
+                        for key in [
+                            layered_neighbor_key(40),
+                            layered_neighbor_key(44),
+                            layered_neighbor_key(48),
+                            parent_key,
+                        ] {
+                            child_active.remove(&key);
+                        }
+                        child_active.insert(child_key);
+                        let child = child.merkleize(&db, None, &mut Proportional).await.unwrap();
+                        assert_neighbors!(child, &child_active, &queries, "child merkleized", &db);
+
+                        let grandchild = child
+                            .new_batch::<Sha256>()
+                            .write(child_key, None)
+                            .write(parent_key, Some(Sha256::fill(5)))
+                            .write(layered_neighbor_key(44), Some(Sha256::fill(6)));
+                        let mut grandchild_active = child_active.clone();
+                        grandchild_active.remove(&child_key);
+                        grandchild_active.insert(parent_key);
+                        grandchild_active.insert(layered_neighbor_key(44));
+                        let grandchild = grandchild
+                            .merkleize(&db, None, &mut Proportional)
+                            .await
+                            .unwrap();
+                        assert_neighbors!(
+                            grandchild,
+                            &grandchild_active,
+                            &queries,
+                            "grandchild merkleized",
+                            &db
+                        );
+                        assert_neighbors!(&db, &base_active, &queries, "descendants pending db");
+
+                        if drop_unapplied {
+                            drop(parent);
+                            drop(child);
+                            assert_neighbors!(
+                                grandchild,
+                                &grandchild_active,
+                                &queries,
+                                "dropped unapplied ancestors",
+                                &db
+                            );
+                            let db = db.apply_batch(grandchild).await.unwrap();
+                            assert_neighbors!(
+                                &db,
+                                &grandchild_active,
+                                &queries,
+                                "ancestors applied"
+                            );
+                            db.destroy().await.unwrap();
+                            return;
+                        }
+
+                        // Reads through descendants stay exact as ancestors are applied or dropped.
+                        let db = db
+                            .apply_batch(std::sync::Arc::clone(&parent))
+                            .await
+                            .unwrap();
+                        assert_neighbors!(&db, &parent_active, &queries, "parent applied");
+                        for stale in [&empty_batch, &base_batch] {
+                            for query in &queries {
+                                assert!(matches!(
+                                    stale.get_next_key(query, &db).await,
+                                    Err(crate::qmdb::Error::StaleRead)
+                                ));
+                                assert!(matches!(
+                                    stale.get_prev_key(query, &db).await,
+                                    Err(crate::qmdb::Error::StaleRead)
+                                ));
+                            }
+                        }
+                        assert_neighbors!(
+                            child,
+                            &child_active,
+                            &queries,
+                            "child after parent apply",
+                            &db
+                        );
+                        assert_neighbors!(
+                            grandchild,
+                            &grandchild_active,
+                            &queries,
+                            "grandchild after parent apply",
+                            &db
+                        );
+                        drop(parent);
+                        assert_neighbors!(
+                            child,
+                            &child_active,
+                            &queries,
+                            "child after parent drop",
+                            &db
+                        );
+                        assert_neighbors!(
+                            grandchild,
+                            &grandchild_active,
+                            &queries,
+                            "grandchild after parent drop",
+                            &db
+                        );
+
+                        let db = db.apply_batch(std::sync::Arc::clone(&child)).await.unwrap();
+                        assert_neighbors!(&db, &child_active, &queries, "child applied");
+                        drop(child);
+                        assert_neighbors!(
+                            grandchild,
+                            &grandchild_active,
+                            &queries,
+                            "grandchild after child drop",
+                            &db
+                        );
+
+                        let db = db.apply_batch(grandchild).await.unwrap();
+                        assert_neighbors!(&db, &grandchild_active, &queries, "grandchild applied");
+                        let db = db.commit().await.unwrap();
+                        db.destroy().await.unwrap();
+                    });
+                }
+            }
+        };
+    }
+
+    test_layered_batch_neighbors!(
+        test_layered_batch_neighbors_any,
+        any::ordered::fixed::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, Sequential>,
+        any::test::fixed_db_config::<OneCap>,
+        any
+    );
+    test_layered_batch_neighbors!(
+        test_layered_batch_neighbors_current,
+        current::ordered::fixed::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 32, Sequential>,
+        current::tests::fixed_config::<OneCap>,
+        current
+    );
+
+    #[test]
+    fn test_neighbors_variable_length_keys() {
+        deterministic::Runner::default().start(|context| async move {
+            type TestDb = current::ordered::variable::partitioned::Db<
+                mmb::Family,
+                deterministic::Context,
+                Vec<u8>,
+                Vec<u8>,
+                Sha256,
+                OneCap,
+                2,
+                32,
+                Sequential,
+            >;
+            let config = current::tests::variable_config_partitioned::<OneCap>("neighbors");
+            let config = current::VariableConfig {
+                journal_config: crate::journal::contiguous::variable::Config {
+                    codec_config: (((..=3).into(), ()), ((..=4096).into(), ())),
+                    partition: config.journal_config.partition,
+                    items_per_section: config.journal_config.items_per_section,
+                    compression: config.journal_config.compression,
+                    page_cache: config.journal_config.page_cache,
+                    write_buffer: config.journal_config.write_buffer,
+                    replay_buffer: config.journal_config.replay_buffer,
+                },
+                merkle_config: config.merkle_config,
+                grafted_metadata_partition: config.grafted_metadata_partition,
+                translator: config.translator,
+                init_cache: config.init_cache,
+                init_buffer: config.init_buffer,
+                init_concurrency: config.init_concurrency,
+            };
+            let mut db = TestDb::init(context.child("db"), config.clone(), None)
+                .await
+                .unwrap();
+
+            // Include empty keys, keys shorter than the partition prefix, and keys differing only
+            // by trailing zeros. All must retain their full lexicographic ordering after translation.
+            let mut queries = vec![vec![]];
+            for a in [0, 1, 255] {
+                queries.push(vec![a]);
+                for b in [0, 1, 255] {
+                    queries.push(vec![a, b]);
+                    for c in [0, 1, 255] {
+                        queries.push(vec![a, b, c]);
+                    }
+                }
+            }
+            let active: BTreeSet<_> = queries.iter().step_by(2).cloned().collect();
+            let mut batch = db.new_batch();
+            for (i, key) in active.iter().rev().enumerate() {
+                batch = batch.write(key.clone(), Some(vec![1; i * 100]));
+            }
+
+            let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+            assert_neighbors!(batch, &active, &queries, "merkleized", &db);
+            let empty: BTreeSet<Vec<u8>> = BTreeSet::new();
+            assert_neighbors!(&db, &empty, &queries, "pending db");
+            db = db.apply_batch(batch).await.unwrap();
+            for recovered in [false, true] {
+                if recovered {
+                    db = db.commit().await.unwrap();
+                    drop(db);
+                    db = TestDb::init(context.child("reopen"), config.clone(), None)
+                        .await
+                        .unwrap();
+                }
+                assert_neighbors!(
+                    &db,
+                    &active,
+                    &queries,
+                    format_args!("recovered={recovered}")
+                );
+            }
+            db.destroy().await.unwrap();
+        });
+    }
+
+    macro_rules! test_scans {
+        ($name:ident, $db:ty, $config:path) => {
+            #[test]
+            fn $name() {
+                deterministic::Runner::default().start(|context| async move {
+                    type TestDb = $db;
+                    let config = $config("scans");
+                    let mut db = TestDb::init(context.child("db"), config.clone(), None)
+                        .await
+                        .unwrap();
+                    let mut active = BTreeMap::new();
+                    let min = Sha256::fill(0);
+                    let max = Sha256::fill(0xFF);
+                    let a = neighbor_key([0x20, 0x20, 0x20]);
+                    let b = neighbor_key([0x20, 0x20, 0x60]);
+                    let c = neighbor_key([0x20, 0x60, 0x20]);
+                    let d = neighbor_key([0x60, 0x20, 0x20]);
+                    let queries = [
+                        min,
+                        neighbor_key([0x10, 0, 0]),
+                        a,
+                        neighbor_key([0x20, 0x20, 0x40]),
+                        b,
+                        c,
+                        neighbor_key([0x40, 0, 0]),
+                        d,
+                        max,
+                    ];
+                    let mut bounds = vec![Bound::Unbounded];
+                    for query in queries {
+                        bounds.extend([Bound::Included(query), Bound::Excluded(query)]);
+                    }
+
+                    // Insert out of order, across collision buckets and partitions, then delete and
+                    // replace keys. Include both ends of the key space and return to an empty DB.
+                    let phases = [
+                        vec![],
+                        vec![(b, Some(Sha256::fill(1)))],
+                        vec![
+                            (max, Some(Sha256::fill(2))),
+                            (d, Some(Sha256::fill(3))),
+                            (c, Some(Sha256::fill(4))),
+                            (a, Some(Sha256::fill(5))),
+                            (min, Some(Sha256::fill(6))),
+                        ],
+                        vec![(b, None), (d, None), (a, Some(Sha256::fill(7)))],
+                        vec![(min, None), (a, None), (c, None), (max, None)],
+                    ];
+                    for writes in phases {
+                        let mut batch = db.new_batch();
+                        for (key, value) in writes {
+                            batch = batch.write(key, value);
+                            match value {
+                                Some(value) => {
+                                    active.insert(key, value);
+                                }
+                                None => {
+                                    active.remove(&key);
+                                }
+                            }
+                        }
+                        let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+                        db = db.apply_batch(batch).await.unwrap();
+                        let expected: Vec<_> = active.iter().map(|(&k, &v)| (k, v)).collect();
+
+                        let before = context.auditor().state();
+                        let stream = require_send(db.stream_range(..));
+                        assert_eq!(context.auditor().state(), before);
+                        assert_eq!(
+                            require_send(stream.try_collect::<Vec<_>>()).await.unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            require_send(db.keys(..).try_collect::<Vec<_>>())
+                                .await
+                                .unwrap(),
+                            active.keys().copied().collect::<Vec<_>>(),
+                        );
+
+                        // Filtering is also defined for reversed and doubly exclusive equal bounds,
+                        // which BTreeMap::range rejects. These ranges must produce an empty stream.
+                        for start in &bounds {
+                            for end in &bounds {
+                                let range = (*start, *end);
+                                let expected: Vec<_> = active
+                                    .iter()
+                                    .filter(|(key, _)| range.contains(*key))
+                                    .map(|(&key, &value)| (key, value))
+                                    .collect();
+                                let actual = require_send(
+                                    db.stream_range((start.as_ref(), end.as_ref()))
+                                        .try_collect::<Vec<_>>(),
+                                )
+                                .await
+                                .unwrap();
+                                assert_eq!(actual, expected, "range {range:?}");
+                                assert_eq!(
+                                    db.keys((start.as_ref(), end.as_ref()))
+                                        .try_collect::<Vec<_>>()
+                                        .await
+                                        .unwrap(),
+                                    expected.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+                                    "keys {range:?}"
+                                );
+                            }
+                        }
+
+                        // Resuming after the last key must neither skip nor repeat colliding keys.
+                        let mut start = Bound::Unbounded;
+                        let mut paginated = Vec::new();
+                        loop {
+                            let page = db
+                                .stream_range((start, Bound::Unbounded))
+                                .take(2)
+                                .try_collect::<Vec<_>>()
+                                .await
+                                .unwrap();
+                            let Some((last, _)) = page.last() else {
+                                break;
+                            };
+                            start = Bound::Excluded(*last);
+                            paginated.extend(page);
+                            assert!(paginated.len() <= expected.len());
+                        }
+                        assert_eq!(paginated, expected);
+
+                        assert_eq!(
+                            db.stream_range(a..=b)
+                                .try_collect::<Vec<_>>()
+                                .await
+                                .unwrap(),
+                            active
+                                .range(a..=b)
+                                .map(|(&k, &v)| (k, v))
+                                .collect::<Vec<_>>(),
+                        );
+                        assert_eq!(
+                            db.stream_range(..b).try_collect::<Vec<_>>().await.unwrap(),
+                            active.range(..b).map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+                        );
+
+                        db = db.sync().await.unwrap();
+                        let boundary = db.sync_boundary();
+                        db = db.prune(boundary).await.unwrap();
+                        drop(db);
+                        db = TestDb::init(context.child("reopen"), config.clone(), None)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            db.stream_range(..).try_collect::<Vec<_>>().await.unwrap(),
+                            expected
+                        );
+                    }
+                    db.destroy().await.unwrap();
+                });
+            }
+        };
+    }
+
+    test_scans!(
+        test_stream_range_any_fixed,
+        any::ordered::fixed::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, Sequential>,
+        any::test::fixed_db_config::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_any_variable,
+        any::ordered::variable::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, Sequential>,
+        any::test::variable_db_config::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_any_fixed_partitioned,
+        any::ordered::fixed::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, Sequential>,
+        any::test::fixed_db_config_partitioned::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_any_variable_partitioned,
+        any::ordered::variable::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, Sequential>,
+        any::test::variable_db_config_partitioned::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_current_fixed,
+        current::ordered::fixed::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 32, Sequential>,
+        current::tests::fixed_config::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_current_variable,
+        current::ordered::variable::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 32, Sequential>,
+        current::tests::variable_config::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_current_fixed_partitioned,
+        current::ordered::fixed::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, 32, Sequential>,
+        current::tests::fixed_config_partitioned::<OneCap>
+    );
+    test_scans!(
+        test_stream_range_current_variable_partitioned,
+        current::ordered::variable::partitioned::Db<mmr::Family, deterministic::Context, Digest, Digest, Sha256, OneCap, 1, 32, Sequential>,
+        current::tests::variable_config_partitioned::<OneCap>
+    );
+
+    #[test]
+    fn test_stream_range_lazy_errors() {
+        deterministic::Runner::default().start(|context| async move {
+            type TestDb = any::ordered::fixed::Db<
+                mmr::Family,
+                deterministic::Context,
+                Digest,
+                Digest,
+                Sha256,
+                OneCap,
+                Sequential,
+            >;
+            let config = any::test::fixed_db_config::<OneCap>("scan-errors");
+            let cache = config.journal_config.page_cache.clone();
+            let db = TestDb::init(context.child("db"), config, None)
+                .await
+                .unwrap();
+            let mut batch = db.new_batch();
+            let keys: Vec<_> = (1..=20).map(|i| neighbor_key([i * 8, 0, 0])).collect();
+            for &key in &keys {
+                batch = batch.write(key, Some(key));
+            }
+            let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+            let db = db.apply_batch(batch).await.unwrap().sync().await.unwrap();
+            cache.clear();
+            context.storage_fault_config().write().read_rate = Some(probability!(1.0));
+
+            // Construction performs no reads, and the first read error arrives on polling.
+            let before = context.auditor().state();
+            let stream = db.stream_range(..);
+            assert_eq!(context.auditor().state(), before);
+            pin_mut!(stream);
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.unwrap().is_err());
+            context.storage_fault_config().write().read_rate = None;
+            assert_eq!(stream.next().await.unwrap().unwrap(), (keys[0], keys[0]));
+
+            // A later bucket is also read again without losing or repeating a successful entry.
+            cache.clear();
+            context.storage_fault_config().write().read_rate = Some(probability!(1.0));
+            assert!(stream.next().await.unwrap().is_err());
+            context.storage_fault_config().write().read_rate = None;
+            assert_eq!(
+                stream.try_collect::<Vec<_>>().await.unwrap(),
+                keys[1..].iter().map(|&key| (key, key)).collect::<Vec<_>>()
+            );
+
+            // A lower bound with no bucket of its own starts at the next translated key, and
+            // that read is repeated too.
+            cache.clear();
+            context.storage_fault_config().write().read_rate = Some(probability!(1.0));
+            let stream = db.stream_range(neighbor_key([12, 0, 0])..);
+            pin_mut!(stream);
+            assert!(stream.next().await.unwrap().is_err());
+            context.storage_fault_config().write().read_rate = None;
+            assert_eq!(stream.next().await.unwrap().unwrap().0, keys[1]);
+
+            // Empty ranges and completion at the upper bound need no further reads.
+            cache.clear();
+            context.storage_fault_config().write().read_rate = Some(probability!(1.0));
+            assert!(
+                db.stream_range(keys[1]..keys[0])
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.stream_range(keys[0]..keys[0])
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            context.storage_fault_config().write().read_rate = None;
+            let stream = db.stream_range(..=keys[0]);
+            pin_mut!(stream);
+            assert_eq!(stream.next().await.unwrap().unwrap().0, keys[0]);
+            cache.clear();
+            context.storage_fault_config().write().read_rate = Some(probability!(1.0));
+            assert!(stream.next().await.is_none());
+            context.storage_fault_config().write().read_rate = None;
+
+            // A bound between two keys also ends the scan without reading the next bucket.
+            let stream = db.stream_range(..=neighbor_key([12, 0, 0]));
+            pin_mut!(stream);
+            assert_eq!(stream.next().await.unwrap().unwrap().0, keys[0]);
+            cache.clear();
+            context.storage_fault_config().write().read_rate = Some(probability!(1.0));
+            assert!(stream.next().await.is_none());
+            context.storage_fault_config().write().read_rate = None;
+        });
+    }
+
+    #[test]
+    fn test_stream_range_variable_keys() {
+        deterministic::Runner::default().start(|context| async move {
+            type TestDb = any::ordered::variable::Db<
+                mmr::Family,
+                deterministic::Context,
+                Vec<u8>,
+                Digest,
+                Sha256,
+                OneCap,
+                Sequential,
+            >;
+            let base = any::test::variable_db_config::<OneCap>("scan-variable-keys");
+            let config = any::VariableConfig {
+                journal_config: crate::journal::contiguous::variable::Config {
+                    codec_config: (((0..=32).into(), ()), ()),
+                    partition: base.journal_config.partition,
+                    items_per_section: base.journal_config.items_per_section,
+                    compression: base.journal_config.compression,
+                    page_cache: base.journal_config.page_cache,
+                    write_buffer: base.journal_config.write_buffer,
+                    replay_buffer: base.journal_config.replay_buffer,
+                },
+                merkle_config: base.merkle_config,
+                translator: base.translator,
+                init_cache: base.init_cache,
+                init_buffer: base.init_buffer,
+                init_concurrency: base.init_concurrency,
+            };
+            let db = TestDb::init(context.child("db"), config, None)
+                .await
+                .unwrap();
+            let keys = vec![
+                vec![],
+                vec![0],
+                vec![0, 0],
+                vec![0, 1],
+                vec![0, 1, 0],
+                vec![0xFF],
+            ];
+            let mut batch = db.new_batch();
+            for key in keys.iter().rev() {
+                batch = batch.write(key.clone(), Some(Sha256::fill(key.len() as u8)));
+            }
+            let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+            let db = db.apply_batch(batch).await.unwrap();
+            assert_eq!(db.keys(..).try_collect::<Vec<_>>().await.unwrap(), keys);
+            let mut bounds = vec![Bound::Unbounded];
+            for key in &keys {
+                bounds.extend([Bound::Included(key.clone()), Bound::Excluded(key.clone())]);
+            }
+            for start in &bounds {
+                for end in &bounds {
+                    let range = (start.clone(), end.clone());
+                    let expected: Vec<_> = keys
+                        .iter()
+                        .filter(|key| range.contains(*key))
+                        .map(|key| (key.clone(), Sha256::fill(key.len() as u8)))
+                        .collect();
+                    assert_eq!(
+                        db.stream_range(range)
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+            db.destroy().await.unwrap();
+        });
+    }
+
+    /// How `Controlled` treats reads of its `blocked` and `failed` positions.
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        /// The `failed` read returns an error while the `blocked` read stays pending.
+        Error,
+        /// The `blocked` read stays pending until the test drops the outer future.
+        Cancel,
+        /// The `blocked` read waits until the `failed` read succeeds.
+        Reorder,
+    }
+
+    /// Progress of the controlled reads, shared between the journal and the test.
+    #[derive(Default)]
+    struct State {
+        /// Receiver the blocked read awaits in `Reorder` mode.
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+        /// Sender the `failed` read uses to release the blocked read in `Reorder` mode.
+        releaser: Mutex<Option<oneshot::Sender<()>>>,
+        /// Positions whose reads succeeded, in completion order.
+        completed: Mutex<Vec<u64>>,
+        /// Set when the blocked read starts.
+        blocked_started: AtomicBool,
+        /// Set when the blocked read stops waiting, whether released or dropped.
+        blocked_dropped: AtomicBool,
+        /// Set when the `failed` read returns its error.
+        error_seen: AtomicBool,
+    }
+
+    /// Sets `blocked_dropped` when the blocked read stops waiting, whether released or dropped.
+    struct PendingGuard(Arc<State>);
+
+    impl Drop for PendingGuard {
+        fn drop(&mut self) {
+            self.0.blocked_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Wraps a journal so that reads of `blocked` and `failed` behave as `mode` directs.
+    struct Controlled<C> {
+        inner: C,
+        mode: Mode,
+        blocked: u64,
+        failed: u64,
+        state: Arc<State>,
+    }
+
+    impl<C: Contiguous> Contiguous for Controlled<C> {
+        type Item = C::Item;
+
+        fn bounds(&self) -> Range<u64> {
+            self.inner.bounds()
+        }
+
+        async fn read(&self, position: u64) -> Result<Self::Item, JournalError> {
+            if position == self.blocked {
+                let _guard = PendingGuard(self.state.clone());
+                self.state.blocked_started.store(true, Ordering::SeqCst);
+                if matches!(self.mode, Mode::Reorder) {
+                    let release = self.state.release.lock().take().unwrap();
+                    release.await.unwrap();
+                } else {
+                    pending::<()>().await;
+                }
+            }
+            if position == self.failed && matches!(self.mode, Mode::Error) {
+                self.state.error_seen.store(true, Ordering::SeqCst);
+                return Err(JournalError::Runtime(commonware_runtime::Error::ReadFailed));
+            }
+            let item = self.inner.read(position).await?;
+            self.state.completed.lock().push(position);
+            if position == self.failed && matches!(self.mode, Mode::Reorder) {
+                self.state.releaser.lock().take().unwrap().send(()).unwrap();
+            }
+            Ok(item)
+        }
+
+        async fn read_many(&self, positions: &[u64]) -> Result<Vec<Self::Item>, JournalError> {
+            self.inner.read_many(positions).await
+        }
+
+        fn try_read_sync(&self, position: u64) -> Option<Self::Item> {
+            self.inner.try_read_sync(position)
+        }
+
+        fn try_read_many_sync(&self, positions: &[u64]) -> Vec<Option<Self::Item>> {
+            self.inner.try_read_many_sync(positions)
+        }
+
+        async fn replay(
+            &self,
+            range: Range<u64>,
+            buffer: NonZeroUsize,
+            read_options: ReadOptions,
+        ) -> Result<
+            impl Stream<Item = Result<contiguous::Batch<Self::Item>, JournalError>> + Send,
+            JournalError,
+        > {
+            self.inner.replay(range, buffer, read_options).await
+        }
+    }
+
+    /// An ordered fixed database whose log reads go through `Controlled`.
+    type ControlledDb = Db<
+        mmr::Family,
+        deterministic::Context,
+        Controlled<Journal<deterministic::Context, fixed::Operation<mmr::Family, Digest, Digest>>>,
+        OrderedIndex<TwoCap, Location<mmr::Family>>,
+        Sha256,
+        fixed::Update<Digest, Digest>,
+        BITMAP_CHUNK_BYTES,
+        Sequential,
+    >;
+
+    /// Builds a database holding `count` keys whose journal controls reads of the two lowest key
+    /// locations. Returns the database, the ascending key locations, and the shared read state.
+    async fn make_db(
+        context: deterministic::Context,
+        count: usize,
+        mode: Mode,
+    ) -> (ControlledDb, Vec<Location<mmr::Family>>, Arc<State>) {
+        // Write `count` keys that differ only in their last byte and collect their log locations.
+        let db = fixed::test::create_test_db(context).await;
+        let keys: Vec<_> = (0..count)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[31] = i as u8;
+                Digest::from(key)
+            })
+            .collect();
+        let mut batch = db.new_batch();
+        for key in &keys {
+            batch = batch.write(*key, Some(Sha256::fill(7)));
+        }
+        let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+        let db = db.apply_batch(batch).await.unwrap();
+        let mut locs = Vec::new();
+        for key in &keys {
+            locs.push(db.get_with_loc(key).await.unwrap().unwrap().1);
+        }
+        locs.sort();
+
+        // Rebuild the database around a controlled journal that blocks the lowest location and
+        // treats the next one as `mode` directs.
+        let (releaser, release) = oneshot::channel();
+        let state = Arc::new(State {
+            release: Mutex::new(Some(release)),
+            releaser: Mutex::new(Some(releaser)),
+            ..State::default()
+        });
+        let Db {
+            log,
+            root,
+            inactivity_floor_loc,
+            snapshot,
+            active_keys,
+            bitmap,
+            metrics,
+            _update,
+        } = db;
+        let authenticated::Journal {
+            merkle,
+            journal,
+            hasher,
+        } = log;
+        let log = authenticated::Journal {
+            merkle,
+            journal: Controlled {
+                inner: journal,
+                mode,
+                blocked: *locs[0],
+                failed: *locs[1],
+                state: state.clone(),
+            },
+            hasher,
+        };
+        (
+            Db {
+                log,
+                root,
+                inactivity_floor_loc,
+                snapshot,
+                active_keys,
+                bitmap,
+                metrics,
+                _update,
+            },
+            locs,
+            state,
+        )
+    }
+
+    /// Checks the read outcome for `mode` and returns the updates of a successful read.
+    ///
+    /// In `Error` mode, the batch polls the blocked read before the failing one on its first pass.
+    /// The error must then arrive without waiting for the blocked read, and that read must already
+    /// be dropped. In `Cancel` mode, the blocked read must still be held, so the caller can check
+    /// that dropping the outer future releases it. In `Reorder` mode, the second location's read
+    /// must complete before the first.
+    fn check_completion<T>(
+        result: Option<Result<T, crate::qmdb::Error<mmr::Family>>>,
+        state: &State,
+        mode: Mode,
+        locs: &[Location<mmr::Family>],
+    ) -> Option<T> {
+        assert!(state.blocked_started.load(Ordering::SeqCst));
+        match mode {
+            Mode::Error => {
+                assert!(state.error_seen.load(Ordering::SeqCst));
+                assert!(
+                    matches!(
+                        result,
+                        Some(Err(crate::qmdb::Error::Journal(JournalError::Runtime(
+                            commonware_runtime::Error::ReadFailed
+                        ))))
+                    ),
+                    "the batch must return the error while the blocked read is pending"
+                );
+                assert!(state.blocked_dropped.load(Ordering::SeqCst));
+                None
+            }
+            Mode::Cancel => {
+                assert!(result.is_none());
+                assert!(!state.blocked_dropped.load(Ordering::SeqCst));
+                None
+            }
+            Mode::Reorder => {
+                let completed = state.completed.lock();
+                let first = completed.iter().position(|loc| *loc == *locs[0]).unwrap();
+                let second = completed.iter().position(|loc| *loc == *locs[1]).unwrap();
+                assert!(second < first);
+                Some(
+                    result
+                        .expect("reordered reads must finish")
+                        .expect("reordered reads must succeed"),
+                )
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(30)]
+    #[case(31)]
+    #[case(64)]
+    fn test_ordered_concurrent_reads(
+        #[case] count: usize,
+        #[values(Mode::Error, Mode::Cancel, Mode::Reorder)] mode: Mode,
+    ) {
+        deterministic::Runner::default().start(|context| async move {
+            // Production batches take either path, because the snapshot iterators of `OrderedIndex`
+            // report an unknown size hint while those of the partitioned ordered index report an
+            // exact one. This test passes an exact-size slice, so the 30 case runs on the small
+            // collector and the larger cases on the unordered path. Error and Reorder batches must
+            // finish before the timeout, and a Cancel batch must still be pending when it fires.
+            let (db, locs, state) = make_db(context.child("db"), count, mode).await;
+            let mut read = Box::pin(db.fetch_all_updates(locs.iter().copied()));
+            let result = commonware_macros::select! {
+                result = &mut read => Some(result),
+                _ = context.sleep(Duration::from_secs(1)) => None,
+            };
+            let updates = check_completion(result, &state, mode, &locs);
+
+            // Dropping the batch must leave no blocked read alive in any mode.
+            drop(read);
+            assert!(state.blocked_dropped.load(Ordering::SeqCst));
+
+            // Updates come back in descending key order.
+            if let Some(updates) = updates {
+                let keys: Vec<_> = updates
+                    .iter()
+                    .map(|update| update.key.as_ref()[31])
+                    .collect();
+                assert_eq!(keys, (0..count as u8).rev().collect::<Vec<_>>());
+            }
+        });
+    }
+}

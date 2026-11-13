@@ -22,7 +22,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::Tr
 use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
-    Block, Header, Sealable, SealedBlock, proposal::MAXIMUM_BLOCK_SIZE,
+    Block, Header, Sealable, SealedBlock, StateSyncProof, proposal::MAXIMUM_BLOCK_SIZE,
 };
 use rand::{CryptoRng, Rng};
 use std::{future::Future, sync::Arc};
@@ -112,13 +112,19 @@ where
             transactions_root: execution.block.transactions.root(),
             transactions_range: execution.block.transactions_range.clone(),
         };
+        let state_sync = StateSyncProof {
+            ops_root: execution.block.state.ops_root(),
+            witness: execution.block.state.ops_root_witness().clone(),
+        };
         let block = Block {
             header,
+            state_sync,
             body: execution.body,
         };
 
         // Selection summed the body's encoded size as it accepted each transaction.
-        let encoded_size = block.header.encode_size() + execution.body_size;
+        let encoded_size =
+            block.header.encode_size() + block.state_sync.encode_size() + execution.body_size;
         debug_assert_eq!(encoded_size, block.encode_size());
 
         // A transaction source may exceed its budget. Trimming here would
@@ -189,8 +195,14 @@ where
             return None;
         }
 
+        if !block.verify_state_root() {
+            reject_verify(block.header.height, "state_sync_proof_mismatch");
+            return None;
+        }
+
         // The worker jobs share the immutable body independently of the block header.
         let header = block.header.clone();
+        let state_ops_root = block.state_sync.ops_root;
         let body = Arc::clone(&block.body);
         drop(block);
 
@@ -263,6 +275,10 @@ where
         if !commitments_match(&header, &execution) {
             return None;
         }
+        if execution.state.ops_root() != state_ops_root {
+            reject_verify(header.height, "state_ops_root_mismatch");
+            return None;
+        }
 
         info!(
             epoch = header.context.round.epoch().get(),
@@ -297,6 +313,15 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        if !block.verify_state_root() {
+            error!(
+                height = block.header.height,
+                reason = "state_sync_proof_mismatch",
+                "application.apply.reject"
+            );
+            return None;
+        }
+
         // Decode the body and derive its transfers and digests on the strategy.
         let strategy = self.strategy.clone();
         let body = Arc::clone(&block.body);
@@ -311,10 +336,10 @@ where
             .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
             .ok()?;
 
-        // Settle the body and append its digests, taking the transaction-history
-        // floor from the start of the header's transaction range.
+        // Settle the body and append its indexed history entries, taking the
+        // transaction-history floor from the start of the header's transaction range.
         let (state_batch, transaction_batch) = batches;
-        apply_prepared_body::<E, H, St>(
+        let batches = apply_prepared_body::<E, H, St>(
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
@@ -324,6 +349,17 @@ where
         )
         .await
         .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
-        .ok()
+        .ok()?;
+        if batches.0.root() != block.header.state_root
+            || batches.0.ops_root() != block.state_sync.ops_root
+        {
+            error!(
+                height,
+                reason = "state_root_mismatch",
+                "application.apply.reject"
+            );
+            return None;
+        }
+        Some(batches)
     }
 }

@@ -100,6 +100,7 @@ fn unique_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
                 Account {
                     balance: 1,
                     nonce: Nonce::default(),
+                    tx_count: 0,
                 },
             );
             state.insert(recipient, Account::default());
@@ -123,6 +124,7 @@ fn shared_fixture(transaction_count: usize) -> (State, Vec<PreparedTransfer>) {
             let account = Account {
                 balance: transaction_count as u64,
                 nonce: Nonce::default(),
+                tx_count: 0,
             };
             (key(index), account)
         })

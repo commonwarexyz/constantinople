@@ -12,6 +12,7 @@ import {
     markSubmissionRejected,
     markTransactionFinalized,
     markValidatorFinalizationObserved,
+    submissionTimeline,
     restoreSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
@@ -74,6 +75,8 @@ function reconcilingTransaction(): SubmittedTransaction {
         value: '7',
         nonce: '2',
         submittedAt: 1_000,
+        reportedInMs: null,
+        reportedHeight: null,
         finalizationObservedInMs: null,
         proofObservedInMs: null,
         status: 'reconciling',
@@ -224,7 +227,7 @@ test('wallet observation timing restores only nonnegative safe integer durations
     }
 });
 
-test('indexer finality report records no authenticated height or observation', () => {
+test('a relayer finality report records local timing but no authenticated height or observation', () => {
     const [observed] = markValidatorFinalizationObserved(
         digest,
         19,
@@ -234,6 +237,8 @@ test('indexer finality report records no authenticated height or observation', (
 
     assert.equal(observed.status, 'reconciling');
     assert.equal(observed.finalizedHeight, null);
+    assert.equal(observed.reportedInMs, 250);
+    assert.equal(observed.reportedHeight, 19);
     assert.equal(observed.finalizationObservedInMs, null);
     assert.equal(observed.proofObservedInMs, null);
     assert.equal(observed.certificate.status, 'waiting');
@@ -242,6 +247,8 @@ test('indexer finality report records no authenticated height or observation', (
     const restored = restoreSubmittedTransaction(observed);
     assert.equal(restored?.status, 'reconciling');
     assert.equal(restored?.finalizedHeight, null);
+    assert.equal(restored?.reportedInMs, 250);
+    assert.equal(restored?.reportedHeight, 19);
     assert.equal(restored?.finalizationObservedInMs, null);
     assert.equal(restored?.proofObservedInMs, null);
 
@@ -254,6 +261,32 @@ test('indexer finality report records no authenticated height or observation', (
 
     const [afterReport] = markValidatorFinalizationObserved(digest, 99, 1_500, [finalized]);
     assert.deepEqual(afterReport, finalized);
+});
+
+test('the submission timeline ends at the first pending or failed step and keeps stored timing', () => {
+    const submitted = reconcilingTransaction();
+    assert.deepEqual(submissionTimeline(submitted).map((step) => [step.kind, step.state, step.elapsedMs]), [['reported', 'pending', null]]);
+
+    const [reported] = markValidatorFinalizationObserved(digest, 19, 1_640, [submitted]);
+    assert.deepEqual(submissionTimeline(reported).map((step) => [step.label, step.state, step.elapsedMs]),
+        [['reported h19', 'done', 640], ['awaiting proof', 'pending', null]]);
+
+    const [verified] = markTransactionFinalized(verifiedBundle(), 2_200, [reported]);
+    const steps = submissionTimeline(verified);
+    assert.deepEqual(steps.map((step) => [step.state, step.elapsedMs]), [['done', 640], ['done', 1_200]]);
+    assert.match(steps[1]!.label, /^cert h\d+ \/ loc \d+$/);
+
+    // A reload keeps both durations while the chain evidence is re-verified.
+    const restored = restoreSubmittedTransaction(verified)!;
+    assert.deepEqual(submissionTimeline(restored).map((step) => [step.state, step.elapsedMs]), [['done', 640], ['pending', null]]);
+    const [again] = markTransactionFinalized(verifiedBundle(), 9_999, [restored]);
+    assert.deepEqual(submissionTimeline(again).map((step) => step.elapsedMs), [640, 1_200]);
+
+    const [failed] = markReconciliationError(digest, 'certificate failed verification', [reported]);
+    assert.deepEqual(submissionTimeline(failed).map((step) => [step.state, step.detail]),
+        [['done', ''], ['failed', 'certificate failed verification']]);
+    const [rejected] = markSubmissionRejected(digest, 'nonce already used', [submitted]);
+    assert.deepEqual(submissionTimeline(rejected).map((step) => [step.label, step.state, step.detail]), [['rejected', 'failed', 'nonce already used']]);
 });
 
 test('only waiting rows owned by the current sender are reconciled', () => {

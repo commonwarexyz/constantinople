@@ -10,33 +10,9 @@
 //! transfers before any account is read. Verification therefore plans the body, reads every
 //! account it touches once, and settles the whole body or rejects it.
 //!
-//! ```text
-//! body transactions
-//!        |
-//!        v
-//! prepare
-//!        |
-//!        +--> sealed message digests ----------------------------+
-//!        |                                                       |
-//!        v                                                       |
-//! prepared transfers                                             |
-//!        |                                                       |
-//!        v                                                       |
-//! Plan::new: each touched account once, with its debit and       |
-//! credit sums and its nonce effects in block order               |
-//!        |                                                       |
-//!        v                                                       v
-//! stage the plan's accounts in one read            transaction-history append
-//!        |                                                       |
-//!        v                                                       |
-//! Plan::settle: one slot per staged account                      |
-//!        |                                                       |
-//!        v                                                       v
-//! staged state merkleize          +           transaction-history merkleize
-//!        |
-//!        v
-//! merkleized commitments
-//! ```
+//! After settlement, a reverse walk of the accepted body assigns each transaction its sender
+//! and recipient indices from the final account counts. History append and state merkleization
+//! then run concurrently. Indexing uses the settled accounts without further database access.
 //!
 //! Account state is read with one awaited QMDB `stage` call. It returns the starting accounts and
 //! a staged batch that retains each key's resolved location, so merkleizing the settled slots skips
@@ -45,10 +21,10 @@
 //! key's final value and not on that order.
 //!
 //! A body that cannot settle (a refused nonce, a debit beyond a starting balance, or a final
-//! balance past `u64::MAX`) is rejected whole, with no partial state to reconcile. Different plans
-//! may report a different offending account and reason, so a rejection only marks the body
-//! invalid. Transaction history is append-only, and digests are appended in block order, so the
-//! transaction-history commitment reflects block order.
+//! balance or history count past `u64::MAX`) is rejected whole, with no partial state to reconcile.
+//! Different plans may report a different offending account and reason, so a rejection only
+//! marks the body invalid. Transaction-history entries append in block order, so their commitment
+//! reflects that order.
 //!
 //! Proposing, verifying, and applying certified blocks all use this same transition.
 //! `execute_proposal` builds a proposal best effort with a [`Selection`]. Malformed candidates are
@@ -73,8 +49,8 @@
 use super::{
     INVALID_TRANSACTION_FLOOR, MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
-    db::{self, StateBatch, StateSlots, StateStaged, TransactionBatch, apply_transaction_digests},
-    reject_verify,
+    db::{self, StateBatch, StateSlots, StateStaged, TransactionBatch, apply_transaction_entries},
+    history, reject_verify,
 };
 use crate::executor::{self, PreparedTransfer, TransferAccount};
 use commonware_codec::EncodeSize;
@@ -95,12 +71,7 @@ use commonware_storage::{
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{AccountKey, Header, LazySignedTransaction, SignedTransaction};
-use std::{
-    future::{Future, ready},
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::{future::Future, sync::Arc, time::Duration};
 use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -175,6 +146,23 @@ where
     H: Hasher,
     S: Strategy,
 {
+    compute_with(batch, transfers, strategy, |_, slots| slots).await
+}
+
+// The finish callback runs inside the settlement job, while the plan still owns its key
+// order, so callers can keep what they need from the keys without a second job.
+async fn compute_with<E, H, S, R>(
+    batch: StateBatch<E, H, EightCap, S>,
+    transfers: Arc<Vec<PreparedTransfer>>,
+    strategy: &S,
+    finish: impl FnOnce(&[AccountKey], StateSlots) -> R + Send + 'static,
+) -> (StateStaged<E, H, EightCap, S>, Option<R>)
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+    R: Send + 'static,
+{
     // A body whose debit or credit sums overflow cannot settle, so it stages
     // no reads and settles to `None`.
     let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
@@ -208,7 +196,7 @@ where
             settle_span.in_scope(|| {
                 plan.settle(&executor::starting_accounts(reads), &s)
                     .ok()
-                    .map(executor::account_slots)
+                    .map(|slots| finish(plan.keys(), executor::account_slots(slots)))
             })
         })
         .await;
@@ -266,9 +254,6 @@ where
         .map(|prepared| prepared.into_iter().unzip())
 }
 
-/// An in-flight transaction-history append chained across refill rounds.
-type PendingAppend<E, H, S> = Pin<Box<dyn Future<Output = TransactionBatch<E, H, S>> + Send>>;
-
 /// Wall-clock budget for building one proposal. Refill rounds keep running
 /// while block headroom remains and this deadline has not passed; a round in
 /// flight always completes (popped transactions must be executed or they
@@ -296,11 +281,9 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// line up with the selection's keys. The loop ends when the mempool has
 /// nothing left that fits or the build deadline passes.
 ///
-/// Each round starts appending its accepted digests before the next refill.
-/// When offloaded, the append can overlap later rounds and the final state
-/// merkleize. The strategy may instead complete an append inline. Chained
-/// appends preserve the accepted digests' block order. An empty selection
-/// proposes an empty block so an idle chain keeps making progress.
+/// After settlement, history entries take their indices from the final account
+/// counts and append in block order while state merkleization runs. An empty
+/// selection proposes an empty block so an idle chain keeps making progress.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S, I>(
@@ -326,6 +309,7 @@ where
     let mut staged: Option<StateStaged<E, H, EightCap, S>> = None;
     let mut selection: Selection<AccountKey, TransferAccount> = Selection::new();
     let mut body: Vec<LazySignedTransaction<H>> = Vec::new();
+    let mut accepted: Vec<(PreparedTransfer, H::Digest)> = Vec::new();
     let mut included_bytes = 0usize;
 
     // Each accepted transaction adds its length-prefixed encoding to the body's encoded size, so
@@ -333,10 +317,6 @@ where
     let mut framed_bytes = 0usize;
     let mut candidates = candidates;
 
-    // Rounds share one history batch, so each append is joined before the
-    // next starts. Offloaded appends can overlap the next round's work.
-    let mut transaction_batch = Some(transaction_batch);
-    let mut pending_append: Option<PendingAppend<E, H, S>> = None;
     let deadline = clock.current() + BUILD_TIMEOUT;
 
     loop {
@@ -417,65 +397,46 @@ where
             dropped = tracing::field::Empty,
         );
         let work_size = prepared.len();
-        let (selection_back, body_back, chunk, included_delta, framed_delta, dropped_bytes) =
+        let (selection_back, body_back, accepted_back, included_delta, framed_delta, dropped_bytes) =
             strategy
                 .spawn(work_size, {
                     let span = select_span.clone();
                     let mut selection = selection;
                     let mut body = body;
+                    let mut accepted = accepted;
                     move |_: S| {
                         span.in_scope(|| {
                             let applied = selection.apply(&prepared);
-                            let mut chunk: Vec<H::Digest> = Vec::with_capacity(prepared.len());
                             let mut included = 0usize;
                             let mut framed = 0usize;
                             let mut dropped = 0usize;
                             let mut candidates = candidates.into_iter();
-                            for (prepared, &accepted) in prepared.iter().zip(&applied) {
+                            for (prepared, &kept) in prepared.iter().zip(&applied) {
                                 let transaction =
                                     candidates.next().expect("one candidate per transaction");
-                                let Candidate(Some((_, digest, size))) = prepared else {
+                                let Candidate(Some((transfer, digest, size))) = prepared else {
                                     continue;
                                 };
-                                if accepted {
+                                if kept {
                                     included += size;
                                     framed += size.encode_size() + size;
-                                    chunk.push(*digest);
+                                    accepted.push((*transfer, *digest));
                                     body.push(transaction);
                                 } else {
                                     dropped += size;
                                 }
                             }
-                            (selection, body, chunk, included, framed, dropped)
+                            (selection, body, accepted, included, framed, dropped)
                         })
                     }
                 })
                 .await;
         selection = selection_back;
         body = body_back;
+        accepted = accepted_back;
         included_bytes += included_delta;
         framed_bytes += framed_delta;
         select_span.record("dropped", dropped_bytes.traced());
-
-        // Start this round's history append before refilling so it can
-        // overlap the next round when the strategy offloads it.
-        if !chunk.is_empty() {
-            let batch = match pending_append.take() {
-                Some(append) => {
-                    append
-                        .instrument(info_span!("application.execute.apply_wait"))
-                        .await
-                }
-                None => transaction_batch
-                    .take()
-                    .expect("transaction batch is owned until the first append"),
-            };
-            let apply_span = info_span!("application.execute.apply", txs = chunk.len().traced());
-            let work_size = chunk.len();
-            pending_append = Some(Box::pin(strategy.spawn(work_size, move |_: S| {
-                apply_span.in_scope(|| apply_transaction_digests(batch, &chunk))
-            })));
-        }
 
         if clock.current() >= deadline {
             break;
@@ -497,29 +458,31 @@ where
         None => stage_empty(unstaged.take().expect("nothing was staged")).await,
     };
 
-    // Settle the accepted transfers while any offloaded history append drains.
     let settle_span = info_span!(
         "application.execute.settle",
         accounts = selection.keys().len().traced()
     );
     let work_size = selection.keys().len();
-    let slots = strategy
+    let (slots, keys) = strategy
         .spawn(work_size, move |s: S| {
-            settle_span.in_scope(|| executor::account_slots(selection.settle(&s)))
+            settle_span.in_scope(|| {
+                let keys = selection.keys().to_vec();
+                let slots = executor::account_slots(selection.settle(&s));
+                (slots, keys)
+            })
         })
         .await;
 
-    // Pass the append future into `finalize_child` so any remaining work can
-    // overlap state merkleization. Empty selections need no append job.
-    let drained = transaction_batch.take();
-    let append = pending_append.take();
-    let transaction_batch = async move {
-        match append {
-            Some(append) => append.await,
-            None => drained.expect("transaction batch is owned until the first append"),
-        }
-    }
-    .instrument(info_span!("application.execute.apply_wait"));
+    // History entries derive from the settled counts but are not needed by the state
+    // merkleize, so their derivation and append run beside it instead of ahead of it.
+    let apply_span = info_span!("application.execute.apply", txs = accepted.len().traced());
+    let counts = history::tx_counts(&slots);
+    let transaction_batch = strategy.spawn(accepted.len(), move |_: S| {
+        apply_span.in_scope(|| {
+            let entries = history::entries(accepted.into_iter(), &keys, &counts);
+            apply_transaction_entries(transaction_batch, &entries)
+        })
+    });
 
     let body_size = body.len().encode_size() + framed_bytes;
     let block = finalize_child(
@@ -563,24 +526,28 @@ where
     let transaction_count = transfers.len();
     let transfers = Arc::new(transfers);
 
-    // The history append is independent of state execution, so start it before
-    // compute. The strategy may run it inline or offload it to overlap compute.
-    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let work_size = digests.len();
-    let apply = strategy.spawn(work_size, move |_: S| {
-        apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
-    });
-    let (staged, slots) = compute(state_batch, transfers, &strategy).await;
+    let accepted = Arc::clone(&transfers);
+    let (staged, settled) = compute_with(state_batch, transfers, &strategy, move |keys, slots| {
+        (slots, keys.to_vec())
+    })
+    .await;
+    let (slots, keys) = settled.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    // Join the append before surfacing a rejection so its panics propagate
-    // and no job outlives this call.
-    let transaction_batch = apply.await;
-    let slots = slots.ok_or(STATIC_INVALID_TRANSACTION)?;
+    // History entries derive from the settled counts but are not needed by the state
+    // merkleize, so their derivation and append run beside it instead of ahead of it.
+    let apply_span = info_span!("application.execute.apply", txs = accepted.len().traced());
+    let counts = history::tx_counts(&slots);
+    let transaction_batch = strategy.spawn(accepted.len(), move |_: S| {
+        apply_span.in_scope(|| {
+            let entries = history::entries(accepted.iter().copied().zip(digests), &keys, &counts);
+            apply_transaction_entries(transaction_batch, &entries)
+        })
+    });
 
     Ok(finalize_child(
         staged,
         slots,
-        ready(transaction_batch),
+        transaction_batch,
         parent_floor,
         transaction_count,
         "database merkleization during verification must succeed",
@@ -604,27 +571,26 @@ where
 {
     let transfers = Arc::new(transfers);
 
-    // The history append is independent of state execution, so start it before
-    // compute. The strategy may run it inline or offload it to overlap compute.
-    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let work_size = digests.len();
-    let apply = strategy.spawn(work_size, move |_: S| {
+    let accepted = Arc::clone(&transfers);
+    let (staged, settled) = compute_with(state_batch, transfers, &strategy, move |keys, slots| {
+        (slots, keys.to_vec())
+    })
+    .await;
+    let (slots, keys) = settled.ok_or(STATIC_INVALID_TRANSACTION)?;
+    let apply_span = info_span!("application.execute.apply", txs = accepted.len().traced());
+    let counts = history::tx_counts(&slots);
+    let transaction_batch = strategy.spawn(accepted.len(), move |_: S| {
         apply_span.in_scope(|| {
-            apply_transaction_digests(transaction_batch, &digests)
+            let entries = history::entries(accepted.iter().copied().zip(digests), &keys, &counts);
+            apply_transaction_entries(transaction_batch, &entries)
                 .with_inactivity_floor(transaction_floor)
         })
     });
-    let (staged, slots) = compute(state_batch, transfers, &strategy).await;
-
-    // Join the append before surfacing a rejection so its panics propagate
-    // and no job outlives this call.
-    let transaction_batch = apply.await;
-    let slots = slots.ok_or(STATIC_INVALID_TRANSACTION)?;
 
     // The replayed header supplies the transaction-history floor, and merkleize
     // rejects a floor below the parent's or past this block's commit. Any other
     // merkleize failure is a storage failure.
-    match db::finalize_execution(staged, slots, ready(transaction_batch)).await {
+    match db::finalize_execution(staged, slots, transaction_batch).await {
         Ok(merkleized) => Ok(merkleized),
         Err(QmdbError::FloorRegressed(..) | QmdbError::FloorBeyondSize(..)) => {
             Err(INVALID_TRANSACTION_FLOOR)
@@ -667,7 +633,7 @@ where
 /// Merkleizes the staged state and transaction batches into a child block
 /// execution. `transaction_batch` is a future so a still-draining history
 /// append can overlap the state merkleize; callers holding a finished batch
-/// pass it via [`ready`].
+/// pass it via [`core::future::ready`].
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
 async fn finalize_child<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
@@ -688,7 +654,7 @@ where
         db::finalize_execution(state_staged, state_slots, transaction_batch)
             .await
             .expect(expect_message);
-    let state_sync_range = range_from_bounds(state.bounds());
+    let state_sync_range = non_empty_range!(*state.sync_boundary(), *state.bounds().tip.size);
     let transactions_range = range_from_bounds(transactions.bounds());
 
     BlockExecution {

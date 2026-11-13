@@ -49,7 +49,10 @@ no table may rewrite an existing key with a different value. `account_meta` is
 keyed by `(account, qmdb_location)` with one row per account-state QMDB
 operation, and proof readers take the highest location below the certified
 state boundary for an account. Each finalized transaction adds one `tx_meta`
-row and one `tx_activity` row per distinct side to the bulk commit. The bulk
+row and one `tx_activity` row per distinct participating account to the bulk commit.
+Activity rows are keyed by `(account, account_index)`, where the index is
+authenticated by the transaction-history append. A self-transfer consumes one
+account index and produces one sender activity row. The bulk
 commit bounds indexer throughput, so a per-transaction row is only added when
 readers cannot derive the same information elsewhere.
 
@@ -58,15 +61,43 @@ The digest-keyed `tx_meta` row contract is:
 | Column | Type | Nullability | Purpose |
 | ------ | ---- | ----------- | ------- |
 | `tx_digest` | fixed-size binary with 32 bytes | non-null | Transaction digest and primary key. |
-| `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-hash QMDB append location. |
+| `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-history QMDB append location. |
 | `body` | binary | non-null | Encoded signed transaction bytes. |
 | `height` | unsigned 64-bit integer | non-null | Finalized block height containing the transaction. |
+| `sender_index` | unsigned 64-bit integer | non-null | Sender history index from the captured append. |
+| `recipient_index` | unsigned 64-bit integer | non-null | Recipient history index from the captured append. |
 
 A transaction proof needs the finalized height that contains the transaction
 and its QMDB location. `tx_meta` carries both, so a digest lookup is one point
 read. Each `tx_activity` row also carries its transaction's `qmdb_location`.
 Combined account reads use those locations for one multi-proof and fetch the
 signed transaction bodies with a batch of digest-keyed `tx_meta` lookups.
+
+Transaction-history appends contain the message digest followed by two
+big-endian `u64` indices. With SHA-256 this is a 48-byte value. Account values
+contain balance, nonce base, nonce bitmap, and transaction count, each encoded
+as a big-endian `u64`, for 32 bytes. The publisher indexes the captured values;
+it does not reconstruct authenticated indices from SQL.
+
+Account pages bind a retained account update to its inclusion block through
+parent headers and the block's state append interval. The account proof's
+`write_height` describes that inclusion; floor copies can include an unchanged
+value in a later block. It does not establish the latest value at the certificate.
+The authenticated account count fixes a complete history interval. The first
+page ends at that count; every page returns exactly the indices
+`[max(0, end - 10), end)` in descending order. A next cursor is the eight-byte
+big-endian lower endpoint and exists only when that endpoint is nonzero.
+Subsequent requests pin `at`, `digest`, and `account_location` from the first
+response.
+Missing account evidence means unknown, rather than a proven empty history.
+
+The transaction proof uses the same certified root as the account response,
+and every transaction must precede the account's inclusion block commit.
+Historical transaction locations below the transaction inactivity floor remain
+valid. Account state operations must remain inside the certified state range.
+Account inclusion ancestry has the same 4096-header bound as block ancestry.
+These encoding and SQL schema changes require a fresh spike Store; they do not
+migrate an existing deployment.
 
 Proofs become queryable once a grouped publication barrier covers the upload
 that carried the transaction. The publisher writes append-only publication
@@ -151,7 +182,7 @@ must be installed. Browser clients use generated TypeScript bindings.
 
 | Method | Request | Result |
 | ------ | ------- | ------ |
-| `GetAccount` | 32-byte account; activity mode; optional 24-byte cursor, paired snapshot height and digest, or activity selection | Account update proof when indexed, plus up to ten transactions under one certified snapshot. |
+| `GetAccount` | 32-byte account; optional 8-byte exclusive-end cursor; paired snapshot height/digest and account location for continuation; activity flag | Historical account update proof, inclusion ancestry, and an exact complete page of up to fifty transactions. |
 | `GetBlock` | Positive height and optional offset | Up to 50 consecutive transactions, with a certificate and ancestry proving the block's own transaction interval. |
 | `GetTransaction` | 32-byte transaction digest | One transaction with its exact inclusion height and proof. |
 | `Search` | One 32-byte identity | One indexed account or transaction navigation hint. |
@@ -201,13 +232,14 @@ use ConnectRPC; health, readiness, and metrics remain ordinary HTTP endpoints.
 
 Block reads discover transaction digests from consecutive QMDB operations,
 then fetch bodies through the digest primary key. A later certificate can cover
-a block that has no certificate of its own. Account pagination supplies both the
-snapshot height and digest to retain the same view while publication advances.
+a block that has no certificate of its own. Account pagination supplies the
+snapshot height, digest, and account operation location to retain the same
+proven account version while publication advances.
 
-All-activity pages seek directly from the cursor and read at most 11 activity
-rows, one more than a page. Sent and received filters apply the role as a row
-filter over the same key ranges, so they may scan additional history before
-filling a page when matches are sparse.
+Account pages seek directly over their authenticated index interval and read
+at most fifty activity rows. Missing, reordered, or mismatched indices fail the
+response. Every page is complete: a sent-only or received-only page could not prove
+that it omitted nothing.
 
 Limits are 4096 ancestry headers, 1 MiB per proof, and 8 MiB per protobuf
 response. Malformed requests return `invalid_argument`, temporarily unavailable
@@ -216,8 +248,7 @@ returns `internal`, and work exceeding supported bounds returns
 `resource_exhausted`.
 
 Account proofs establish historical membership, and a missing update is not a
-nonexistence proof. Account transaction lists carry membership proofs for their
-returned rows without a claim of completeness.
+nonexistence proof.
 
 ## Back-pressure model
 

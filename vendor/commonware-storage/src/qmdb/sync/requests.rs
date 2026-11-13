@@ -1,0 +1,143 @@
+//! Manages outstanding fetch requests with monotonically increasing request IDs.
+//!
+//! Each request is assigned a unique ID and keeps the request it was issued for, letting
+//! the engine check replies against what was requested. Removing a request aborts its future.
+
+use crate::{
+    merkle::{Family, Location},
+    qmdb::sync::{Request, engine::IndexedFetchResult},
+};
+use commonware_cryptography::Digest;
+use commonware_utils::futures::{AbortablePool, Aborter};
+use futures::future::Aborted;
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    ops::Range,
+};
+
+/// Unique identifier for a fetch request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct Id(u64);
+
+/// Mutable request state kept while the request is still tracked.
+struct TrackedRequest<F: Family> {
+    request: Request<F>,
+    _aborter: Aborter,
+}
+
+/// Manages outstanding fetch requests.
+pub(super) struct Requests<F: Family, Op, D: Digest, E> {
+    /// Futures that will resolve to fetch results.
+    futures: AbortablePool<'static, IndexedFetchResult<F, Op, D, E>>,
+
+    /// Counter for assigning unique request IDs.
+    next_id: u64,
+
+    /// Active requests keyed by ID. Removing an entry drops its [`Aborter`],
+    /// which aborts and drops the request's future.
+    tracked: HashMap<Id, TrackedRequest<F>>,
+
+    /// Reverse index from location to request ID, for gap detection.
+    by_location: BTreeMap<Location<F>, Id>,
+}
+
+impl<F: Family, Op: Send, D: Digest, E: Send> Requests<F, Op, D, E> {
+    pub fn new() -> Self {
+        Self {
+            futures: AbortablePool::default(),
+            next_id: 0,
+            tracked: HashMap::new(),
+            by_location: BTreeMap::new(),
+        }
+    }
+
+    /// Register a request, returning its assigned ID. If a request already exists at the same
+    /// start location, the old one is superseded and aborted.
+    pub fn insert<Fut>(&mut self, request: Request<F>, make: impl FnOnce(Id) -> Fut) -> Id
+    where
+        Fut: Future<Output = IndexedFetchResult<F, Op, D, E>> + Send + 'static,
+    {
+        let id = Id(self.next_id);
+        self.next_id += 1;
+        if let Some(old_id) = self.by_location.insert(request.start(), id) {
+            self.tracked.remove(&old_id);
+        }
+        let aborter = self.futures.push(make(id));
+        self.tracked.insert(
+            id,
+            TrackedRequest {
+                request,
+                _aborter: aborter,
+            },
+        );
+        id
+    }
+
+    /// Complete a request by ID. Returns the request if it was tracked.
+    pub fn remove(&mut self, id: Id) -> Option<Request<F>> {
+        if let Some(TrackedRequest {
+            request,
+            _aborter: _,
+        }) = self.tracked.remove(&id)
+        {
+            self.by_location.remove(&request.start());
+            Some(request)
+        } else {
+            None
+        }
+    }
+
+    /// Retain requests matching `keep`, aborting all others.
+    pub fn retain(&mut self, mut keep: impl FnMut(Request<F>) -> bool) {
+        let tracked = &mut self.tracked;
+        self.by_location.retain(|_, id| {
+            let request = tracked
+                .get(id)
+                .expect("location index must reference a tracked request")
+                .request;
+            if keep(request) {
+                true
+            } else {
+                tracked.remove(id);
+                false
+            }
+        });
+    }
+
+    /// Iterate over the maximum operation ranges covered by outstanding requests, in ascending
+    /// order.
+    pub fn ranges(&self) -> impl Iterator<Item = Range<Location<F>>> + '_ {
+        self.by_location.values().map(|id| {
+            let request = &self
+                .tracked
+                .get(id)
+                .expect("location index must reference a tracked request")
+                .request;
+            let start = request.start();
+            start..start.checked_add(request.max_ops().get()).unwrap()
+        })
+    }
+
+    /// Check if a location has an outstanding request.
+    pub fn contains(&self, loc: &Location<F>) -> bool {
+        self.by_location.contains_key(loc)
+    }
+
+    /// Resolves to the next fetch result, or [`Aborted`] if the request was cancelled.
+    /// Never resolves once all completed and aborted results have been drained.
+    pub async fn next_completed(&mut self) -> Result<IndexedFetchResult<F, Op, D, E>, Aborted> {
+        self.futures.next_completed().await
+    }
+
+    /// Get the number of outstanding requests, not including aborted ones.
+    pub fn len(&self) -> usize {
+        self.tracked.len()
+    }
+}
+
+impl<F: Family, Op: Send, D: Digest, E: Send> Default for Requests<F, Op, D, E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

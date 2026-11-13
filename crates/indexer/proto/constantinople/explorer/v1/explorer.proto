@@ -11,21 +11,18 @@ service ExplorerService {
   rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse);
 }
 
-enum ActivityMode {
-  ACTIVITY_MODE_ALL = 0;
-  ACTIVITY_MODE_SENT = 1;
-  ACTIVITY_MODE_RECEIVED = 2;
-}
-
 message GetAccountRequest {
   bytes account = 1;
-  ActivityMode mode = 2;
+  reserved 2;
+  // Eight-byte big-endian exclusive account-history index.
   optional bytes cursor = 3;
   // A pinned request supplies both at and digest.
   optional uint64 at = 4;
   optional bytes digest = 5;
   // Omitted means true.
   optional bool activity = 6;
+  // Required with a cursor; pins the account update under at/digest.
+  optional uint64 account_location = 7;
 }
 
 message GetBlockRequest {
@@ -54,6 +51,11 @@ message ProofBundle {
 message AccountProof {
   uint64 location = 1;
   bytes proof = 2;
+  // Inclusion block of this update, authenticated by the bundle ancestry.
+  uint64 write_height = 3;
+  // The account's active update, proven against the certified header's
+  // current-state root and the requested key.
+  bytes encoded_operation = 4;
 }
 
 enum TransactionRole {
@@ -64,10 +66,13 @@ enum TransactionRole {
 message TransactionRow {
   uint64 location = 1;
   bytes body = 2;
-  // Account activity positions are hints until verified against a block.
+  // Account activity block positions are hints; the participant indices below
+  // are part of the authenticated history value.
   uint64 height = 3;
   uint32 index = 4;
   optional TransactionRole role = 5;
+  uint64 sender_index = 6;
+  uint64 recipient_index = 7;
 }
 
 message SearchRequest { bytes value = 1; }

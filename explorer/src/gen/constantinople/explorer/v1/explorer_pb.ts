@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file constantinople/explorer/v1/explorer.proto.
  */
 export const file_constantinople_explorer_v1_explorer: GenFile = /*@__PURE__*/
-  fileDesc("Ciljb25zdGFudGlub3BsZS9leHBsb3Jlci92MS9leHBsb3Jlci5wcm90bxIaY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEi2AEKEUdldEFjY291bnRSZXF1ZXN0Eg8KB2FjY291bnQYASABKAwSNgoEbW9kZRgCIAEoDjIoLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkFjdGl2aXR5TW9kZRITCgZjdXJzb3IYAyABKAxIAIgBARIPCgJhdBgEIAEoBEgBiAEBEhMKBmRpZ2VzdBgFIAEoDEgCiAEBEhUKCGFjdGl2aXR5GAYgASgISAOIAQFCCQoHX2N1cnNvckIFCgNfYXRCCQoHX2RpZ2VzdEILCglfYWN0aXZpdHkiMQoPR2V0QmxvY2tSZXF1ZXN0Eg4KBmhlaWdodBgBIAEoBBIOCgZvZmZzZXQYAiABKAQiJwoVR2V0VHJhbnNhY3Rpb25SZXF1ZXN0Eg4KBmRpZ2VzdBgBIAEoDCLDAgoLUHJvb2ZCdW5kbGUSEwoLY2VydGlmaWNhdGUYASABKAwSDwoHaGVhZGVycxgCIAMoDBIXCg9zZXF1ZW5jZV9udW1iZXIYAyABKAQSOQoHYWNjb3VudBgEIAEoCzIoLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkFjY291bnRQcm9vZhJACgx0cmFuc2FjdGlvbnMYBSADKAsyKi5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5UcmFuc2FjdGlvblJvdxIfChJ0cmFuc2FjdGlvbnNfcHJvb2YYBiABKAxIAYgBARIZCg9hY3Rpdml0eV9jdXJzb3IYByABKAxIABIWCgxibG9ja19vZmZzZXQYCCABKARIAEINCgtuZXh0X2N1cnNvckIVChNfdHJhbnNhY3Rpb25zX3Byb29mIi8KDEFjY291bnRQcm9vZhIQCghsb2NhdGlvbhgBIAEoBBINCgVwcm9vZhgCIAEoDCKYAQoOVHJhbnNhY3Rpb25Sb3cSEAoIbG9jYXRpb24YASABKAQSDAoEYm9keRgCIAEoDBIOCgZoZWlnaHQYAyABKAQSDQoFaW5kZXgYBCABKA0SPgoEcm9sZRgFIAEoDjIrLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlRyYW5zYWN0aW9uUm9sZUgAiAEBQgcKBV9yb2xlIh4KDVNlYXJjaFJlcXVlc3QSDQoFdmFsdWUYASABKAwiVQoOU2VhcmNoUmVzcG9uc2USNAoEa2luZBgBIAEoDjImLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlNlYXJjaEtpbmQSDQoFdmFsdWUYAiABKAwiMgoSV2F0Y2hCbG9ja3NSZXF1ZXN0EhIKBWFmdGVyGAEgASgESACIAQFCCAoGX2FmdGVyIoABChNXYXRjaEJsb2Nrc1Jlc3BvbnNlEhcKD3NlcXVlbmNlX251bWJlchgEIAEoBBITCgtjZXJ0aWZpY2F0ZRgFIAEoDBIPCgdoZWFkZXJzGAYgAygMSgQIARACSgQIAhADSgQIAxAEUgZoZWlnaHRSBmRpZ2VzdFIIdHhfY291bnQiKQoYU3VibWl0VHJhbnNhY3Rpb25SZXF1ZXN0Eg0KBWJhdGNoGAEgASgMIrIBChlTdWJtaXRUcmFuc2FjdGlvblJlc3BvbnNlEkQKCWNvbXBsZXRlZBgBIAEoCzIvLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkNvbXBsZXRlZFN1Ym1pc3Npb25IABJECglhbWJpZ3VvdXMYAiABKAsyLy5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5BbWJpZ3VvdXNTdWJtaXNzaW9uSABCCQoHb3V0Y29tZSKGAwoTQ29tcGxldGVkU3VibWlzc2lvbhITCgtodHRwX3N0YXR1cxgBIAEoDRI6CglmaW5hbGl6ZWQYAiABKAsyJS5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5GaW5hbGl6ZWRIABJNChNwYXJ0aWFsbHlfZmluYWxpemVkGAMgASgLMi4uY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuUGFydGlhbGx5RmluYWxpemVkSAASNAoHZHJvcHBlZBgEIAEoCzIhLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkVtcHR5SAASNAoHcGVuZGluZxgFIAEoCzIhLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkVtcHR5SAASNQoIcmVqZWN0ZWQYBiABKAsyIS5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5FbXB0eUgAEgwKBGJvZHkYByABKAwSFAoMY29udGVudF90eXBlGAggASgJQggKBnJlc3VsdCIbCglGaW5hbGl6ZWQSDgoGaGVpZ2h0GAEgASgEIkgKElBhcnRpYWxseUZpbmFsaXplZBIOCgZoZWlnaHQYASABKAQSEAoIaW5jbHVkZWQYAiABKAQSEAoIZmlsdGVyZWQYAyABKAQiBwoFRW1wdHkiTwoTQW1iaWd1b3VzU3VibWlzc2lvbhIOCgZyZWFzb24YASABKAkSGAoLaHR0cF9zdGF0dXMYAiABKA1IAIgBAUIOCgxfaHR0cF9zdGF0dXMqWQoMQWN0aXZpdHlNb2RlEhUKEUFDVElWSVRZX01PREVfQUxMEAASFgoSQUNUSVZJVFlfTU9ERV9TRU5UEAESGgoWQUNUSVZJVFlfTU9ERV9SRUNFSVZFRBACKk0KD1RyYW5zYWN0aW9uUm9sZRIbChdUUkFOU0FDVElPTl9ST0xFX1NFTkRFUhAAEh0KGVRSQU5TQUNUSU9OX1JPTEVfUkVDRUlWRVIQASpCCgpTZWFyY2hLaW5kEhcKE1NFQVJDSF9LSU5EX0FDQ09VTlQQABIbChdTRUFSQ0hfS0lORF9UUkFOU0FDVElPThABMp0FCg9FeHBsb3JlclNlcnZpY2USZAoKR2V0QWNjb3VudBItLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkdldEFjY291bnRSZXF1ZXN0GicuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuUHJvb2ZCdW5kbGUSYAoIR2V0QmxvY2sSKy5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5HZXRCbG9ja1JlcXVlc3QaJy5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5Qcm9vZkJ1bmRsZRJsCg5HZXRUcmFuc2FjdGlvbhIxLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkdldFRyYW5zYWN0aW9uUmVxdWVzdBonLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlByb29mQnVuZGxlEl8KBlNlYXJjaBIpLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlNlYXJjaFJlcXVlc3QaKi5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5TZWFyY2hSZXNwb25zZRJwCgtXYXRjaEJsb2NrcxIuLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLldhdGNoQmxvY2tzUmVxdWVzdBovLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLldhdGNoQmxvY2tzUmVzcG9uc2UwARKAAQoRU3VibWl0VHJhbnNhY3Rpb24SNC5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5TdWJtaXRUcmFuc2FjdGlvblJlcXVlc3QaNS5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5TdWJtaXRUcmFuc2FjdGlvblJlc3BvbnNlYgZwcm90bzM");
+  fileDesc("Ciljb25zdGFudGlub3BsZS9leHBsb3Jlci92MS9leHBsb3Jlci5wcm90bxIaY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEi2gEKEUdldEFjY291bnRSZXF1ZXN0Eg8KB2FjY291bnQYASABKAwSEwoGY3Vyc29yGAMgASgMSACIAQESDwoCYXQYBCABKARIAYgBARITCgZkaWdlc3QYBSABKAxIAogBARIVCghhY3Rpdml0eRgGIAEoCEgDiAEBEh0KEGFjY291bnRfbG9jYXRpb24YByABKARIBIgBAUIJCgdfY3Vyc29yQgUKA19hdEIJCgdfZGlnZXN0QgsKCV9hY3Rpdml0eUITChFfYWNjb3VudF9sb2NhdGlvbkoECAIQAyIxCg9HZXRCbG9ja1JlcXVlc3QSDgoGaGVpZ2h0GAEgASgEEg4KBm9mZnNldBgCIAEoBCInChVHZXRUcmFuc2FjdGlvblJlcXVlc3QSDgoGZGlnZXN0GAEgASgMIsMCCgtQcm9vZkJ1bmRsZRITCgtjZXJ0aWZpY2F0ZRgBIAEoDBIPCgdoZWFkZXJzGAIgAygMEhcKD3NlcXVlbmNlX251bWJlchgDIAEoBBI5CgdhY2NvdW50GAQgASgLMiguY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuQWNjb3VudFByb29mEkAKDHRyYW5zYWN0aW9ucxgFIAMoCzIqLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlRyYW5zYWN0aW9uUm93Eh8KEnRyYW5zYWN0aW9uc19wcm9vZhgGIAEoDEgBiAEBEhkKD2FjdGl2aXR5X2N1cnNvchgHIAEoDEgAEhYKDGJsb2NrX29mZnNldBgIIAEoBEgAQg0KC25leHRfY3Vyc29yQhUKE190cmFuc2FjdGlvbnNfcHJvb2YiYAoMQWNjb3VudFByb29mEhAKCGxvY2F0aW9uGAEgASgEEg0KBXByb29mGAIgASgMEhQKDHdyaXRlX2hlaWdodBgDIAEoBBIZChFlbmNvZGVkX29wZXJhdGlvbhgEIAEoDCLHAQoOVHJhbnNhY3Rpb25Sb3cSEAoIbG9jYXRpb24YASABKAQSDAoEYm9keRgCIAEoDBIOCgZoZWlnaHQYAyABKAQSDQoFaW5kZXgYBCABKA0SPgoEcm9sZRgFIAEoDjIrLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlRyYW5zYWN0aW9uUm9sZUgAiAEBEhQKDHNlbmRlcl9pbmRleBgGIAEoBBIXCg9yZWNpcGllbnRfaW5kZXgYByABKARCBwoFX3JvbGUiHgoNU2VhcmNoUmVxdWVzdBINCgV2YWx1ZRgBIAEoDCJVCg5TZWFyY2hSZXNwb25zZRI0CgRraW5kGAEgASgOMiYuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuU2VhcmNoS2luZBINCgV2YWx1ZRgCIAEoDCIyChJXYXRjaEJsb2Nrc1JlcXVlc3QSEgoFYWZ0ZXIYASABKARIAIgBAUIICgZfYWZ0ZXIigAEKE1dhdGNoQmxvY2tzUmVzcG9uc2USFwoPc2VxdWVuY2VfbnVtYmVyGAQgASgEEhMKC2NlcnRpZmljYXRlGAUgASgMEg8KB2hlYWRlcnMYBiADKAxKBAgBEAJKBAgCEANKBAgDEARSBmhlaWdodFIGZGlnZXN0Ugh0eF9jb3VudCIpChhTdWJtaXRUcmFuc2FjdGlvblJlcXVlc3QSDQoFYmF0Y2gYASABKAwisgEKGVN1Ym1pdFRyYW5zYWN0aW9uUmVzcG9uc2USRAoJY29tcGxldGVkGAEgASgLMi8uY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuQ29tcGxldGVkU3VibWlzc2lvbkgAEkQKCWFtYmlndW91cxgCIAEoCzIvLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkFtYmlndW91c1N1Ym1pc3Npb25IAEIJCgdvdXRjb21lIoYDChNDb21wbGV0ZWRTdWJtaXNzaW9uEhMKC2h0dHBfc3RhdHVzGAEgASgNEjoKCWZpbmFsaXplZBgCIAEoCzIlLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkZpbmFsaXplZEgAEk0KE3BhcnRpYWxseV9maW5hbGl6ZWQYAyABKAsyLi5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5QYXJ0aWFsbHlGaW5hbGl6ZWRIABI0Cgdkcm9wcGVkGAQgASgLMiEuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuRW1wdHlIABI0CgdwZW5kaW5nGAUgASgLMiEuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuRW1wdHlIABI1CghyZWplY3RlZBgGIAEoCzIhLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLkVtcHR5SAASDAoEYm9keRgHIAEoDBIUCgxjb250ZW50X3R5cGUYCCABKAlCCAoGcmVzdWx0IhsKCUZpbmFsaXplZBIOCgZoZWlnaHQYASABKAQiSAoSUGFydGlhbGx5RmluYWxpemVkEg4KBmhlaWdodBgBIAEoBBIQCghpbmNsdWRlZBgCIAEoBBIQCghmaWx0ZXJlZBgDIAEoBCIHCgVFbXB0eSJPChNBbWJpZ3VvdXNTdWJtaXNzaW9uEg4KBnJlYXNvbhgBIAEoCRIYCgtodHRwX3N0YXR1cxgCIAEoDUgAiAEBQg4KDF9odHRwX3N0YXR1cypNCg9UcmFuc2FjdGlvblJvbGUSGwoXVFJBTlNBQ1RJT05fUk9MRV9TRU5ERVIQABIdChlUUkFOU0FDVElPTl9ST0xFX1JFQ0VJVkVSEAEqQgoKU2VhcmNoS2luZBIXChNTRUFSQ0hfS0lORF9BQ0NPVU5UEAASGwoXU0VBUkNIX0tJTkRfVFJBTlNBQ1RJT04QATKdBQoPRXhwbG9yZXJTZXJ2aWNlEmQKCkdldEFjY291bnQSLS5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5HZXRBY2NvdW50UmVxdWVzdBonLmNvbnN0YW50aW5vcGxlLmV4cGxvcmVyLnYxLlByb29mQnVuZGxlEmAKCEdldEJsb2NrEisuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuR2V0QmxvY2tSZXF1ZXN0GicuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuUHJvb2ZCdW5kbGUSbAoOR2V0VHJhbnNhY3Rpb24SMS5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5HZXRUcmFuc2FjdGlvblJlcXVlc3QaJy5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5Qcm9vZkJ1bmRsZRJfCgZTZWFyY2gSKS5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5TZWFyY2hSZXF1ZXN0GiouY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuU2VhcmNoUmVzcG9uc2UScAoLV2F0Y2hCbG9ja3MSLi5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5XYXRjaEJsb2Nrc1JlcXVlc3QaLy5jb25zdGFudGlub3BsZS5leHBsb3Jlci52MS5XYXRjaEJsb2Nrc1Jlc3BvbnNlMAESgAEKEVN1Ym1pdFRyYW5zYWN0aW9uEjQuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuU3VibWl0VHJhbnNhY3Rpb25SZXF1ZXN0GjUuY29uc3RhbnRpbm9wbGUuZXhwbG9yZXIudjEuU3VibWl0VHJhbnNhY3Rpb25SZXNwb25zZWIGcHJvdG8z");
 
 /**
  * @generated from message constantinople.explorer.v1.GetAccountRequest
@@ -22,11 +22,8 @@ export type GetAccountRequest = Message<"constantinople.explorer.v1.GetAccountRe
   account: Uint8Array;
 
   /**
-   * @generated from field: constantinople.explorer.v1.ActivityMode mode = 2;
-   */
-  mode: ActivityMode;
-
-  /**
+   * Eight-byte big-endian exclusive account-history index.
+   *
    * @generated from field: optional bytes cursor = 3;
    */
   cursor?: Uint8Array;
@@ -49,6 +46,13 @@ export type GetAccountRequest = Message<"constantinople.explorer.v1.GetAccountRe
    * @generated from field: optional bool activity = 6;
    */
   activity?: boolean;
+
+  /**
+   * Required with a cursor; pins the account update under at/digest.
+   *
+   * @generated from field: optional uint64 account_location = 7;
+   */
+  accountLocation?: bigint;
 };
 
 /**
@@ -175,6 +179,21 @@ export type AccountProof = Message<"constantinople.explorer.v1.AccountProof"> & 
    * @generated from field: bytes proof = 2;
    */
   proof: Uint8Array;
+
+  /**
+   * Inclusion block of this update, authenticated by the bundle ancestry.
+   *
+   * @generated from field: uint64 write_height = 3;
+   */
+  writeHeight: bigint;
+
+  /**
+   * The account's active update, proven against the certified header's
+   * current-state root and the requested key.
+   *
+   * @generated from field: bytes encoded_operation = 4;
+   */
+  encodedOperation: Uint8Array;
 };
 
 /**
@@ -199,7 +218,8 @@ export type TransactionRow = Message<"constantinople.explorer.v1.TransactionRow"
   body: Uint8Array;
 
   /**
-   * Account activity positions are hints until verified against a block.
+   * Account activity block positions are hints; the participant indices below
+   * are part of the authenticated history value.
    *
    * @generated from field: uint64 height = 3;
    */
@@ -214,6 +234,16 @@ export type TransactionRow = Message<"constantinople.explorer.v1.TransactionRow"
    * @generated from field: optional constantinople.explorer.v1.TransactionRole role = 5;
    */
   role?: TransactionRole;
+
+  /**
+   * @generated from field: uint64 sender_index = 6;
+   */
+  senderIndex: bigint;
+
+  /**
+   * @generated from field: uint64 recipient_index = 7;
+   */
+  recipientIndex: bigint;
 };
 
 /**
@@ -508,32 +538,6 @@ export const AmbiguousSubmissionSchema: GenMessage<AmbiguousSubmission> = /*@__P
   messageDesc(file_constantinople_explorer_v1_explorer, 16);
 
 /**
- * @generated from enum constantinople.explorer.v1.ActivityMode
- */
-export enum ActivityMode {
-  /**
-   * @generated from enum value: ACTIVITY_MODE_ALL = 0;
-   */
-  ALL = 0,
-
-  /**
-   * @generated from enum value: ACTIVITY_MODE_SENT = 1;
-   */
-  SENT = 1,
-
-  /**
-   * @generated from enum value: ACTIVITY_MODE_RECEIVED = 2;
-   */
-  RECEIVED = 2,
-}
-
-/**
- * Describes the enum constantinople.explorer.v1.ActivityMode.
- */
-export const ActivityModeSchema: GenEnum<ActivityMode> = /*@__PURE__*/
-  enumDesc(file_constantinople_explorer_v1_explorer, 0);
-
-/**
  * @generated from enum constantinople.explorer.v1.TransactionRole
  */
 export enum TransactionRole {
@@ -552,7 +556,7 @@ export enum TransactionRole {
  * Describes the enum constantinople.explorer.v1.TransactionRole.
  */
 export const TransactionRoleSchema: GenEnum<TransactionRole> = /*@__PURE__*/
-  enumDesc(file_constantinople_explorer_v1_explorer, 1);
+  enumDesc(file_constantinople_explorer_v1_explorer, 0);
 
 /**
  * @generated from enum constantinople.explorer.v1.SearchKind
@@ -573,7 +577,7 @@ export enum SearchKind {
  * Describes the enum constantinople.explorer.v1.SearchKind.
  */
 export const SearchKindSchema: GenEnum<SearchKind> = /*@__PURE__*/
-  enumDesc(file_constantinople_explorer_v1_explorer, 2);
+  enumDesc(file_constantinople_explorer_v1_explorer, 1);
 
 /**
  * @generated from service constantinople.explorer.v1.ExplorerService
@@ -629,3 +633,4 @@ export const ExplorerService: GenService<{
   },
 }> = /*@__PURE__*/
   serviceDesc(file_constantinople_explorer_v1_explorer, 0);
+

@@ -14,18 +14,20 @@
 //! loaded accounts all or nothing.
 //!
 //! The plan holds each account the body touches once, with its debit and credit
-//! sums and its nonce effects in block order. Each account is loaded once,
-//! settled once, and written once. If any nonce is refused, any debit exceeds
-//! its account's starting balance, or any final balance overflows, the whole
-//! block body is invalid and no partial state is applied. A proposer instead
-//! selects its body one candidate at a time, dropping each that cannot settle,
-//! so the body it proposes settles under the verifier's plan.
+//! sums and its nonce and history-count effects in block order. Each account is
+//! loaded once, settled once, and written once. If any nonce is refused, any debit
+//! exceeds its account's starting balance, or any final balance or history count
+//! overflows, the whole block body is invalid and no partial state is applied.
+//! A proposer instead selects its body one candidate at a time, dropping each
+//! that cannot settle, so the body it proposes settles under the verifier's plan.
 //!
 //! Touched accounts are staged out of the unordered state QMDB in one read,
 //! and final account values are recorded as one slot per staged read, so
 //! merkleization reuses each key's resolved location. The state commitment
 //! depends on the final key/value set. Transaction history is append-only, so
-//! transaction digests are still appended in block order.
+//! indexed transaction entries are appended in block order. Their indices are
+//! derived from settled account counts, counting each distinct sender and
+//! recipient once per transaction.
 
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -33,7 +35,7 @@ use commonware_runtime::{
     Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
-use commonware_storage::mmr;
+use commonware_storage::{mmr, qmdb::current::batch::Boundary};
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
@@ -67,7 +69,7 @@ where
     pub start: mmr::Location,
     /// Exclusive operation location where this batch ends.
     pub end: mmr::Location,
-    /// Root after applying this batch.
+    /// Operation-log root after applying this batch.
     pub root: D,
     /// Prefix frontier in MMR pin order.
     pub pinned_nodes: Vec<D>,
@@ -82,6 +84,8 @@ where
 {
     /// Account-state operation range.
     pub state: FinalizedRange<H::Digest, StateOperation>,
+    /// Current-state authentication changes from the same account-state batch.
+    pub state_boundary: Boundary<mmr::Family, H::Digest, 32>,
     /// Transaction-history operation range.
     pub transactions: FinalizedRange<H::Digest, TransactionHistoryOperation<H>>,
 }

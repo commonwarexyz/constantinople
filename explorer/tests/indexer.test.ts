@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
 import { create } from '@bufbuild/protobuf';
@@ -13,15 +14,13 @@ import {
     ExplorerService, WatchBlocksResponseSchema, type WatchBlocksResponse,
 } from '../src/gen/constantinople/explorer/v1/explorer_pb.ts';
 import { subscribeBlocks, type VerifiedBlockBatch } from '../src/indexer.ts';
-import { createBlockBatchVerifier, verifyBlockBundle } from '../src/proofBundle.ts';
+import { createBlockBatchVerifier } from '../src/proofBundle.ts';
+import { simplexFinalizationVerifier } from '../src/qmdb.ts';
+import { readFixture } from './fixtureSource.ts';
 import { explorerFetch } from './rpcTest.ts';
 
 const INDEXER = 'https://indexer.example';
-const DIGESTS = [
-    '02b1918cde9d139569548a500ccca920e673fcd4dd107f592df40fe73c120410',
-    '7d443c0c127dcfcada61c9f4c327eb646a4597a97732141f2ee179e9f41abced',
-    '1e09c5718799f0be0419cfbe15b5f12751ade8fc370ab43c2cc2648975296f12',
-];
+let expectedDigests: string[];
 type WatchBlocks = ServiceImpl<typeof ExplorerService>['watchBlocks'];
 interface WireBundle { certificate: string; headers: string[]; sequenceNumber: string }
 interface PublisherFixture {
@@ -82,12 +81,22 @@ function terminalError(error: unknown) {
 }
 
 test.before(async () => {
-    fixture = JSON.parse(await readFile(new URL('../../tests/fixtures/proofBundle.json', import.meta.url), 'utf8'));
-    feedFixture = JSON.parse(await readFile(new URL('../../tests/fixtures/blockFeed.json', import.meta.url), 'utf8'));
+    fixture = await readFixture<PublisherFixture>('proofBundle');
+    feedFixture = await readFixture<BlockFeedFixture>('blockFeed');
     await Promise.all([
         initQmdbWasm(toArrayBuffer(await readFile(new URL('./generated/wasm/exoware_qmdb_wasm_bg.wasm', import.meta.resolve('@exowarexyz/qmdb'))))),
         ensureSimplexWasm({ module_or_path: await readFile(new URL('./generated/wasm/exoware_simplex_wasm_bg.wasm', import.meta.resolve('@exowarexyz/simplex/wasm'))) }),
     ]);
+    const certificateBytes = fromHex(fixture.historicalBlock.certificate);
+    const certificate = await (await simplexFinalizationVerifier(fixture.verificationMaterial)).verifyFinalization(certificateBytes, {
+        kind: 'finalization', index: 'latest', height: 0n, key: new Uint8Array(), value: certificateBytes, source: 'get',
+    });
+    assert.ok(certificate);
+    const headerBytes = [...fixture.historicalBlock.headers].reverse().map(fromHex);
+    headerBytes.push(certificate.header.subarray(certificate.payload.length));
+    expectedDigests = headerBytes.map((header) => createHash('sha256').update(header).digest('hex'));
+    assert.equal(expectedDigests.length, 3);
+    assert.equal(expectedDigests[2], toHex(certificate.payload.subarray(0, 32)));
 });
 
 test('generated WatchBlocks authenticates the latest block using only its parent', async (context) => {
@@ -108,11 +117,11 @@ test('generated WatchBlocks authenticates the latest block using only its parent
     const before = Date.now();
     const batch = await nextBatch(stream);
     assert.deepEqual(batch.blocks.map((row) => ({ ...row, digest: toHex(row.digest) })), [{
-        height: 3n, digest: DIGESTS[2], txCount: 0, timestampMs: 3n,
+        height: 3n, digest: expectedDigests[2], txCount: 0, timestampMs: 3n,
         finality: { certifiedHeight: 3n, certificateView: 3n },
     }]);
     assert.equal(batch.target.height, 3n);
-    assert.equal(toHex(batch.target.blockDigest), DIGESTS[2]);
+    assert.equal(toHex(batch.target.blockDigest), expectedDigests[2]);
     assert.equal('sequenceNumber' in batch.target, false);
     assert.equal(batch.sequenceNumberHint, (1n << 64n) - 1n);
     assert.ok(batch.receivedAt >= before && batch.receivedAt <= Date.now());
@@ -128,7 +137,7 @@ test('explicit genesis catch-up publishes one ascending batch with counts from p
     const stream = subscribeBlocks(INDEXER, { ...options(), after: 0n });
     const batch = await nextBatch(stream);
     assert.deepEqual(batch.blocks.map((row) => row.height), [1n, 2n, 3n]);
-    assert.deepEqual(batch.blocks.map((row) => toHex(row.digest)), DIGESTS);
+    assert.deepEqual(batch.blocks.map((row) => toHex(row.digest)), expectedDigests);
     assert.deepEqual(batch.blocks.map((row) => row.txCount), [3, 55, 0]);
     assert.deepEqual(batch.blocks.map((row) => row.timestampMs), [1n, 2n, 3n]);
     assert.ok(batch.blocks.every((row) => row.finality.certifiedHeight === 3n && row.finality.certificateView === 3n));
@@ -245,10 +254,10 @@ test('reconnect bridges the accepted digest independently of the shared certific
     });
     const first = await nextBatch(stream);
     assert.deepEqual(first.blocks.map((row) => row.height), [1n]);
-    await verifyBlockBundle({ indexerUrl: INDEXER, ...options(), height: 3n }, fixture.emptyBlock);
+    await createBlockBatchVerifier(fixture.verificationMaterial).verify(frame(fixture.emptyBlock));
     const second = await nextBatch(stream);
     assert.deepEqual(second.blocks.map((row) => [row.height, row.txCount]), [[2n, 55], [3n, 0]]);
-    await verifyBlockBundle({ indexerUrl: INDEXER, ...options(), height: 1n }, fixture.directBlock);
+    await createBlockBatchVerifier(fixture.verificationMaterial).verify(frame(fixture.directBlock));
     await assert.rejects(stream.next(), terminalError);
     assert.deepEqual(cursors, [undefined, 1n, 3n]);
     assert.equal(reconnects, 3);
@@ -378,17 +387,18 @@ test('mutating published buffers cannot change the private resume digest or cach
     settings.simplexVerificationMaterial = '00';
     first.blocks[0]!.digest.fill(0);
     for (const value of Object.values(first.target)) if (value instanceof Uint8Array) value.fill(0);
-    const cached = await verifyBlockBundle({ indexerUrl: INDEXER, ...options(), height: 1n }, fixture.directBlock);
+    const cached = await createBlockBatchVerifier(fixture.verificationMaterial).verify(frame(fixture.directBlock));
+    assert.ok(cached);
     for (const key of ['blockDigest', 'stateRoot', 'transactionsRoot'] as const) {
         assert.deepEqual(cached.target[key], expectedTarget[key]);
     }
     const next = await nextBatch(stream);
-    assert.deepEqual(next.blocks.map((row) => toHex(row.digest)), DIGESTS.slice(1));
-    assert.equal(toHex(next.target.blockDigest), DIGESTS[2]);
+    assert.deepEqual(next.blocks.map((row) => toHex(row.digest)), expectedDigests.slice(1));
+    assert.equal(toHex(next.target.blockDigest), expectedDigests[2]);
     assert.deepEqual(cursors, [undefined, 1n]);
     await stream.return();
     const fresh = subscribeBlocks(INDEXER, options());
-    assert.equal(toHex((await nextBatch(fresh)).target.blockDigest), DIGESTS[2]);
+    assert.equal(toHex((await nextBatch(fresh)).target.blockDigest), expectedDigests[2]);
     await fresh.return();
 });
 
@@ -403,7 +413,7 @@ test('a certificate cached under one verification context cannot authenticate an
         ...options(), simplexVerificationMaterial: toHex(foreignMaterial),
     }).next());
     const restored = subscribeBlocks(INDEXER, options());
-    assert.equal(toHex((await nextBatch(restored)).blocks[0]!.digest), DIGESTS[0]);
+    assert.equal(toHex((await nextBatch(restored)).blocks[0]!.digest), expectedDigests[0]);
     await restored.return();
 });
 

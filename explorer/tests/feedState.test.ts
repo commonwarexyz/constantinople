@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appendVerifiedBatch, EMPTY_FEED } from '../src/feedState.ts';
+import { appendVerifiedBatch, EMPTY_FEED, shownCount, shownFeed } from '../src/feedState.ts';
 import type { VerifiedBlockBatch } from '../src/indexer.ts';
+import { blockRecency } from '../src/blockRecency.ts';
 
 function batch(heights: number[], receivedAt: number, txCount = 0): VerifiedBlockBatch {
     const height = BigInt(heights.at(-1)!);
@@ -60,4 +61,40 @@ test('an empty replay leaves both authenticated state and local observation wind
     const initial = appendVerifiedBatch(EMPTY_FEED, batch([1], 1));
     const replay = { ...batch([2], 100), blocks: [] };
     assert.equal(appendVerifiedBatch(initial, replay), initial);
+});
+
+test('recency follows the newest verified header rather than bootstrap ancestors or receipt time', () => {
+    const initial = batch([1, 2, 3], 100_000);
+    const latest = 95_000n;
+    const incoming = {
+        ...initial,
+        blocks: initial.blocks.map((block) => block.height === 3n ? { ...block, timestampMs: latest } : block),
+        target: { ...initial.target, timestampMs: latest },
+    };
+    const feed = appendVerifiedBatch(EMPTY_FEED, incoming);
+    assert.equal(blockRecency(feed.blocks[0]!.timestampMs, 100_000).kind, 'recent');
+    assert.equal(blockRecency(feed.blocks.at(-1)!.timestampMs, 100_000).kind, 'stale');
+    const delivered = batch([4], 200_000);
+    const backlog = appendVerifiedBatch(feed, {
+        ...delivered,
+        blocks: delivered.blocks.map((block) => ({ ...block, timestampMs: latest })),
+        target: { ...delivered.target, timestampMs: latest },
+    });
+    assert.equal(backlog.observedRateWindow.latestBlockAt, 200_000);
+    assert.equal(blockRecency(backlog.blocks[0]!.timestampMs, 200_000).kind, 'stale');
+});
+
+test('blocks still being released are held back from the rows and totals together', () => {
+    const initial = appendVerifiedBatch(EMPTY_FEED, batch([1, 2], 10_000, 3));
+    const feed = appendVerifiedBatch(initial, batch([3, 4, 5, 6], 11_000, 2));
+    assert.equal(feed.publishedProofTarget!.height, 6n);
+
+    // The first block of the batch is shown on arrival and the rest follow.
+    const arriving = shownFeed(feed, shownCount(feed, 11_000));
+    assert.deepEqual(arriving.blocks.map((block) => block.height), [3n, 2n, 1n]);
+    assert.deepEqual([arriving.totalBlocksObserved, arriving.totalTxObserved], [3, 8]);
+
+    const released = shownFeed(feed, shownCount(feed, 12_000));
+    assert.deepEqual(released.blocks.map((block) => block.height), [6n, 5n, 4n, 3n, 2n, 1n]);
+    assert.deepEqual([released.totalBlocksObserved, released.totalTxObserved], [6, 14]);
 });

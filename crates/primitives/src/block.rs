@@ -6,7 +6,8 @@
 //! - [`Block`] - Execution payload and required consensus metadata.
 
 use crate::{
-    LazySignedTransaction, Sealable, Sealed, SignedTransaction, proposal::MAXIMUM_BLOCK_SIZE,
+    Account, AccountKey, LazySignedTransaction, Sealable, Sealed, SignedTransaction,
+    proposal::MAXIMUM_BLOCK_SIZE,
 };
 use commonware_codec::{
     Buf, Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write,
@@ -15,7 +16,15 @@ use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_utils::range::NonEmptyRange;
+use commonware_storage::{
+    mmr,
+    qmdb::{
+        self,
+        any::{self, unordered::Update, value::FixedEncoding},
+        current::proof::OpsRootWitness,
+    },
+};
+use commonware_utils::{bitmap::Prunable, range::NonEmptyRange};
 use std::sync::Arc;
 
 /// A block header containing metadata, consensus context, and state commitment roots.
@@ -168,6 +177,83 @@ impl Default for BlockCfg {
     }
 }
 
+/// Authenticates the operations root used by state sync against the header's current root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateSyncProof<D: Digest> {
+    /// Operations root authenticated by `witness`.
+    pub ops_root: D,
+    /// Native current-root opening for the operations root.
+    pub witness: OpsRootWitness<mmr::Family, D>,
+}
+
+impl<D: Digest> StateSyncProof<D> {
+    /// The empty account database contains one active commit and no account updates.
+    pub fn initial<H: Hasher<Digest = D>>() -> Self {
+        let hasher = qmdb::hasher::<H>();
+        let mut bitmap = Prunable::<32>::new();
+        bitmap.push(true);
+        let (chunk, bits) = bitmap.last_chunk();
+        let ops_root =
+            any::initial_root::<mmr::Family, Update<AccountKey, FixedEncoding<Account>>, H>();
+
+        // The one-commit tree lies below the grafting height, so the virtual grafted root is
+        // the operations root. Its active bit is committed by the partial chunk.
+        Self {
+            ops_root,
+            witness: OpsRootWitness {
+                grafted_root: ops_root,
+                pending_chunk_digest: Default::default(),
+                partial_chunk: Some((bits, hasher.digest(chunk))),
+            },
+        }
+    }
+
+    pub fn root<H: Hasher<Digest = D>>(&self) -> D {
+        self.witness.root::<H>(&self.ops_root)
+    }
+
+    pub fn verify<H: Hasher<Digest = D>>(&self, root: &D) -> bool {
+        self.witness.verify::<H>(&self.ops_root, root)
+    }
+
+    /// Upper bound on this proof's encoded size.
+    pub fn max_encode_size() -> usize {
+        Self {
+            ops_root: D::EMPTY,
+            witness: OpsRootWitness {
+                grafted_root: D::EMPTY,
+                pending_chunk_digest: Default::default(),
+                partial_chunk: Some((u64::MAX, D::EMPTY)),
+            },
+        }
+        .encode_size()
+    }
+}
+
+impl<D: Digest> Write for StateSyncProof<D> {
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        self.ops_root.write(buf);
+        self.witness.write(buf);
+    }
+}
+
+impl<D: Digest> Read for StateSyncProof<D> {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        Ok(Self {
+            ops_root: D::read(buf)?,
+            witness: OpsRootWitness::read(buf)?,
+        })
+    }
+}
+
+impl<D: Digest> EncodeSize for StateSyncProof<D> {
+    fn encode_size(&self) -> usize {
+        self.ops_root.encode_size() + self.witness.encode_size()
+    }
+}
+
 /// A block containing signed transactions and required epoch-consensus metadata.
 #[derive(Debug)]
 pub struct Block<C, P, H>
@@ -178,6 +264,8 @@ where
 {
     /// The execution header.
     pub header: Header<C, H::Digest, P>,
+    /// Proof material for syncing the state committed by the header.
+    pub state_sync: StateSyncProof<H::Digest>,
     /// Ordered transactions included in this execution payload.
     ///
     /// Each transaction is held in a [`LazySignedTransaction`] so block
@@ -198,6 +286,7 @@ where
     fn clone(&self) -> Self {
         Self {
             header: self.header.clone(),
+            state_sync: self.state_sync.clone(),
             body: Arc::clone(&self.body),
         }
     }
@@ -217,8 +306,12 @@ where
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
+        let state_sync = StateSyncProof::initial::<H>();
+        let mut header: Header<C, H::Digest, P> = u.arbitrary()?;
+        header.state_root = state_sync.root::<H>();
         Ok(Self {
-            header: u.arbitrary()?,
+            header,
+            state_sync,
             body: Arc::new(body.into_iter().map(LazySignedTransaction::new).collect()),
         })
     }
@@ -231,7 +324,9 @@ where
     H: Hasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.header == other.header && self.body == other.body
+        self.header == other.header
+            && self.state_sync == other.state_sync
+            && self.body == other.body
     }
 }
 
@@ -250,12 +345,21 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    /// Creates a new block from already-decoded transactions.
-    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
+    /// Creates a block from decoded transactions and its state-root opening.
+    pub fn new(
+        header: Header<C, H::Digest, P>,
+        body: Vec<SignedTransaction<H>>,
+        state_sync: StateSyncProof<H::Digest>,
+    ) -> Self {
         Self {
             header,
+            state_sync,
             body: Arc::new(body.into_iter().map(LazySignedTransaction::new).collect()),
         }
+    }
+
+    pub fn verify_state_root(&self) -> bool {
+        self.state_sync.verify::<H>(&self.header.state_root)
     }
 }
 
@@ -266,7 +370,7 @@ where
     H: Hasher,
 {
     fn encode_size(&self) -> usize {
-        self.header.encode_size() + self.body.encode_size()
+        self.header.encode_size() + self.state_sync.encode_size() + self.body.encode_size()
     }
 }
 
@@ -278,6 +382,7 @@ where
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.header.write(buf);
+        self.state_sync.write(buf);
         self.body.write(buf);
     }
 }
@@ -293,9 +398,18 @@ where
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         // Limit this block without consuming trailing metadata from its enclosing message.
         let mut buf = bytes::Buf::take(buf, MAXIMUM_BLOCK_SIZE);
+        let header = Header::read_cfg(&mut buf, &())?;
+        let state_sync = StateSyncProof::read(&mut buf)?;
+        if !state_sync.verify::<H>(&header.state_root) {
+            return Err(CodecError::Invalid(
+                "Block",
+                "state sync proof does not match header",
+            ));
+        }
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
-            header: Header::read_cfg(&mut buf, &())?,
+            header,
+            state_sync,
             body: Arc::read_cfg(&mut buf, &tx_vec_cfg)?,
         })
     }
@@ -419,7 +533,7 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 42,
             timestamp: 1000,
-            state_root: sha256::Digest::EMPTY,
+            state_root: StateSyncProof::initial::<sha256::Sha256>().root::<sha256::Sha256>(),
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
@@ -454,6 +568,7 @@ mod tests {
         let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
             test_header(),
             vec![],
+            StateSyncProof::initial::<sha256::Sha256>(),
         );
 
         let mut buf = Vec::with_capacity(block.encode_size());
@@ -468,6 +583,53 @@ mod tests {
     }
 
     #[test]
+    fn block_decode_authenticates_state_sync_proof() {
+        type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+        let block = TestBlock::new(
+            test_header(),
+            Vec::new(),
+            StateSyncProof::initial::<sha256::Sha256>(),
+        );
+        assert!(block.verify_state_root());
+
+        let mut wrong_ops = block.clone();
+        wrong_ops.state_sync.ops_root = sha256::Digest::EMPTY;
+        let mut wrong_witness = block.clone();
+        wrong_witness.state_sync.witness.grafted_root = sha256::Digest::EMPTY;
+        let mut wrong_root = block.clone();
+        wrong_root.header.state_root = sha256::Digest::EMPTY;
+        for invalid in [wrong_ops, wrong_witness, wrong_root] {
+            assert!(!invalid.verify_state_root());
+            assert!(TestBlock::decode_cfg(invalid.encode(), &BlockCfg::default()).is_err());
+        }
+
+        let header_bytes = block.header.encode_size();
+        let proof_bytes = block.state_sync.encode_size();
+        let encoded = block.encode();
+        assert_eq!(&encoded[..header_bytes], block.header.encode().as_ref());
+        for end in header_bytes..header_bytes + proof_bytes {
+            assert!(TestBlock::decode_cfg(encoded.slice(..end), &BlockCfg::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn state_sync_proof_size_bound_covers_chunk_shapes() {
+        let mut proof = StateSyncProof::initial::<sha256::Sha256>();
+        for partial in [
+            None,
+            Some((1, sha256::Digest::EMPTY)),
+            Some((u64::MAX, sha256::Digest::EMPTY)),
+        ] {
+            proof.witness.partial_chunk = partial;
+            assert!(proof.encode_size() <= StateSyncProof::<sha256::Digest>::max_encode_size());
+        }
+        assert_eq!(
+            proof.encode_size(),
+            StateSyncProof::<sha256::Digest>::max_encode_size(),
+        );
+    }
+
+    #[test]
     fn cloned_block_shares_body_and_preserves_deferred_wire_bytes() {
         type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
 
@@ -476,6 +638,7 @@ mod tests {
         let payload_size =
             crate::Transaction::<sha256::Digest>::SIZE + crate::TransactionSignature::MIN_SIZE;
         let mut encoded = test_header().encode().to_vec();
+        StateSyncProof::initial::<sha256::Sha256>().write(&mut encoded);
         2usize.write(&mut encoded);
         for fill in [0xfe, 0xff] {
             payload_size.write(&mut encoded);
@@ -519,7 +682,11 @@ mod tests {
             crate::TRANSACTION_NAMESPACE,
             &mut sha256::Sha256::default(),
         );
-        let block = Block::new(test_header(), vec![transaction]);
+        let block = Block::new(
+            test_header(),
+            vec![transaction],
+            StateSyncProof::initial::<sha256::Sha256>(),
+        );
 
         // A clone shares the body and its decoded transactions.
         let cloned = block.clone();
@@ -533,6 +700,7 @@ mod tests {
 
     fn encoded_block_with_size(size: usize) -> Vec<u8> {
         let mut encoded = test_header().encode().to_vec();
+        StateSyncProof::initial::<sha256::Sha256>().write(&mut encoded);
         let minimum_transaction =
             crate::Transaction::<sha256::Digest>::SIZE + crate::TransactionSignature::MIN_SIZE;
         let framed_transaction = minimum_transaction + minimum_transaction.encode_size();
@@ -580,6 +748,7 @@ mod tests {
         let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
             test_header(),
             vec![],
+            StateSyncProof::initial::<sha256::Sha256>(),
         );
         let expected = block.encode_size();
 
@@ -610,6 +779,7 @@ mod tests {
         let block = Block::<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>::new(
             test_header(),
             vec![signed],
+            StateSyncProof::initial::<sha256::Sha256>(),
         );
 
         let encoded = block.encode();

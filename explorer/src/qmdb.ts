@@ -7,12 +7,15 @@ const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const ACCOUNT_VALUE_BYTES = 24;
+const ACCOUNT_VALUE_BYTES = 32;
 const U64_BYTES = 8;
 const MAX_BLOCK_TIMESTAMP_MS = 7_258_118_400_000n;
 
 export const MAX_ANCESTRY_HEADERS = 4096;
 export const MAX_EXECUTION_HEADER_BYTES = 512;
+
+/** Most transactions the indexer returns on one account or block page. */
+export const TRANSACTION_PAGE = 50n;
 export const MAX_FINALIZATION_CERTIFICATE_BYTES = 16 * 1024;
 
 export interface VerifiedTransactionProof {
@@ -46,16 +49,15 @@ export interface LatestProofTarget extends FinalizedTransactionTarget {
     readonly sequenceNumber: bigint;
 }
 
-export type AccountActivityMode = 'all' | 'sent' | 'received';
-
 export interface AccountTransactionRow {
     readonly digest: string;
     readonly direction: 'sent' | 'received';
     readonly counterparty: string;
     readonly value: bigint;
     readonly nonce: bigint;
-    readonly height: bigint;
-    readonly blockIndex: number;
+    readonly accountIndex: bigint;
+    readonly senderIndex: bigint;
+    readonly recipientIndex: bigint;
     readonly location: bigint;
 }
 
@@ -68,6 +70,9 @@ export interface VerifiedAccountProof {
     readonly balance: bigint;
     readonly nonce: bigint;
     readonly nonceBitmap: bigint;
+    readonly txCount: bigint;
+    readonly writeHeight: bigint;
+    readonly timestampMs: bigint;
     readonly location: bigint;
     readonly tip: bigint;
     readonly proofSizeBytes: number;
@@ -259,9 +264,15 @@ function readVarint(bytes: Uint8Array, offset: number): { value: bigint; offset:
     throw new Error('finalized block header varint is too long');
 }
 
+/**
+ * The balance of an account with no stored state, which the chain treats as already holding it.
+ * The native proof fixture exports the Rust value, and a test asserts the two agree.
+ */
+export const DEFAULT_ACCOUNT_BALANCE = 100n;
+
 export function decodeAccountValue(
     value: Uint8Array,
-): Pick<VerifiedAccountProof, 'balance' | 'nonce' | 'nonceBitmap'> {
+): Pick<VerifiedAccountProof, 'balance' | 'nonce' | 'nonceBitmap' | 'txCount'> {
     if (value.length !== ACCOUNT_VALUE_BYTES) {
         throw new Error('malformed account proof value');
     }
@@ -269,6 +280,7 @@ export function decodeAccountValue(
         balance: readU64Be(value, 0),
         nonce: readU64Be(value, 8),
         nonceBitmap: readU64Be(value, 16),
+        txCount: readU64Be(value, 24),
     };
 }
 

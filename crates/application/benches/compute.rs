@@ -33,7 +33,7 @@ use commonware_runtime::{
 use commonware_storage::{
     journal::contiguous::fixed::Config as FixedJournalConfig,
     merkle::full::Config as MmrConfig,
-    qmdb::any::{FixedConfig, batch::Slot},
+    qmdb::{any::batch::Slot, current::FixedConfig},
     translator::EightCap,
 };
 use commonware_utils::{NZU64, NZUsize};
@@ -300,6 +300,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             write_buffer: NZUsize!(1 << 20),
             replay_buffer: NZUsize!(1 << 20),
         },
+        grafted_metadata_partition: "compute-state-grafted-metadata".into(),
         translator: EightCap,
         init_cache: Some(NZUsize!(1 << 18)),
         init_buffer: NZUsize!(1 << 21),
@@ -474,6 +475,7 @@ fn main() {
                     Some(Account {
                         balance: 1_000_000,
                         nonce: Nonce::default(),
+                        tx_count: 0,
                     }),
                 );
             }

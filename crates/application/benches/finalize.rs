@@ -21,7 +21,7 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::full::Config as MmrConfig,
-    qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
+    qmdb::{current::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU64, NZUsize};
@@ -76,6 +76,7 @@ fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayo
             write_buffer: NZUsize!(1 << 20),
             replay_buffer: NZUsize!(1 << 20),
         },
+        grafted_metadata_partition: "finalize-state-grafted-metadata".into(),
         translator: EightCap,
         init_cache: Some(NZUsize!(1 << 18)),
         init_buffer: NZUsize!(1 << 21),
@@ -136,6 +137,7 @@ fn main() {
                     Some(Account {
                         balance: 1_000_000,
                         nonce: Nonce::default(),
+                        tx_count: 0,
                     }),
                 );
             }

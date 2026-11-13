@@ -1,30 +1,31 @@
 import type { VerifiedBlock } from './indexer.ts';
 
 type HistogramBlock = Pick<VerifiedBlock, 'height' | 'txCount'>;
-const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 
+/** One fixed-width column: a block's share of the visible peak, or an empty block. */
+export interface HistogramColumn {
+    readonly height: bigint;
+    readonly txCount: number;
+    /** Bar height as a share of the visible peak, in [0, 1]; zero for an empty block. */
+    readonly fraction: number;
+}
+
+/**
+ * The newest `width` blocks as columns, oldest first, scaled to their exact peak. Columns before
+ * the first observed block are null so unobserved history stays blank rather than fabricated.
+ */
 export function buildHistogram(
     blocks: readonly HistogramBlock[],
     width: number,
-    rows: number,
-): { lines: string[]; zeroLine: string; domain: number } {
+): { columns: (HistogramColumn | null)[]; domain: number } {
     const recent = blocks.slice(0, width).reverse();
     const peak = recent.reduce((value, block) => Math.max(value, block.txCount), 0);
     const domain = peak || 1;
-    const padding = ' '.repeat(width - recent.length);
-    const ramp = BLOCK_GLYPHS.length - 1;
-    const stepsPerColumn = rows * ramp;
-    const columnSteps = recent.map((block) => block.txCount === 0 ? 0
-        : Math.min(stepsPerColumn, Math.max(1, Math.round(block.txCount / domain * stepsPerColumn))));
-    const lines: string[] = [];
-    for (let row = 0; row < rows; row++) {
-        const rowsBelow = rows - 1 - row;
-        lines.push(padding + columnSteps.map((steps) =>
-            BLOCK_GLYPHS[Math.max(0, Math.min(ramp, steps - rowsBelow * ramp))],
-        ).join(''));
-    }
-    const zeroLine = padding + recent.map((block) => block.txCount === 0 ? '·' : ' ').join('');
-    return { lines, zeroLine, domain };
+    const padding: null[] = Array.from({ length: width - recent.length }, () => null);
+    const columns = recent.map((block) => ({
+        height: block.height, txCount: block.txCount, fraction: block.txCount / domain,
+    }));
+    return { columns: [...padding, ...columns], domain };
 }
 
 export function formatAverageTxPerBlock(totalTransactions: number, totalBlocks: number): string {

@@ -10,6 +10,7 @@
         "noUnusedParameters": true,
         "noFallthroughCasesInSwitch": true,
         "allowImportingTsExtensions": true,
+        "allowJs": true,
         "rewriteRelativeImportExtensions": true,
         "outDir": "dist-test",
         "rootDir": ".",
@@ -17,6 +18,7 @@
     },
     "include": [
         "tests/**/*.ts",
+        "src/gen/account_wasm/*.js",
         "src/codec.ts",
         "src/historyKey.ts",
         "src/nonce.ts",

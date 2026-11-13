@@ -13,9 +13,9 @@ use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
-    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
+    AccountKey, LazySignedTransaction, Transaction, TransactionHistoryEntry, TransactionPublicKey,
 };
-use std::array::TryFromSliceError;
+use std::{array::TryFromSliceError, collections::BTreeMap};
 use tracing::info_span;
 
 struct IndexedTransaction<D: Digest> {
@@ -60,12 +60,13 @@ where
 /// `appended` starting at `append_start`.
 ///
 /// Consensus only finalizes well-formed transactions and appends each body
-/// digest in order, so any disagreement means the upload cannot be indexed.
+/// digest and participant indices in order, so any disagreement means the upload
+/// cannot be indexed.
 pub(crate) fn encode_block_rows<H, P>(
     block: &EngineBlock<H, P>,
     finalized_ts_micros: i64,
     append_start: u64,
-    appended: &[H::Digest],
+    appended: &[TransactionHistoryEntry<H::Digest>],
 ) -> Result<Vec<SqlRow>, PublishError>
 where
     H: Hasher,
@@ -89,11 +90,12 @@ where
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
     sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
+    let mut account_indices = BTreeMap::<[u8; AccountKey::SIZE], u64>::new();
     for (index, (lazy, appended)) in block.body.iter().zip(appended).enumerate() {
         let tx = index_transaction::<H>(height, index, lazy)?;
 
-        // Proofs for a tx_meta location must return this transaction's digest.
-        if tx.digest != *appended {
+        // Each SQL location refers to the captured entry for this transaction.
+        if tx.digest != appended.digest {
             return Err(PublishError::InvalidTransaction {
                 height,
                 index,
@@ -113,11 +115,39 @@ where
             .try_into()
             .expect("account key has fixed width");
         let receiver = tx.to;
+        if sender == receiver && appended.sender_index != appended.recipient_index {
+            return Err(PublishError::InvalidTransaction {
+                height,
+                index,
+                reason: "self-transfer history indices differ",
+            });
+        }
+        // The first captured position anchors each account's history in this
+        // block; later appearances advance across both transaction roles.
+        for (account, account_index) in [
+            (sender, appended.sender_index),
+            (receiver, appended.recipient_index),
+        ]
+        .into_iter()
+        .take(if sender == receiver { 1 } else { 2 })
+        {
+            if let Some(previous) = account_indices.insert(account, account_index) {
+                if previous.checked_add(1) != Some(account_index) {
+                    return Err(PublishError::InvalidTransaction {
+                        height,
+                        index,
+                        reason: "account history indices are not consecutive",
+                    });
+                }
+            }
+        }
         sql.push(encode_tx_meta_row(TxMetaRow {
             digest,
             qmdb_location,
             body: tx.bytes,
             height,
+            sender_index: appended.sender_index,
+            recipient_index: appended.recipient_index,
         }));
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
@@ -129,6 +159,7 @@ where
             value: tx.value,
             nonce: tx.nonce,
             qmdb_location,
+            account_index: appended.sender_index,
         }));
         if receiver != sender {
             sql.push(encode_tx_activity_row(TxActivityRow {
@@ -141,6 +172,7 @@ where
                 value: tx.value,
                 nonce: tx.nonce,
                 qmdb_location,
+                account_index: appended.recipient_index,
             }));
         }
     }
@@ -222,7 +254,7 @@ mod tests {
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
     use constantinople_engine::types::{EngineBlock, EngineCommitment};
     use constantinople_primitives::{
-        Block, Header, LazySignedTransaction, Sealable, Sealed, SignedTransaction,
+        Block, Header, LazySignedTransaction, Sealable, Sealed, SignedTransaction, StateSyncProof,
         TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
     use core::num::NonZeroU64;
@@ -251,11 +283,13 @@ mod tests {
             Block::<TestCommitment, ed25519::VerifyingKey, Sha256>::new(
                 test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
                 vec![transaction],
+                StateSyncProof::initial::<Sha256>(),
             )
             .seal(&mut Sha256::default()),
         );
 
-        let rows = encode_block_rows(&block, 1_000, 0, &[digest]).expect("block should index");
+        let rows = encode_block_rows(&block, 1_000, 0, &[entry(digest, 0, 0)])
+            .expect("block should index");
         assert_activity_sender(&rows, sender_account.as_ref());
     }
 
@@ -264,6 +298,7 @@ mod tests {
         let first = transfer(1);
         let second = transfer(3);
         let digests = [*first.message_digest(), *second.message_digest()];
+        let entries = digests.map(|digest| entry(digest, 0, 0));
 
         // Earlier blocks' retained operations sit between the range start and these appends.
         let block = unchecked_block(
@@ -273,7 +308,7 @@ mod tests {
             ],
             non_empty_range!(2u64, 10u64),
         );
-        let rows = encode_block_rows(&block, 1_000, 7, &digests).expect("block should index");
+        let rows = encode_block_rows(&block, 1_000, 7, &entries).expect("block should index");
 
         let meta = &rows[0];
         assert_eq!(meta.table, BLOCK_META_TABLE);
@@ -337,9 +372,9 @@ mod tests {
             non_empty_range!(0u64, 4u64),
         );
         for (block, appended) in [
-            (&empty, vec![digest]),
+            (&empty, vec![entry(digest, 0, 0)]),
             (&single, Vec::new()),
-            (&single, vec![digest, digest]),
+            (&single, vec![entry(digest, 0, 0), entry(digest, 0, 0)]),
         ] {
             let Err(error) = encode_block_rows(block, 1_000, 1, &appended) else {
                 panic!("invalid block should not index");
@@ -369,7 +404,12 @@ mod tests {
             non_empty_range!(0u64, 3u64),
         );
 
-        let Err(error) = encode_block_rows(&block, 1_000, 0, &[first_digest, first_digest]) else {
+        let Err(error) = encode_block_rows(
+            &block,
+            1_000,
+            0,
+            &[entry(first_digest, 0, 0), entry(first_digest, 0, 0)],
+        ) else {
             panic!("invalid block should not index");
         };
         assert!(
@@ -383,6 +423,118 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn history_indices_follow_accounts_across_roles_and_self_transfers() {
+        let transactions = [
+            transfer_to(1, 2, 0),
+            transfer_to(2, 3, 0),
+            transfer_to(2, 2, 1),
+            transfer_to(1, 2, 1),
+        ];
+        let indices = [(40, 5), (6, 20), (7, 7), (41, 8)];
+        let entries: Vec<_> = transactions
+            .iter()
+            .zip(indices)
+            .map(|(tx, (sender, recipient))| entry(*tx.message_digest(), sender, recipient))
+            .collect();
+        let block = unchecked_block(
+            transactions
+                .into_iter()
+                .map(LazySignedTransaction::new)
+                .collect(),
+            non_empty_range!(3u64, 13u64),
+        );
+        let rows =
+            encode_block_rows(&block, 1_000, 8, &entries).expect("consecutive account histories");
+        let meta: Vec<_> = rows
+            .iter()
+            .filter(|row| row.table == TX_META_TABLE)
+            .collect();
+        for (row, (sender_index, recipient_index)) in meta.iter().zip(indices) {
+            assert!(
+                matches!(row.values.get(4), Some(CellValue::UInt64(value)) if *value == sender_index)
+            );
+            assert!(
+                matches!(row.values.get(5), Some(CellValue::UInt64(value)) if *value == recipient_index)
+            );
+        }
+        let account = |seed| {
+            AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+                ed25519::SigningKey::from_seed(seed).public_key(),
+            ))
+        };
+        let activity: Vec<_> = rows
+            .iter()
+            .filter(|row| row.table == TX_ACTIVITY_TABLE)
+            .collect();
+        let expected = [
+            (account(1), 0, 40, 8),
+            (account(2), 1, 5, 8),
+            (account(2), 0, 6, 9),
+            (account(3), 1, 20, 9),
+            (account(2), 0, 7, 10),
+            (account(1), 0, 41, 11),
+            (account(2), 1, 8, 11),
+        ];
+        assert_eq!(activity.len(), expected.len());
+        for (row, (account, role, index, location)) in activity.iter().zip(expected) {
+            assert!(
+                matches!(row.values.first(), Some(CellValue::FixedBinary(value)) if value.as_slice() == account.as_ref())
+            );
+            assert!(matches!(row.values.get(3), Some(CellValue::UInt64(value)) if *value == role));
+            assert!(
+                matches!(row.values.get(8), Some(CellValue::UInt64(value)) if *value == location)
+            );
+            assert!(matches!(row.values.get(9), Some(CellValue::UInt64(value)) if *value == index));
+        }
+
+        for (position, sender, recipient, reason) in [
+            (1, 5, 20, "account history indices are not consecutive"),
+            (1, 8, 20, "account history indices are not consecutive"),
+            (1, 4, 20, "account history indices are not consecutive"),
+            (2, 7, 8, "self-transfer history indices differ"),
+            (3, 41, 9, "account history indices are not consecutive"),
+        ] {
+            let mut altered = entries.clone();
+            altered[position].sender_index = sender;
+            altered[position].recipient_index = recipient;
+            let Err(error) = encode_block_rows(&block, 1_000, 8, &altered) else {
+                panic!("invalid history indices should be rejected");
+            };
+            assert!(
+                matches!(error, PublishError::InvalidTransaction { index, reason: actual, .. } if index == position && actual == reason)
+            );
+        }
+    }
+
+    #[test]
+    fn account_history_indices_do_not_wrap() {
+        let first = transfer_to(1, 1, 0);
+        let second = transfer_to(1, 1, 1);
+        let entries = [
+            entry(*first.message_digest(), u64::MAX, u64::MAX),
+            entry(*second.message_digest(), 0, 0),
+        ];
+        let block = unchecked_block(
+            vec![
+                LazySignedTransaction::new(first),
+                LazySignedTransaction::new(second),
+            ],
+            non_empty_range!(0u64, 3u64),
+        );
+        let Err(error) = encode_block_rows(&block, 1_000, 0, &entries) else {
+            panic!("overflowing account history should be rejected");
+        };
+        assert!(matches!(
+            error,
+            PublishError::InvalidTransaction {
+                index: 1,
+                reason: "account history indices are not consecutive",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -412,7 +564,12 @@ mod tests {
                 ],
                 non_empty_range!(0u64, 3u64),
             );
-            let Err(error) = encode_block_rows(&block, 1_000, 0, &[digest, digest]) else {
+            let Err(error) = encode_block_rows(
+                &block,
+                1_000,
+                0,
+                &[entry(digest, 0, 0), entry(digest, 0, 0)],
+            ) else {
                 panic!("invalid block should not index");
             };
             assert!(
@@ -458,24 +615,42 @@ mod tests {
         let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
+                state_sync: StateSyncProof::initial::<Sha256>(),
                 body: vec![lazy].into(),
             },
             sha256::Digest::EMPTY,
         ));
 
-        let rows = encode_block_rows(&block, 1_000, 0, &[digest]).expect("block should index");
+        let rows = encode_block_rows(&block, 1_000, 0, &[entry(digest, 0, 0)])
+            .expect("block should index");
         assert_activity_sender(&rows, sender_account.as_ref());
         assert_tx_meta_body(&rows, &transaction);
     }
 
+    fn entry(
+        digest: sha256::Digest,
+        sender_index: u64,
+        recipient_index: u64,
+    ) -> TransactionHistoryEntry<sha256::Digest> {
+        TransactionHistoryEntry {
+            digest,
+            sender_index,
+            recipient_index,
+        }
+    }
+
     fn transfer(seed: u64) -> SignedTransaction<Sha256> {
+        transfer_to(seed, seed + 1, 0)
+    }
+
+    fn transfer_to(seed: u64, recipient: u64, nonce: u64) -> SignedTransaction<Sha256> {
         let signer = ed25519::SigningKey::from_seed(seed);
-        let recipient = ed25519::SigningKey::from_seed(seed + 1).public_key();
+        let recipient = ed25519::SigningKey::from_seed(recipient).public_key();
         Transaction::<sha256::Digest>::new(
             TransactionPublicKey::ed25519(signer.public_key()),
             TransactionPublicKey::ed25519(recipient),
             NonZeroU64::MIN,
-            0,
+            nonce,
         )
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default())
     }
@@ -497,6 +672,7 @@ mod tests {
         EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(leader, transactions_range),
+                state_sync: StateSyncProof::initial::<Sha256>(),
                 body: body.into(),
             },
             sha256::Digest::EMPTY,
@@ -522,7 +698,7 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        assert_eq!(meta.values.len(), 4);
+        assert_eq!(meta.values.len(), 6);
         assert!(matches!(meta.values.get(1), Some(CellValue::UInt64(0))));
         let Some(CellValue::Binary(body)) = meta.values.get(2) else {
             panic!("tx_meta body should be binary");
@@ -553,7 +729,7 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 7,
             timestamp: 1_000,
-            state_root: sha256::Digest::EMPTY,
+            state_root: StateSyncProof::initial::<Sha256>().root::<Sha256>(),
             state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
             transactions_root: sha256::Digest::EMPTY,
             transactions_range,

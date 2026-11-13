@@ -1,0 +1,125 @@
+use super::utils::{FreezerType, Key, append_random, init};
+use commonware_runtime::{
+    Runner,
+    benchmarks::{context, tokio},
+    tokio::Config,
+};
+use commonware_storage::freezer::Identifier;
+use commonware_utils::{TestRng, futures::try_join_all};
+use criterion::{Criterion, criterion_group};
+use rand::RngExt as _;
+use std::{hint::black_box, time::Instant};
+
+/// Items pre-loaded into the store.
+#[cfg(not(full_bench))]
+const ITEMS: u64 = 10_000;
+#[cfg(full_bench)]
+const ITEMS: u64 = 250_000;
+
+#[cfg(not(full_bench))]
+const READS: [usize; 1] = [1_000];
+#[cfg(full_bench)]
+const READS: [usize; 3] = [1_000, 10_000, 50_000];
+
+/// Select random keys for benchmarking.
+pub fn select_keys(count: usize, keys: &[Key]) -> Vec<Key> {
+    let mut rng = TestRng::new(42);
+    let mut selected_keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let idx = rng.random_range(0..keys.len());
+        selected_keys.push(keys[idx].clone());
+    }
+    selected_keys
+}
+
+/// Select recently added keys for benchmarking.
+pub fn select_recent_keys(count: usize, keys: &[Key]) -> Vec<Key> {
+    let start = if keys.len() > count {
+        keys.len() - count
+    } else {
+        0
+    };
+    keys[start..].to_vec()
+}
+
+/// Read keys serially from a freezer store.
+pub async fn read_serial_keys(store: &FreezerType, keys: &[Key]) {
+    for key in keys {
+        black_box(store.get(Identifier::Key(key)).await.unwrap().unwrap());
+    }
+}
+
+/// Read keys concurrently from a freezer store.
+pub async fn read_concurrent_keys(store: &FreezerType, keys: &[Key]) {
+    let mut futures = Vec::with_capacity(keys.len());
+    for key in keys {
+        futures.push(store.get(Identifier::Key(key)));
+    }
+    black_box(try_join_all(futures).await.unwrap());
+}
+
+fn bench_get(c: &mut Criterion) {
+    // Populate the freezer with random keys
+    let cfg = Config::default();
+    let builder = commonware_runtime::tokio::Runner::new(cfg.clone());
+    let (keys, checkpoint) = builder.start(|ctx| async move {
+        let store = init(ctx, None).await;
+        let (store, keys) = append_random(store, ITEMS).await;
+        let checkpoint = store.close().await.unwrap();
+        (keys, checkpoint)
+    });
+
+    // Run the benchmarks
+    let runner = tokio::Runner::new(cfg.clone());
+    for pattern in ["random", "recent"] {
+        for mode in ["serial", "concurrent"] {
+            for reads in READS {
+                let label = format!(
+                    "{}/pattern={} mode={} reads={}",
+                    module_path!(),
+                    pattern,
+                    mode,
+                    reads
+                );
+                c.bench_function(&label, |b| {
+                    b.to_async(&runner).iter_custom(|iters| {
+                        let keys = keys.clone();
+                        async move {
+                            let ctx = context::get::<commonware_runtime::tokio::Context>();
+                            let store = init(ctx, Some(checkpoint)).await;
+                            let selected_keys = match pattern {
+                                "random" => select_keys(reads, &keys),
+                                "recent" => select_recent_keys(reads, &keys),
+                                _ => unreachable!(),
+                            };
+                            let start = Instant::now();
+                            for _ in 0..iters {
+                                match mode {
+                                    "serial" => read_serial_keys(&store, &selected_keys).await,
+                                    "concurrent" => {
+                                        read_concurrent_keys(&store, &selected_keys).await
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                            start.elapsed()
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    // Clean up shared artifacts
+    let cleaner = commonware_runtime::tokio::Runner::new(cfg);
+    cleaner.start(|ctx| async move {
+        let store = init(ctx, None).await;
+        store.destroy().await.unwrap();
+    });
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = bench_get
+}

@@ -1,0 +1,356 @@
+//! Benchmarks for applying already-merkleized QMDB batches.
+
+use crate::common::{
+    AnyOFixP256Db, AnyUFixDb, CHUNK_SIZE, Digest, ImmFixDb, PAGE_CACHE_SIZE, any_fix_cfg_full,
+    any_fix_cfg_with, imm_fix_cfg_with, make_fixed_value, seed_db,
+};
+use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_macros::boxed;
+use commonware_runtime::{
+    Supervisor,
+    benchmarks::{context, tokio},
+    tokio::{Config, Context},
+};
+use commonware_storage::{
+    merkle::mmb::Family as Mmb,
+    qmdb::{
+        any::traits::{BatchableDb, UnmerkleizedBatch},
+        floor::Proportional,
+    },
+};
+use commonware_utils::{NZU64, NZUsize, TestRng};
+use criterion::{Criterion, criterion_group};
+use rand::Rng;
+use std::{
+    num::NonZeroU64,
+    time::{Duration, Instant},
+};
+
+const NUM_KEYS: u64 = 65_536;
+const UPDATES: [u64; 1] = [16_384];
+const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(10_000_000);
+
+// Unordered "any" DB with a fixed-size value.
+type Db = AnyUFixDb<Mmb>;
+
+// Immutable "any" DB with a fixed-size value.
+type ImmDb = ImmFixDb<Mmb>;
+
+// Ordered "any" DB with a partitioned snapshot index.
+type ODb = AnyOFixP256Db<Mmb>;
+
+fn write_updates<D: BatchableDb<K = Digest, V = Digest>>(
+    mut batch: D::Batch,
+    updates: u64,
+    rng: &mut TestRng,
+) -> D::Batch {
+    for _ in 0..updates {
+        let idx = rng.next_u64() % NUM_KEYS;
+        let key = Sha256::hash(&[&idx.to_be_bytes()]);
+        batch = batch.write(key, Some(make_fixed_value(rng)));
+    }
+    batch
+}
+
+async fn open_db(ctx: &Context) -> Db {
+    Db::init(
+        ctx.child("storage"),
+        any_fix_cfg_with(ctx, ITEMS_PER_BLOB, PAGE_CACHE_SIZE),
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+#[boxed]
+async fn bench_direct_apply(ctx: &Context, updates: u64) -> Duration {
+    let db = open_db(ctx).await;
+    let db = seed_db(db, NUM_KEYS).await;
+
+    let mut rng = TestRng::new(7);
+    let batch = write_updates::<Db>(db.new_batch(), updates, &mut rng);
+    let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(batch).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+async fn open_ord_db(ctx: &Context) -> ODb {
+    ODb::init(
+        ctx.child("storage"),
+        any_fix_cfg_full(ctx, ITEMS_PER_BLOB, PAGE_CACHE_SIZE, NZUsize!(1)),
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+#[boxed]
+async fn bench_ord_direct_apply(ctx: &Context, updates: u64) -> Duration {
+    let db = open_ord_db(ctx).await;
+    let db = seed_db(db, NUM_KEYS).await;
+
+    let mut rng = TestRng::new(7);
+    let batch = write_updates::<ODb>(db.new_batch(), updates, &mut rng);
+    let batch = batch.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(batch).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+#[boxed]
+async fn bench_apply_with_uncommitted_ancestor(ctx: &Context, updates: u64) -> Duration {
+    let db = open_db(ctx).await;
+    let db = seed_db(db, NUM_KEYS).await;
+
+    let mut rng = TestRng::new(7);
+    let parent = write_updates::<Db>(db.new_batch(), updates, &mut rng);
+    let parent = parent
+        .merkleize(&db, None, &mut Proportional)
+        .await
+        .unwrap();
+
+    let child = write_updates::<Db>(parent.new_batch(), updates, &mut rng);
+    let child = child.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(child).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+#[boxed]
+async fn bench_apply_with_committed_ancestor(ctx: &Context, updates: u64) -> Duration {
+    let db = open_db(ctx).await;
+    let db = seed_db(db, NUM_KEYS).await;
+
+    let mut rng = TestRng::new(7);
+    let parent = write_updates::<Db>(db.new_batch(), updates, &mut rng);
+    let parent = parent
+        .merkleize(&db, None, &mut Proportional)
+        .await
+        .unwrap();
+
+    let child = write_updates::<Db>(parent.new_batch(), updates, &mut rng);
+    let child = child.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let db = db.apply_batch(parent).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(child).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+// 1 committed + 1 uncommitted ancestor: apply A, then apply C (whose chain is [B, A]).
+#[boxed]
+async fn bench_apply_committed_uncommitted_chain(ctx: &Context, updates: u64) -> Duration {
+    let db = open_db(ctx).await;
+    let db = seed_db(db, NUM_KEYS).await;
+
+    let mut rng = TestRng::new(7);
+    let a = write_updates::<Db>(db.new_batch(), updates, &mut rng);
+    let a = a.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let b = write_updates::<Db>(a.new_batch(), updates, &mut rng);
+    let b = b.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let c = write_updates::<Db>(b.new_batch(), updates, &mut rng);
+    let c = c.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let db = db.apply_batch(a).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(c).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+// 2 uncommitted ancestors: apply C directly without applying A or B.
+#[boxed]
+async fn bench_apply_multi_uncommitted(ctx: &Context, updates: u64) -> Duration {
+    let db = open_db(ctx).await;
+    let db = seed_db(db, NUM_KEYS).await;
+
+    let mut rng = TestRng::new(7);
+    let a = write_updates::<Db>(db.new_batch(), updates, &mut rng);
+    let a = a.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let b = write_updates::<Db>(a.new_batch(), updates, &mut rng);
+    let b = b.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    let c = write_updates::<Db>(b.new_batch(), updates, &mut rng);
+    let c = c.merkleize(&db, None, &mut Proportional).await.unwrap();
+
+    drop(a);
+    drop(b);
+
+    let start = Instant::now();
+    let db = db.apply_batch(c).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+// Immutable databases are insert-only, so every batch writes fresh keys drawn from `counter`.
+#[boxed]
+async fn seed_imm_db(db: ImmDb, keys: u64, counter: &mut u64, rng: &mut TestRng) -> ImmDb {
+    let mut batch = db.new_batch();
+    for _ in 0..keys {
+        let key = Sha256::hash(&[&counter.to_be_bytes()]);
+        *counter += 1;
+        batch = batch.set(key, make_fixed_value(rng));
+    }
+    let floor = db.inactivity_floor_loc();
+    let batch = batch.merkleize(&db, None, floor).await.unwrap();
+    db.apply_batch(batch).await.unwrap().commit().await.unwrap()
+}
+
+async fn open_imm_db(ctx: &Context) -> ImmDb {
+    ImmDb::init(
+        ctx.child("storage"),
+        imm_fix_cfg_with(ctx, ITEMS_PER_BLOB),
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+#[boxed]
+async fn bench_imm_direct_apply(ctx: &Context, updates: u64) -> Duration {
+    let db = open_imm_db(ctx).await;
+    let mut rng = TestRng::new(7);
+    let mut counter = 0u64;
+    let db = seed_imm_db(db, NUM_KEYS, &mut counter, &mut rng).await;
+
+    let mut batch = db.new_batch();
+    for _ in 0..updates {
+        let key = Sha256::hash(&[&counter.to_be_bytes()]);
+        counter += 1;
+        batch = batch.set(key, make_fixed_value(&mut rng));
+    }
+    let floor = db.inactivity_floor_loc();
+    let batch = batch.merkleize(&db, None, floor).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(batch).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+#[boxed]
+async fn bench_imm_apply_with_uncommitted_ancestor(ctx: &Context, updates: u64) -> Duration {
+    let db = open_imm_db(ctx).await;
+    let mut rng = TestRng::new(7);
+    let mut counter = 0u64;
+    let db = seed_imm_db(db, NUM_KEYS, &mut counter, &mut rng).await;
+    let floor = db.inactivity_floor_loc();
+
+    let mut parent = db.new_batch();
+    for _ in 0..updates {
+        let key = Sha256::hash(&[&counter.to_be_bytes()]);
+        counter += 1;
+        parent = parent.set(key, make_fixed_value(&mut rng));
+    }
+    let parent = parent.merkleize(&db, None, floor).await.unwrap();
+
+    let mut child = parent.new_batch();
+    for _ in 0..updates {
+        let key = Sha256::hash(&[&counter.to_be_bytes()]);
+        counter += 1;
+        child = child.set(key, make_fixed_value(&mut rng));
+    }
+    let child = child.merkleize(&db, None, floor).await.unwrap();
+
+    let start = Instant::now();
+    let db = db.apply_batch(child).await.unwrap();
+    let elapsed = start.elapsed();
+
+    db.destroy().await.unwrap();
+    elapsed
+}
+
+fn bench_apply_batch(c: &mut Criterion) {
+    let runner = tokio::Runner::new(Config::default());
+
+    for updates in UPDATES {
+        macro_rules! apply_case {
+            ($label:literal, $bench:ident) => {
+                c.bench_function(
+                    &format!(
+                        "{}/{} chunk={CHUNK_SIZE} updates={updates}",
+                        module_path!(),
+                        $label
+                    ),
+                    |b| {
+                        b.to_async(&runner).iter_custom(|iters| async move {
+                            let ctx = context::get::<Context>();
+                            let mut total = Duration::ZERO;
+                            for _ in 0..iters {
+                                total += $bench(&ctx, updates).await;
+                            }
+                            total
+                        });
+                    },
+                );
+            };
+        }
+
+        // One criterion benchmark per (case, variant) pair.
+        apply_case!(
+            "case=direct variant=any::unordered::fixed::mmb",
+            bench_direct_apply
+        );
+        apply_case!(
+            "case=direct variant=any::ordered::p256::fixed::mmb",
+            bench_ord_direct_apply
+        );
+        apply_case!(
+            "case=uncomm_ancestor variant=any::unordered::fixed::mmb",
+            bench_apply_with_uncommitted_ancestor
+        );
+        apply_case!(
+            "case=comm_ancestor variant=any::unordered::fixed::mmb",
+            bench_apply_with_committed_ancestor
+        );
+        apply_case!(
+            "case=comm_uncomm_chain variant=any::unordered::fixed::mmb",
+            bench_apply_committed_uncommitted_chain
+        );
+        apply_case!(
+            "case=multi_uncomm variant=any::unordered::fixed::mmb",
+            bench_apply_multi_uncommitted
+        );
+        apply_case!(
+            "case=direct variant=immutable::fixed::mmb",
+            bench_imm_direct_apply
+        );
+        apply_case!(
+            "case=uncomm_ancestor variant=immutable::fixed::mmb",
+            bench_imm_apply_with_uncommitted_ancestor
+        );
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = bench_apply_batch
+}

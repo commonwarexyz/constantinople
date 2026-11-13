@@ -60,7 +60,7 @@ use commonware_storage::{
     },
     merkle::full::Config as MmrConfig,
     mmr,
-    qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
+    qmdb::{current::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZDuration, NZU64, NZUsize, non_empty_range, union};
@@ -731,7 +731,7 @@ where
 {
     (
         StateSyncTarget::new(
-            block.header.state_root,
+            block.state_sync.ops_root,
             non_empty_range!(
                 mmr::Location::new(block.header.state_range.start()),
                 mmr::Location::new(block.header.state_range.end())
@@ -843,6 +843,7 @@ where
         init_cache: Some(STATE_INIT_CACHE_SIZE),
         init_buffer: NZUsize!(1 << 21),
         init_concurrency: (),
+        grafted_metadata_partition: format!("{partition_prefix}-state-grafted-metadata"),
     }
 }
 
@@ -915,12 +916,18 @@ mod unit_tests {
             parent: sha256::Digest::EMPTY,
             height: 0,
             timestamp: 0,
-            state_root: sha256::Digest::EMPTY,
+            state_root: constantinople_primitives::StateSyncProof::initial::<sha256::Sha256>()
+                .root::<sha256::Sha256>(),
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
         };
-        let inner = Block::new(header, Vec::new()).seal(&mut sha256::Sha256::default());
+        let inner = Block::new(
+            header,
+            Vec::new(),
+            constantinople_primitives::StateSyncProof::initial::<sha256::Sha256>(),
+        )
+        .seal(&mut sha256::Sha256::default());
         let encoded = inner.encode();
         let block: EngineBlock<sha256::Sha256, ed25519::VerifyingKey> = inner.into();
 
@@ -965,15 +972,19 @@ mod unit_tests {
             parent: sha256::Digest::EMPTY,
             height: u64::MAX,
             timestamp: u64::MAX,
-            state_root: sha256::Digest::EMPTY,
+            state_root: constantinople_primitives::StateSyncProof::initial::<sha256::Sha256>()
+                .root::<sha256::Sha256>(),
             state_range: non_empty_range!(u64::MAX - 1, u64::MAX),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
         };
-        let block: EngineBlock<sha256::Sha256, ed25519::VerifyingKey> =
-            Block::new(header, vec![transaction; transaction_count])
-                .seal(&mut sha256::Sha256::default())
-                .into();
+        let block: EngineBlock<sha256::Sha256, ed25519::VerifyingKey> = Block::new(
+            header,
+            vec![transaction; transaction_count],
+            constantinople_primitives::StateSyncProof::initial::<sha256::Sha256>(),
+        )
+        .seal(&mut sha256::Sha256::default())
+        .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
 
         // The budget reserves framing for minimum-size transactions, so the slack a maximum

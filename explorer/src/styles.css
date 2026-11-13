@@ -145,7 +145,6 @@ h3 {
 .block-log__header,
 .wallet__cell > span,
 .transfer label > span,
-.tx-history__title,
 .account-proof-grid__cell > span,
 .account-page__subhead h3,
 .search label {
@@ -158,8 +157,7 @@ h3 {
 
 /* Section heading: a label with a rule beneath it. */
 .account-page__title,
-.account-page__subhead,
-.tx-history__title {
+.account-page__subhead {
     padding-bottom: var(--space-sm);
     border-bottom: 1px solid var(--theme-border);
     margin-bottom: var(--space-sm);
@@ -167,6 +165,7 @@ h3 {
 
 /* Primary action: filled accent. */
 .wallet-trigger,
+.menu-trigger,
 .modal__close,
 .account-page__title button,
 .account-page__pager button,
@@ -254,6 +253,40 @@ button:disabled {
 
 .verified-surface > strong {
     color: var(--theme-success);
+}
+
+/* Datum secondary line: counts under a value. One line, no wrap. */
+.wallet__cell > small,
+.account-proof-grid__cell > small {
+    min-height: 1.4em;
+    margin: 0;
+    color: var(--theme-text-dim);
+    font-size: var(--text-sm);
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/*
+ * The certified age sits beside the certificate it derives from. A view presenting that
+ * certificate as the latest state judges the age against the browser clock; the judgement colors
+ * only the age and never restyles the proof.
+ */
+.cert-age {
+    color: var(--theme-text-dim);
+}
+
+.cert-age--latest {
+    color: inherit;
+}
+
+.cert-age--latest > .age--ahead {
+    color: var(--theme-accent);
+}
+
+.cert-age--latest > .age--stale {
+    color: var(--theme-error);
 }
 
 .verification-error {
@@ -371,6 +404,7 @@ button:disabled {
 
 .app__status .dot {
     display: inline-block;
+    flex: none;
     width: 0.7ch;
     height: 0.7ch;
     border-radius: 50%;
@@ -384,6 +418,11 @@ button:disabled {
 
 .wallet-trigger {
     text-align: center;
+}
+
+/* Narrow screens fold the wallet and search behind this button. */
+.menu-trigger {
+    display: none;
 }
 
 .app__main {
@@ -411,16 +450,16 @@ button:disabled {
     align-items: center;
 }
 
-/* Popups */
-
+/* Popups hang from a fixed top inset, so content that arrives later extends them downward
+   without moving what is already shown. */
 .modal {
     position: fixed;
     inset: 0;
     z-index: 10;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
-    padding: 2ch;
+    padding: 8vh 2ch 2ch;
     background: rgba(14, 15, 16, 0.72);
 }
 
@@ -450,6 +489,7 @@ button:disabled {
 /* Homepage: histogram, statistics, block log */
 
 .histogram-frame {
+    --histogram-column: 8px;
     flex: 0 0 auto;
     width: 100%;
     display: flex;
@@ -457,54 +497,36 @@ button:disabled {
     overflow: hidden;
 }
 
-/* The ASCII histogram sizes its glyph grid in pixels so columns fit the frame; it is exempt from
-   the text tokens. */
+/*
+ * The histogram is a row of fixed-pixel-width columns, one per observed block, right-aligned so
+ * a new block appends as one whole column. Bars are boxes rather than glyphs so adjacent columns
+ * meet without seams. It is exempt from the text tokens.
+ */
 .histogram {
-    width: max-content;
-    max-width: 100%;
+    width: 100%;
     height: clamp(90px, 13.5vh, 165px);
     margin: 0;
     display: flex;
-    flex-direction: column;
+    align-items: flex-end;
     justify-content: flex-end;
     padding: 0 0 clamp(0.75rem, 1.4vw, 1.5rem);
     border-bottom: 1px solid var(--theme-border);
-    font-family: var(--font-family-mono);
-    font-size: 14px;
-    line-height: 1;
-    letter-spacing: 0;
     overflow: hidden;
-    white-space: pre;
-    justify-self: center;
-    position: relative;
 }
 
-.histogram__plot {
-    position: relative;
-    color: var(--theme-accent);
-    display: flex;
-    flex-direction: column;
-    flex: 0 0 auto;
-    width: max-content;
+/*
+ * A bar's height is its block's share of the visible peak; an actual empty block is a dim
+ * baseline tick, so a run of empty blocks reads as a thin dim line rather than a bead chain.
+ */
+.histogram__column {
+    flex: 0 0 var(--histogram-column);
+    height: calc(var(--bar, 0) * 100%);
+    background: var(--theme-accent);
 }
 
-.histogram__line {
-    display: block;
-}
-
-.histogram__zeros {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    color: var(--theme-text-dim);
-}
-
-.histogram__measure {
-    position: absolute;
-    top: 0;
-    left: 0;
-    visibility: hidden;
-    pointer-events: none;
+.histogram__column--empty {
+    height: 2px;
+    background: var(--theme-text-dim);
 }
 
 .observed-stats {
@@ -588,7 +610,7 @@ button:disabled {
     padding: 0.7ch 0;
     border-bottom: 1px solid var(--theme-border);
     overflow: hidden;
-    animation: block-row-in 180ms ease-out both;
+    animation: block-row-in min(180ms, var(--block-row-fade, 180ms)) ease-out both;
 }
 
 .block-row:hover,
@@ -756,13 +778,6 @@ button:disabled {
     grid-column: 1 / -1;
 }
 
-.wallet__history-values {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-xs) var(--space-md);
-    color: var(--theme-success);
-}
-
 .wallet__actions {
     margin-left: auto;
     display: flex;
@@ -771,7 +786,7 @@ button:disabled {
 }
 
 .wallet__grid {
-    grid-template-columns: minmax(0, 3fr) minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     margin-bottom: var(--space-md);
 }
 
@@ -795,11 +810,6 @@ button:disabled {
 
 /* Transaction rows (submitted transactions, account, block, and transaction pages) */
 
-.tx-list {
-    margin-top: var(--space-sm);
-}
-
-.tx-record,
 .account-tx-row {
     display: flex;
     flex-direction: column;
@@ -808,11 +818,6 @@ button:disabled {
     border-bottom: 1px solid var(--theme-border);
 }
 
-.tx-record:last-child {
-    border-bottom: none;
-}
-
-.tx-record__primary,
 .account-tx-row__main {
     display: flex;
     flex-wrap: wrap;
@@ -821,7 +826,6 @@ button:disabled {
     min-width: 0;
 }
 
-.tx-record__primary .copyable,
 .account-tx-row__main .copyable,
 .tx-party .copyable {
     width: 20ch;
@@ -838,22 +842,11 @@ button:disabled {
     flex: 0 1 auto;
 }
 
-.tx-record__label,
-.tx-record__arrow,
-.tx-record__nonce,
 .account-tx-row__label {
     color: var(--theme-text-dim);
     flex-shrink: 0;
 }
 
-.tx-record__time {
-    margin-left: auto;
-    color: var(--theme-text-dim);
-    white-space: nowrap;
-    flex-shrink: 0;
-}
-
-.tx-record__secondary,
 .account-tx-row__meta {
     min-width: 0;
     display: flex;
@@ -863,11 +856,40 @@ button:disabled {
     color: var(--theme-text-dim);
 }
 
-.tx-record__state {
+/*
+ * Submission timeline: the steps since submission, right-aligned at the end of the row's
+ * metadata line in label size. Each step carries its elapsed time; a failed step ends the line
+ * in error color.
+ */
+.timeline {
+    margin: 0 0 0 auto;
+    padding: 0;
+    list-style: none;
     display: inline-flex;
-    align-items: center;
-    gap: 0.5ch;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-xs) var(--space-md);
+    font-size: var(--text-sm);
     white-space: nowrap;
+    color: var(--theme-text-dim);
+}
+
+.timeline__step {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+}
+
+.timeline__step + .timeline__step::before {
+    content: "›";
+}
+
+.timeline__step--failed {
+    color: var(--theme-error);
+}
+
+.timeline__elapsed {
+    color: var(--theme-text);
 }
 
 .tx-record__detail {
@@ -1020,36 +1042,6 @@ button:disabled {
     white-space: nowrap;
 }
 
-.account-page__modes {
-    display: inline-grid;
-    grid-template-columns: repeat(3, minmax(max-content, 1fr));
-    gap: 1px;
-    border: 1px solid var(--theme-border);
-    background: var(--theme-border);
-}
-
-.account-page__mode {
-    border: 0;
-    color: var(--theme-text-dim);
-    background: var(--theme-background);
-    padding: var(--pad-control);
-    cursor: pointer;
-}
-
-.account-page__mode:hover {
-    color: var(--theme-text);
-}
-
-.account-page__mode--active,
-.account-page__mode--active:hover {
-    color: var(--theme-background);
-    background: var(--theme-text);
-}
-
-.account-page__mode:focus-visible {
-    outline-offset: -1px;
-}
-
 .account-page__pager {
     display: flex;
     gap: var(--space-md);
@@ -1080,6 +1072,7 @@ button:disabled {
 .search {
     grid-area: search;
     justify-self: center;
+    position: relative;
     width: 100%;
     min-width: 0;
     max-width: 42ch;
@@ -1096,12 +1089,25 @@ button:disabled {
     width: 100%;
 }
 
+/* Search feedback drops below the field like a popup, so the header never changes height. */
 .search__status {
+    position: absolute;
+    top: calc(100% + var(--space-xs));
+    left: 0;
+    right: 0;
+    z-index: 1;
+    margin: 0;
+    padding: var(--pad-field);
+    border: 1px solid var(--theme-border);
+    background: var(--theme-background);
+    box-shadow: 0.5ch 0.5ch 0 rgba(0, 0, 0, 0.35);
     color: var(--theme-text-dim);
     font-size: var(--text-sm);
-    min-height: 1lh;
-    margin: var(--space-xs) 0 0;
     overflow-wrap: anywhere;
+}
+
+.search__status:empty {
+    display: none;
 }
 
 /* Narrow screens */
@@ -1134,37 +1140,65 @@ button:disabled {
         --text-lg: 1rem;
     }
 
+    /*
+     * The header is the title and a menu button. A connection status, the wallet and search each
+     * take a full row beneath in that order. The wallet and search show only while the menu is
+     * open, and the height is left out.
+     */
     .app__header {
         padding: var(--gutter);
         gap: 0.75rem var(--gutter);
-        grid-template-columns: minmax(0, 1fr);
-        grid-template-areas: "title" "search" "actions";
+        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-areas: none;
+        align-items: center;
     }
 
-    .app__title {
-        text-align: center;
+    .app__title,
+    .menu-trigger {
+        grid-area: auto;
     }
 
-    .search {
-        max-width: none;
+    .menu-trigger {
+        display: block;
     }
 
     .app__header-actions {
-        justify-self: stretch;
-        flex-wrap: wrap;
-        justify-content: space-between;
+        display: contents;
+    }
+
+    .app__status,
+    .wallet-trigger,
+    .search {
+        grid-area: auto;
+        grid-column: 1 / -1;
     }
 
     .app__status {
-        flex: 1 1 auto;
+        order: 1;
+        justify-content: center;
+        white-space: normal;
+        overflow-wrap: anywhere;
     }
 
     .wallet-trigger {
-        flex: 0 0 auto;
-        max-width: 22ch;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        order: 2;
+    }
+
+    .search {
+        order: 3;
+        max-width: none;
+    }
+
+    .app__header-separator,
+    .app__status--height,
+    .app__header:not(.app__header--menu-open) .wallet-trigger,
+    .app__header:not(.app__header--menu-open) .search {
+        display: none;
+    }
+
+    /* Field hints use the hint size so the search hint fits a narrow field. */
+    input::placeholder {
+        font-size: var(--text-sm);
     }
 
     /* Homepage stacks histogram, statistics, then a scrolling block log. */
@@ -1179,13 +1213,12 @@ button:disabled {
     }
 
     .histogram-frame {
+        --histogram-column: 4px;
         height: clamp(140px, 28dvh, 260px);
     }
 
     .histogram {
-        width: 100%;
         height: 100%;
-        font-size: 7px;
         padding-bottom: 0;
         border-bottom: none;
     }
@@ -1266,6 +1299,7 @@ button:disabled {
     }
 
     .wallet__grid,
+    .wallet__evidence,
     .transfer {
         grid-template-columns: 1fr;
     }
@@ -1275,12 +1309,8 @@ button:disabled {
         gap: var(--space-xs);
     }
 
-    .account-page__modes,
     .account-page__pager {
         width: 100%;
-    }
-
-    .account-page__pager {
         justify-content: flex-end;
     }
 
@@ -1295,10 +1325,6 @@ button:disabled {
         height: 100vh;
         height: 100dvh;
         border: 0;
-    }
-
-    .tx-record__time {
-        margin-left: 0;
     }
 
     .wallet__header {
@@ -1318,20 +1344,12 @@ button:disabled {
 }
 
 @media (max-width: 480px) {
-    .app__status {
-        flex: 1 1 100%;
-    }
-
     .wallet__actions {
         grid-template-columns: 1fr;
     }
 
-    .app__header-separator {
-        display: none;
-    }
-
-    .histogram {
-        font-size: 6px;
+    .histogram-frame {
+        --histogram-column: 3px;
     }
 }
 

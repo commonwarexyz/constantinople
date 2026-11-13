@@ -8,12 +8,19 @@ export interface SearchMatch {
     readonly value: string;
 }
 
+/** The search status for input that is neither an address nor a transaction hash. */
+export const SEARCH_INPUT_INVALID = 'not an address or transaction hash';
+
 export function normalizeSearchQuery(value: string): string {
-    return toHex(parseAccountKeyHex(value.trim().replace(/^0x/i, '')));
+    try {
+        return toHex(parseAccountKeyHex(value.trim().replace(/^0x/i, '')));
+    } catch {
+        throw new Error(SEARCH_INPUT_INVALID);
+    }
 }
 
 /** Returns a navigation hint. Destination pages authenticate their own evidence. */
-export async function searchIndexer(endpoint: string, query: string, signal: AbortSignal): Promise<SearchMatch | null> {
+export async function searchIndexer(endpoint: string, query: string, signal: AbortSignal): Promise<SearchMatch> {
     signal.throwIfAborted();
     const value = normalizeSearchQuery(query);
     try {
@@ -24,7 +31,8 @@ export async function searchIndexer(endpoint: string, query: string, signal: Abo
         }
         return { kind: match.kind === SearchKind.ACCOUNT ? 'account' : 'transaction', value };
     } catch (error) {
-        if (error instanceof ConnectError && error.code === Code.NotFound) return null;
+        signal.throwIfAborted();
+        if (error instanceof ConnectError && error.code === Code.NotFound) return { kind: 'account', value };
         throw error;
     }
 }

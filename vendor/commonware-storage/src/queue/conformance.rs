@@ -1,0 +1,86 @@
+//! Queue conformance tests
+
+use crate::queue::{Config, Error, Queue};
+use commonware_codec::RangeCfg;
+use commonware_conformance::conformance_tests;
+use commonware_runtime::{
+    Supervisor as _,
+    buffer::paged::CacheRef,
+    conformance::{StorageConformance, StorageWorkload},
+};
+use commonware_utils::{NZU16, NZU64, NZUsize};
+use core::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use rand::RngExt as _;
+
+const WRITE_BUFFER: NonZeroUsize = NZUsize!(1024);
+const REPLAY_BUFFER: NonZeroUsize = NZUsize!(1024);
+const ITEMS_PER_SECTION: NonZeroU64 = NZU64!(64);
+const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
+const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
+
+fn config(seed: u64) -> Config<(RangeCfg<usize>, ())> {
+    Config {
+        partition: format!("queue-conformance-{seed}"),
+        items_per_section: ITEMS_PER_SECTION,
+        page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
+        write_buffer: WRITE_BUFFER,
+        replay_buffer: REPLAY_BUFFER,
+        compression: None,
+        codec_config: (RangeCfg::new(0..256), ()),
+    }
+}
+
+struct QueueWorkload;
+
+impl StorageWorkload for QueueWorkload {
+    type Error = Error;
+
+    async fn run(
+        mut context: commonware_runtime::deterministic::Context,
+        seed: u64,
+    ) -> Result<(), Self::Error> {
+        let (mut queue, mut reader) = Queue::<_, Vec<u8>>::init(
+            context.child("queue").with_attribute("index", 0),
+            config(seed),
+        )
+        .await?;
+
+        let items_count = context.random_range(1..(ITEMS_PER_SECTION.get() as usize) * 4);
+        let mut data = vec![Vec::new(); items_count];
+        for item in data.iter_mut() {
+            let size = context.random_range(0..256);
+            item.resize(size, 0);
+            context.fill(item.as_mut_slice());
+        }
+        for item in &data {
+            (queue, _) = queue.enqueue(item).await?;
+        }
+
+        let dequeue_count = items_count / 2;
+        for _ in 0..dequeue_count {
+            let (pos, _) = reader.try_recv().await?.expect("queue should have items");
+            reader.ack(pos)?;
+        }
+
+        // The reader's snapshot keeps the journal's blobs open, so drop both handles before
+        // reopening.
+        queue.sync().await?;
+        drop(reader);
+
+        let (queue, mut reader) = Queue::<_, Vec<u8>>::init(
+            context.child("queue").with_attribute("index", 1),
+            config(seed),
+        )
+        .await?;
+        while let Some((pos, item)) = reader.try_recv().await? {
+            assert_eq!(item, data[pos as usize]);
+            reader.ack(pos)?;
+        }
+        queue.sync().await?;
+        Ok(())
+    }
+}
+
+conformance_tests! {
+    StorageConformance<QueueWorkload> => 512,
+}

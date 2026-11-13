@@ -7,7 +7,8 @@ use commonware_consensus::{
     types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{
-    Digested, Digestible as _, Signer as _, bls12381::primitives::variant::MinSig, sha256,
+    Digest as _, Digested, Digestible as _, Signer as _, bls12381::primitives::variant::MinSig,
+    sha256,
 };
 use commonware_cryptography_curve25519::signing as ed25519;
 use commonware_glue::stateful::{
@@ -21,7 +22,7 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::full::Config as MmrConfig,
-    qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
+    qmdb::{current::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
@@ -29,7 +30,9 @@ use constantinople_application::consensus::{
     Application, Databases, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
-use constantinople_primitives::{Account, AccountKey, Nonce, PublicKeyCache};
+use constantinople_primitives::{
+    Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, StateSyncProof,
+};
 use std::sync::{Arc, Mutex};
 
 type TestCommitment = EngineCommitment<sha256::Sha256, ed25519::VerifyingKey>;
@@ -66,6 +69,7 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
             write_buffer: NZUsize!(4096),
             replay_buffer: NZUsize!(4096),
         },
+        grafted_metadata_partition: "hook-state-grafted-metadata".into(),
         translator: EightCap,
         init_cache: Some(NZUsize!(1024)),
         init_buffer: NZUsize!(1 << 21),
@@ -98,6 +102,7 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
             Some(Account {
                 balance: 1,
                 nonce: Nonce::default(),
+                tx_count: 0,
             }),
         )
         .merkleize()
@@ -105,13 +110,39 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
         .expect("merkleize state");
     let transactions = transactions.merkleize().await.expect("merkleize history");
     let state_target = StateSyncTarget::new(
-        state.root(),
-        non_empty_range!(state.bounds().inactivity_floor, state.bounds().tip.size),
+        state.ops_root(),
+        non_empty_range!(state.sync_boundary(), state.bounds().tip.size),
     );
     let transaction_target = TransactionHistoryTarget {
         root: transactions.root(),
         size: transactions.bounds().tip.size,
     };
+    let block = Block::new(
+        Header {
+            context: Context {
+                round: Round::zero(),
+                leader: ed25519::SigningKey::from_seed(1).public_key(),
+                parent: (View::zero(), TestCommitment::default()),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: 0,
+            timestamp: 0,
+            state_root: state.root(),
+            state_range: non_empty_range!(
+                state.sync_boundary().as_u64(),
+                state.bounds().tip.size.as_u64()
+            ),
+            transactions_root: transactions.root(),
+            transactions_range: non_empty_range!(0, transactions.bounds().tip.size.as_u64()),
+        },
+        Vec::new(),
+        StateSyncProof {
+            ops_root: state.ops_root(),
+            witness: state.ops_root_witness().clone(),
+        },
+    )
+    .seal(&mut sha256::Sha256::default())
+    .into();
     let inner = Application::new(
         context.child("app"),
         Sequential,
@@ -122,8 +153,7 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
         state_target,
         transaction_target,
     );
-    let mut app = TestApp::new(inner, None);
-    let block = app.genesis().await;
+    let app = TestApp::new(inner, None);
     (app, dbs, (state, transactions), block)
 }
 
@@ -140,7 +170,10 @@ fn finalized_hook_shares_the_engine_block_allocation() {
             let expected = hook_expected.clone();
             Box::pin(async move {
                 assert!(Arc::ptr_eq(&shared, &expected));
-                assert_eq!(artifacts.state.root, shared.header.state_root);
+                assert_eq!(artifacts.state.root, shared.state_sync.ops_root);
+                assert_eq!(artifacts.state_boundary.root, shared.header.state_root);
+                assert_eq!(artifacts.state_boundary.witness, shared.state_sync.witness);
+                assert!(shared.verify_state_root());
                 assert_eq!(artifacts.transactions.root, shared.header.transactions_root);
                 assert!(!artifacts.state.operations.is_empty());
 

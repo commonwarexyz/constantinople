@@ -1,0 +1,436 @@
+//! Shared types for Merkle-family data structures (MMR, MMB).
+//!
+//! This module provides generic `Position<F>` and `Location<F>` types parameterized by a
+//! [`Family`] marker trait. Each Merkle family (e.g. MMR, MMB) implements the trait with
+//! its own constants and conversion formulas, while the shared arithmetic, codec, and comparison
+//! logic lives here.
+
+pub mod batch;
+#[cfg(test)]
+pub(crate) mod conformance;
+pub mod hasher;
+#[cfg(feature = "std")]
+mod persisted;
+#[cfg(feature = "std")]
+pub use persisted::{compact, full};
+mod location;
+pub mod mem;
+pub mod mmb;
+pub mod mmr;
+pub mod path;
+mod position;
+mod proof;
+mod read;
+#[cfg(feature = "std")]
+pub mod storage;
+#[cfg(feature = "std")]
+pub mod verification;
+
+use bytes::BufMut;
+use commonware_codec::{Buf, EncodeSize, Read, Write};
+use commonware_cryptography::Digest;
+use core::fmt::Debug;
+pub use location::{Location, LocationRangeExt};
+pub use position::Position;
+pub use proof::{
+    ElementPlan, MAX_PROOF_DIGESTS_PER_ELEMENT, Proof, RangePlan, multi_proof_positions,
+};
+pub use read::Readable;
+use thiserror::Error;
+
+/// Safe upper bound on the number of pinned nodes for any u64-backed Merkle family.
+///
+/// Pinned nodes are produced by [`Family::nodes_to_pin`], whose default
+/// implementation returns the peaks of the sub-structure at the prune
+/// location. A structure with `n` leaves has at most `popcount(n)` peaks, and
+/// since [`Location`] is backed by a `u64`, `n <= u64::MAX` yields at most 64
+/// peaks.
+pub const MAX_PINNED_NODES: usize = 64;
+
+/// Defines the strategy used to fold peaks into the final root digest.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Bagging {
+    /// Peaks are bagged forward from oldest to newest, placing the smallest peak at the top.
+    ForwardFold,
+    /// Peaks are bagged backward from newest to oldest, placing the largest peak at the top.
+    BackwardFold,
+}
+
+impl Bagging {
+    /// Domain tag committed by every root folded under this policy.
+    ///
+    /// Tags are unique across policies. Changing one changes every root folded under that policy.
+    pub const fn domain(self) -> u8 {
+        match self {
+            Self::ForwardFold => 0,
+            Self::BackwardFold => 1,
+        }
+    }
+}
+
+/// Marker trait for Merkle-family data structures.
+///
+/// Provides the per-family constants and conversion functions that differentiate
+/// MMR from MMB (or other future Merkle structures). Families capture structural topology
+/// only; bagging is owned by the [`hasher::Hasher`] instance and supplied by the consumer.
+pub trait Family: Copy + Debug + Default + Send + Sync + 'static {
+    /// Domain tag committed by every root of this family.
+    ///
+    /// Tags are unique across families. Changing one changes every root of that family.
+    const DOMAIN: u8;
+
+    /// Maximum valid node count / size.
+    const MAX_NODES: Position<Self>;
+
+    /// Maximum valid leaf count.
+    const MAX_LEAVES: Location<Self>;
+
+    /// Convert a leaf location to its node position, or equivalently, convert a leaf count to the
+    /// corresponding total node count (size).
+    ///
+    /// The public, guaranteed domain is `loc <= MAX_LEAVES`. Some implementations may also accept
+    /// slightly larger temporary values for internal probing (for example, when checking the next
+    /// size boundary), but callers must not rely on that behavior.
+    fn location_to_position(loc: Location<Self>) -> Position<Self>;
+
+    /// Convert a node position to its leaf location, or `None` if the position is not a leaf.
+    /// Equivalently, convert a total node count (size) to the corresponding leaf count, returning
+    /// `None` if the size is not valid.
+    ///
+    /// The caller guarantees `pos <= MAX_NODES`.
+    fn position_to_location(pos: Position<Self>) -> Option<Location<Self>>;
+
+    /// Whether `size` is a valid tree size for this Merkle structure.
+    fn is_valid_size(size: Position<Self>) -> bool;
+
+    /// Returns the largest valid size that is no greater than `size`.
+    fn to_nearest_size(size: Position<Self>) -> Position<Self>;
+
+    /// Return the peaks of a structure with the given `size` as `(position, height)` pairs
+    /// in canonical oldest-to-newest order (suitable for
+    /// [`Hasher::root`](crate::merkle::hasher::Hasher::root)).
+    fn peaks(size: Position<Self>) -> impl Iterator<Item = (Position<Self>, u32)> + Send;
+
+    /// Count the number of oldest peaks that are entirely inactive.
+    ///
+    /// A peak is considered entirely inactive if all of its leaves strictly precede the
+    /// `inactivity_floor`. These peaks can be safely bagged forward into the `grafted_root`.
+    fn inactive_peaks(size: Location<Self>, inactivity_floor: Location<Self>) -> usize {
+        let mut inactive_count = 0;
+        let mut leaf_capacity_sum = 0u64;
+        for (_, height) in Self::peaks(Self::location_to_position(size)) {
+            let capacity = 1u64.checked_shl(height).expect("height excessively large");
+            leaf_capacity_sum = leaf_capacity_sum
+                .checked_add(capacity)
+                .expect("capacity overflow");
+            if leaf_capacity_sum <= *inactivity_floor {
+                inactive_count += 1;
+            } else {
+                break;
+            }
+        }
+        inactive_count
+    }
+
+    /// Compute positions of nodes that must be pinned when pruning to `prune_loc`.
+    ///
+    /// Pinned nodes are the minimal set of pruned digests required to continue growing the
+    /// structure and recomputing its root after pruning. The default implementation returns the
+    /// peaks of the sub-structure at `prune_loc`, which is sufficient for both root computation and
+    /// re-merkleization of retained leaves. Implementations may override this if their family
+    /// requires a different canonical pinned-node set for the pruning boundary.
+    ///
+    /// # Panics
+    ///
+    /// Implementations panic if `prune_loc` is invalid (i.e., exceeds
+    /// [`MAX_LEAVES`](Self::MAX_LEAVES)). Callers must validate inputs before calling.
+    fn nodes_to_pin(prune_loc: Location<Self>) -> impl Iterator<Item = Position<Self>> + Send {
+        let prune_pos = Self::location_to_position(prune_loc);
+        Self::peaks(prune_pos)
+            .filter(move |&(pos, _)| pos < prune_pos)
+            .map(|(pos, _)| pos)
+    }
+
+    /// Return the positions of the left and right children of the node at `pos` with the
+    /// given `height`. The caller guarantees `height > 0` (leaves have no children).
+    fn children(pos: Position<Self>, height: u32) -> (Position<Self>, Position<Self>);
+
+    /// Return the heights of the internal nodes that lie between `size_for(N)` and
+    /// `size_for(N+1)`, where `N` is the given leaf count. These are the nodes created
+    /// when the `N`-th leaf is appended.
+    fn parent_heights(leaves: Location<Self>) -> impl Iterator<Item = u32>;
+
+    /// Return the height of the node at `pos`.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if `pos` does not correspond to a node that exists in some valid
+    /// instance of this family (i.e., it is not a position that would appear in a structure of any
+    /// size).
+    fn pos_to_height(pos: Position<Self>) -> u32;
+}
+
+/// Pending-chunk slot for Merkle families that do not carry a pending chunk (e.g. MMR).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Unused;
+
+impl Write for Unused {
+    #[inline]
+    fn write(&self, _: &mut impl BufMut) {}
+}
+
+impl EncodeSize for Unused {
+    #[inline]
+    fn encode_size(&self) -> usize {
+        0
+    }
+}
+
+impl Read for Unused {
+    type Cfg = ();
+
+    #[inline]
+    fn read_cfg(_: &mut impl Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
+        Ok(Self)
+    }
+}
+
+impl<D: Digest> TryFrom<Option<D>> for Unused {
+    type Error = commonware_codec::Error;
+
+    #[inline]
+    fn try_from(value: Option<D>) -> Result<Self, Self::Error> {
+        match value {
+            None => Ok(Self),
+            Some(_) => Err(commonware_codec::Error::Invalid(
+                "PendingChunk",
+                "pending chunk present for family without pending chunks",
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl arbitrary::Arbitrary<'_> for Unused {
+    fn arbitrary(_: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(Self)
+    }
+}
+
+/// The pending-chunk slot carried by a [Graftable] family's proof and witness types.
+pub trait PendingChunk<D: Digest>:
+    Clone
+    + Debug
+    + Eq
+    + Write
+    + EncodeSize
+    + Read<Cfg = ()>
+    + Send
+    + Sync
+    + TryFrom<Option<D>, Error: Debug>
+{
+    /// View the slot as an `Option<&D>`.
+    fn as_ref(&self) -> Option<&D> {
+        None
+    }
+}
+
+impl<D: Digest> PendingChunk<D> for Option<D> {
+    #[inline]
+    fn as_ref(&self) -> Option<&D> {
+        Self::as_ref(self)
+    }
+}
+
+impl<D: Digest> PendingChunk<D> for Unused {}
+
+/// Extension of [`Family`] with methods needed for grafting bitmap chunks onto a Merkle structure.
+/// Grafting combines an activity bitmap with an ops Merkle structure by hashing bitmap chunks
+/// together with ops subtree roots. These methods provide the coordinate conversions and
+/// chunk-to-peak mappings required by that process.
+pub trait Graftable: Family {
+    /// The pending-chunk slot type for this family's proofs and witnesses.
+    type PendingChunk<D: Digest>: PendingChunk<D>;
+
+    /// Return the nodes that collectively cover the leaf range of a bitmap chunk in a structure of
+    /// the given `size`.
+    ///
+    /// A chunk at index `chunk_idx` with grafting height `grafting_height` covers leaves
+    /// `[chunk_idx << grafting_height, (chunk_idx + 1) << grafting_height)`. The returned nodes
+    /// partition that range: each node's leaf range is entirely within the chunk, and together they
+    /// cover it exactly.
+    ///
+    /// Results are returned in oldest-to-newest (left-to-right) order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is not a valid size or if the chunk's leaf range exceeds the structure's
+    /// leaf count.
+    fn chunk_peaks(
+        size: Position<Self>,
+        chunk_idx: u64,
+        grafting_height: u32,
+    ) -> impl Iterator<Item = (Position<Self>, u32)> + Send;
+
+    /// Return the deterministic position of the node at `height` whose leftmost leaf is at
+    /// `leaf_start`.
+    ///
+    /// For some families, this position corresponds to a node that physically exists in any
+    /// structure containing those leaves. For others (e.g. MMB with delayed merging), it may be a
+    /// "virtual" position that no actual node occupies, but is still deterministic and unique for
+    /// the given leaf range and height.
+    ///
+    /// Used by grafting to map grafted-structure positions to ops-structure positions for domain
+    /// separation in hash pre-images.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `height` is excessively large (e.g., `>= 63`), or if the resulting position
+    /// computation overflows the bounds of the underlying numeric types.
+    fn subtree_root_position(leaf_start: Location<Self>, height: u32) -> Position<Self>;
+
+    /// Return the location of the leftmost leaf covered by the node at `pos` with `height`. For a
+    /// leaf (height 0), returns its own location.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `height` is excessively large (e.g., `>= 63`), or if an invalid combination of
+    /// `pos` and `height` results in arithmetic underflow/overflow.
+    fn leftmost_leaf(pos: Position<Self>, height: u32) -> Location<Self>;
+
+    /// Return the minimum leaf count at which the node at `pos` with `height` exists in the
+    /// structure.
+    ///
+    /// For families without delayed merging (e.g. MMR), a node exists as soon as all leaves
+    /// in its span have been appended. For families with delayed merging (e.g. MMB), the
+    /// node is created some number of leaf insertions _after_ its last leaf, so the birth
+    /// size is larger. The MMB override accounts for this delay.
+    ///
+    /// This is used by the grafted-tree pruning logic to determine when a chunk-pair's
+    /// parent has been born in the ops tree, which controls when it is safe to prune the
+    /// pair's individual grafted leaves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `height` is excessively large (e.g., `>= 63`), or if arithmetic overflows.
+    fn peak_birth_size(pos: Position<Self>, height: u32) -> u64 {
+        let leftmost = *Self::leftmost_leaf(pos, height);
+        let width = 1u64.checked_shl(height).expect("height excessively large");
+        leftmost.checked_add(width).expect("birth size overflow")
+    }
+}
+
+/// Errors that can occur when interacting with a Merkle-family data structure.
+#[derive(Debug, Error)]
+pub enum Error<F: Family> {
+    /// The position does not correspond to a leaf node.
+    #[error("{0} is not a leaf")]
+    NonLeaf(Position<F>),
+
+    /// The position exceeds the valid range.
+    #[error("{0} > MAX_NODES")]
+    PositionOverflow(Position<F>),
+
+    /// The location exceeds the valid range.
+    #[error("{0} > MAX_LEAVES")]
+    LocationOverflow(Location<F>),
+
+    /// The range is empty but must contain at least one element.
+    #[error("range is empty")]
+    Empty,
+
+    /// The end of a range is out of bounds.
+    #[error("range end out of bounds: {0}")]
+    RangeOutOfBounds(Location<F>),
+
+    /// The requested size is invalid.
+    #[error("invalid size: {0}")]
+    InvalidSize(u64),
+
+    /// A requested leaf location exceeds the current leaf count.
+    #[error("leaf location out of bounds: {0}")]
+    LeafOutOfBounds(Location<F>),
+
+    /// A requested leaf location repeats the location before it.
+    #[error("duplicate leaf location: {0}")]
+    DuplicateLocation(Location<F>),
+
+    /// A requested leaf location is less than the location before it.
+    #[error("unsorted leaf location: {0}")]
+    UnsortedLocation(Location<F>),
+
+    /// A required node was not available (e.g. pruned).
+    #[error("element pruned: {0}")]
+    ElementPruned(Position<F>),
+
+    /// A required digest was compressed into a synthetic accumulator (e.g. a backward-fold
+    /// suffix accumulator) when the source proof was constructed, so it is not individually
+    /// available. Unlike [`Error::ElementPruned`], the digest still exists in the source
+    /// structure; the caller can recover by supplying it through an explicit witness slice.
+    #[error("digest hidden behind synthetic accumulator: {0}")]
+    CompressedDigest(Position<F>),
+
+    /// The provided pinned node list does not match the expected pruning boundary.
+    #[error("invalid pinned nodes")]
+    InvalidPinnedNodes,
+
+    /// The structure is at none of the states recorded by the batch's chain, so applying the
+    /// batch would combine it with a different history.
+    #[error("stale batch: no matching chain state (size {actual}, fork size {expected})")]
+    StaleBatch {
+        /// The base size when the batch chain was forked.
+        expected: Position<F>,
+        /// The current structure size.
+        actual: Position<F>,
+    },
+
+    /// An unapplied ancestor batch was dropped before this batch was merkleized, so this batch
+    /// lacks that ancestor's changes. Keep an ancestor alive until it is applied or until the
+    /// descendants that will be applied have been merkleized.
+    #[error("ancestor dropped: expected size {expected}, actual size {actual}")]
+    AncestorDropped {
+        /// The size the structure would have after applying the batch and its ancestors.
+        expected: Position<F>,
+        /// The structure's size when the batch was rejected.
+        actual: Position<F>,
+    },
+
+    /// The proof is invalid.
+    #[error("invalid proof")]
+    InvalidProof,
+
+    /// The requested inactive peak count cannot be represented by the current peak list.
+    #[error("inactive peak count {requested} exceeds peak count {peaks}")]
+    InvalidInactivePeaks {
+        /// Requested inactive peak count.
+        requested: usize,
+        /// Number of available peaks.
+        peaks: usize,
+    },
+
+    /// The root does not match the computed root.
+    #[error("root mismatch")]
+    RootMismatch,
+
+    /// A metadata error occurred.
+    #[cfg(feature = "std")]
+    #[error("metadata error: {0}")]
+    Metadata(#[from] crate::metadata::Error),
+
+    /// A journal error occurred.
+    #[cfg(feature = "std")]
+    #[error("journal error: {0}")]
+    Journal(#[from] crate::journal::Error),
+
+    /// A required node is missing.
+    #[error("missing node: {0}")]
+    MissingNode(Position<F>),
+
+    /// Data is corrupted.
+    #[error("data corrupted: {0}")]
+    DataCorrupted(&'static str),
+
+    /// Bit offset is out of bounds.
+    #[error("bit offset {0} out of bounds (size: {1})")]
+    BitOutOfBounds(u64, u64),
+}
