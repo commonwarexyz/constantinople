@@ -65,6 +65,8 @@ service details.
 
 See [`deploy/README.md`](./bin/deploy/README.md).
 
+See [`PERFORMANCE.md`](./PERFORMANCE.md) for how a fleet performs under different configurations.
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md).

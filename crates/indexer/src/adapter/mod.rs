@@ -2,7 +2,7 @@
 
 use crate::{
     adapter_metrics::{AdapterMetrics, serve_metrics, track_requests},
-    require_store_ready, store_client,
+    store_client, wait_for_store_ready,
 };
 use axum::{Router, middleware, routing::get};
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -68,7 +68,7 @@ async fn serve(
     routes: impl FnOnce(&StoreClient, Option<&str>) -> Result<Router, BoxError>,
 ) -> Result<(), BoxError> {
     let client = store_client(&settings.store_url, settings.api_key.as_deref())?;
-    require_store_ready(&client).await?;
+    wait_for_store_ready(&client).await;
     let metrics = AdapterMetrics::new();
     let app = build_app(
         routes(&client, settings.relayer_url.as_deref())?,
