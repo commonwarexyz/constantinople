@@ -173,7 +173,7 @@ impl Recorded {
                 inactive_peaks: inactive_peaks(&self.block, transactions),
                 digests,
             },
-            operations: vec![(location, operation.encode().to_vec())],
+            operations: vec![(location, operation.encode())],
         };
 
         // Block one has no parent header. Every later block links to its parent's digest.

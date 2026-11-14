@@ -780,7 +780,9 @@ async fn assert_transaction_proof(client: &StoreClient, bundle: &Value, certifie
 
     // A changed operation or root must fail verification.
     let mut changed = proof.clone();
-    changed.operations[0].1[0] ^= 1;
+    let mut operation = changed.operations[0].1.to_vec();
+    operation[0] ^= 1;
+    changed.operations[0].1 = operation.into();
     assert!(!changed.verify::<Sha256>());
     let mut wrong_root = proof;
     wrong_root.ops_root = Digest::EMPTY;

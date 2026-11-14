@@ -246,6 +246,10 @@ pub(crate) struct LocalArgs {
     /// leaves RocksDB's stock parallelism.
     #[arg(long = "chain-indexer-db-parallelism")]
     chain_indexer_db_parallelism: Option<i32>,
+    /// Compaction rate limit in megabytes per second for the local
+    /// `chain-indexer` store. Omitted leaves compaction unlimited.
+    #[arg(long = "chain-indexer-db-compaction-rate-limit")]
+    chain_indexer_db_compaction_rate_limit: Option<NonZeroU32>,
     /// Local `explorer-indexer` HTTP port.
     #[arg(long = "explorer-indexer-port", default_value_t = DEFAULT_EXPLORER_INDEXER_PORT)]
     explorer_indexer_port: u16,
@@ -333,6 +337,10 @@ pub(crate) struct RemoteArgs {
     /// leaves RocksDB's stock parallelism.
     #[arg(long = "chain-indexer-db-parallelism")]
     chain_indexer_db_parallelism: Option<i32>,
+    /// Compaction rate limit in megabytes per second for the shared
+    /// `chain-indexer` store. Omitted leaves compaction unlimited.
+    #[arg(long = "chain-indexer-db-compaction-rate-limit")]
+    chain_indexer_db_compaction_rate_limit: Option<NonZeroU32>,
     /// Shared `explorer-indexer` HTTP port.
     #[arg(long = "explorer-indexer-port", default_value_t = DEFAULT_EXPLORER_INDEXER_PORT)]
     explorer_indexer_port: u16,
@@ -575,6 +583,10 @@ pub(crate) struct ChainIndexerConfig {
     /// leaves RocksDB's stock parallelism.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_parallelism: Option<i32>,
+    /// Compaction rate limit in megabytes per second. Omitted leaves
+    /// compaction unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_compaction_rate_limit: Option<NonZeroU32>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

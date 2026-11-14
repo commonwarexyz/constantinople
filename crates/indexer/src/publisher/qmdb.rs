@@ -3437,9 +3437,7 @@ mod tests {
                         },
                     ] {
                         checkpoint.encoded_operations[0] =
-                            TransactionOperation::<Sha256>::Append(altered)
-                                .encode()
-                                .to_vec();
+                            TransactionOperation::<Sha256>::Append(altered).encode();
                         assert!(!checkpoint.verify::<Sha256>());
                     }
                 }

@@ -21,6 +21,8 @@ usage() {
     echo "  --spammer-submitters <count>            default 500 rotating, 200 stable" >&2
     echo "  --max-pool-bytes <bytes>                default deploy CLI value rotating, 536870912 stable" >&2
     echo "  --storage-size <gib>                    default 300" >&2
+    echo "  --chain-indexer-compaction-rate-limit <mb/s>" >&2
+    echo "                                          default unlimited, managed chain-indexer only" >&2
 }
 
 reset_options() {
@@ -39,6 +41,7 @@ reset_options() {
     # Validators retain up to about 10,500 blocks, which is 164 GiB of full
     # 16 MiB blocks, beside their state.
     STORAGE_SIZE=300
+    CHAIN_INDEXER_COMPACTION_RATE_LIMIT=
     GENERATE_ARGS=()
     # The indexer runs the validator binary, which is built for the validators'
     # CPU model (see docker/docker-bake.hcl). Keep it on the same vendor.
@@ -93,6 +96,9 @@ parse_options() {
             --storage-size)
                 target=STORAGE_SIZE
                 ;;
+            --chain-indexer-compaction-rate-limit)
+                target=CHAIN_INDEXER_COMPACTION_RATE_LIMIT
+                ;;
             *)
                 echo "unknown option $option" >&2
                 usage
@@ -116,6 +122,10 @@ prepare_deployment() {
     fi
     if [ -n "$INDEXER_URL" ] && [ -z "$STORE_URL" ]; then
         echo "--indexer-url requires --store-url" >&2
+        return 2
+    fi
+    if [ -n "$CHAIN_INDEXER_COMPACTION_RATE_LIMIT" ] && [ -n "$STORE_URL" ]; then
+        echo "--chain-indexer-compaction-rate-limit requires the managed chain-indexer" >&2
         return 2
     fi
 
@@ -214,6 +224,9 @@ prepare_deployment() {
             --chain-indexer-storage-iops 3000
             --chain-indexer-db-parallelism 12
         )
+        if [ -n "$CHAIN_INDEXER_COMPACTION_RATE_LIMIT" ]; then
+            REMOTE_ARGS+=(--chain-indexer-db-compaction-rate-limit "$CHAIN_INDEXER_COMPACTION_RATE_LIMIT")
+        fi
     fi
 
     if [ -n "$INDEXER_URL" ]; then
