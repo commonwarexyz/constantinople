@@ -46,6 +46,8 @@ const ROCKS_COMPACTION_READAHEAD_SIZE: usize = 8 * 1024 * 1024;
 const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 256 * 1024 * 1024;
 const ROCKS_STAGE_WORKERS: usize = 4;
 const ROCKS_MAX_QUEUED_WAVES: usize = 4;
+const ROCKS_LOG_MERGE_FILES: usize = 1024;
+const ROCKS_MAX_OPEN_FILES: i32 = 16_384;
 const DEFAULT_METRICS_PORT: u16 = 9090;
 
 #[derive(Debug, Parser)]
@@ -221,7 +223,8 @@ async fn serve_metrics(State(registry): State<Arc<Registry>>) -> String {
 ///
 /// Only DB-scoped options apply here: the store owns its column-family
 /// options (tuned to its write path), and its ingest path writes SSTs
-/// directly (no WAL or memtables), so write-path tuning has no effect.
+/// directly for all but some small commit groups, so write-path tuning
+/// has little effect.
 fn chain_indexer_db_options(db_parallelism: Option<i32>) -> Options {
     let mut opts = Options::default();
     if let Some(jobs) = db_parallelism {
@@ -231,6 +234,10 @@ fn chain_indexer_db_options(db_parallelism: Option<i32>) -> Options {
     opts.set_max_subcompactions(ROCKS_MAX_SUBCOMPACTIONS);
     opts.set_bytes_per_sync(ROCKS_SYNC_BYTES);
     opts.set_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE);
+
+    // Stock RocksDB keeps every table file open. The cap bounds open tables when the backlog of
+    // log files awaiting a merge grows.
+    opts.set_max_open_files(ROCKS_MAX_OPEN_FILES);
     opts
 }
 
@@ -244,6 +251,8 @@ fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
                 .expect("rocks stage worker count must be nonzero"),
             max_queued_waves: NonZeroUsize::new(ROCKS_MAX_QUEUED_WAVES)
                 .expect("rocks queued wave limit must be nonzero"),
+            log_merge_files: NonZeroUsize::new(ROCKS_LOG_MERGE_FILES)
+                .expect("rocks log merge file count must be nonzero"),
         },
     }
 }

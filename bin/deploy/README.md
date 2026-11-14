@@ -559,7 +559,8 @@ The explorer server accepts `--store-url`, `--relayer-url`, `--port`,
 both service URLs resolve through the deployer host map. An explicit CLI Store
 URL overrides the YAML URL and drops its associated credential.
 
-The server probes Store readiness before binding. `/health` and `/ready`
+The server waits for the Store to report readiness before binding, probing
+again every second. `/health` and `/ready`
 indicate completed startup, not ongoing Store availability. Managed deployment
 sets `metrics_port: 9090` on a separate listener. The browser only needs access
 to the explorer API; Store, SQL, and QMDB access stays on the server.

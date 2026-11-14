@@ -71,6 +71,7 @@ use commonware_storage::{
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{AccountKey, Header, LazySignedTransaction, SignedTransaction};
+use futures::future::{Either, ready};
 use std::{future::Future, sync::Arc, time::Duration};
 use tracing::{Instrument as _, info_span};
 
@@ -286,6 +287,11 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// After settlement, history entries take their indices from the final account
 /// counts and append in block order while state merkleization runs. An empty
 /// selection proposes an empty block so an idle chain keeps making progress.
+///
+/// The body shares the encoding buffers its candidates arrived with. When any
+/// candidate was left out, the body's encoding moves into one buffer of its own
+/// during the merkleize, so the block does not keep a dropped candidate's
+/// encoding alive.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S, I>(
@@ -318,6 +324,10 @@ where
     // Each accepted transaction adds its length-prefixed encoding to the body's encoded size, so
     // the block's size needs no pass over the body.
     let mut framed_bytes = 0usize;
+
+    // Every candidate a round receives is counted, so the finished body can tell whether it
+    // kept them all.
+    let mut offered = 0usize;
     let mut candidates = candidates;
 
     let deadline = clock.current() + BUILD_TIMEOUT;
@@ -326,6 +336,7 @@ where
         if candidates.is_empty() {
             break;
         }
+        offered += candidates.len();
 
         // A proposer chooses its body, so candidates that fail to decode or
         // prepare can be excluded. Keep one prepared candidate per transaction
@@ -494,19 +505,37 @@ where
         })
     });
 
-    let body_size = body.len().encode_size() + framed_bytes;
+    let transaction_count = body.len();
+    let body_size = transaction_count.encode_size() + framed_bytes;
+
+    // A body that kept every candidate uses every byte of the buffers their encodings arrived
+    // in. A body that left candidates out would keep their encodings alive for as long as the
+    // block lives, so its transactions move into a buffer of their own. The merkleize does not
+    // read the body, so the move runs beside it.
+    let body = if transaction_count == offered {
+        Either::Left(ready(body))
+    } else {
+        let pack_span = info_span!("application.execute.pack", txs = transaction_count.traced());
+        Either::Right(strategy.spawn(transaction_count, move |_: S| {
+            pack_span.in_scope(|| {
+                let mut body = body;
+                LazySignedTransaction::pack(&mut body);
+                body
+            })
+        }))
+    };
     let block = finalize_child(
         staged,
         slots,
         transaction_batch,
         parent_floor,
-        body.len(),
+        transaction_count,
         "database merkleization must succeed",
     )
     .await;
     ProposalExecution {
         block,
-        body: Arc::new(body),
+        body: Arc::new(body.await),
         body_size,
     }
 }

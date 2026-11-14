@@ -18,6 +18,12 @@ where
     /// signature accepted, held in the handle a block body stores so the proposal can take them
     /// without copying.
     ///
+    /// Returned transactions should keep no other bytes alive. Each carries its encoding in a
+    /// buffer that holds only transactions of this response (see
+    /// [`LazySignedTransaction::pack`]), and its decoded value is not a view into a larger
+    /// buffer. A block that keeps all of them then encodes by copying those buffers, which stay
+    /// alive for as long as the block does.
+    ///
     /// `round` is the consensus round the proposal targets. Speculative
     /// pre-builds call this before the round is entered and before `parent`
     /// certifies, so implementations must not assume the round is live or

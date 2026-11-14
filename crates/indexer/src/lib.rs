@@ -23,6 +23,5 @@ mod test_store;
 pub use client::{FinalizedPublicationTarget, IndexerClient, ReadError, TransactionMetadata};
 pub use publisher::{CertificateReporter, Publisher};
 pub use store::{
-    StoreClient, StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,
-    writer_store_client,
+    StoreClient, StoreClientBuildError, store_client, wait_for_store_ready, writer_store_client,
 };

@@ -698,6 +698,53 @@ mod tests {
         assert_eq!(block.encode(), cloned.encode());
     }
 
+    #[test]
+    fn packed_block_encodes_like_a_block_built_from_values() {
+        use crate::auth::tests::{
+            ed25519_signer, ed25519_transaction, webauthn_signer, webauthn_transaction,
+        };
+        type TestBlock = Block<sha256::Digest, ed25519::VerifyingKey, sha256::Sha256>;
+
+        // Build a block from decoded values of both signature schemes. Its encoding walks the
+        // values.
+        let transactions = vec![
+            ed25519_transaction(&ed25519_signer(0), 0),
+            webauthn_transaction(&webauthn_signer(0), 1),
+            ed25519_transaction(&ed25519_signer(1), 2),
+        ];
+        let expected = TestBlock::new(
+            test_header(),
+            transactions.clone(),
+            StateSyncProof::initial::<sha256::Sha256>(),
+        );
+        let encoded = expected.encode();
+
+        // Pack the same body, as a transaction source does before a proposal takes it.
+        let mut body: Vec<_> = transactions
+            .into_iter()
+            .map(LazySignedTransaction::new)
+            .collect();
+        LazySignedTransaction::pack(&mut body);
+        let packed = TestBlock {
+            header: test_header(),
+            state_sync: StateSyncProof::initial::<sha256::Sha256>(),
+            body: Arc::new(body),
+        };
+
+        // The packed block has the same bytes, size and digest, so its erasure-coded shards
+        // and the block other validators decode are the same too.
+        assert_eq!(packed.encode(), encoded);
+        assert_eq!(packed.encode_size(), encoded.len());
+        assert_eq!(packed, expected);
+        assert_eq!(
+            packed.clone().seal(&mut sha256::Sha256::default()).seal(),
+            expected.clone().seal(&mut sha256::Sha256::default()).seal()
+        );
+        let decoded = TestBlock::decode_cfg(packed.encode(), &BlockCfg::default()).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.encode(), encoded);
+    }
+
     fn encoded_block_with_size(size: usize) -> Vec<u8> {
         let mut encoded = test_header().encode().to_vec();
         StateSyncProof::initial::<sha256::Sha256>().write(&mut encoded);

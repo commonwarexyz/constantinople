@@ -4,10 +4,14 @@ use exoware_sdk::{
     transport::BalancedHttp2Config,
 };
 use std::time::Duration;
+use tracing::warn;
 
-/// Failure from the adapter's startup readiness check.
+/// Pause between Store readiness probes at startup.
+const STORE_READY_RETRY: Duration = Duration::from_secs(1);
+
+/// Failure of one Store readiness probe.
 #[derive(Debug, thiserror::Error)]
-pub enum StoreReadinessError {
+enum StoreReadinessError {
     /// The Store answered the probe but did not report readiness.
     #[error("Store readiness probe returned a non-success response")]
     NotReady,
@@ -48,8 +52,8 @@ fn store_client_builder(url: &str, api_key: Option<&str>) -> StoreClientBuilder 
     }
 }
 
-/// Requires one successful Store readiness response.
-pub async fn require_store_ready(client: &StoreClient) -> Result<(), StoreReadinessError> {
+/// Sends one readiness probe to the Store.
+async fn probe_store_ready(client: &StoreClient) -> Result<(), StoreReadinessError> {
     match client.ready().await {
         Ok(true) => Ok(()),
         Ok(false) => Err(StoreReadinessError::NotReady),
@@ -57,11 +61,23 @@ pub async fn require_store_ready(client: &StoreClient) -> Result<(), StoreReadin
     }
 }
 
+/// Waits until the Store reports readiness, probing again after every failure.
+///
+/// A deployment starts the adapter and the Store together, and the Store can take longer to
+/// listen. The adapter has nothing to serve without the Store, so it waits for as long as that
+/// takes instead of exiting.
+pub async fn wait_for_store_ready(client: &StoreClient) {
+    while let Err(error) = probe_store_ready(client).await {
+        warn!(?error, "Store is not ready, probing again");
+        tokio::time::sleep(STORE_READY_RETRY).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,
-        writer_store_client,
+        StoreClientBuildError, StoreReadinessError, probe_store_ready, store_client,
+        wait_for_store_ready, writer_store_client,
     };
     use axum::{
         Router,
@@ -368,11 +384,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_succeeds_after_exactly_one_probe() {
+    async fn probe_succeeds_after_exactly_one_request() {
         let (url, requests, task) = readiness_server(StatusCode::OK).await;
         let client = store_client(&url, None).expect("client should build");
 
-        require_store_ready(&client)
+        probe_store_ready(&client)
             .await
             .expect("Store should be ready");
 
@@ -381,11 +397,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_rejects_non_success_after_exactly_one_probe() {
+    async fn probe_rejects_non_success_after_exactly_one_request() {
         let (url, requests, task) = readiness_server(StatusCode::SERVICE_UNAVAILABLE).await;
         let client = store_client(&url, None).expect("client should build");
 
-        let error = require_store_ready(&client)
+        let error = probe_store_ready(&client)
             .await
             .expect_err("Store should not be ready");
 
@@ -395,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_rejects_transport_errors() {
+    async fn probe_rejects_transport_errors() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("temporary listener should bind");
@@ -406,10 +422,46 @@ mod tests {
         let client = store_client(&format!("http://{address}"), None)
             .expect("client should build for a closed address");
 
-        let error = require_store_ready(&client)
+        let error = probe_store_ready(&client)
             .await
             .expect_err("closed address should fail");
 
         assert!(matches!(error, StoreReadinessError::Probe(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_probes_until_the_store_is_ready() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/ready",
+            get(move || {
+                let observed = observed.clone();
+                async move {
+                    if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("readiness listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("readiness listener should have an address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("readiness server should run");
+        });
+        let client = store_client(&format!("http://{address}"), None).expect("client should build");
+
+        wait_for_store_ready(&client).await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        task.abort();
     }
 }
