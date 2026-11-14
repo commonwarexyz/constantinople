@@ -160,7 +160,8 @@ pub struct Config<St: Strategy> {
 /// A batch of transactions waiting in the pool.
 ///
 /// Each transaction is held behind a shared handle, the element type of a block body, so serving
-/// a proposal moves handles rather than transactions.
+/// a proposal moves handles rather than transactions. The handles of an admitted batch share one
+/// buffer of `total_bytes` that holds the batch's encoding and nothing else.
 struct PoolEntry<H: Hasher> {
     transactions: Vec<LazySignedTransaction<H>>,
     /// The message digest of each transaction, in order.
@@ -999,7 +1000,7 @@ where
                         continue;
                     }
 
-                    let entry = new_entry(transactions, &mut known_digests);
+                    let mut entry = new_entry(transactions, &mut known_digests);
                     if !entry.transactions.is_empty()
                         && !can_admit_submission(
                             lane,
@@ -1059,6 +1060,9 @@ where
                         let _ = ingest_result.send(IngestStatus::Accepted);
                     }
                     if !entry.transactions.is_empty() {
+                        // The batch is queued with its encoding in one buffer, so a block that
+                        // takes it encodes it by copying that buffer.
+                        LazySignedTransaction::pack(&mut entry.transactions);
                         let pool = match lane {
                             SubmissionLane::Foreground => &mut foreground_pool,
                             SubmissionLane::Background => &mut background_pool,
@@ -1200,7 +1204,7 @@ mod tests {
         serve_queued_proposals, status_for_finalized_block, watch_batch,
     };
     use ahash::{AHashMap, AHashSet};
-    use commonware_codec::EncodeSize as _;
+    use commonware_codec::{Encode as _, EncodeSize as _};
     use commonware_cryptography::{Signer, sha256};
     use commonware_cryptography_curve25519::signing as ed25519;
     use commonware_math::algebra::Random;
@@ -1744,6 +1748,47 @@ mod tests {
                 proposal[0].get().expect("decoded").encode_size(),
                 max_propose_bytes
             );
+        });
+    }
+
+    #[test]
+    fn admitted_batch_serves_its_encoding_from_one_buffer() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let transactions = signed_transactions(1, 3);
+            let digests = digests_of(&transactions);
+            let (mailbox, sender, _handle) =
+                start_test_actor(context, 1 << 20, total_bytes_for(&transactions)).await;
+
+            // Admit the first transaction alone, then a batch that repeats it. The pool drops
+            // the repeat, so the second entry holds the other two.
+            for (batch_id, range) in [("first", 0..1), ("second", 0..3)] {
+                let result = mailbox
+                    .try_ingest(
+                        batch_id.into(),
+                        digests[range.clone()].to_vec(),
+                        transactions[range].to_vec(),
+                    )
+                    .unwrap();
+                assert!(matches!(result.await.unwrap(), IngestStatus::Accepted));
+            }
+            let proposal = propose(&sender, 1).await;
+            assert_eq!(proposal.len(), 3);
+
+            // Every served transaction encodes to the bytes of its decoded value.
+            let served: Vec<_> = proposal
+                .iter()
+                .map(LazySignedTransaction::encoded_signed_transaction)
+                .collect();
+            for (bytes, transaction) in served.iter().zip(&transactions) {
+                assert_eq!(bytes, &transaction.encode());
+            }
+
+            // The second entry's transactions lie back to back in a buffer nothing else holds.
+            assert_eq!(served[1].as_ptr_range().end, served[2].as_ptr());
+            drop(proposal);
+            let [_, second, third] = served.try_into().unwrap();
+            drop(second);
+            assert!(third.is_unique());
         });
     }
 

@@ -62,11 +62,15 @@ where
     }
 }
 
+/// Wraps a batch in block body handles that share one buffer holding the batch's encoding, as
+/// the pool serves them.
 fn handles<H: Hasher>(transactions: Vec<VerifiedTransaction<H>>) -> Vec<LazySignedTransaction<H>> {
-    transactions
+    let mut handles: Vec<_> = transactions
         .into_iter()
         .map(LazySignedTransaction::new)
-        .collect()
+        .collect();
+    LazySignedTransaction::pack(&mut handles);
+    handles
 }
 
 impl<C, P, H> TransactionSource<C, P, H> for StaticTransactionSource<C, P, H>

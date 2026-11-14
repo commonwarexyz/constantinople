@@ -758,6 +758,84 @@ fn propose_drops_inapplicable_and_refills() {
     });
 }
 
+/// A body that keeps every candidate encodes from the buffers its candidates arrived in. A body
+/// that leaves a candidate out encodes from a buffer of its own, so the block does not keep the
+/// dropped candidate's encoding alive.
+#[test]
+fn proposal_body_keeps_only_its_own_encoding_alive() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            dbs,
+            parent,
+            sender,
+            alt_sender,
+            recipient,
+            ..
+        } = Box::pin(verify_harness(&context)).await;
+        let keep = transfer(&sender, &recipient, 1);
+        let duplicate = transfer(&sender, &recipient, 2);
+        let other = transfer(&alt_sender, &recipient, 3);
+
+        // The duplicate consumes the nonce of the transfer before it, so selection drops it.
+        for (candidates, kept) in [
+            (vec![keep.clone(), other.clone()], vec![0, 1]),
+            (vec![keep, duplicate, other], vec![0, 2]),
+        ] {
+            // Offer the candidates the way a transaction source serves them.
+            let mut offered: Vec<_> = candidates
+                .into_iter()
+                .map(LazySignedTransaction::new)
+                .collect();
+            LazySignedTransaction::pack(&mut offered);
+            let (state_batch, transaction_batch) = dbs.new_batches().await;
+            let execution = super::execution::execute_proposal(
+                Sequential,
+                &context,
+                state_batch,
+                transaction_batch,
+                parent_transactions_inactivity_floor(&parent),
+                &parent.header,
+                Round::new(Epoch::zero(), View::new(1)),
+                offered.clone(),
+                &mut TestSource::new(Vec::new()),
+                true,
+            )
+            .await;
+            let body = execution.body;
+            assert_eq!(body.len(), kept.len());
+
+            // The body encodes to the bytes of its decoded values.
+            let values: Vec<_> = body
+                .iter()
+                .map(|transaction| transaction.get().expect("body decodes").clone())
+                .map(LazySignedTransaction::new)
+                .collect();
+            assert_eq!(body.encode(), values.encode());
+            assert_eq!(body.encode_size(), execution.body_size);
+
+            // A full selection reuses the offered buffer, and a partial one leaves it.
+            let encodings: Vec<_> = body
+                .iter()
+                .map(LazySignedTransaction::encoded_signed_transaction)
+                .collect();
+            let reused = encodings.iter().zip(&kept).all(|(encoding, &index)| {
+                encoding.as_ptr() == offered[index].encoded_signed_transaction().as_ptr()
+            });
+            assert_eq!(reused, kept.len() == offered.len());
+
+            // Either way the body's transactions lie back to back, and once the candidates
+            // are gone nothing but the body keeps their buffer alive.
+            assert_eq!(encodings[0].as_ptr_range().end, encodings[1].as_ptr());
+            drop((offered, body));
+            let [first, last] = encodings
+                .try_into()
+                .expect("the body holds two transactions");
+            drop(first);
+            assert!(last.is_unique());
+        }
+    });
+}
+
 #[test]
 fn prepare_stages_the_block_propose_builds() {
     deterministic::Runner::default().start(|context| async move {

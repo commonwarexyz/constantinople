@@ -11,7 +11,7 @@ use crate::{
     PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionSignature,
     auth::verify_signatures,
 };
-use bytes::{BufMut, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use commonware_codec::{
     Buf, DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Viewing, Write,
     types::lazy::Lazy,
@@ -209,6 +209,14 @@ pub trait Signable: Sealable {
 impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
+///
+/// `pending` holds the encoded signed transaction without the lazy length prefix, and encoding
+/// copies it whenever it is present. Whenever a decoded value is present too, `pending` is that
+/// value's encoding. A value decoded from `pending` encodes back to the same bytes, because each
+/// field of a signed transaction is written as the bytes it was read from, every integer and
+/// length has a fixed width, and decoding rejects trailing bytes. [`Self::pack`] is the only
+/// place that gives `pending` to a transaction that already has a value, and it stores the bytes
+/// that transaction encoded to.
 pub struct LazySignedTransaction<H>
 where
     H: Hasher,
@@ -268,8 +276,8 @@ where
 
     /// Returns the encoded signed transaction bytes without the lazy length prefix.
     ///
-    /// If this value came from block decoding, this clones the deferred bytes and
-    /// does not materialize the transaction.
+    /// If this value came from block decoding or was packed, this shares the bytes it holds
+    /// and does not materialize the transaction.
     pub fn encoded_signed_transaction(&self) -> Bytes {
         if let Some(bytes) = &self.pending {
             return bytes.clone();
@@ -278,6 +286,43 @@ where
         self.get()
             .expect("lazy signed transaction must have a value")
             .encode()
+    }
+
+    /// Moves the encodings of `transactions` into one shared buffer, in order.
+    ///
+    /// Packing changes neither the bytes a transaction encodes to nor its decoded value. A
+    /// packed transaction encodes by copying its range of the buffer, so encoding the list
+    /// reads one allocation instead of visiting every decoded value. The buffer holds exactly
+    /// the encoded transactions. It stays alive while any of them does, or any value later
+    /// decoded from one of them, so a transaction that outlives the rest keeps all of it alive.
+    pub fn pack(transactions: &mut [Self]) {
+        let size = transactions.iter().map(Self::payload_size).sum();
+        let mut buffer = BytesMut::with_capacity(size);
+        for transaction in transactions {
+            transaction.write_payload(&mut buffer);
+            transaction.pending = Some(buffer.split().freeze());
+        }
+    }
+
+    /// Returns the size of the encoded signed transaction without the lazy length prefix.
+    fn payload_size(&self) -> usize {
+        if let Some(pending) = &self.pending {
+            return pending.len();
+        }
+        self.get()
+            .expect("lazy signed transaction must have a value")
+            .encode_size()
+    }
+
+    /// Writes the encoded signed transaction without the lazy length prefix.
+    fn write_payload(&self, buf: &mut impl BufMut) {
+        if let Some(pending) = &self.pending {
+            buf.put_slice(pending);
+            return;
+        }
+        self.get()
+            .expect("lazy signed transaction must have a value")
+            .write(buf);
     }
 
     fn deferred(bytes: Bytes) -> Self {
@@ -312,16 +357,8 @@ where
     H: Hasher,
 {
     fn write(&self, buf: &mut impl BufMut) {
-        if let Some(pending) = &self.pending {
-            pending.len().write(buf);
-            buf.put_slice(pending);
-            return;
-        }
-        let transaction = self
-            .get()
-            .expect("lazy signed transaction must have a value");
-        transaction.encode_size().write(buf);
-        transaction.write(buf);
+        self.payload_size().write(buf);
+        self.write_payload(buf);
     }
 }
 
@@ -330,13 +367,7 @@ where
     H: Hasher,
 {
     fn encode_size(&self) -> usize {
-        if let Some(pending) = &self.pending {
-            return pending.len().encode_size() + pending.len();
-        }
-        let len = self
-            .get()
-            .expect("lazy signed transaction must have a value")
-            .encode_size();
+        let len = self.payload_size();
         len.encode_size() + len
     }
 }
@@ -822,6 +853,105 @@ mod test {
                 assert_eq!(owned.encode(), payload);
             }
         }
+    }
+
+    #[test]
+    fn decoded_transactions_encode_to_the_bytes_they_were_read_from() {
+        for transaction in lazy_signed_view_fixtures() {
+            // Replace each byte of the payload with every other value. This reaches the scheme
+            // bytes, the key padding, the transfer value and both WebAuthn length prefixes.
+            let payload = transaction.encode();
+            let mut accepted = 0;
+            for position in 0..payload.len() {
+                let mut mutated = payload.to_vec();
+                for byte in 0..=u8::MAX {
+                    mutated[position] = byte;
+
+                    // Any payload the decoder accepts is the only encoding of its value.
+                    let Ok(decoded) =
+                        SignedTransaction::<sha256::Sha256>::decode(Copying(&mutated))
+                    else {
+                        continue;
+                    };
+                    accepted += 1;
+                    assert_eq!(
+                        decoded.encode().as_ref(),
+                        mutated,
+                        "byte {byte} at {position} must decode to a value that encodes back"
+                    );
+                }
+            }
+            assert!(accepted > payload.len());
+        }
+    }
+
+    #[test]
+    fn packed_transactions_encode_from_one_buffer_without_changing_a_byte() {
+        // Collect transactions of both signature schemes that hold only a value, only deferred
+        // bytes, and deferred bytes that do not decode.
+        let mut transactions = Vec::new();
+        for transaction in lazy_signed_view_fixtures() {
+            let payload = transaction.encode();
+            let mut undecodable = payload.to_vec();
+            undecodable.push(0);
+            transactions.push(LazySignedTransaction::new(transaction));
+            transactions.push(lazy_signed_view_read(&payload).unwrap());
+            transactions.push(lazy_signed_view_read(&undecodable).unwrap());
+        }
+
+        // Record what every transaction encodes to and where the decoded values live. None of
+        // this decodes a deferred transaction.
+        let payloads: Vec<_> = transactions
+            .iter()
+            .map(LazySignedTransaction::encoded_signed_transaction)
+            .collect();
+        let encoded = transactions.encode();
+        let values: Vec<_> = transactions
+            .iter()
+            .step_by(3)
+            .map(|transaction| core::ptr::from_ref(transaction.get().unwrap()))
+            .collect();
+        let unpacked = transactions.clone();
+
+        // Pack twice. The second pass moves encodings that already share a buffer.
+        for _ in 0..2 {
+            LazySignedTransaction::pack(&mut transactions);
+
+            // Packing changes no encoding, and the encodings lie back to back in one buffer,
+            // in order.
+            assert_eq!(transactions.encode(), encoded);
+            assert_eq!(transactions.encode_size(), encoded.len());
+            let packed: Vec<_> = transactions
+                .iter()
+                .map(LazySignedTransaction::encoded_signed_transaction)
+                .collect();
+            assert_eq!(packed, payloads);
+            for pair in packed.windows(2) {
+                assert_eq!(pair[0].as_ptr_range().end, pair[1].as_ptr());
+            }
+        }
+        assert_eq!(unpacked.encode(), encoded);
+
+        // Every decoded value stays where it was and encodes to the packed bytes. A deferred
+        // transaction decodes from the packed bytes to the same value, or still fails to.
+        for ((chunk, payload), value) in transactions.chunks(3).zip(payloads.chunks(3)).zip(values)
+        {
+            let decoded = chunk[0].get().unwrap();
+            assert!(core::ptr::eq(decoded, value));
+            assert_eq!(decoded.encode(), payload[0]);
+            assert_eq!(chunk[1].get(), Some(decoded));
+            assert!(chunk[2].get().is_none());
+        }
+
+        // Nothing but the transactions and the values decoded from them keeps the buffer
+        // alive. The clones share those values.
+        let last = transactions.pop().unwrap().encoded_signed_transaction();
+        assert!(!last.is_unique());
+        drop((transactions, unpacked));
+        assert!(last.is_unique());
+
+        // An empty list packs to nothing.
+        LazySignedTransaction::<sha256::Sha256>::pack(&mut []);
     }
 
     fn invalid_public_key_bytes() -> [u8; TransactionPublicKey::SIZE] {
