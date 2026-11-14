@@ -24,7 +24,7 @@ use prometheus_client::{
 use serde::Deserialize;
 use std::{
     fs,
-    num::{NonZeroU32, NonZeroUsize},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -48,9 +48,6 @@ const ROCKS_STAGE_WORKERS: usize = 4;
 const ROCKS_MAX_QUEUED_WAVES: usize = 4;
 const ROCKS_LOG_MERGE_FILES: usize = 1024;
 const ROCKS_MAX_OPEN_FILES: i32 = 16_384;
-const ROCKS_RATE_LIMIT_REFILL_PERIOD_US: i64 = 100_000;
-const ROCKS_RATE_LIMIT_FAIRNESS: i32 = 10;
-const BYTES_PER_MB: i64 = 1_000_000;
 const DEFAULT_METRICS_PORT: u16 = 9090;
 
 #[derive(Debug, Parser)]
@@ -88,17 +85,6 @@ struct Cli {
     /// RocksDB's stock parallelism when omitted.
     #[arg(long, conflicts_with_all = ["hosts", "config"])]
     db_parallelism: Option<i32>,
-
-    /// Caps the megabytes per second (1 MB = 1,000,000 bytes) RocksDB writes
-    /// in compactions and flushes, state compactions and log merges alike, so
-    /// one large state compaction cannot take the disk's whole bandwidth from
-    /// commits. Leaves compaction unlimited when omitted.
-    ///
-    /// The cap spreads a compaction over more time and does not reduce what
-    /// it writes, so it has to stay above the store's average compaction
-    /// rate. Staged files written by commits are not limited.
-    #[arg(long, conflicts_with_all = ["hosts", "config"])]
-    db_compaction_rate_limit: Option<NonZeroU32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,17 +96,6 @@ struct DeployerConfig {
     /// Leaves RocksDB's stock parallelism when omitted.
     #[serde(default)]
     db_parallelism: Option<i32>,
-    /// Megabytes per second. Leaves compaction unlimited when omitted.
-    #[serde(default)]
-    db_compaction_rate_limit: Option<NonZeroU32>,
-}
-
-/// RocksDB options chosen per host. Each leaves RocksDB's stock behavior
-/// when unset.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct DbSettings {
-    parallelism: Option<i32>,
-    compaction_rate_limit: Option<NonZeroU32>,
 }
 
 const fn default_metrics_port() -> u16 {
@@ -143,17 +118,14 @@ fn resolve_data_dir(config_path: &Path, data_dir: PathBuf) -> PathBuf {
         .join(data_dir)
 }
 
-fn load_settings(cli: Cli) -> (PathBuf, u16, u16, DbSettings) {
+fn load_settings(cli: Cli) -> (PathBuf, u16, u16, Option<i32>) {
     if let Some(config_path) = cli.config {
         let config = load_deployer_config(&config_path);
         return (
             resolve_data_dir(&config_path, config.data_dir),
             config.port,
             config.metrics_port,
-            DbSettings {
-                parallelism: config.db_parallelism,
-                compaction_rate_limit: config.db_compaction_rate_limit,
-            },
+            config.db_parallelism,
         );
     }
 
@@ -162,10 +134,7 @@ fn load_settings(cli: Cli) -> (PathBuf, u16, u16, DbSettings) {
             .expect("clap should require --data-dir or --hosts"),
         cli.port,
         cli.metrics_port,
-        DbSettings {
-            parallelism: cli.db_parallelism,
-            compaction_rate_limit: cli.db_compaction_rate_limit,
-        },
+        cli.db_parallelism,
     )
 }
 
@@ -256,32 +225,25 @@ async fn serve_metrics(State(registry): State<Arc<Registry>>) -> String {
 /// options (tuned to its write path), and its ingest path writes SSTs
 /// directly for all but some small commit groups, so write-path tuning
 /// has little effect.
-fn chain_indexer_db_options(db: &DbSettings) -> Options {
+fn chain_indexer_db_options(db_parallelism: Option<i32>) -> Options {
     let mut opts = Options::default();
-    if let Some(jobs) = db.parallelism {
+    if let Some(jobs) = db_parallelism {
         opts.increase_parallelism(jobs);
         opts.set_max_background_jobs(jobs);
-    }
-    if let Some(mb) = db.compaction_rate_limit {
-        opts.set_ratelimiter(
-            i64::from(mb.get()) * BYTES_PER_MB,
-            ROCKS_RATE_LIMIT_REFILL_PERIOD_US,
-            ROCKS_RATE_LIMIT_FAIRNESS,
-        );
     }
     opts.set_max_subcompactions(ROCKS_MAX_SUBCOMPACTIONS);
     opts.set_bytes_per_sync(ROCKS_SYNC_BYTES);
     opts.set_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE);
 
-    // Stock RocksDB keeps every table file open. The cap bounds open tables
-    // when the backlog of log files awaiting a merge grows.
+    // Stock RocksDB keeps every table file open. The cap bounds open tables when the backlog of
+    // log files awaiting a merge grows.
     opts.set_max_open_files(ROCKS_MAX_OPEN_FILES);
     opts
 }
 
-fn chain_indexer_rocks_config(db: &DbSettings) -> RocksConfig {
+fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
     RocksConfig {
-        db_options: chain_indexer_db_options(db),
+        db_options: chain_indexer_db_options(db_parallelism),
         write_pipeline: RocksWritePipelineConfig {
             max_commit_batch_bytes: NonZeroUsize::new(ROCKS_MAX_COMMIT_BATCH_BYTES)
                 .expect("rocks write commit batch byte limit must be nonzero"),
@@ -299,11 +261,11 @@ async fn run(
     data_dir: &Path,
     port: u16,
     metrics_port: u16,
-    db: DbSettings,
+    db_parallelism: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let engine = Arc::new(RocksStore::open(
         data_dir,
-        Some(chain_indexer_rocks_config(&db)),
+        Some(chain_indexer_rocks_config(db_parallelism)),
     )?);
     let (registry, metrics) = ingest_metrics();
     let connect = connect_stack(AppState::new(engine));
@@ -332,7 +294,7 @@ async fn run(
 
 fn main() {
     let cli = Cli::parse();
-    let (data_dir, port, metrics_port, db) = load_settings(cli);
+    let (data_dir, port, metrics_port, db_parallelism) = load_settings(cli);
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -345,7 +307,7 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async move {
-        if let Err(error) = run(&data_dir, port, metrics_port, db).await {
+        if let Err(error) = run(&data_dir, port, metrics_port, db_parallelism).await {
             eprintln!("chain-indexer exited with error: {error}");
             std::process::exit(1);
         }
@@ -354,7 +316,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, DEFAULT_METRICS_PORT, DbSettings, load_settings, operational_routes};
+    use super::{Cli, DEFAULT_METRICS_PORT, load_settings, operational_routes};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -362,7 +324,6 @@ mod tests {
     use clap::Parser;
     use std::{
         fs,
-        num::NonZeroU32,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -441,82 +402,17 @@ mod tests {
         ])
         .expect("deployer invocation should parse");
 
-        let (data_dir, port, metrics_port, db) = load_settings(cli);
+        let (data_dir, port, metrics_port, db_parallelism) = load_settings(cli);
 
         assert_eq!(port, 18_090);
         assert_eq!(metrics_port, DEFAULT_METRICS_PORT);
-        assert_eq!(db, DbSettings::default());
+        assert_eq!(db_parallelism, None);
         assert_eq!(
             data_dir,
             config_path.parent().unwrap().join("chain-indexer")
         );
 
         let _ = fs::remove_file(config_path);
-    }
-
-    #[test]
-    fn local_settings_read_db_options() {
-        let cli = Cli::try_parse_from([
-            "chain-indexer",
-            "--data-dir",
-            "./chain-indexer",
-            "--db-parallelism",
-            "12",
-            "--db-compaction-rate-limit",
-            "600",
-        ])
-        .expect("local invocation should parse");
-        let (_, _, _, db) = load_settings(cli);
-
-        assert_eq!(
-            db,
-            DbSettings {
-                parallelism: Some(12),
-                compaction_rate_limit: NonZeroU32::new(600),
-            }
-        );
-    }
-
-    #[test]
-    fn local_settings_reject_zero_compaction_rate_limit() {
-        let parsed = Cli::try_parse_from([
-            "chain-indexer",
-            "--data-dir",
-            "./chain-indexer",
-            "--db-compaction-rate-limit",
-            "0",
-        ]);
-
-        assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn deployer_settings_read_db_options_from_config() {
-        let config_path = temp_path("chain-indexer-db", ".yaml");
-        fs::write(
-            &config_path,
-            "port: 18090\ndata_dir: chain-indexer\ndb_parallelism: 12\ndb_compaction_rate_limit: 600\n",
-        )
-        .expect("config should write");
-        let cli = Cli::try_parse_from([
-            "chain-indexer",
-            "--hosts",
-            "hosts.yaml",
-            "--config",
-            config_path.to_str().expect("utf-8 path"),
-        ])
-        .expect("deployer invocation should parse");
-        let (_, _, _, db) = load_settings(cli);
-
-        assert_eq!(
-            db,
-            DbSettings {
-                parallelism: Some(12),
-                compaction_rate_limit: NonZeroU32::new(600),
-            }
-        );
-
-        fs::remove_file(config_path).expect("config should be removed");
     }
 
     #[test]

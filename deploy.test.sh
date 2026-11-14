@@ -86,15 +86,6 @@ assert_excludes --propose-skip-final-refill "${GENERATE_ARGS[@]}"
 assert_excludes --max-pool-bytes "${GENERATE_ARGS[@]}"
 assert_pair --spammer-presigned-batches 2 "${GENERATE_ARGS[@]}"
 assert_pair --bandwidth-weighting vpc-1 "${REMOTE_ARGS[@]}"
-assert_excludes --chain-indexer-db-compaction-rate-limit "${REMOTE_ARGS[@]}"
-
-prepare_case --chain-indexer-compaction-rate-limit 600
-assert_pair --chain-indexer-db-compaction-rate-limit 600 "${REMOTE_ARGS[@]}"
-assert_count --chain-indexer-db-compaction-rate-limit 1 "${REMOTE_ARGS[@]}"
-
-if (prepare_case --store-url https://store.example.com --chain-indexer-compaction-rate-limit 600) >/dev/null 2>&1; then
-    fail "compaction rate limit with an external Store should fail"
-fi
 
 prepare_case --leader stable
 assert_pair --leader-term-length 1000000 "${GENERATE_ARGS[@]}"
@@ -211,8 +202,7 @@ for option in \
     --max-propose-bytes \
     --spammer-submitters \
     --max-pool-bytes \
-    --storage-size \
-    --chain-indexer-compaction-rate-limit
+    --storage-size
 do
     if (reset_options; parse_options "$option") >/dev/null 2>&1; then
         fail "missing value should fail for $option"
@@ -235,8 +225,7 @@ for mapping in \
     "--max-propose-bytes MAX_PROPOSE_BYTES" \
     "--spammer-submitters SPAMMER_SUBMITTERS" \
     "--max-pool-bytes MAX_POOL_BYTES" \
-    "--storage-size STORAGE_SIZE" \
-    "--chain-indexer-compaction-rate-limit CHAIN_INDEXER_COMPACTION_RATE_LIMIT"
+    "--storage-size STORAGE_SIZE"
 do
     read -r option variable <<< "$mapping"
     reset_options

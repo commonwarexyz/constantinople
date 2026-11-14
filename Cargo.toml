@@ -72,12 +72,12 @@ commonware-cryptography = { version = "2026.10.0", default-features = false }
 commonware-cryptography-curve25519 = "2026.10.0"
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "e076729fa1284bb6728c844f52996df2538d0959" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "e076729fa1284bb6728c844f52996df2538d0959" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "e076729fa1284bb6728c844f52996df2538d0959" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "e076729fa1284bb6728c844f52996df2538d0959" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "e076729fa1284bb6728c844f52996df2538d0959" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "e076729fa1284bb6728c844f52996df2538d0959" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "72dbdc1280af82e706471d09eb222a64da507545" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "72dbdc1280af82e706471d09eb222a64da507545" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "72dbdc1280af82e706471d09eb222a64da507545" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "72dbdc1280af82e706471d09eb222a64da507545" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "72dbdc1280af82e706471d09eb222a64da507545" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "72dbdc1280af82e706471d09eb222a64da507545" }
 datafusion = "55"
 
 # Other

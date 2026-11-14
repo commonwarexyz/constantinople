@@ -280,15 +280,16 @@ vCPUs against 16, with the same 12 RocksDB background jobs. Runs D to F ran on N
 fleet from branch store-file-count (#256's head), D with an 8 MiB cap and E and F with the
 168,000-byte cap and 64 streams of 226 accounts. Each run started from genesis.
 
-### The rate limit
+### A compaction rate limit
 
-`--chain-indexer-compaction-rate-limit <mb/s>` caps what RocksDB may write in compactions and
-flushes, and is off by default. A limit spreads a large compaction over time without reducing the
-total, so it helps only while the disk's sustained bandwidth covers the steady compaction demand.
+A RocksDB rate limiter caps what compactions and flushes may write. Runs C and D set one at 600
+MB/s on the Store through a chain indexer option that has since been removed. A limit spreads a
+large compaction over time without reducing the total, so it helps only while the disk's sustained
+bandwidth covers the steady compaction demand, and a disk that does has little need of it.
 
-Run C shows it working. Over 20 minutes at 49 blocks a second a 600 MB/s limit took p90 commit
-latency from above 500 ms to 108 ms on the same disk. Its state level zero peaked at 240 files
-against 90 without the limit, which is deferred work.
+Run C shows it working. Over 20 minutes at 49 blocks a second the limit took p90 commit latency
+from above 500 ms to 108 ms on the same disk. Its state level zero peaked at 240 files against 90
+without the limit, which is deferred work.
 
 Run D shows it failing. At 54 blocks a second the limit was saturated, with 617 MB/s written against
 a 600 MB/s limit and the instance's 625 MB/s EBS baseline, when the Store's disk traffic had already
@@ -296,11 +297,10 @@ been about 680 MB/s at the lower block rate. When a 21 GiB state compaction star
 state level zero went from 12 to 1,197 files in 80 seconds, RocksDB stalled writes and commit
 latency doubled. The run's percentiles look healthy only because its window ended about three
 minutes later. Run C's 20 minutes most likely ended before its deferred work came due (inferred).
-Size the disk for the compaction demand rather than limiting it, and keep the limit for smoothing
-spikes on a disk whose sustained bandwidth already exceeds that demand. A limit close to the average
-compaction rate has not been run for hours. While a long compaction runs, RocksDB keeps obsolete
-files on disk, so a count of `*.sst` files overstates the live files. Read live counts from
-`compacted to: files[...]` in the RocksDB LOG.
+Size the disk for the compaction demand instead of limiting it.
+
+While a long compaction runs, RocksDB keeps obsolete files on disk, so a count of `*.sst` files
+overstates the live files. Read live counts from `compacted to: files[...]` in the RocksDB LOG.
 
 ### EBS or NVMe
 
@@ -382,8 +382,7 @@ cost 3 to 16% of throughput and 44 to 54 ms of finalization in the runs above.
 - 1, 2 and 4 MiB caps and the 168,000-byte cap on US and European regions on the current code.
 
 - The effect of `leader_optimistic_views` 4 against the preset's 16.
-- The chain indexer on c8id.4xlarge, the size `deploy.sh` picks, and the compaction rate limit
-  with #256's head beyond 16 minutes.
+- The chain indexer on c8id.4xlarge, the size `deploy.sh` picks.
 - Runs longer than 26 minutes. Store growth, validator pruning past one cycle, and long
   compactions over hours have not been observed.
 - The rewrite load from RocksDB's bottommost-file compactions, which begin once the explorer reads

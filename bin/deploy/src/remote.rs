@@ -354,7 +354,6 @@ fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<Chai
         port: remote.chain_indexer_port,
         data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
         db_parallelism: remote.chain_indexer_db_parallelism,
-        db_compaction_rate_limit: remote.chain_indexer_db_compaction_rate_limit,
     })
 }
 
@@ -579,9 +578,8 @@ fn port_configs(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<aws::PortConfig
 #[cfg(test)]
 mod tests {
     use super::{
-        build_deployer_config, build_secondaries, chain_indexer_config, deployer_config_yaml,
-        expected_binary_files, explorer_indexer_config, port_configs, remote_spammer_config,
-        validate_ports,
+        build_deployer_config, build_secondaries, deployer_config_yaml, expected_binary_files,
+        explorer_indexer_config, port_configs, remote_spammer_config, validate_ports,
     };
     use crate::{
         BandwidthWeighting, CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
@@ -596,10 +594,7 @@ mod tests {
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
-    use std::{
-        num::NonZeroU32,
-        path::{Path, PathBuf},
-    };
+    use std::path::{Path, PathBuf};
 
     fn generate_args() -> GenerateArgs {
         GenerateArgs {
@@ -637,7 +632,6 @@ mod tests {
                 base_metrics_port: 9090,
                 chain_indexer_port: 8090,
                 chain_indexer_db_parallelism: None,
-                chain_indexer_db_compaction_rate_limit: None,
                 explorer_indexer_port: 8092,
             }),
         }
@@ -666,7 +660,6 @@ mod tests {
             http_cidrs: vec!["198.51.100.4/32".to_string()],
             chain_indexer_port: 8090,
             chain_indexer_db_parallelism: None,
-            chain_indexer_db_compaction_rate_limit: None,
             explorer_indexer_port: 8092,
             profiling: true,
             traces: 0.0,
@@ -1178,21 +1171,6 @@ mod tests {
         assert_eq!(config.instances[4].availability_zone_group, None);
         assert!(config.ports.iter().any(|port| port.port == 8090));
         assert!(config.ports.iter().any(|port| port.port == 8092));
-    }
-
-    #[test]
-    fn chain_indexer_config_carries_compaction_rate_limit_only_when_set() {
-        let mut args = generate_args();
-        args.indexer = true;
-        let mut remote = remote_args();
-        let yaml = |remote: &RemoteArgs| {
-            let config = chain_indexer_config(&args, remote).expect("managed chain-indexer");
-            serde_yaml::to_string(&config).expect("chain-indexer config should serialize")
-        };
-
-        assert!(!yaml(&remote).contains("db_compaction_rate_limit"));
-        remote.chain_indexer_db_compaction_rate_limit = NonZeroU32::new(600);
-        assert!(yaml(&remote).contains("db_compaction_rate_limit: 600"));
     }
 
     #[test]

@@ -361,18 +361,13 @@ fn local_run_commands(
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
-        let db_compaction_rate_limit = local
-            .chain_indexer_db_compaction_rate_limit
-            .map(|mb| format!(" --db-compaction-rate-limit {mb}"))
-            .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --features chain-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}{}",
+            "cargo run --release -p constantinople-indexer --features chain-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             metrics_port,
             data_dir.display(),
             db_parallelism,
-            db_compaction_rate_limit,
         ));
         let admission_port = relayer_http_port(args, local).unwrap_or(local.base_http_port);
         commands.push(format!(
@@ -472,10 +467,7 @@ mod tests {
         default_public_key_cache_size, default_publisher_rayon_threads,
         default_state_page_cache_bytes, generate_local_cluster_material, total_secondaries,
     };
-    use std::{
-        num::NonZeroU32,
-        path::{Path, PathBuf},
-    };
+    use std::path::{Path, PathBuf};
 
     const TEST_SIMPLEX_VERIFICATION_MATERIAL: &str = "abcdef";
 
@@ -520,7 +512,6 @@ mod tests {
             base_metrics_port: 9090,
             chain_indexer_port: 8090,
             chain_indexer_db_parallelism: None,
-            chain_indexer_db_compaction_rate_limit: None,
             explorer_indexer_port: 8092,
         }
     }
@@ -959,32 +950,6 @@ mod tests {
         assert!(indexer_cmd.contains("--port 8090"));
         assert!(indexer_cmd.contains("--metrics-port 9094"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
-        assert!(!indexer_cmd.contains("--db-compaction-rate-limit"));
-    }
-
-    #[test]
-    fn local_indexer_command_carries_compaction_rate_limit() {
-        let mut args = test_args(false);
-        args.indexer = true;
-        let GenerateTarget::Local(local) = &mut args.target else {
-            panic!("test_args must construct a Local target");
-        };
-        local.chain_indexer_db_compaction_rate_limit = NonZeroU32::new(600);
-
-        let commands = local_run_commands(
-            Path::new("/tmp/configs"),
-            &args,
-            local_args(&args),
-            &[],
-            TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        )
-        .unwrap();
-        let indexer_cmd = commands
-            .iter()
-            .find(|command| command.contains("--bin chain-indexer"))
-            .expect("chain-indexer command should be present");
-
-        assert!(indexer_cmd.contains(" --db-compaction-rate-limit 600"));
     }
 
     #[test]
