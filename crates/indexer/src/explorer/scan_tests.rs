@@ -265,6 +265,35 @@ async fn activity_cursor_seeks_read_only_the_remaining_page() {
     assert_page(&sql, &reads, [3; 32], 3, &[(2, 1, 2), (1, 1, 1), (0, 1, 0)]).await;
     assert_page(&sql, &reads, [3; 32], 0, &[]).await;
 
+    // The early read of a first page fetches one page and its margin, and
+    // below a cursor at most one page, without reading beyond either.
+    for (account, cursor, expected) in [
+        ([1; 32], None, (4032..4096).rev().collect::<Vec<_>>()),
+        ([3; 32], None, (0..24).rev().collect()),
+        ([1; 32], Some(100), (50..100).rev().collect()),
+        ([3; 32], Some(10), (0..10).rev().collect()),
+        ([3; 32], Some(0), Vec::new()),
+    ] {
+        let request = AccountRequest {
+            key: AccountKey::from(account),
+            cursor: cursor.map(Cursor),
+            snapshot: None,
+            account_location: None,
+            activity: true,
+        };
+        let batches = newest_activity_rows(&sql, &request).await.unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(|row| uint(batch, 0, row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        let (range, point) = reads.finish().await;
+        assert!(
+            range + point <= expected.len(),
+            "early activity must read only its rows: range={range}, point={point}"
+        );
+    }
+
     server.abort();
     let _ = server.await;
 }

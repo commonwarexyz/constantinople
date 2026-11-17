@@ -4,6 +4,16 @@
 //! publication target. SQL metadata supplies only hints (heights, indices,
 //! locations, and digests). The client verifies every returned claim against
 //! the certificate through parent headers and QMDB proofs.
+//!
+//! The publication, Simplex, and SQL reads of one request share one monotonic
+//! session. Independent reads run together, and every read issued after the
+//! certificate requires at least the sequence that returned it. The response
+//! reports the highest sequence that session observed.
+//!
+//! QMDB proofs are read outside that session. Its floor bounds only their
+//! publication lookup, their rows are read at or above the sequence that
+//! published their watermark, and every proof is checked against the certified
+//! root.
 
 use crate::{
     adapter::BoxError,
@@ -26,7 +36,7 @@ use commonware_cryptography::{
 };
 use commonware_cryptography_curve25519::signing::VerifyingKey;
 use commonware_storage::{
-    merkle::{Location, mmr},
+    merkle::{Location, Proof, mmr, multi_proof_positions},
     qmdb::{
         any::{unordered, value::FixedEncoding},
         keyless,
@@ -49,13 +59,17 @@ use datafusion::arrow::{
 use exoware_qmdb::{
     QmdbError,
     adapter::{Keyless, Unordered},
-    proof::encode_operation_multi_proof,
+    proof::{RawBatchMultiProof, encode_operation_multi_proof},
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, RangeMode, ReadSession, StoreClient};
 use exoware_simplex::{Finalized, keys};
 use exoware_sql::SqlContext;
+use futures::future::{
+    AbortHandle, BoxFuture, Either, FutureExt, Shared, abortable, join, join_all, select,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
     sync::Arc,
 };
 
@@ -67,6 +81,17 @@ pub use evidence::{Absence, MAX_EVIDENCE_BYTES, RecentFinalized};
 
 /// Maximum transactions returned on one account activity page or one block page.
 const TRANSACTION_PAGE: u64 = 50;
+
+/// Maximum concurrent requests that prove one page of transaction locations.
+const PROOF_LOOKUPS: usize = 25;
+
+/// Maximum concurrent lookups that fetch a page of transaction bodies while
+/// the page's proof is also being read.
+const BODY_LOOKUPS: usize = 8;
+
+/// Rows a first page's early activity read fetches beyond one page, to make
+/// up for the rows above the certified height that it drops.
+const EARLY_ACTIVITY_MARGIN: u64 = 14;
 
 /// Maximum parent headers linking a certificate to the requested block's parent.
 const MAX_HEADERS: u64 = 4096;
@@ -107,6 +132,15 @@ type HistoryEntry = TransactionHistoryEntry<Digest>;
 type TransactionLog = Keyless<mmr::Family, Sha256, HistoryEntry, FixedEncoding<HistoryEntry>>;
 type StateOperation = unordered::Operation<mmr::Family, AccountKey, FixedEncoding<AccountValue>>;
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<HistoryEntry>>;
+type TransactionProof = RawBatchMultiProof<Digest, mmr::Family>;
+
+/// Encoded multi-proof, proven history entries by location, and signed bodies
+/// by digest.
+type Evidence = (
+    Vec<u8>,
+    BTreeMap<u64, HistoryEntry>,
+    BTreeMap<Digest, Bytes>,
+);
 
 /// Store clients shared by every explorer route.
 struct Explorer {
@@ -269,12 +303,52 @@ impl AccountRequest {
     }
 }
 
-/// Account update and the block interval that contains it.
-struct AccountEvidence {
+/// Account update proven at the certified state boundary, with the write
+/// height its metadata row supplies.
+struct AccountUpdate {
     proof: AccountProof,
     value: Account,
-    headers: Vec<Vec<u8>>,
-    transaction_end: u64,
+}
+
+/// Unverified SQL rows for the account activity page between two account
+/// indices.
+struct ActivityHints {
+    /// Inclusive account index at the bottom of the page.
+    lower: u64,
+    /// Exclusive account index at the top of the page.
+    end: u64,
+    batches: Vec<RecordBatch>,
+}
+
+/// Transaction evidence for the (location, digest) pairs an account page is
+/// expected to name, read beside the account's state proof.
+///
+/// The pairs come from unvalidated rows, so the evidence is used only when the
+/// validated page names exactly those pairs. Polling `evidence` drives both
+/// reads.
+struct EarlyEvidence<'a> {
+    pairs: EarlyRead<'a, Vec<(u64, Digest)>>,
+    evidence: EarlyRead<'a, Evidence>,
+    /// Stops the evidence read the next time it is polled.
+    stop: AbortHandle,
+}
+
+/// Read whose result every clone can await, with none when it failed.
+type EarlyRead<'a, T> = Shared<BoxFuture<'a, Option<Arc<T>>>>;
+
+impl EarlyEvidence<'_> {
+    /// Returns the early evidence when it was read for exactly `expected` and
+    /// every read succeeded. Any other pairs stop the early read, so it does
+    /// not run beside the evidence the page then reads for itself.
+    async fn matching(&self, expected: &[(u64, Digest)]) -> Option<Evidence> {
+        let pairs = self.pairs.clone().await;
+        if pairs.is_none_or(|pairs| pairs.as_slice() != expected) {
+            self.stop.abort();
+            return None;
+        }
+        let evidence = self.evidence.clone().await?;
+        Some((*evidence).clone())
+    }
 }
 
 /// Checks a fixed-width application identity or cursor before reading Store.
@@ -306,6 +380,11 @@ struct Anchor {
     session: ReadSession,
     /// SQL metadata tables read through the same session.
     sql: SqlContext,
+    /// Digest of the newest publication target when the certificate sits at
+    /// that height. A lower height's target is read during confirmation.
+    newest: Option<Digest>,
+    /// Block digest a pinned snapshot names.
+    exact: Option<Digest>,
 }
 
 /// Newest publication target and the session that observed it.
@@ -326,7 +405,8 @@ impl Anchor {
             .ok_or_else(|| Failure::invalid("Store omitted sequence metadata"))
     }
 
-    /// Starts a bundle with the certificate and the current floor.
+    /// Builds a bundle with the certificate and the highest Store sequence the
+    /// request's session observed. Every read must finish before this call.
     fn bundle(&self) -> Result<Bundle, Failure> {
         Ok(Bundle {
             certificate: self.raw.to_vec(),
@@ -375,7 +455,8 @@ impl Explorer {
         }))
     }
 
-    /// Selects a certificate under the newest publication target.
+    /// Selects a certificate under the newest publication target. The caller
+    /// runs its reads through [`Self::confirmed`].
     async fn anchor(
         &self,
         first: u64,
@@ -419,7 +500,9 @@ impl Explorer {
     }
 
     /// Selects one certificate within an inclusive published height interval.
-    /// An empty interval or absent certificate leaves a live feed waiting.
+    /// An empty interval or absent certificate leaves a live feed waiting. The
+    /// certificate's own publication target is checked by [`Self::confirmed`],
+    /// which wraps every read made against it.
     async fn anchor_between(
         &self,
         published: &Published,
@@ -435,22 +518,32 @@ impl Explorer {
             return Err(Failure::invalid("certificate bound exceeds publication"));
         }
 
-        // Scan the Simplex height index for one certificate in the inclusive
-        // bound. Appending a zero byte makes the exclusive end key include
-        // `upper`.
+        // A certificate at the height a one-row scan reaches first is the one
+        // that scan selects, so a point read there stands in for the scan.
         let session = published.session.with_client(self.simplex.clone());
-        let start = keys::finalized_by_height(Height::new(lower));
-        let mut end = keys::finalized_by_height(Height::new(upper)).to_vec();
-        end.push(0);
-        let mode = if reverse {
-            RangeMode::Reverse
-        } else {
-            RangeMode::Forward
+        let first = keys::finalized_by_height(Height::new(if reverse { upper } else { lower }));
+        let found = match session.get(&first).await? {
+            Some(raw) => Some((first, raw)),
+            None if lower == upper => None,
+            None => {
+                // Appending a zero byte makes the exclusive end key include
+                // `upper`.
+                let start = keys::finalized_by_height(Height::new(lower));
+                let mut end = keys::finalized_by_height(Height::new(upper)).to_vec();
+                end.push(0);
+                let mode = if reverse {
+                    RangeMode::Reverse
+                } else {
+                    RangeMode::Forward
+                };
+                session
+                    .range_with_mode(&start, &Bytes::from(end), 1, mode)
+                    .await?
+                    .into_iter()
+                    .next()
+            }
         };
-        let rows = session
-            .range_with_mode(&start, &Bytes::from(end), 1, mode)
-            .await?;
-        let Some((key, raw)) = rows.into_iter().next() else {
+        let Some((key, raw)) = found else {
             return Ok(None);
         };
         let height = keys::finalized_height_from_key(&key)
@@ -471,25 +564,6 @@ impl Explorer {
             return Err(Failure::invalid("certificate height does not match index"));
         }
 
-        // The certified block must be the published block at its height, which
-        // keeps responses within the publication boundary. A pinned snapshot
-        // must also name that block.
-        let marker = if height == published.height {
-            published.digest
-        } else {
-            let bytes = published
-                .session
-                .get(&publication_target_key(height))
-                .await?
-                .ok_or_else(|| Failure::pending("certificate publication is not ready"))?;
-            Digest::decode(bytes)?
-        };
-        if marker != *header.seal() || exact.is_some_and(|digest| digest != *header.seal()) {
-            return Err(Failure::invalid(
-                "certificate does not match publication or requested digest",
-            ));
-        }
-
         // SQL reads join the request session, so they observe at least the
         // Store state that held the certificate.
         let sql = self
@@ -500,27 +574,87 @@ impl Explorer {
             header,
             session,
             sql,
+            newest: (height == published.height).then_some(published.digest),
+            exact,
         }))
     }
 
-    /// Proves the account's value at the certified state boundary. An account with no active
-    /// update there is reported as not found, without an absence proof.
+    /// Requires the certified block to be the published block at its height,
+    /// which keeps responses within the publication boundary. A pinned
+    /// snapshot must also name that block.
+    async fn confirm(&self, anchor: &Anchor) -> Result<(), Failure> {
+        let marker = match anchor.newest {
+            Some(digest) => digest,
+            None => {
+                let bytes = anchor
+                    .session
+                    .with_client(self.targets.clone())
+                    .get(&publication_target_key(anchor.header.height))
+                    .await?
+                    .ok_or_else(|| Failure::pending("certificate publication is not ready"))?;
+                Digest::decode(bytes)?
+            }
+        };
+        let block = anchor.header.seal();
+        if marker != *block || anchor.exact.is_some_and(|digest| digest != *block) {
+            return Err(Failure::invalid(
+                "certificate does not match publication or requested digest",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs `reads` against `anchor` while [`Self::confirm`] checks its
+    /// publication target, which never changes once written. Both run to
+    /// completion and a failed check is reported first, so nothing is returned
+    /// for an unconfirmed certificate.
+    async fn confirmed<T>(
+        &self,
+        anchor: &Anchor,
+        reads: impl Future<Output = Result<T, Failure>>,
+    ) -> Result<T, Failure> {
+        let (confirmed, value) = join(self.confirm(anchor), reads).await;
+        confirmed?;
+        value
+    }
+
+    /// Proves the account's value at the certified state boundary and reads the metadata row
+    /// of that update. An account with no active update there is reported as not found,
+    /// without an absence proof.
     async fn account_proof(
         &self,
         anchor: &Anchor,
         request: &AccountRequest,
-    ) -> Result<AccountEvidence, Failure> {
+    ) -> Result<AccountUpdate, Failure> {
         let start = anchor.header.state_range.start();
         let end = anchor.header.state_range.end();
         let tip = end
             .checked_sub(1)
             .ok_or_else(|| Failure::invalid("certified state range is empty"))?;
-        let mut lookups = Box::pin(self.state.get_many_raw(
+        let metadata = |location: u64| {
+            let query = format!(
+                "SELECT qmdb_location, tx_count, write_height FROM account_meta WHERE account = X'{}' AND qmdb_location = {location} LIMIT 1",
+                hex(request.key.as_ref())
+            );
+            async move { query_rows(&anchor.sql, &query, 1).await }
+        };
+
+        // The metadata row of a pinned location is read beside the proof and
+        // used only once the proof confirms that location.
+        let keys = [request.key];
+        let proof = Box::pin(self.state.get_many_raw(
             Location::new(tip),
-            &[request.key],
+            &keys,
             Some(anchor.floor()?),
-        ))
-        .await?;
+        ));
+        let (lookups, pinned) = match request.account_location {
+            Some(location) => {
+                let (lookups, batches) = join(proof, metadata(location)).await;
+                (lookups, Some(batches))
+            }
+            None => (proof.await, None),
+        };
+        let mut lookups = lookups?;
         if lookups.len() > 1 {
             return Err(Failure::invalid(
                 "account lookup returned an invalid result count",
@@ -566,11 +700,10 @@ impl Explorer {
         bounded_proof(&encoded)?;
 
         // The authenticated update fixes the metadata row used for its write-height provenance.
-        let query = format!(
-            "SELECT qmdb_location, tx_count, write_height FROM account_meta WHERE account = X'{}' AND qmdb_location = {location} LIMIT 1",
-            hex(request.key.as_ref())
-        );
-        let batches = query_rows(&anchor.sql, &query, 1).await?;
+        let batches = match pinned {
+            Some(batches) => batches?,
+            None => metadata(location).await?,
+        };
         let Some(batch) = batches.first() else {
             return Err(Failure::pending("account update metadata is not available"));
         };
@@ -589,9 +722,29 @@ impl Explorer {
         if value.tx_count != count {
             return Err(Failure::invalid("account proof disagrees with metadata"));
         }
+        Ok(AccountUpdate {
+            proof: AccountProof {
+                location,
+                proof: encoded,
+                write_height,
+                encoded_operation,
+                ..Default::default()
+            },
+            value,
+        })
+    }
 
+    /// Links an account update to the block that wrote it. Returns the
+    /// ancestry headers and the exclusive end of that block's transactions.
+    async fn account_inclusion(
+        &self,
+        anchor: &Anchor,
+        update: &AccountUpdate,
+    ) -> Result<(Vec<Vec<u8>>, u64), Failure> {
         // The parent's end separates this block's state appends from older
         // updates. Floor copies are included and carry their unchanged value.
+        let location = update.proof.location;
+        let write_height = update.proof.write_height;
         let (headers, writer, _, transaction_end) = self.ancestry(anchor, write_height).await?;
         let state_start = if write_height == 1 {
             1
@@ -608,41 +761,58 @@ impl Explorer {
                 "account update is outside its inclusion block",
             ));
         }
-        Ok(AccountEvidence {
-            proof: AccountProof {
-                location,
-                proof: encoded,
-                write_height,
-                encoded_operation,
-                ..Default::default()
-            },
-            value,
-            headers,
-            transaction_end,
+        Ok((headers, transaction_end))
+    }
+
+    /// Reads the SQL hints for the page below the account's exclusive end.
+    async fn activity_hints(
+        &self,
+        anchor: &Anchor,
+        request: &AccountRequest,
+        update: &AccountUpdate,
+    ) -> Result<ActivityHints, Failure> {
+        let end = request
+            .cursor
+            .map_or(update.value.tx_count, |cursor| cursor.0);
+        if end > update.value.tx_count {
+            return Err(Failure::bad("cursor exceeds the proven account count"));
+        }
+        let lower = end.saturating_sub(TRANSACTION_PAGE);
+        let batches = if lower == end {
+            Vec::new()
+        } else {
+            activity_rows(&anchor.sql, request, lower, end, update.proof.write_height).await?
+        };
+        Ok(ActivityHints {
+            lower,
+            end,
+            batches,
         })
     }
 
-    /// Proves the complete contiguous page below the account's exclusive end.
+    /// Proves the complete contiguous page that `hints` describe. Every hinted
+    /// location must precede `transaction_end`, the end of the block that wrote
+    /// the account update. Evidence that `early` already read for exactly the
+    /// validated page is used in place of a second read.
     async fn activity(
         &self,
         anchor: &Anchor,
         request: &AccountRequest,
-        account: &AccountEvidence,
+        update: &AccountUpdate,
+        transaction_end: u64,
+        hints: ActivityHints,
+        early: Option<&EarlyEvidence<'_>>,
     ) -> Result<(Vec<TransactionRow>, Option<Vec<u8>>, Option<Vec<u8>>), Failure> {
-        let end = request
-            .cursor
-            .map_or(account.value.tx_count, |cursor| cursor.0);
-        if end > account.value.tx_count {
-            return Err(Failure::bad("cursor exceeds the proven account count"));
-        }
-        let lower = end.saturating_sub(TRANSACTION_PAGE);
+        let ActivityHints {
+            lower,
+            end,
+            batches,
+        } = hints;
         let expected_count = (end - lower) as usize;
         let next = (lower > 0).then(|| Cursor(lower).encode());
         if expected_count == 0 {
             return Ok((Vec::new(), None, next));
         }
-        let batches =
-            activity_rows(&anchor.sql, request, lower, end, account.proof.write_height).await?;
         let mut hints = Vec::with_capacity(expected_count);
         for batch in &batches {
             for row in 0..batch.num_rows() {
@@ -654,10 +824,10 @@ impl Explorer {
                 let location = uint(batch, 5, row)?;
                 if index != end - 1 - hints.len() as u64
                     || height == 0
-                    || height > account.proof.write_height
+                    || height > update.proof.write_height
                     || block_index > u64::from(u32::MAX)
                     || role > 1
-                    || location >= account.transaction_end
+                    || location >= transaction_end
                 {
                     return Err(Failure::invalid(
                         "activity row violates account page bounds",
@@ -673,7 +843,14 @@ impl Explorer {
             .iter()
             .map(|(_, _, _, _, digest, location)| (*location, *digest))
             .collect::<Vec<_>>();
-        let (proof, entries, bodies) = self.transaction_evidence(anchor, &expected).await?;
+        let read = match early {
+            Some(early) => early.matching(&expected).await,
+            None => None,
+        };
+        let (proof, entries, bodies) = match read {
+            Some(evidence) => evidence,
+            None => self.transaction_evidence(anchor, &expected).await?,
+        };
         let mut seen = BTreeSet::new();
         let mut rows = Vec::with_capacity(expected_count);
         for (index, height, block_index, role, digest, location) in hints {
@@ -715,20 +892,64 @@ impl Explorer {
         Ok((rows, Some(proof), next))
     }
 
-    /// Proves SQL-supplied (location, digest) pairs and fetches their bodies.
-    /// The proven digests must equal the supplied ones exactly.
+    /// Starts reading the evidence for the page `request` is expected to
+    /// return, which needs nothing from the account's state proof.
+    fn early_evidence<'a>(
+        &'a self,
+        anchor: &'a Anchor,
+        request: &'a AccountRequest,
+    ) -> EarlyEvidence<'a> {
+        let pairs = self.expected_activity(anchor, request).boxed().shared();
+        let expected = pairs.clone();
+        let (evidence, stop) = abortable(async move {
+            let pairs = expected.await?;
+            if pairs.is_empty() {
+                return None;
+            }
+            let evidence = self.transaction_evidence(anchor, &pairs).await.ok()?;
+            Some(Arc::new(evidence))
+        });
+        let evidence = evidence.map(|read| read.ok().flatten()).boxed().shared();
+        EarlyEvidence {
+            pairs,
+            evidence,
+            stop,
+        }
+    }
+
+    /// Reads the (location, digest) pairs of the page `request` is expected to
+    /// return, newest first, without the account's proven count. A failed or
+    /// malformed read yields none.
+    async fn expected_activity(
+        &self,
+        anchor: &Anchor,
+        request: &AccountRequest,
+    ) -> Option<Arc<Vec<(u64, Digest)>>> {
+        // Rows above the certified height lie outside the snapshot, and the
+        // page holds the newest rows at or below it.
+        let batches = newest_activity_rows(&anchor.sql, request).await.ok()?;
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                if uint(batch, 1, row).ok()? > anchor.header.height
+                    || pairs.len() == TRANSACTION_PAGE as usize
+                {
+                    continue;
+                }
+                pairs.push((uint(batch, 3, row).ok()?, digest_at(batch, 2, row).ok()?));
+            }
+        }
+        Some(Arc::new(pairs))
+    }
+
+    /// Proves SQL-supplied (location, digest) pairs and fetches their bodies in
+    /// one concurrent round. The proven digests must equal the supplied ones
+    /// exactly.
     async fn transaction_evidence(
         &self,
         anchor: &Anchor,
         expected: &[(u64, Digest)],
-    ) -> Result<
-        (
-            Vec<u8>,
-            BTreeMap<u64, HistoryEntry>,
-            BTreeMap<Digest, Bytes>,
-        ),
-        Failure,
-    > {
+    ) -> Result<Evidence, Failure> {
         // Collapse duplicate locations, rejecting two digests for one location.
         let mut locations = BTreeMap::new();
         for &(location, digest) in expected {
@@ -740,9 +961,15 @@ impl Explorer {
             }
         }
 
-        let (encoded, digests) = self
-            .transaction_proof(anchor, &locations.keys().copied().collect::<Vec<_>>())
-            .await?;
+        // Each body must hash to its supplied digest and the proof must
+        // authenticate exactly those digests, so both are read together.
+        let requested = locations.keys().copied().collect::<Vec<_>>();
+        let (proof, bodies) = join(
+            self.transaction_proof(anchor, &requested),
+            self.bodies(anchor, locations.values().copied(), BODY_LOOKUPS),
+        )
+        .await;
+        let (encoded, digests) = proof?;
         if locations.len() != digests.len()
             || locations.iter().any(|(location, digest)| {
                 digests
@@ -754,10 +981,7 @@ impl Explorer {
                 "transaction proof disagrees with metadata",
             ));
         }
-        let bodies = self
-            .bodies(anchor, digests.values().map(|entry| entry.digest))
-            .await?;
-        Ok((encoded, digests, bodies))
+        Ok((encoded, digests, bodies?))
     }
 
     /// Proves ascending `locations` against the certified transactions root and
@@ -779,21 +1003,25 @@ impl Explorer {
             ));
         }
 
-        // Request one multi-proof at the certified tip, reading QMDB at or
-        // above the request floor.
+        // Prove the locations at the certified tip in concurrent parts. The
+        // request floor bounds the publication lookup they share.
         let requested = locations
             .iter()
             .copied()
             .map(Location::new)
             .collect::<Vec<_>>();
-        let proof = self
-            .transactions
-            .operation_multi_proof(
-                Location::new(range.end() - 1),
-                &requested,
-                Some(anchor.floor()?),
-            )
-            .await?;
+        let tip = Location::new(range.end() - 1);
+        let floor = Some(anchor.floor()?);
+        let size = requested.len().div_ceil(PROOF_LOOKUPS).max(1);
+        let parts = join_all(
+            requested
+                .chunks(size)
+                .map(|part| self.transactions.operation_multi_proof(tip, part, floor)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let proof = merge_proofs(&requested, size, parts)?;
 
         // The proof must verify against the certified root and cover exactly
         // the requested locations.
@@ -827,25 +1055,35 @@ impl Explorer {
         Ok((encoded.to_vec(), digests))
     }
 
-    /// Fetches signed bodies for proven transaction digests. Bodies come from
-    /// SQL, so each must decode and hash to its proven digest.
+    /// Fetches signed bodies for transaction digests in at most `lookups`
+    /// concurrent queries. Bodies come from SQL, so each must decode and hash
+    /// to its digest.
     async fn bodies(
         &self,
         anchor: &Anchor,
         digests: impl Iterator<Item = Digest>,
+        lookups: usize,
     ) -> Result<BTreeMap<Digest, Bytes>, Failure> {
         // Look up bodies by the digest primary key, at most one row per digest.
         let expected = digests.collect::<BTreeSet<_>>();
-        let literals = expected
-            .iter()
-            .map(|digest| format!("X'{}'", hex(digest.as_ref())))
-            .collect::<Vec<_>>()
-            .join(",");
-        let query = format!(
-            "SELECT tx_digest, body FROM tx_meta WHERE tx_digest IN ({literals}) LIMIT {}",
-            expected.len()
-        );
-        let batches = query_rows(&anchor.sql, &query, expected.len()).await?;
+        let ordered = expected.iter().collect::<Vec<_>>();
+        let size = ordered.len().div_ceil(lookups).max(1);
+        let lookups = ordered.chunks(size).map(|chunk| {
+            let literals = chunk
+                .iter()
+                .map(|digest| format!("X'{}'", hex(digest.as_ref())))
+                .collect::<Vec<_>>()
+                .join(",");
+            let query = format!(
+                "SELECT tx_digest, body FROM tx_meta WHERE tx_digest IN ({literals}) LIMIT {}",
+                chunk.len()
+            );
+            async move { query_rows(&anchor.sql, &query, chunk.len()).await }
+        });
+        let mut batches = Vec::new();
+        for lookup in join_all(lookups).await {
+            batches.extend(lookup?);
+        }
 
         // Accept each requested digest once, with a body that matches it.
         let mut bodies = BTreeMap::new();
@@ -901,7 +1139,17 @@ impl Explorer {
                 "SELECT height, digest FROM block_meta WHERE height >= {lowest} AND height < {} ORDER BY height DESC LIMIT {count}",
                 current.height
             );
-            let batches = query_rows(&anchor.sql, &query, count as usize).await?;
+
+            // The certified header names its parent, so a lone ancestor is read
+            // by that digest beside its hint.
+            let hinted = query_rows(&anchor.sql, &query, count as usize);
+            let parent = keys::header_by_digest(&current.parent);
+            let (batches, named) = if count == 1 {
+                let (batches, header) = join(hinted, anchor.session.get(&parent)).await;
+                (batches?, Some(header))
+            } else {
+                (hinted.await?, None)
+            };
             let mut hints = BTreeMap::new();
             for batch in &batches {
                 for row in 0..batch.num_rows() {
@@ -918,18 +1166,26 @@ impl Explorer {
                 return Err(Failure::pending("ancestor metadata is not ready"));
             }
 
-            // Fetch every hinted header in one batched Simplex read.
+            // Fetch every hinted header in one batched Simplex read, unless the
+            // lone hint names the parent digest already read.
             let keys = hints
                 .values()
                 .map(keys::header_by_digest)
                 .collect::<Vec<_>>();
-            let key_refs = keys.iter().collect::<Vec<_>>();
-            let raw = anchor
-                .session
-                .get_many(&key_refs, 128)
-                .await?
-                .collect()
-                .await?;
+            let raw: HashMap<_, _> = match named {
+                Some(header) if keys.as_slice() == std::slice::from_ref(&parent) => {
+                    header?.map(|bytes| (parent, bytes)).into_iter().collect()
+                }
+                _ => {
+                    let key_refs = keys.iter().collect::<Vec<_>>();
+                    anchor
+                        .session
+                        .get_many(&key_refs, 128)
+                        .await?
+                        .collect()
+                        .await?
+                }
+            };
 
             // Walk down from the certificate. Each header must have its height
             // and hinted digest, and its child must name it as both parent block
@@ -992,20 +1248,64 @@ async fn account(
     // Anchor to the newest certificate under the publication boundary, or to
     // the pinned snapshot.
     let anchor = explorer.anchor(1, request.snapshot, true).await?;
-    let mut bundle = anchor.bundle()?;
+    let reads = Box::pin(async {
+        // The page's transaction evidence does not need the state proof, so it
+        // is started first for the pairs the page is expected to name.
+        let early = request
+            .activity
+            .then(|| explorer.early_evidence(&anchor, &request));
+        let page = Box::pin(async {
+            let update = explorer.account_proof(&anchor, &request).await?;
 
-    let account = explorer.account_proof(&anchor, &request).await?;
-    if request.activity {
-        let (transactions, proof, cursor) = explorer.activity(&anchor, &request, &account).await?;
+            // The inclusion ancestry and the activity hints both follow from
+            // the proven update, so they are read together.
+            let (inclusion, hints) = join(explorer.account_inclusion(&anchor, &update), async {
+                if !request.activity {
+                    return Ok::<_, Failure>(None);
+                }
+                let hints = explorer.activity_hints(&anchor, &request, &update).await?;
+                Ok(Some(hints))
+            })
+            .await;
+            let (headers, transaction_end) = inclusion?;
+            let page = match hints? {
+                Some(hints) => Some(
+                    explorer
+                        .activity(
+                            &anchor,
+                            &request,
+                            &update,
+                            transaction_end,
+                            hints,
+                            early.as_ref(),
+                        )
+                        .await?,
+                ),
+                None => None,
+            };
+            Ok((update, headers, page))
+        });
+
+        // The early evidence is polled only while the page is unfinished, so it
+        // ends with a page that fails first.
+        match &early {
+            Some(early) => match select(page, early.evidence.clone()).await {
+                Either::Left((page, _)) => page,
+                Either::Right((_, page)) => page.await,
+            },
+            None => page.await,
+        }
+    });
+    let (update, headers, page) = explorer.confirmed(&anchor, reads).await?;
+
+    let mut bundle = anchor.bundle()?;
+    if let Some((transactions, proof, cursor)) = page {
         bundle.transactions = transactions;
         bundle.transactions_proof = proof;
         bundle.next_cursor = cursor.map(proto::proof_bundle::NextCursor::ActivityCursor);
     }
-    bundle.headers = account.headers;
-    bundle.account = Some(account.proof).into();
-
-    // Report the floor after every read, since each read can raise it.
-    bundle.sequence_number = anchor.floor()?;
+    bundle.headers = headers;
+    bundle.account = Some(update.proof).into();
     response(bundle)
 }
 
@@ -1017,52 +1317,64 @@ async fn block(explorer: &Explorer, request: proto::GetBlockRequest) -> Result<B
         return Err(Failure::bad("height must be positive"));
     }
 
-    // Link the lowest covering certificate down to the block's parent, which
-    // fixes the block's own transaction interval.
     let anchor = explorer.anchor(height, None, false).await?;
-    let (headers, _, start, end) = explorer.ancestry(&anchor, height).await?;
+    let reads = Box::pin(async {
+        // Link the lowest covering certificate down to the block's parent,
+        // which fixes the block's own transaction interval.
+        let (headers, _, start, end) = explorer.ancestry(&anchor, height).await?;
 
-    // Offsets are block indices, and every returned index must fit in a `u32`.
-    let count = end - start;
-    if offset > count {
-        return Err(Failure::bad("block offset exceeds transaction count"));
-    }
-    let page_end = offset.saturating_add(TRANSACTION_PAGE).min(count);
-    if page_end > u64::from(u32::MAX) {
-        return Err(Failure::limit("block index exceeds supported range"));
-    }
+        // Offsets are block indices, and every returned index must fit in a `u32`.
+        let count = end - start;
+        if offset > count {
+            return Err(Failure::bad("block offset exceeds transaction count"));
+        }
+        let page_end = offset.saturating_add(TRANSACTION_PAGE).min(count);
+        if page_end > u64::from(u32::MAX) {
+            return Err(Failure::limit("block index exceeds supported range"));
+        }
+
+        // Only the proof names a block page's digests, so the bodies follow it
+        // and may use the proof's share of requests.
+        let mut transactions = Vec::new();
+        let mut proof = None;
+        if offset < page_end {
+            let locations = (start + offset..start + page_end).collect::<Vec<_>>();
+            let (encoded, digests) = explorer.transaction_proof(&anchor, &locations).await?;
+            let bodies = explorer
+                .bodies(
+                    &anchor,
+                    digests.values().map(|entry| entry.digest),
+                    PROOF_LOOKUPS + BODY_LOOKUPS,
+                )
+                .await?;
+            transactions = digests
+                .into_iter()
+                .map(|(location, entry)| TransactionRow {
+                    location,
+                    body: bodies[&entry.digest].to_vec(),
+                    sender_index: entry.sender_index,
+                    recipient_index: entry.recipient_index,
+                    height,
+                    index: (location - start) as u32,
+                    role: None,
+                    ..Default::default()
+                })
+                .collect();
+            proof = Some(encoded);
+        }
+
+        // Return the next page's offset while transactions remain.
+        let next =
+            (page_end < count).then_some(proto::proof_bundle::NextCursor::BlockOffset(page_end));
+        Ok((headers, transactions, proof, next))
+    });
+    let (headers, transactions, proof, next) = explorer.confirmed(&anchor, reads).await?;
+
     let mut bundle = anchor.bundle()?;
     bundle.headers = headers;
-
-    // Prove the page's locations and fetch bodies for the proven digests.
-    if offset < page_end {
-        let locations = (start + offset..start + page_end).collect::<Vec<_>>();
-        let (proof, digests) = explorer.transaction_proof(&anchor, &locations).await?;
-        let bodies = explorer
-            .bodies(&anchor, digests.values().map(|entry| entry.digest))
-            .await?;
-        bundle.transactions = digests
-            .into_iter()
-            .map(|(location, entry)| TransactionRow {
-                location,
-                body: bodies[&entry.digest].to_vec(),
-                sender_index: entry.sender_index,
-                recipient_index: entry.recipient_index,
-                height,
-                index: (location - start) as u32,
-                role: None,
-                ..Default::default()
-            })
-            .collect();
-        bundle.transactions_proof = Some(proof);
-    }
-
-    // Return the next page's offset while transactions remain.
-    bundle.next_cursor =
-        (page_end < count).then_some(proto::proof_bundle::NextCursor::BlockOffset(page_end));
-
-    // Report the floor after every read, since each read can raise it.
-    bundle.sequence_number = anchor.floor()?;
+    bundle.transactions = transactions;
+    bundle.transactions_proof = proof;
+    bundle.next_cursor = next;
     response(bundle)
 }
 
@@ -1099,19 +1411,30 @@ async fn transaction(
     // The SQL height and location are hints. The certificate, ancestry, and
     // proof must confirm that the location lies in that block's interval.
     let anchor = explorer.anchor_at(&published, height, None, false).await?;
-    let (headers, _, start, end) = explorer.ancestry(&anchor, height).await?;
-    if location < start || location >= end {
-        return Err(Failure::invalid(
-            "transaction is outside its block interval",
-        ));
-    }
-    let index = u32::try_from(location - start)
-        .map_err(|_| Failure::limit("transaction index exceeds supported range"))?;
+    let expected = [(location, digest)];
+    let reads = Box::pin(async {
+        // The ancestry and the evidence both follow from the hints, so they
+        // are read together.
+        let (ancestry, evidence) = Box::pin(join(
+            explorer.ancestry(&anchor, height),
+            explorer.transaction_evidence(&anchor, &expected),
+        ))
+        .await;
+        let (headers, _, start, end) = ancestry?;
+        if location < start || location >= end {
+            return Err(Failure::invalid(
+                "transaction is outside its block interval",
+            ));
+        }
+        let index = u32::try_from(location - start)
+            .map_err(|_| Failure::limit("transaction index exceeds supported range"))?;
 
-    // The proof must authenticate exactly this digest at the hinted location.
-    let (proof, entries, bodies) = explorer
-        .transaction_evidence(&anchor, &[(location, digest)])
-        .await?;
+        // The proof must authenticate exactly this digest at the hinted location.
+        let (proof, entries, bodies) = evidence?;
+        Ok((headers, index, proof, entries, bodies))
+    });
+    let (headers, index, proof, entries, bodies) = explorer.confirmed(&anchor, reads).await?;
+
     let mut bundle = anchor.bundle()?;
     bundle.headers = headers;
     bundle.transactions = vec![TransactionRow {
@@ -1125,9 +1448,6 @@ async fn transaction(
         ..Default::default()
     }];
     bundle.transactions_proof = Some(proof);
-
-    // Report the floor after every read, since each read can raise it.
-    bundle.sequence_number = anchor.floor()?;
     response(bundle)
 }
 
@@ -1137,6 +1457,61 @@ fn bounded_proof(bytes: &[u8]) -> Result<(), Failure> {
         return Err(Failure::limit("proof exceeds 1 MiB"));
     }
     Ok(())
+}
+
+/// Combines the multi-proofs of consecutive `size`-location parts of ascending
+/// `locations` into the one multi-proof for all of them.
+///
+/// A multi-proof holds the digest at each of its [`multi_proof_positions`]. The
+/// positions for all locations are the union of the positions for each part,
+/// so the parts supply every digest. The caller verifies the result.
+fn merge_proofs(
+    locations: &[Location<mmr::Family>],
+    size: usize,
+    parts: Vec<TransactionProof>,
+) -> Result<TransactionProof, Failure> {
+    let mismatch = || Failure::invalid("transaction proof parts do not combine");
+    let first = parts.first().ok_or_else(mismatch)?;
+    let watermark = first.watermark;
+    let ops_root = first.ops_root;
+    let ops_root_witness = first.ops_root_witness.clone();
+    let leaves = first.proof.leaves;
+    let inactive_peaks = first.proof.inactive_peaks;
+
+    // Index each part's digests by position. Every part must describe the same
+    // tree and hold one digest per position of its own locations.
+    let mut digests = HashMap::new();
+    let mut operations = Vec::with_capacity(locations.len());
+    for (part, proven) in parts.into_iter().zip(locations.chunks(size)) {
+        let positions = multi_proof_positions(leaves, proven).map_err(|_| mismatch())?;
+        if part.watermark != watermark
+            || part.ops_root != ops_root
+            || part.ops_root_witness != ops_root_witness
+            || part.proof.leaves != leaves
+            || part.proof.inactive_peaks != inactive_peaks
+            || part.proof.digests.len() != positions.len()
+        {
+            return Err(mismatch());
+        }
+        digests.extend(positions.into_iter().zip(part.proof.digests));
+        operations.extend(part.operations);
+    }
+    let digests = multi_proof_positions(leaves, locations)
+        .map_err(|_| mismatch())?
+        .into_iter()
+        .map(|position| digests.get(&position).copied().ok_or_else(mismatch))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RawBatchMultiProof {
+        watermark,
+        ops_root,
+        ops_root_witness,
+        proof: Proof {
+            leaves,
+            inactive_peaks,
+            digests,
+        },
+        operations,
+    })
 }
 
 /// Bounds and decodes a stored signed transaction, requiring its message digest
@@ -1169,6 +1544,28 @@ async fn activity_rows(
         hex(request.key.as_ref())
     );
     query_rows(sql, &query, count).await
+}
+
+/// Reads the newest rows of an account's history below the request's cursor,
+/// newest first, with [`EARLY_ACTIVITY_MARGIN`] more on a first page.
+async fn newest_activity_rows(
+    sql: &SqlContext,
+    request: &AccountRequest,
+) -> Result<Vec<RecordBatch>, Failure> {
+    let (bound, count) = request.cursor.map_or_else(
+        || (String::new(), TRANSACTION_PAGE + EARLY_ACTIVITY_MARGIN),
+        |cursor| {
+            (
+                format!(" AND account_index < {}", cursor.0),
+                TRANSACTION_PAGE,
+            )
+        },
+    );
+    let query = format!(
+        "SELECT account_index, height, tx_digest, qmdb_location FROM tx_activity WHERE account = X'{}'{bound} ORDER BY account_index DESC LIMIT {count}",
+        hex(request.key.as_ref())
+    );
+    query_rows(sql, &query, count as usize).await
 }
 
 /// Runs a SQL query, rejecting results with more than `max` rows and dropping
