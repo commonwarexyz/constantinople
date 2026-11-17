@@ -32,8 +32,8 @@ pub(super) fn router(
         )
         .with_deadline_policy(
             DeadlinePolicy::new()
-                .with_max(Duration::from_secs(11))
-                .with_default_timeout(Duration::from_secs(11)),
+                .with_max(Duration::from_secs(30))
+                .with_default_timeout(Duration::from_secs(30)),
         );
     Ok(Router::new().fallback_service(transport))
 }
