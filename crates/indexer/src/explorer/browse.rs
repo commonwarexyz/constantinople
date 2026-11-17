@@ -80,18 +80,22 @@ impl Explorer {
             return Ok(None);
         };
         let height = anchor.header.height;
-        if after.is_some_and(|after| height - after > MAX_HEADERS) {
-            return Err(Failure::limit("certificate gap exceeds 4096 heights"));
-        }
-        if anchor.header.encode().len() > MAX_HEADER_BYTES {
-            return Err(Failure::limit("certified header exceeds 512 bytes"));
-        }
 
         // A resumed batch includes the prior verified header as overlap. For
         // genesis, ancestry stops at height 1 because height 0 has no ordinary
         // certificate or uploaded header. Bootstrap needs only the head's parent.
         let first = after.map_or(height, |after| after + 1);
-        let (headers, _, _, _) = self.ancestry(&anchor, first).await?;
+        let reads = Box::pin(async {
+            if after.is_some_and(|after| height - after > MAX_HEADERS) {
+                return Err(Failure::limit("certificate gap exceeds 4096 heights"));
+            }
+            if anchor.header.encode().len() > MAX_HEADER_BYTES {
+                return Err(Failure::limit("certified header exceeds 512 bytes"));
+            }
+            let (headers, _, _, _) = self.ancestry(&anchor, first).await?;
+            Ok(headers)
+        });
+        let headers = self.confirmed(&anchor, reads).await?;
         let batch = WatchBlocksResponse {
             sequence_number: anchor.floor()?,
             certificate: anchor.raw.to_vec(),

@@ -4,6 +4,10 @@ use super::*;
 mod scan_tests;
 
 use crate::{
+    namespaces::{
+        PUBLICATION_TARGET_PREFIX_VALUE, SIMPLEX_PREFIX_VALUE, SQL_META_PREFIX_VALUE,
+        STATE_QMDB_PREFIX_VALUE, TRANSACTIONS_QMDB_PREFIX_VALUE,
+    },
     proto,
     publisher::{
         Publisher, PublisherMetrics,
@@ -15,12 +19,13 @@ use crate::{
             encode_tx_activity_row,
         },
     },
-    store::writer_store_client,
+    store::{store_client, writer_store_client},
     test_store::ObservedStore,
 };
 use axum::{
     body::{Body, to_bytes},
-    http::{HeaderName, Method, Request, StatusCode},
+    extract::State,
+    http::{HeaderName, Method, Request, StatusCode, header::CONTENT_TYPE},
     response::Response,
 };
 use buffa::Message;
@@ -54,10 +59,13 @@ use constantinople_primitives::{
     StateSyncProof, TRANSACTION_NAMESPACE, Transaction, TransactionHistoryEntry,
     TransactionPublicKey, TransactionSignature, verify_transactions,
 };
+use exoware_sdk::{Key, StoreKeyPrefix, StoreWriteBatch};
+use exoware_simulator::{AppState, RocksStore, connect_stack};
 use p256::ecdsa::{SigningKey, signature::Signer as _};
 use rand::{SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
-use std::{future::Future, num::NonZeroU64};
+use std::{future::Future, num::NonZeroU64, sync::Mutex, time::Duration};
+use tokio::sync::{Notify, oneshot};
 use tower::ServiceExt as _;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -104,9 +112,26 @@ struct Fixture {
     verification_material: String,
 }
 
+/// Test Store that fixture workers and read clients connect to.
+trait Served {
+    fn url(&self) -> &str;
+
+    async fn shutdown(self);
+}
+
+impl Served for ObservedStore {
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    async fn shutdown(self) {
+        Self::shutdown(self).await;
+    }
+}
+
 /// Store, explorer router, and publishing workers for one fixture run.
-struct FixtureStore {
-    store: ObservedStore,
+struct FixtureStore<S = ObservedStore> {
+    store: S,
     client: StoreClient,
     router: Router,
     publisher: Publisher<Sha256, VerifyingKey>,
@@ -116,15 +141,22 @@ struct FixtureStore {
 }
 
 impl FixtureStore {
-    /// Opens an observed Store and connects the router, QMDB publisher, and
-    /// certificate reporter with the same writer credential.
+    /// Opens an observed Store and connects the fixture workers to it.
     async fn open(context: commonware_runtime::tokio::Context) -> Self {
         let store = ObservedStore::open("explorer-fixture").await.unwrap();
-        let client = writer_store_client(&store.url, Some("explorer-fixture")).unwrap();
+        Self::connect(context, store).await
+    }
+}
+
+impl<S: Served> FixtureStore<S> {
+    /// Connects the router, QMDB publisher, and certificate reporter to
+    /// `store` with the same writer credential.
+    async fn connect(context: commonware_runtime::tokio::Context, store: S) -> Self {
+        let client = writer_store_client(store.url(), Some("explorer-fixture")).unwrap();
         let router = router(&client, None).unwrap();
         let (publisher, worker) = Publisher::connect(
             context.child("publisher"),
-            &store.url,
+            store.url(),
             Some("explorer-fixture"),
             4,
             PublisherMetrics::new(&context.child("metrics")),
@@ -136,7 +168,7 @@ impl FixtureStore {
         let (reporter, reporter_worker) =
             CertificateReporter::<Sha256, VerifyingKey, Scheme>::connect(
                 context.child("certificates"),
-                &store.url,
+                store.url(),
                 Some("explorer-fixture"),
                 4,
             )
@@ -160,6 +192,381 @@ impl FixtureStore {
         self.worker.await.unwrap();
         self.store.shutdown().await;
     }
+}
+
+/// One Store query as an uncompressed read client sent it.
+#[derive(Clone, Debug)]
+struct StoreQuery {
+    /// Query method, one of `Get`, `GetMany`, `Range`, or `Reduce`.
+    method: String,
+    /// First requested key or range start, led by its namespace byte.
+    key: Vec<u8>,
+    /// Minimum Store sequence the query required.
+    floor: Option<u64>,
+}
+
+impl StoreQuery {
+    /// Reads the first key and the sequence floor from an encoded query.
+    fn parse(method: &str, mut bytes: &[u8]) -> Self {
+        let floor_field = match method {
+            "Range" => 6,
+            "Reduce" => 4,
+            _ => 2,
+        };
+        let mut key = None;
+        let mut floor = None;
+        while !bytes.is_empty() {
+            let tag = varint(&mut bytes);
+            match tag & 7 {
+                0 => {
+                    let value = varint(&mut bytes);
+                    if tag >> 3 == floor_field {
+                        floor = Some(value);
+                    }
+                }
+                2 => {
+                    let len = usize::try_from(varint(&mut bytes)).unwrap();
+                    if tag >> 3 == 1 && key.is_none() {
+                        key = Some(bytes[..len].to_vec());
+                    }
+                    bytes = &bytes[len..];
+                }
+                wire => {
+                    panic!("query field must be a varint or length-delimited, got wire type {wire}")
+                }
+            }
+        }
+        Self {
+            method: method.to_string(),
+            key: key.unwrap_or_default(),
+            floor,
+        }
+    }
+
+    fn namespace(&self) -> Option<u8> {
+        self.key.first().copied()
+    }
+
+    fn is(&self, method: &str, namespace: u8) -> bool {
+        self.method == method && self.namespace() == Some(namespace)
+    }
+
+    /// Whether this fetches transaction bodies. A body lookup's key is one
+    /// digest behind its namespace and table bytes.
+    fn is_body_lookup(&self) -> bool {
+        self.is("GetMany", SQL_META_PREFIX_VALUE) && self.key.len() == 34
+    }
+}
+
+fn varint(bytes: &mut &[u8]) -> u64 {
+    let mut value = 0;
+    for shift in (0..70).step_by(7) {
+        let byte = bytes[0];
+        *bytes = &bytes[1..];
+        value |= u64::from(byte & 127) << shift;
+        if byte < 128 {
+            return value;
+        }
+    }
+    panic!("fixture protobuf varint must terminate");
+}
+
+/// Key as the Store sees it, led by its namespace byte.
+fn physical(namespace: u8, key: &Key) -> Vec<u8> {
+    [&[namespace][..], key.as_ref()].concat()
+}
+
+type Matcher = Box<dyn Fn(&StoreQuery) -> bool + Send>;
+
+/// Queries kept in flight until the test releases them.
+struct Hold {
+    /// Answered query that starts the hold.
+    after: Matcher,
+    /// Queries the started hold captures until it holds `width` of them.
+    capture: Matcher,
+    width: usize,
+    started: bool,
+    held: Vec<Held>,
+}
+
+struct Held {
+    query: StoreQuery,
+    release: Option<oneshot::Sender<()>>,
+    answered: Option<oneshot::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct GateState {
+    log: Vec<StoreQuery>,
+    holds: Vec<Hold>,
+}
+
+/// Log of Store queries, with holds that keep chosen queries unanswered.
+///
+/// A hold fills only once `width` captured queries wait together, so a read
+/// plan that issues those queries one after another never fills it.
+#[derive(Default)]
+struct Gate {
+    state: Mutex<GateState>,
+    changed: Notify,
+}
+
+impl Gate {
+    /// Registers a hold that starts once a query matching `after` is answered,
+    /// then captures the next `width` queries matching `capture`.
+    fn hold(
+        &self,
+        after: impl Fn(&StoreQuery) -> bool + Send + 'static,
+        capture: impl Fn(&StoreQuery) -> bool + Send + 'static,
+        width: usize,
+    ) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.holds.push(Hold {
+            after: Box::new(after),
+            capture: Box::new(capture),
+            width,
+            started: false,
+            held: Vec::new(),
+        });
+        state.holds.len() - 1
+    }
+
+    /// Waits until `hold` is full and returns its queries in arrival order.
+    async fn gathered(&self, hold: usize) -> Vec<StoreQuery> {
+        let held = |state: &GateState| {
+            state.holds[hold]
+                .held
+                .iter()
+                .map(|held| held.query.clone())
+                .collect::<Vec<_>>()
+        };
+        let full = async {
+            loop {
+                // Register for the notification before checking, so a query
+                // that arrives in between still wakes the waiter.
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let state = self.state.lock().unwrap();
+                    if state.holds[hold].held.len() == state.holds[hold].width {
+                        return held(&state);
+                    }
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), full)
+            .await
+            .unwrap_or_else(|_| {
+                let state = self.state.lock().unwrap();
+                panic!(
+                    "{} Store reads must be in flight together, found {:?}",
+                    state.holds[hold].width,
+                    held(&state)
+                )
+            })
+    }
+
+    /// Releases one held query and waits for the Store's complete answer.
+    async fn release(&self, hold: usize, index: usize) {
+        let (release, answered) = {
+            let mut state = self.state.lock().unwrap();
+            let held = &mut state.holds[hold].held[index];
+            (held.release.take().unwrap(), held.answered.take().unwrap())
+        };
+        release.send(()).unwrap();
+        answered.await.unwrap();
+    }
+
+    /// Waits until `hold` is full, releases its queries in arrival order, and
+    /// returns them.
+    async fn pass(&self, hold: usize) -> Vec<StoreQuery> {
+        let held = self.gathered(hold).await;
+        for index in 0..held.len() {
+            self.release(hold, index).await;
+        }
+        held
+    }
+
+    /// Waits until the client has abandoned every query `hold` still holds.
+    async fn abandoned(&self, hold: usize) {
+        let open = || {
+            let state = self.state.lock().unwrap();
+            state.holds[hold]
+                .held
+                .iter()
+                .filter(|held| {
+                    held.release
+                        .as_ref()
+                        .is_some_and(|release| !release.is_closed())
+                })
+                .count()
+        };
+        let closed = async {
+            while open() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .is_err()
+        {
+            panic!("{} held Store reads must be abandoned", open());
+        }
+    }
+
+    /// Returns and clears the logged queries.
+    fn take_log(&self) -> Vec<StoreQuery> {
+        std::mem::take(&mut self.state.lock().unwrap().log)
+    }
+
+    /// Logs an arriving query and captures it for the first started hold with
+    /// room. A captured query waits on the returned receiver.
+    fn arrive(&self, query: &StoreQuery) -> Option<(oneshot::Receiver<()>, oneshot::Sender<()>)> {
+        let mut state = self.state.lock().unwrap();
+        state.log.push(query.clone());
+        let hold = state
+            .holds
+            .iter_mut()
+            .find(|hold| hold.started && hold.held.len() < hold.width && (hold.capture)(query))?;
+        let (release, released) = oneshot::channel();
+        let (answer, answered) = oneshot::channel();
+        hold.held.push(Held {
+            query: query.clone(),
+            release: Some(release),
+            answered: Some(answered),
+        });
+        drop(state);
+        self.changed.notify_waiters();
+        Some((released, answer))
+    }
+
+    /// Starts every hold that waits for this answered query.
+    fn answer(&self, query: &StoreQuery) {
+        let mut state = self.state.lock().unwrap();
+        for hold in state.holds.iter_mut().filter(|hold| !hold.started) {
+            hold.started = (hold.after)(query);
+        }
+    }
+}
+
+/// Store whose uncompressed queries pass through a [`Gate`].
+struct GatedStore {
+    url: String,
+    gate: Arc<Gate>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl GatedStore {
+    async fn open() -> Self {
+        let engine = RocksStore::open_owned(tempfile::tempdir().unwrap(), None).unwrap();
+        let gate = Arc::new(Gate::default());
+        let app = Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .fallback_service(connect_stack(AppState::new(Arc::new(engine))))
+            .layer(axum::middleware::from_fn_with_state(
+                gate.clone(),
+                gate_query,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { url, gate, server }
+    }
+}
+
+impl Served for GatedStore {
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    async fn shutdown(self) {
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+
+/// Passes each uncompressed Store query through the gate. A hold starts only
+/// after the Store has produced the whole answer to its starting query, and a
+/// released query reports back once its own answer is complete.
+async fn gate_query(
+    State(gate): State<Arc<Gate>>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let compressed = ["content-encoding", "connect-content-encoding"]
+        .iter()
+        .any(|header| request.headers().contains_key(*header));
+    let Some(method) = path
+        .strip_prefix("/store.query.v1.Service/")
+        .filter(|_| !compressed)
+    else {
+        return next.run(request).await;
+    };
+    let streamed = request.headers()[CONTENT_TYPE] == "application/connect+proto";
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 256 * 1024).await.unwrap();
+    let query = StoreQuery::parse(method, if streamed { &body[5..] } else { &body[..] });
+    let held = gate.arrive(&query);
+    let answer = match held {
+        Some((released, answer)) => {
+            released.await.unwrap();
+            Some(answer)
+        }
+        None => None,
+    };
+    let response = next.run(Request::from_parts(parts, Body::from(body))).await;
+    let (parts, body) = response.into_parts();
+    let body = to_bytes(body, MAX_RESPONSE_BYTES).await.unwrap();
+    gate.answer(&query);
+    if let Some(answer) = answer {
+        let _ = answer.send(());
+    }
+    Response::from_parts(parts, Body::from(body))
+}
+
+/// Store sequence a read with no floor observes.
+async fn store_sequence(client: &StoreClient) -> u64 {
+    let session = ReadSession::monotonic(publication_target_client(client).unwrap(), None);
+    session.get(&publication_target_key(1)).await.unwrap();
+    session.evaluated_sequence().unwrap()
+}
+
+/// Commits one row outside every explorer namespace and returns the Store
+/// sequence of that write.
+async fn advance(client: &StoreClient) -> u64 {
+    let unused = client.prefixed(StoreKeyPrefix::new(vec![0x7f]).unwrap());
+    let mut batch = StoreWriteBatch::new();
+    batch
+        .push(&unused, &Key::from_static(b"tick"), b"tock".as_slice())
+        .unwrap();
+    batch.commit(client).await.unwrap()
+}
+
+/// Asserts that two bundles carry the same evidence, whatever Store sequence
+/// each observed.
+fn assert_same_evidence(actual: &proto::ProofBundle, expected: &proto::ProofBundle) {
+    let mut bundles = [bundle_json(actual), bundle_json(expected)];
+    for bundle in &mut bundles {
+        bundle.as_object_mut().unwrap().remove("sequenceNumber");
+    }
+    assert_eq!(bundles[0], bundles[1]);
+}
+
+/// Publishes every fixture block with its certificate to a gated Store and
+/// returns an uncompressed read client for it.
+async fn gated(
+    context: commonware_runtime::tokio::Context,
+    fixture: &Fixture,
+) -> (FixtureStore<GatedStore>, StoreClient) {
+    let environment = FixtureStore::connect(context, GatedStore::open().await).await;
+    for block in &fixture.blocks {
+        publish(&environment.publisher, &environment.reporter, block, true).await;
+    }
+    let client = store_client(&environment.store.url, None).unwrap();
+    (environment, client)
 }
 
 /// Builds the captured QMDB range from `start` to the end of `operations`,
@@ -1761,6 +2168,672 @@ fn publisher_bundles_cover_descendants_empty_blocks_and_fixed_account_pages() {
         assert!(store.requests().iter().all(|request| request.authorized));
 
         serve_fixture_if_requested(environment.router.clone(), &fixture).await;
+        environment.close().await;
+    });
+}
+
+/// Decodes the height certified by a served bundle.
+fn certified_height(bundle: &proto::ProofBundle) -> u64 {
+    certificate_height(&bundle_json(bundle))
+}
+
+/// Namespaces of the held queries, in ascending order.
+fn namespaces(held: &[StoreQuery]) -> Vec<u8> {
+    let mut namespaces = held
+        .iter()
+        .map(|query| query.namespace().expect("Store key must carry a namespace"))
+        .collect::<Vec<_>>();
+    namespaces.sort_unstable();
+    namespaces
+}
+
+/// Requests that read `keys` items when split evenly across at most `limit`
+/// requests.
+fn requests(keys: usize, limit: usize) -> usize {
+    keys.div_ceil(keys.div_ceil(limit))
+}
+
+#[test]
+fn transaction_reads_share_one_round_and_the_sequence_covers_each() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        let fixture = fixture(context.child("state_fixture")).await;
+        let (environment, client) = Box::pin(gated(context, &fixture)).await;
+        let gate = &environment.store.gate;
+
+        // Block 2 has its own certificate below the newest target, so its
+        // transaction needs five reads once that certificate is known.
+        let digest = *fixture.blocks[1].transactions[0].message_digest();
+        let request = proto::GetTransactionRequest {
+            digest: digest.as_ref().to_vec(),
+            ..Default::default()
+        };
+        let expected = Box::pin(transaction(
+            &Explorer::new(&client).unwrap(),
+            request.clone(),
+        ))
+        .await
+        .unwrap();
+        let certificate = physical(
+            SIMPLEX_PREFIX_VALUE,
+            &keys::finalized_by_height(Height::new(2)),
+        );
+        let body = move |query: &StoreQuery| {
+            query
+                .key
+                .windows(32)
+                .any(|window| window == digest.as_ref())
+        };
+        let session_reads: [(&str, Matcher); 4] = [
+            (
+                "publication target",
+                Box::new(|query| query.is("Get", PUBLICATION_TARGET_PREFIX_VALUE)),
+            ),
+            (
+                "parent header",
+                Box::new(|query| query.is("Get", SIMPLEX_PREFIX_VALUE)),
+            ),
+            (
+                "ancestor hint",
+                Box::new(move |query| {
+                    query.namespace() == Some(SQL_META_PREFIX_VALUE) && !body(query)
+                }),
+            ),
+            (
+                "body",
+                Box::new(move |query| {
+                    query.namespace() == Some(SQL_META_PREFIX_VALUE) && body(query)
+                }),
+            ),
+        ];
+
+        // Each session read in turn is the only one answered after a write, and
+        // the bundle must report that write's sequence.
+        for (name, last) in session_reads {
+            let explorer = Explorer::new(&client).unwrap();
+            let floor = store_sequence(&client).await;
+            let probe = certificate.clone();
+            let hold = gate.hold(
+                move |query| query.method == "Get" && query.key == probe,
+                |_| true,
+                5,
+            );
+            let (bundle, top) = join(Box::pin(transaction(&explorer, request.clone())), async {
+                // All five reads wait together, each requiring the sequence the
+                // certificate was read at.
+                let held = gate.gathered(hold).await;
+                assert!(
+                    held.iter().all(|query| query.floor == Some(floor)),
+                    "{name}: {held:?}"
+                );
+                let last = held
+                    .iter()
+                    .position(&*last)
+                    .unwrap_or_else(|| panic!("{name} must be in flight: {held:?}"));
+                for index in (0..held.len()).filter(|index| *index != last) {
+                    gate.release(hold, index).await;
+                }
+                let top = advance(&client).await;
+                gate.release(hold, last).await;
+                top
+            })
+            .await;
+            let bundle = bundle.unwrap();
+            assert!(top > floor);
+            assert_eq!(bundle.sequence_number, top, "{name}");
+            assert_same_evidence(&bundle, &expected);
+        }
+        environment.close().await;
+    });
+}
+
+#[test]
+fn page_reads_share_a_round_wherever_they_are_independent() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        let fixture = fixture(context.child("state_fixture")).await;
+        let (environment, client) = Box::pin(gated(context, &fixture)).await;
+        let gate = &environment.store.gate;
+        let probe = |height| {
+            let key = physical(
+                SIMPLEX_PREFIX_VALUE,
+                &keys::finalized_by_height(Height::new(height)),
+            );
+            move |query: &StoreQuery| query.method == "Get" && query.key == key
+        };
+
+        // A block page reads the target, the parent's hint, and the parent
+        // header together, then its proof parts, then its body lookups.
+        let request = proto::GetBlockRequest {
+            height: 2,
+            ..Default::default()
+        };
+        let expected = Box::pin(block(&Explorer::new(&client).unwrap(), request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(expected.transactions.len(), TRANSACTION_PAGE as usize);
+        let explorer = Explorer::new(&client).unwrap();
+        let linked = gate.hold(probe(2), |_| true, 3);
+        let parts = gate.hold(
+            |query| query.is("Range", TRANSACTIONS_QMDB_PREFIX_VALUE),
+            |query| query.is("GetMany", TRANSACTIONS_QMDB_PREFIX_VALUE),
+            requests(TRANSACTION_PAGE as usize, PROOF_LOOKUPS),
+        );
+        let bodies = gate.hold(
+            |query| query.is("GetMany", TRANSACTIONS_QMDB_PREFIX_VALUE),
+            |query| query.is("GetMany", SQL_META_PREFIX_VALUE),
+            requests(TRANSACTION_PAGE as usize, PROOF_LOOKUPS + BODY_LOOKUPS),
+        );
+        let (bundle, _) = join(Box::pin(block(&explorer, request)), async {
+            assert_eq!(
+                namespaces(&gate.pass(linked).await),
+                [
+                    SIMPLEX_PREFIX_VALUE,
+                    SQL_META_PREFIX_VALUE,
+                    PUBLICATION_TARGET_PREFIX_VALUE
+                ]
+            );
+            assert_eq!(gate.pass(parts).await.len(), 25);
+            assert_eq!(gate.pass(bodies).await.len(), 25);
+        })
+        .await;
+        assert_same_evidence(&bundle.unwrap(), &expected);
+
+        // An account page reads its transaction evidence beside the state
+        // proof and uses it once its own hints name the same pairs.
+        assert_eq!(fixture.blocks[3].account_write_height, Some(4));
+        let request = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            ..Default::default()
+        };
+        let expected = Box::pin(account(&Explorer::new(&client).unwrap(), request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(expected.transactions.len(), TRANSACTION_PAGE as usize);
+        let explorer = Explorer::new(&client).unwrap();
+        let key = fixture.account;
+        let started = gate.hold(probe(4), |_| true, 2);
+        let evidence = gate.hold(
+            |query| query.is("Range", SQL_META_PREFIX_VALUE),
+            |query| {
+                query.namespace() == Some(TRANSACTIONS_QMDB_PREFIX_VALUE)
+                    || query.is("GetMany", SQL_META_PREFIX_VALUE)
+            },
+            1 + BODY_LOOKUPS,
+        );
+        let located = gate.hold(
+            move |query| {
+                query.is("GetMany", SQL_META_PREFIX_VALUE)
+                    && query.key.windows(32).any(|window| window == key.as_ref())
+            },
+            |_| true,
+            3,
+        );
+        gate.take_log();
+        let (bundle, _) = join(Box::pin(account(&explorer, request.clone())), async {
+            // Only the early activity rows are answered, so the evidence reads
+            // gather while the state proof still waits for its first answer.
+            let held = gate.gathered(started).await;
+            assert_eq!(
+                namespaces(&held),
+                [STATE_QMDB_PREFIX_VALUE, SQL_META_PREFIX_VALUE]
+            );
+            let rows = held
+                .iter()
+                .position(|query| query.namespace() == Some(SQL_META_PREFIX_VALUE))
+                .unwrap();
+            gate.release(started, rows).await;
+            let mut reads = vec![SQL_META_PREFIX_VALUE; BODY_LOOKUPS];
+            reads.insert(0, TRANSACTIONS_QMDB_PREFIX_VALUE);
+            assert_eq!(namespaces(&gate.gathered(evidence).await), reads);
+
+            // The state proof and the metadata row then lead to the ancestry
+            // and the page's own hints, which wait together.
+            gate.release(started, 1 - rows).await;
+            assert_eq!(
+                namespaces(&gate.pass(located).await),
+                [
+                    SIMPLEX_PREFIX_VALUE,
+                    SQL_META_PREFIX_VALUE,
+                    SQL_META_PREFIX_VALUE
+                ]
+            );
+            gate.pass(evidence).await;
+        })
+        .await;
+        assert_same_evidence(&bundle.unwrap(), &expected);
+
+        // The page's evidence was read once, as the proof parts and body
+        // lookups the early read issued.
+        let evidence_reads = |log: Vec<StoreQuery>| {
+            (
+                log.iter()
+                    .filter(|query| query.is("GetMany", TRANSACTIONS_QMDB_PREFIX_VALUE))
+                    .count(),
+                log.iter().filter(|query| query.is_body_lookup()).count(),
+            )
+        };
+        let once = (
+            requests(TRANSACTION_PAGE as usize, PROOF_LOOKUPS),
+            requests(TRANSACTION_PAGE as usize, BODY_LOOKUPS),
+        );
+        assert_eq!(evidence_reads(gate.take_log()), once);
+
+        // A snapshot below the newest block is expected to hold the newest
+        // rows at or below its height, so its early evidence is used as well.
+        let snapshot = proto::GetAccountRequest {
+            at: Some(3),
+            digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            ..request
+        };
+        let older = Box::pin(account(&Explorer::new(&client).unwrap(), snapshot))
+            .await
+            .unwrap();
+        assert_eq!(certified_height(&older), 3);
+        assert_eq!(older.transactions.len(), TRANSACTION_PAGE as usize);
+        assert_eq!(evidence_reads(gate.take_log()), once);
+
+        // A pinned page names the update's location, so its metadata row is
+        // read with the state proof and the publication target.
+        let request = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            at: Some(3),
+            digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            account_location: fixture.blocks[2].account_location,
+            activity: Some(false),
+            ..Default::default()
+        };
+        let expected = Box::pin(account(&Explorer::new(&client).unwrap(), request.clone()))
+            .await
+            .unwrap();
+        let explorer = Explorer::new(&client).unwrap();
+        let pinned = gate.hold(probe(3), |_| true, 3);
+        let (bundle, _) = join(Box::pin(account(&explorer, request)), async {
+            assert_eq!(
+                namespaces(&gate.pass(pinned).await),
+                [
+                    STATE_QMDB_PREFIX_VALUE,
+                    SQL_META_PREFIX_VALUE,
+                    PUBLICATION_TARGET_PREFIX_VALUE
+                ]
+            );
+        })
+        .await;
+        assert_same_evidence(&bundle.unwrap(), &expected);
+
+        // A live feed batch reads its lone ancestor's hint and header together.
+        let feed = proto::ExplorerServiceClient::new(
+            connectrpc::client::ServiceTransport::new(router(&client, None).unwrap()),
+            connectrpc::client::ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let live = gate.hold(probe(4), |_| true, 2);
+        let mut stream = feed
+            .watch_blocks(proto::WatchBlocksRequest {
+                after: Some(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (batch, _) = join(stream.message(), async {
+            assert_eq!(
+                namespaces(&gate.pass(live).await),
+                [SIMPLEX_PREFIX_VALUE, SQL_META_PREFIX_VALUE]
+            );
+        })
+        .await;
+        let batch = batch.unwrap().unwrap().to_owned_message();
+        assert_eq!(
+            batch.headers,
+            vec![fixture.blocks[2].block.header.encode().to_vec()]
+        );
+        drop(stream);
+        environment.close().await;
+    });
+}
+
+#[test]
+fn early_evidence_stops_when_the_page_reads_its_own() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        // The account has 20 transactions in block 1 and 60 in block 2, so the
+        // early read for a page pinned at block 1 reaches only four of its rows.
+        let fixture = fixture_with_counts(context.child("state_fixture"), &[20, 60]).await;
+        let (environment, client) = Box::pin(gated(context, &fixture)).await;
+        let gate = &environment.store.gate;
+        let request = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            at: Some(1),
+            digest: Some(fixture.blocks[0].block.seal().as_ref().to_vec()),
+            ..Default::default()
+        };
+        let expected = Box::pin(account(&Explorer::new(&client).unwrap(), request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(expected.transactions.len(), 20);
+
+        // Hold the state proof until the early read has its four body lookups
+        // in flight, and hold those lookups for the rest of the request.
+        let explorer = Explorer::new(&client).unwrap();
+        let key = fixture.account;
+        let certificate = physical(
+            SIMPLEX_PREFIX_VALUE,
+            &keys::finalized_by_height(Height::new(1)),
+        );
+        let state = gate.hold(
+            move |query| query.method == "Get" && query.key == certificate,
+            |query| query.namespace() == Some(STATE_QMDB_PREFIX_VALUE),
+            1,
+        );
+        let early = gate.hold(
+            |query| query.is("Range", SQL_META_PREFIX_VALUE),
+            StoreQuery::is_body_lookup,
+            4,
+        );
+        let own = gate.hold(
+            move |query| {
+                query.is("GetMany", SQL_META_PREFIX_VALUE)
+                    && query.key.windows(32).any(|window| window == key.as_ref())
+            },
+            StoreQuery::is_body_lookup,
+            requests(20, BODY_LOOKUPS),
+        );
+        let (bundle, _) = join(Box::pin(account(&explorer, request)), async {
+            gate.gathered(early).await;
+            gate.pass(state).await;
+
+            // The validated page names other pairs and reads its own bodies.
+            // The early lookups must be abandoned while those are in flight.
+            gate.gathered(own).await;
+            gate.abandoned(early).await;
+            gate.pass(own).await;
+        })
+        .await;
+        assert_same_evidence(&bundle.unwrap(), &expected);
+        environment.close().await;
+    });
+}
+
+#[test]
+fn certificate_scans_run_only_when_the_probed_height_is_empty() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        // Publish three blocks, leaving block 2 without a certificate.
+        let fixture = fixture(context.child("state_fixture")).await;
+        let environment = FixtureStore::connect(context, GatedStore::open().await).await;
+        for (index, block) in fixture.blocks[..3].iter().enumerate() {
+            publish(
+                &environment.publisher,
+                &environment.reporter,
+                block,
+                index != 1,
+            )
+            .await;
+        }
+        let gate = &environment.store.gate;
+        let explorer = Explorer::new(&store_client(&environment.store.url, None).unwrap()).unwrap();
+        let simplex = || {
+            gate.take_log()
+                .into_iter()
+                .filter(|query| query.namespace() == Some(SIMPLEX_PREFIX_VALUE))
+                .map(|query| query.method)
+                .collect::<Vec<_>>()
+        };
+
+        // Block 1 holds its own certificate, which one point read finds.
+        simplex();
+        let direct = Box::pin(block(
+            &explorer,
+            proto::GetBlockRequest {
+                height: 1,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(certified_height(&direct), 1);
+        assert_eq!(simplex(), ["Get"]);
+
+        // Block 2 has none, so the scan finds block 3's certificate and one
+        // batch reads both ancestor headers.
+        let descendant = Box::pin(block(
+            &explorer,
+            proto::GetBlockRequest {
+                height: 2,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(certified_height(&descendant), 3);
+        assert_eq!(simplex(), ["Get", "Range", "GetMany"]);
+
+        // A pinned height bounds the interval to itself, so an empty point
+        // read leaves the request waiting without a scan.
+        let pinned = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            at: Some(2),
+            digest: Some(fixture.blocks[1].block.seal().as_ref().to_vec()),
+            ..Default::default()
+        };
+        let error = Box::pin(account(&explorer, pinned)).await.unwrap_err();
+        assert_eq!(error.0, ErrorCode::Unavailable);
+        assert_eq!(error.1, "finalization certificate is not ready");
+        assert_eq!(simplex(), ["Get"]);
+
+        // The newest height holds a certificate, so the latest account view
+        // needs no scan either.
+        let latest = Box::pin(account(
+            &explorer,
+            proto::GetAccountRequest {
+                account: fixture.account.as_ref().to_vec(),
+                activity: Some(false),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(certified_height(&latest), 3);
+        let reads = simplex();
+        assert_eq!(reads[0], "Get");
+        assert!(!reads.iter().any(|method| method == "Range"), "{reads:?}");
+        environment.close().await;
+    });
+}
+
+#[test]
+fn mismatched_targets_and_proofs_are_reported_ahead_of_later_reads() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        let fixture = fixture(context.child("state_fixture")).await;
+        let environment = FixtureStore::open(context).await;
+        for block in &fixture.blocks {
+            publish(&environment.publisher, &environment.reporter, block, true).await;
+        }
+        let router = &environment.router;
+        let block = &fixture.blocks[1];
+        let digest = *block.transactions[0].message_digest();
+
+        // Name block 1 as the publication target of height 2, below the newest
+        // target.
+        let targets = publication_target_client(&environment.client).unwrap();
+        let mut batch = StoreWriteBatch::new();
+        batch
+            .push(
+                &targets,
+                &publication_target_key(2),
+                fixture.blocks[0].block.seal().as_ref(),
+            )
+            .unwrap();
+        batch.commit(&environment.client).await.unwrap();
+
+        // Every route anchored at block 2's certificate fails on the target,
+        // whatever the reads beside the check would have reported.
+        let pinned = proto::GetAccountRequest {
+            at: Some(2),
+            digest: Some(block.block.seal().as_ref().to_vec()),
+            ..Default::default()
+        };
+        for (name, method, request) in [
+            (
+                "block page",
+                "GetBlock",
+                proto::GetBlockRequest {
+                    height: 2,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "offset beyond the block",
+                "GetBlock",
+                proto::GetBlockRequest {
+                    height: 2,
+                    offset: 56,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "transaction",
+                "GetTransaction",
+                proto::GetTransactionRequest {
+                    digest: digest.as_ref().to_vec(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "pinned account",
+                "GetAccount",
+                proto::GetAccountRequest {
+                    account: fixture.account.as_ref().to_vec(),
+                    ..pinned.clone()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "pinned unknown account",
+                "GetAccount",
+                proto::GetAccountRequest {
+                    account: vec![0; 32],
+                    ..pinned.clone()
+                }
+                .encode_to_vec(),
+            ),
+        ] {
+            let (status, body) = post(router, method, request).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{name}: {body:?}"
+            );
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                error["message"], "certificate does not match publication or requested digest",
+                "{name}"
+            );
+        }
+
+        // Block 3's certificate still matches its own target.
+        let empty = proof_bundle(
+            router,
+            &proto::GetBlockRequest {
+                height: 3,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(certificate_height(&empty), 3);
+
+        // A proof that disagrees with its hint is reported ahead of the body
+        // that the same hint fails to find.
+        let explorer = Explorer::new(&environment.client).unwrap();
+        let anchor = explorer.anchor(3, None, false).await.unwrap();
+        let location = block.first_transaction;
+        let evidence = async |digest| match Box::pin(
+            explorer.transaction_evidence(&anchor, &[(location, digest)]),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("evidence must be rejected"),
+        };
+        let error = evidence(Digest::EMPTY).await;
+        assert_eq!(error.0, ErrorCode::Internal);
+        assert_eq!(error.1, "transaction proof disagrees with metadata");
+
+        // With a matching proof, a missing body leaves the request retryable.
+        let table = anchor.sql.deregister_table("tx_meta").unwrap().unwrap();
+        anchor
+            .sql
+            .register_table(
+                "tx_meta",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(table.schema(), vec![vec![]])
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let error = evidence(digest).await;
+        assert_eq!(error.0, ErrorCode::Unavailable);
+        assert_eq!(error.1, "transaction bodies are not ready");
+        environment.close().await;
+    });
+}
+
+#[test]
+fn early_evidence_is_used_only_for_the_validated_pairs() {
+    commonware_runtime::tokio::Runner::default().start(|context| async move {
+        let fixture = fixture(context.child("state_fixture")).await;
+        let environment = FixtureStore::open(context).await;
+        for block in &fixture.blocks[..3] {
+            publish(&environment.publisher, &environment.reporter, block, true).await;
+        }
+        let explorer = Explorer::new(&environment.client).unwrap();
+        let anchor = explorer.anchor(1, None, true).await.unwrap();
+        let account = proto::GetAccountRequest {
+            account: fixture.account.as_ref().to_vec(),
+            ..Default::default()
+        };
+        let request = AccountRequest::parse(account.clone()).unwrap();
+        let older = AccountRequest::parse(proto::GetAccountRequest {
+            cursor: Some(8_u64.to_be_bytes().to_vec()),
+            at: Some(3),
+            digest: Some(fixture.blocks[2].block.seal().as_ref().to_vec()),
+            account_location: fixture.blocks[2].account_location,
+            ..account
+        })
+        .unwrap();
+        let Ok(update) = explorer.account_proof(&anchor, &request).await else {
+            panic!("fixture account must have a proven update");
+        };
+        let (_, transaction_end) = explorer.account_inclusion(&anchor, &update).await.unwrap();
+        let page = async |early| {
+            let Ok(hints) = explorer.activity_hints(&anchor, &request, &update).await else {
+                panic!("fixture account must have activity hints");
+            };
+            Box::pin(explorer.activity(&anchor, &request, &update, transaction_end, hints, early))
+                .await
+                .unwrap()
+        };
+        let plain = page(None).await;
+        let pairs = plain
+            .0
+            .iter()
+            .map(|row| {
+                let body = Bytes::copy_from_slice(&row.body);
+                let transaction = SignedTransaction::<Sha256>::decode(body).unwrap();
+                (row.location, *transaction.message_digest())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pairs.len(), TRANSACTION_PAGE as usize);
+
+        // Evidence read for the page's own pairs stands in for a second read.
+        let early = explorer.early_evidence(&anchor, &request);
+        assert!(early.matching(&pairs).await.is_some());
+        assert!(early.matching(&pairs[1..]).await.is_none());
+        assert!(page(Some(&early)).await == plain);
+
+        // Evidence read for an older page names other pairs, so the page
+        // reads its own.
+        let early = explorer.early_evidence(&anchor, &older);
+        assert!(early.matching(&pairs).await.is_none());
+        assert!(page(Some(&early)).await == plain);
         environment.close().await;
     });
 }
