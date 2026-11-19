@@ -107,10 +107,41 @@ impl<H: Hasher> Read for Column<H> {
     }
 }
 
+/// A transaction authenticated by tags: its digest and its sender's key.
+type Tagged<H> = (<H as Hasher>::Digest, Option<constantinople_auth::PublicKey>);
+
+/// The transactions of `block` that are authenticated by tags, in order.
+fn tagged<H: Hasher>(block: &InnerBlock<H>) -> Vec<Tagged<H>> {
+    block
+        .body
+        .iter()
+        .filter_map(|lazy| lazy.get().filter(|transaction| transaction.is_mac()))
+        .map(|transaction| {
+            let sender = transaction.value().sender().and_then(|key| key.as_x25519());
+            (*transaction.message_digest(), sender)
+        })
+        .collect()
+}
+
+/// What this node keeps of a block it built: its tagged transactions and the
+/// authenticator of each.
+struct Built<H: Hasher> {
+    tagged: Vec<Tagged<H>>,
+    authenticators: Vec<Tags>,
+}
+
+impl<H: Hasher> Clone for Built<H> {
+    fn clone(&self) -> Self {
+        Self {
+            tagged: self.tagged.clone(),
+            authenticators: self.authenticators.clone(),
+        }
+    }
+}
+
 struct Book<H: Hasher> {
-    /// The authenticators of the tagged transactions of blocks this node built,
-    /// by block digest, oldest first.
-    built: VecDeque<(H::Digest, Vec<Tags>)>,
+    /// Blocks this node built, by block digest, oldest first.
+    built: VecDeque<(H::Digest, Built<H>)>,
     /// Columns received from each peer, oldest first.
     received: HashMap<P, VecDeque<(Commitment<H>, Tags)>>,
     /// Requests for a column that has not arrived.
@@ -139,21 +170,21 @@ impl<H: Hasher> Shared<H> {
         })))
     }
 
-    fn built(&self, block: H::Digest, authenticators: Vec<Tags>) {
+    fn built(&self, block: H::Digest, built: Built<H>) {
         let mut book = self.0.lock();
-        book.built.push_back((block, authenticators));
+        book.built.push_back((block, built));
         while book.built.len() > RETAINED_BLOCKS {
             book.built.pop_front();
         }
     }
 
-    fn authenticators(&self, block: &H::Digest) -> Option<Vec<Tags>> {
+    fn own(&self, block: &H::Digest) -> Option<Built<H>> {
         let book = self.0.lock();
         book.built
             .iter()
             .rev()
-            .find(|(built, _)| built == block)
-            .map(|(_, authenticators)| authenticators.clone())
+            .find(|(digest, _)| digest == block)
+            .map(|(_, built)| built.clone())
     }
 
     fn received(&self, peer: P, commitment: Commitment<H>, tags: Tags) {
@@ -253,8 +284,12 @@ impl<H: Hasher> Chain<Commitment<H>, P, H> for EngineChain<H> {
         self.shared.notarization(round, &payload)
     }
 
-    fn built(&self, block: H::Digest, authenticators: Vec<Tags>) {
-        self.shared.built(block, authenticators);
+    fn built(&self, block: &InnerBlock<H>, authenticators: Vec<Tags>) {
+        let built = Built {
+            tagged: tagged(block),
+            authenticators,
+        };
+        self.shared.built(block.digest(), built);
     }
 
     async fn parent(&self, block: &InnerBlock<H>) -> Option<Arc<InnerBlock<H>>> {
@@ -328,8 +363,8 @@ where
         Some(key)
     }
 
-    /// This validator's report on `block`, proposed by `proposer`, given the
-    /// column the proposer sent it.
+    /// This validator's report on a block by `proposer` with the tagged
+    /// transactions `tagged`, given the column the proposer sent it.
     ///
     /// A column that does not hold one tag per tagged transaction of the block
     /// matches nothing.
@@ -337,22 +372,16 @@ where
         &self,
         strategy: &impl Strategy,
         proposer: Participant,
-        block: &InnerBlock<H>,
+        tagged: Vec<Tagged<H>>,
         column: &Tags,
     ) -> Report {
-        let tagged: Vec<_> = block
-            .body
-            .iter()
-            .filter_map(|lazy| lazy.get().filter(|transaction| transaction.is_mac()))
-            .collect();
+        if tagged.is_empty() {
+            return Report::empty();
+        }
         let shaped = column.len() == tagged.len() && column.bits() == self.bits;
-        let work: Vec<_> = tagged.iter().enumerate().collect();
-        let entries = strategy.map_collect_vec(work, |(position, transaction)| {
-            let digest = *transaction.message_digest();
-            let own = transaction
-                .value()
-                .sender()
-                .and_then(|sender| sender.as_x25519())
+        let work: Vec<_> = tagged.into_iter().enumerate().collect();
+        let entries = strategy.map_collect_vec(work, |(position, (digest, sender))| {
+            let own = sender
                 .and_then(|sender| self.key(&sender))
                 .map(|key| key.tag.tag(proposer, digest.as_ref(), self.bits));
             let matches = shaped && own.is_some() && own == column.get(position);
@@ -442,7 +471,8 @@ where
     /// Records this validator's report on the block with `commitment`, proposed
     /// by `leader` in `round`, so that the vote scheme can sign a vote for it.
     ///
-    /// Waits for the block and, if the block has tagged transactions, for the
+    /// For a block of another validator this waits for the block to be rebuilt
+    /// from its shards and, if the block has tagged transactions, for the
     /// leader's column. Returns `false` if the report can never be made.
     async fn record(&self, round: Round, commitment: Commitment<H>, leader: &P) -> bool {
         // A node that does not vote has nothing to report.
@@ -452,36 +482,36 @@ where
         let Some(proposer) = self.scheme.participants().index(leader) else {
             return false;
         };
-        let Ok(block) = self.shards.subscribe(commitment).await else {
-            return false;
-        };
-        let block: &EngineBlock<H, P> = block.inner();
-        let tagged = block
-            .body
-            .iter()
-            .filter(|lazy| lazy.get().is_some_and(|transaction| transaction.is_mac()))
-            .count();
 
-        let report = if tagged == 0 {
-            Report::empty()
-        } else {
-            let column = if proposer == me {
-                // The tags of this node's own block never left it.
-                let Some(authenticators) = self.shared.authenticators(&block.digest()) else {
-                    warn!(%round, "tags of own block are gone");
-                    return false;
-                };
-                column_for(&authenticators, me, self.tagger.bits)
-            } else {
-                let Ok(column) = self.shared.column(leader.clone(), commitment).await else {
-                    return false;
-                };
-                column
+        let (tagged, column) = if proposer == me {
+            // This node built the block: it knows the block's tagged
+            // transactions, and their tags never left it.
+            let Some(built) = self.shared.own(&commitment.block()) else {
+                warn!(%round, "tags of own block are gone");
+                return false;
             };
-            self.tagger
-                .report(&self.strategy, proposer, block, &column)
-                .await
+            let column = column_for(&built.authenticators, me, self.tagger.bits);
+            (built.tagged, column)
+        } else {
+            let Ok(block) = self.shards.subscribe(commitment).await else {
+                return false;
+            };
+            let block: &EngineBlock<H, P> = block.inner();
+            let tagged = tagged(block);
+            let column = if tagged.is_empty() {
+                Tags::new(self.tagger.bits)
+            } else {
+                match self.shared.column(leader.clone(), commitment).await {
+                    Ok(column) => column,
+                    Err(_) => return false,
+                }
+            };
+            (tagged, column)
         };
+        let report = self
+            .tagger
+            .report(&self.strategy, proposer, tagged, &column)
+            .await;
         self.scheme
             .reports()
             .insert(round, commitment.as_ref(), report);
@@ -491,7 +521,7 @@ where
     /// Sends every other validator its column for the block with `commitment`,
     /// which this node built.
     fn send_columns(&self, commitment: Commitment<H>) {
-        let Some(authenticators) = self.shared.authenticators(&commitment.block()) else {
+        let Some(Built { authenticators, .. }) = self.shared.own(&commitment.block()) else {
             return;
         };
         if authenticators.is_empty() {

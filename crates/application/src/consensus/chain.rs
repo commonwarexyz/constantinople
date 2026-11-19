@@ -30,9 +30,9 @@ where
     ) -> impl Future<Output = Option<ParentNotarization<C>>> + Send;
 
     /// Records the authenticators of the transactions authenticated by tags in
-    /// the block with digest `block`, which this node just built. They are in
-    /// the order of those transactions in the block.
-    fn built(&self, block: H::Digest, authenticators: Vec<Tags>);
+    /// `block`, which this node just built. They are in the order of those
+    /// transactions in the block.
+    fn built(&self, block: &SealedBlock<C, P, H>, authenticators: Vec<Tags>);
 
     /// The parent of `block`, a finalized block that is being replayed.
     ///

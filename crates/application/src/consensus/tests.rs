@@ -59,8 +59,8 @@ impl Chain<sha256::Digest, ed25519::PublicKey, sha256::Sha256> for TestChain {
         self.notarizations.lock().get(&(round, payload)).cloned()
     }
 
-    fn built(&self, block: sha256::Digest, authenticators: Vec<Tags>) {
-        self.built.lock().push((block, authenticators));
+    fn built(&self, block: &TestBlock, authenticators: Vec<Tags>) {
+        self.built.lock().push((*block.seal(), authenticators));
     }
 
     async fn parent(&self, block: &TestBlock) -> Option<Arc<TestBlock>> {

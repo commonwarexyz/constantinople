@@ -43,7 +43,12 @@ impl Chain<TestCommitment, ed25519::PublicKey, sha256::Sha256> for NoChain {
         None
     }
 
-    fn built(&self, _: sha256::Digest, _: Vec<Tags>) {}
+    fn built(
+        &self,
+        _: &SealedBlock<TestCommitment, ed25519::PublicKey, sha256::Sha256>,
+        _: Vec<Tags>,
+    ) {
+    }
 
     async fn parent(
         &self,

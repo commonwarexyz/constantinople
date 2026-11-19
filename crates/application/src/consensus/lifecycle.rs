@@ -229,7 +229,7 @@ where
         }
 
         let block = block.seal(hasher);
-        self.chain.built(block.digest(), authenticators);
+        self.chain.built(&block, authenticators);
         self.proposed_transactions.inc_by(transaction_count as u64);
 
         info!(
