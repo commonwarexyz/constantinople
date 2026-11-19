@@ -1,9 +1,7 @@
 use super::EngineApplication;
 use crate::block::{EngineBlock, EngineCommitment};
 use commonware_consensus::CertifiableBlock as _;
-use commonware_cryptography::{
-    Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
-};
+use commonware_cryptography::{Signer as _, ed25519, sha256};
 use commonware_glue::stateful::{
     Application as StatefulApplication,
     db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _},
@@ -20,20 +18,46 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_application::consensus::{
-    Application, Databases, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, Chain, Databases, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
+use constantinople_auth::Tags;
 use constantinople_mempool::mocks::StaticTransactionSource;
-use constantinople_primitives::{Account, AccountKey, Nonce, PublicKeyCache};
+use constantinople_primitives::{
+    Account, AccountKey, Nonce, ParentNotarization, PublicKeyCache, SealedBlock,
+};
 use std::sync::{Arc, Mutex};
 
 type TestCommitment = EngineCommitment<sha256::Sha256, ed25519::PublicKey>;
 type TestBlock = EngineBlock<sha256::Sha256, ed25519::PublicKey>;
 type TestHook = FinalizedHookFn<TestCommitment, sha256::Sha256, ed25519::PublicKey>;
+/// A chain with nothing to offer: these tests build no blocks.
+#[derive(Clone)]
+struct NoChain;
+
+impl Chain<TestCommitment, ed25519::PublicKey, sha256::Sha256> for NoChain {
+    async fn notarization(
+        &self,
+        _: commonware_consensus::types::Round,
+        _: TestCommitment,
+    ) -> Option<ParentNotarization<TestCommitment>> {
+        None
+    }
+
+    fn built(&self, _: sha256::Digest, _: Vec<Tags>) {}
+
+    async fn parent(
+        &self,
+        _: &SealedBlock<TestCommitment, ed25519::PublicKey, sha256::Sha256>,
+    ) -> Option<Arc<SealedBlock<TestCommitment, ed25519::PublicKey, sha256::Sha256>>> {
+        None
+    }
+}
+
 type TestApp = EngineApplication<
     deterministic::Context,
     sha256::Sha256,
     ed25519::PublicKey,
-    MinSig,
+    NoChain,
     StaticTransactionSource<TestCommitment, ed25519::PublicKey, sha256::Sha256>,
     Sequential,
 >;
@@ -115,6 +139,8 @@ async fn fixture(context: &deterministic::Context) -> (TestApp, TestDbs, TestBat
         PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(64)),
         state_target,
         transaction_target,
+        constantinople_auth::fixture(&mut context.child("validators"), b"test", 6).verifier,
+        NoChain,
     );
     let mut app = TestApp::new(inner, None);
     let block = app.genesis().await;

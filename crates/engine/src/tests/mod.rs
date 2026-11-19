@@ -4,14 +4,15 @@ mod common;
 mod properties;
 
 use crate::{
-    CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    CERTIFICATE_CHANNEL, COLUMN_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
+    StartupMode, TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
     types::{EngineCommitment, EngineFinalization, EngineVariant},
 };
 use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
-    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, validator_fixture,
+    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, secret,
+    validator_fixture,
 };
 use commonware_consensus::{
     Heightable,
@@ -22,15 +23,7 @@ use commonware_consensus::{
     },
     types::{Epoch, Round, View},
 };
-use commonware_cryptography::{
-    Digest as _, Signer,
-    bls12381::{
-        dkg::feldman_desmedt::Output,
-        primitives::{group::Share, variant::MinSig},
-    },
-    certificate::ConstantProvider,
-    sha256,
-};
+use commonware_cryptography::{Digest as _, Signer, certificate::ConstantProvider, sha256};
 use commonware_glue::{
     simulate::{
         action::{Action, Crash, Schedule},
@@ -60,7 +53,8 @@ use properties::{
 use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 use tracing::{info, warn};
 
-const NUM_VALIDATORS: u32 = 4;
+// Six validators tolerate one fault under `n >= 5f + 1`.
+const NUM_VALIDATORS: u32 = 6;
 const ENGINE_NAMESPACE: &[u8] = b"constantinople-engine-test";
 const MAX_PROBE_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
 
@@ -83,12 +77,14 @@ const fn lossy_link() -> Link {
 #[derive(Clone)]
 struct TestEngineDefinition {
     signers: Vec<TestPrivateKey>,
-    output: Output<MinSig, TestPublicKey>,
-    shares: BTreeMap<TestPublicKey, Option<Share>>,
+    /// The validators. The other signers only follow.
+    participants: Set<TestPublicKey>,
+    /// Each node's X25519 secret.
+    secrets: BTreeMap<TestPublicKey, constantinople_auth::PrivateKey>,
     enable_state_sync: bool,
     /// When `true`, every node re-tracks peer set 0 during `init` as
-    /// `TrackedPeers::new(primary, secondary)` — primary = nodes with a DKG
-    /// share, secondary = nodes without. Exercises the p2p discovery secondary
+    /// `TrackedPeers::new(primary, secondary)` — primary = the validators,
+    /// secondary = the other nodes. Exercises the p2p discovery secondary
     /// mechanism. Default `false` leaves all nodes in the primary set as
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
@@ -96,19 +92,19 @@ struct TestEngineDefinition {
     genesis_commitments:
         Arc<Mutex<BTreeMap<TestPublicKey, EngineCommitment<TestHasher, TestPublicKey>>>>,
     restart_barrier: Option<RestartBarrier>,
-    pending_sync_floor: Option<EngineFinalization<TestPublicKey, MinSig>>,
+    pending_sync_floor: Option<EngineFinalization<TestPublicKey>>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
 }
 
 impl TestEngineDefinition {
     fn new(validators: u32) -> Self {
-        let (signers, output, shares) = validator_fixture(validators);
+        let (signers, participants, secrets) = validator_fixture(validators);
 
         Self {
             signers,
-            output,
-            shares,
+            participants,
+            secrets,
             enable_state_sync: false,
             use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
@@ -122,15 +118,16 @@ impl TestEngineDefinition {
 
     /// Extend the node set with `count` secondary (non-voting) participants.
     ///
-    /// Secondaries receive an ed25519 identity but no DKG share, so the engine
-    /// constructs their threshold scheme in verifier mode (`me() == None`).
+    /// Secondaries have an ed25519 identity outside the validator set, so the
+    /// engine constructs their vote scheme in verifier mode (`me() == None`).
     /// Simplex then runs as a silent observer: no votes, no certificates — the
     /// node only processes inbound messages and drives its local state machine.
     fn with_secondaries(mut self, count: u32) -> Self {
         const SECONDARY_SEED_OFFSET: u64 = 1_000_000;
         for i in 0..count {
-            let signer = TestPrivateKey::from_seed(SECONDARY_SEED_OFFSET + u64::from(i));
-            self.shares.insert(signer.public_key(), None);
+            let seed = SECONDARY_SEED_OFFSET + u64::from(i);
+            let signer = TestPrivateKey::from_seed(seed);
+            self.secrets.insert(signer.public_key(), secret(seed));
             self.signers.push(signer);
         }
         self
@@ -139,8 +136,8 @@ impl TestEngineDefinition {
     /// Exercise the `p2p::discovery` secondary peer-set mechanism.
     ///
     /// With this enabled, each node re-tracks peer set 0 as
-    /// `TrackedPeers::new(primary, secondary)` during `init`. Primary = nodes
-    /// with a DKG share, secondary = the rest.
+    /// `TrackedPeers::new(primary, secondary)` during `init`. Primary = the
+    /// validators, secondary = the rest.
     const fn with_discovery_split(mut self) -> Self {
         self.use_discovery_split = true;
         self
@@ -161,22 +158,20 @@ impl TestEngineDefinition {
                 sha256::Digest::EMPTY,
                 sha256::Digest::EMPTY,
                 coding_config_for_participants(
-                    u16::try_from(self.output.players().len()).expect("fixture fits coding limit"),
+                    u16::try_from(self.participants.len()).expect("fixture fits coding limit"),
                 ),
             )),
         };
         let schemes = self
-            .shares
-            .values()
-            .filter_map(Option::as_ref)
-            .map(|share| {
+            .signers
+            .iter()
+            .filter_map(|signer| {
                 TestScheme::signer(
                     &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
-                    self.output.players().clone(),
-                    self.output.public().clone(),
-                    share.clone(),
+                    self.participants.clone(),
+                    signer.clone(),
+                    Default::default(),
                 )
-                .expect("fixture share must create a signing scheme")
             })
             .collect::<Vec<_>>();
         let finalizes = schemes
@@ -225,6 +220,7 @@ impl EngineDefinition for TestEngineDefinition {
             (STATE_RESOLVER_CHANNEL, TEST_QUOTA),
             (TRANSACTION_RESOLVER_CHANNEL, TEST_QUOTA),
             (PROBE_CHANNEL, TEST_QUOTA),
+            (COLUMN_CHANNEL, TEST_QUOTA),
         ]
     }
 
@@ -241,9 +237,9 @@ impl EngineDefinition for TestEngineDefinition {
         } = ctx;
         let public_key = public_key.clone();
         let signer = self.signers[index].clone();
-        let share = self.shares.get(&public_key).cloned().flatten();
+        let secret = self.secrets[&public_key].clone();
         let partition_prefix = format!("validator-{index}");
-        let output = self.output.clone();
+        let validators = self.participants.clone();
         let sync_heights = self.sync_heights.clone();
         let genesis_commitments = self.genesis_commitments.clone();
         let prunable_items_per_section = self.prunable_items_per_section;
@@ -269,7 +265,7 @@ impl EngineDefinition for TestEngineDefinition {
                 .signers
                 .iter()
                 .map(TestPrivateKey::public_key)
-                .partition(|pk| self.shares.get(pk).is_some_and(|share| share.is_some()));
+                .partition(|pk| self.participants.position(pk).is_some());
             let primary: Set<TestPublicKey> = primary.into_iter().try_collect().unwrap();
             let secondary: Set<TestPublicKey> = secondary.into_iter().try_collect().unwrap();
             manager.track(0, TrackedPeers::new(primary, secondary));
@@ -289,13 +285,13 @@ impl EngineDefinition for TestEngineDefinition {
                 .next()
                 .expect("transaction resolver channel must exist");
             let probe_network = channels.next().expect("probe channel must exist");
+            let columns = channels.next().expect("column channel must exist");
             assert!(channels.next().is_none(), "unexpected extra channel");
 
             let (probe_handle, probe_mailbox) = if enable_state_sync {
                 let provider = ConstantProvider::new(TestScheme::verifier(
                     &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
-                    output.players().clone(),
-                    output.public().clone(),
+                    validators.clone(),
                 ));
                 let (probe, probe_mailbox) = Probe::new(ProbeConfig {
                     context: context.child("probe"),
@@ -334,13 +330,14 @@ impl EngineDefinition for TestEngineDefinition {
                 marshal_resolver,
                 state_resolver,
                 transaction_resolver,
+                columns,
             };
 
             let input = StaticTransactionSource::<
                 EngineCommitment<TestHasher, TestPublicKey>,
                 TestPublicKey,
                 TestHasher,
-            >::new(Vec::new());
+            >::new(Vec::<Vec<constantinople_mempool::Candidate<TestHasher>>>::new());
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
@@ -361,17 +358,16 @@ impl EngineDefinition for TestEngineDefinition {
                 _,
                 _,
                 _,
-                _,
                 TestHasher,
-                MinSig,
                 RoundRobin<TestHasher>,
                 _,
                 _,
-                crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
+                crate::types::NoopActivityReporter<TestPublicKey>,
             >::new(
                 context.child("engine"),
                 Config {
                     signer,
+                    secret,
                     manager,
                     blocker,
                     namespace: ENGINE_NAMESPACE.to_vec(),
@@ -379,8 +375,7 @@ impl EngineDefinition for TestEngineDefinition {
                     // deterministic runs.
                     state_page_cache_bytes: 32 * 1024 * 1024,
                     history_page_cache_bytes: 32 * 1024 * 1024,
-                    output,
-                    share,
+                    participants: validators,
                     input,
                     partition_prefix,
                     strategy: Sequential,

@@ -1,23 +1,15 @@
-use crate::{ThresholdScheme, block::ApplicationBlock, types::EngineMarshalMailbox};
+use crate::{Scheme, block::ApplicationBlock, types::EngineMarshalMailbox};
 use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
     marshal::{self, Identifier},
     types::Height,
 };
-use commonware_cryptography::{
-    Digestible, Signer,
-    bls12381::{
-        dkg::feldman_desmedt::{Output, deal},
-        primitives::{group::Share, sharing::Mode, variant::MinSig},
-    },
-    ed25519,
-    sha256::Sha256,
-};
+use commonware_cryptography::{Digestible, Signer, ed25519, sha256::Sha256};
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
 use commonware_runtime::Quota;
 use commonware_utils::{
-    Acknowledgement, N3f1, TryCollect, acknowledgement::Exact, channel::mpsc, sync::Mutex, test_rng,
+    Acknowledgement, TryCollect, acknowledgement::Exact, channel::mpsc, ordered::Set, sync::Mutex,
 };
 use std::{
     collections::BTreeMap,
@@ -30,9 +22,9 @@ use std::{
 pub(crate) type TestHasher = Sha256;
 pub(crate) type TestPrivateKey = ed25519::PrivateKey;
 pub(crate) type TestPublicKey = ed25519::PublicKey;
-pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
+pub(crate) type TestScheme = Scheme;
 pub(crate) type TestBlock = ApplicationBlock<TestHasher, TestPublicKey>;
-pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
+pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey>;
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
 pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);
 
@@ -161,10 +153,12 @@ impl<R> HeightMonitorReporter<R> {
     }
 }
 
+/// The validators' signing keys, the validator set, and the X25519 secret of
+/// each validator.
 type Fixture = (
     Vec<TestPrivateKey>,
-    Output<MinSig, TestPublicKey>,
-    BTreeMap<TestPublicKey, Option<Share>>,
+    Set<TestPublicKey>,
+    BTreeMap<TestPublicKey, constantinople_auth::PrivateKey>,
 );
 
 impl<R> Reporter for HeightMonitorReporter<R>
@@ -224,6 +218,13 @@ impl ProcessedHeight for ValidatorState {
     }
 }
 
+/// The X25519 secret of the node whose signing key has seed `seed`.
+pub(crate) fn secret(seed: u64) -> constantinople_auth::PrivateKey {
+    let mut bytes = [0xa5; 32];
+    bytes[..8].copy_from_slice(&seed.to_be_bytes());
+    constantinople_auth::PrivateKey::from(bytes)
+}
+
 pub(crate) fn validator_fixture(validators: u32) -> Fixture {
     let signers = (0..validators)
         .map(|seed| TestPrivateKey::from_seed(seed.into()))
@@ -233,14 +234,11 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
         .map(TestPrivateKey::public_key)
         .try_collect()
         .unwrap();
-
-    let mut rng = test_rng();
-    let (output, shares) = deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
-        .expect("fixture deal should succeed");
-    let shares = shares
-        .into_iter()
-        .map(|(public_key, share)| (public_key, Some(share)))
+    let secrets = signers
+        .iter()
+        .zip(0u64..)
+        .map(|(signer, seed)| (signer.public_key(), secret(seed)))
         .collect();
 
-    (signers, output, shares)
+    (signers, participants, secrets)
 }

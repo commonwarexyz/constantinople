@@ -6,8 +6,9 @@
 
 pub use crate::block::{EngineBlock, EngineCommitment};
 use crate::{
-    ThresholdScheme,
+    Scheme,
     application::{EngineApplication, EngineReporter},
+    tags::{EngineChain, Gated},
 };
 use commonware_actor::Feedback;
 use commonware_coding::ReedSolomon;
@@ -23,9 +24,7 @@ use commonware_consensus::{
     simplex::{self, types::Finalization},
     types::{Epoch, FixedEpocher, Height},
 };
-use commonware_cryptography::{
-    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
-};
+use commonware_cryptography::{Hasher, PublicKey, certificate::ConstantProvider};
 use commonware_glue::stateful::{Stateful, db::Shared};
 use commonware_storage::{
     mmr,
@@ -46,73 +45,72 @@ pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
-pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
+pub type EngineMarshalMailbox<H, P> = MarshalMailbox<Scheme, EngineVariant<H, P>>;
 
 /// Read-only access to the finalization certificates marshal has stored.
-pub struct FinalizationReader<H: Hasher, P: PublicKey, V: Variant>(EngineMarshalMailbox<H, P, V>);
+pub struct FinalizationReader<H: Hasher, P: PublicKey>(EngineMarshalMailbox<H, P>);
 
-impl<H: Hasher, P: PublicKey, V: Variant> FinalizationReader<H, P, V> {
-    pub(crate) const fn new(mailbox: EngineMarshalMailbox<H, P, V>) -> Self {
+impl<H: Hasher, P: PublicKey> FinalizationReader<H, P> {
+    pub(crate) const fn new(mailbox: EngineMarshalMailbox<H, P>) -> Self {
         Self(mailbox)
     }
 
     /// Returns the finalization stored locally for `height`, if any. This never fetches from peers.
-    pub async fn get(&self, height: Height) -> Option<EngineFinalization<P, V, H>> {
+    pub async fn get(&self, height: Height) -> Option<EngineFinalization<P, H>> {
         self.0.get_finalization(height).await
     }
 }
 
 /// Probe mailbox parameterized over the engine's threshold scheme.
-pub type EngineProbeMailbox<H, P, V> =
-    commonware_glue::stateful::probe::Mailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
+pub type EngineProbeMailbox<H, P> =
+    commonware_glue::stateful::probe::Mailbox<Scheme, EngineVariant<H, P>>;
 
 /// A finalization certificate over the engine's threshold scheme.
-pub type EngineFinalization<P, V, H = commonware_cryptography::sha256::Sha256> =
-    Finalization<ThresholdScheme<P, V>, EngineCommitment<H, P>>;
+pub type EngineFinalization<P, H = commonware_cryptography::sha256::Sha256> =
+    Finalization<Scheme, EngineCommitment<H, P>>;
 
 /// Simplex activity stream observed by the engine, used by the optional
 /// `simplex_observer` reporter slot in [`crate::Config`].
-pub type EngineActivity<P, V, H = commonware_cryptography::sha256::Sha256> =
-    simplex::types::Activity<ThresholdScheme<P, V>, EngineCommitment<H, P>>;
+pub type EngineActivity<P, H = commonware_cryptography::sha256::Sha256> =
+    simplex::types::Activity<Scheme, EngineCommitment<H, P>>;
 
-type NoopReporterMarker<P, V, H> = fn() -> (P, V, H);
+type NoopReporterMarker<P, H> = fn() -> (P, H);
 
 pub(crate) type EngineFinalizedHook<H, P> = FinalizedHookFn<EngineCommitment<H, P>, H, P>;
 
 /// A no-op [`Reporter`] over [`EngineActivity`].
 ///
-/// Pass `None::<NoopActivityReporter<P, V>>` to [`crate::Config::simplex_observer`]
+/// Pass `None::<NoopActivityReporter<P>>` to [`crate::Config::simplex_observer`]
 /// when no external observer is wired in. The type parameter exists only to
 /// pin the activity type; the reporter never forwards anything.
-pub struct NoopActivityReporter<P, V, H = commonware_cryptography::sha256::Sha256>(
-    PhantomData<NoopReporterMarker<P, V, H>>,
+pub struct NoopActivityReporter<P, H = commonware_cryptography::sha256::Sha256>(
+    PhantomData<NoopReporterMarker<P, H>>,
 );
 
-impl<P, V, H> Default for NoopActivityReporter<P, V, H> {
+impl<P, H> Default for NoopActivityReporter<P, H> {
     fn default() -> Self {
         Self(PhantomData)
     }
 }
 
-impl<P, V, H> Clone for NoopActivityReporter<P, V, H> {
+impl<P, H> Clone for NoopActivityReporter<P, H> {
     fn clone(&self) -> Self {
         Self::default()
     }
 }
 
-impl<P, V, H> std::fmt::Debug for NoopActivityReporter<P, V, H> {
+impl<P, H> std::fmt::Debug for NoopActivityReporter<P, H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoopActivityReporter").finish()
     }
 }
 
-impl<P, V, H> Reporter for NoopActivityReporter<P, V, H>
+impl<P, H> Reporter for NoopActivityReporter<P, H>
 where
     P: PublicKey,
-    V: Variant,
     H: Hasher,
 {
-    type Activity = EngineActivity<P, V, H>;
+    type Activity = EngineActivity<P, H>;
 
     fn report(&mut self, _: Self::Activity) -> Feedback {
         Feedback::Ok
@@ -149,20 +147,20 @@ pub(crate) type TransactionResolverMailbox<E, H, T> = commonware_glue::stateful:
 pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
     commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, TransactionDb<E, H, T>>;
 
-pub(crate) type App<E, H, P, V, I, St> = EngineApplication<E, H, P, V, I, St>;
+pub(crate) type App<E, H, P, I, St> = EngineApplication<E, H, P, EngineChain<H>, I, St>;
 
-pub(crate) type AppMailbox<E, H, P, V, I, St> =
-    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, St>>;
+pub(crate) type AppMailbox<E, H, P, I, St> =
+    commonware_glue::stateful::Mailbox<E, App<E, H, P, I, St>>;
 
-pub(crate) type EngineMarshalReporters<E, H, P, V, I, St, R> =
-    Reporters<AppMailbox<E, H, P, V, I, St>, EngineReporter<R, H, P>>;
+pub(crate) type EngineMarshalReporters<E, H, P, I, St, R> =
+    Reporters<AppMailbox<E, H, P, I, St>, EngineReporter<R, H, P>>;
 
-pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
+pub(crate) type SchemeProvider = ConstantProvider<Scheme, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, St> = Stateful<
+pub(crate) type StatefulApp<E, H, P, I, St> = Stateful<
     E,
-    App<E, H, P, V, I, St>,
-    ThresholdScheme<P, V>,
+    App<E, H, P, I, St>,
+    Scheme,
     EngineVariant<H, P>,
     (
         StateResolverMailbox<E, H, St>,
@@ -171,35 +169,34 @@ pub(crate) type StatefulApp<E, H, P, V, I, St> = Stateful<
     St,
 >;
 
-pub(crate) type MarshaledApp<E, H, P, V, I, St> = Marshaled<
+pub(crate) type MarshaledApp<E, H, P, I, St> = Marshaled<
     E,
-    AppMailbox<E, H, P, V, I, St>,
+    AppMailbox<E, H, P, I, St>,
     EngineBlock<H, P>,
     ReedSolomon<H>,
     H,
-    SchemeProvider<P, V>,
+    SchemeProvider,
     St,
     FixedEpocher,
 >;
 
-pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
-    shards::Engine<E, SchemeProvider<P, V>, B, M, ReedSolomon<H>, H, EngineBlock<H, P>, P, T>;
+pub(crate) type ShardsEngine<E, B, M, H, P, T> =
+    shards::Engine<E, SchemeProvider, B, M, ReedSolomon<H>, H, EngineBlock<H, P>, P, T>;
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
 /// Reporter combinator that fans simplex activity to the marshaled
 /// application and an optional external observer.
-pub(crate) type SimplexReporter<E, H, P, V, I, St, O> =
-    Reporters<MarshaledApp<E, H, P, V, I, St>, O>;
+pub(crate) type SimplexReporter<E, H, I, St, O> = Reporters<Gated<E, H, I, St>, O>;
 
-pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, O> = simplex::Engine<
+pub(crate) type SimplexEngine<E, B, H, P, L, St, I, O> = simplex::Engine<
     E,
-    ThresholdScheme<P, V>,
+    Scheme,
     L,
     B,
     EngineCommitment<H, P>,
-    MarshaledApp<E, H, P, V, I, St>,
-    MarshaledApp<E, H, P, V, I, St>,
-    SimplexReporter<E, H, P, V, I, St, O>,
+    Gated<E, H, I, St>,
+    Gated<E, H, I, St>,
+    SimplexReporter<E, H, I, St, O>,
     St,
 >;

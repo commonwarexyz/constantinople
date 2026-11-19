@@ -1,5 +1,5 @@
 use crate::{
-    ThresholdScheme,
+    Scheme,
     block::{ApplicationBlock, EngineBlock, EngineCommitment},
 };
 use commonware_actor::Feedback;
@@ -7,16 +7,15 @@ use commonware_consensus::{
     Reporter,
     marshal::{Update, ancestry::Ancestry},
 };
-use commonware_cryptography::{
-    Digested, Digestible, Hasher, PublicKey, bls12381::primitives::variant::Variant,
-    certificate::Scheme,
-};
+use commonware_cryptography::{Digested, Digestible, Hasher, PublicKey, ed25519};
 use commonware_glue::stateful::{
     Application as StatefulApplication, Input, Proposed, db::DatabaseSet,
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
-use constantinople_application::consensus::{Application, FinalizedArtifacts, FinalizedHookFn};
+use constantinople_application::consensus::{
+    Application, Chain, FinalizedArtifacts, FinalizedHookFn,
+};
 use constantinople_mempool::TransactionSource;
 use futures::Stream;
 use rand::{CryptoRng, Rng};
@@ -26,8 +25,8 @@ use std::{
     task::{Context, Poll},
 };
 
-type InnerApplication<E, H, P, V, I, St> =
-    Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, St>;
+type InnerApplication<E, H, P, X, I, St> =
+    Application<E, H, EngineCommitment<H, P>, X, P, I, St>;
 
 // An engine block and its inner block share one digest. Pairing the inner block
 // with the marshal's digest keeps this conversion synchronous.
@@ -39,15 +38,14 @@ where
     Digested::precomputed(block.inner().inner_shared(), block.digest())
 }
 
-pub(crate) struct EngineApplication<E, H, P, V, I, St>
+pub(crate) struct EngineApplication<E, H, P, X, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
-    V: Variant,
     St: Strategy,
 {
-    inner: InnerApplication<E, H, P, V, I, St>,
+    inner: InnerApplication<E, H, P, X, I, St>,
     finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
 }
 
@@ -90,16 +88,15 @@ where
     }
 }
 
-impl<E, H, P, V, I, St> EngineApplication<E, H, P, V, I, St>
+impl<E, H, P, X, I, St> EngineApplication<E, H, P, X, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
-    V: Variant,
     St: Strategy,
 {
     pub(crate) const fn new(
-        inner: InnerApplication<E, H, P, V, I, St>,
+        inner: InnerApplication<E, H, P, X, I, St>,
         finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
     ) -> Self {
         Self {
@@ -109,12 +106,12 @@ where
     }
 }
 
-impl<E, H, P, V, I, St> Clone for EngineApplication<E, H, P, V, I, St>
+impl<E, H, P, X, I, St> Clone for EngineApplication<E, H, P, X, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
-    V: Variant,
+    X: Clone,
     St: Strategy,
 {
     fn clone(&self) -> Self {
@@ -200,26 +197,27 @@ where
     }
 }
 
-impl<E, H, P, V, I, St> StatefulApplication<E> for EngineApplication<E, H, P, V, I, St>
+// Validators sign votes with ed25519 keys (see `constantinople_auth::Scheme`).
+type Key = ed25519::PublicKey;
+
+impl<E, H, X, I, St> StatefulApplication<E> for EngineApplication<E, H, Key, X, I, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
-    P: PublicKey,
-    V: Variant,
-    ThresholdScheme<P, V>: Scheme<PublicKey = P>,
-    I: TransactionSource<EngineCommitment<H, P>, P, H> + Clone + Sync,
+    X: Chain<EngineCommitment<H, Key>, Key, H>,
+    I: TransactionSource<EngineCommitment<H, Key>, Key, H> + Clone + Sync,
     St: Strategy,
 {
-    type SigningScheme = ThresholdScheme<P, V>;
-    type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, P>, P>;
-    type Block = EngineBlock<H, P>;
-    type Databases = <InnerApplication<E, H, P, V, I, St> as StatefulApplication<E>>::Databases;
+    type SigningScheme = Scheme;
+    type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, Key>, Key>;
+    type Block = EngineBlock<H, Key>;
+    type Databases = <InnerApplication<E, H, Key, X, I, St> as StatefulApplication<E>>::Databases;
     type Captured = Option<FinalizedArtifacts<H>>;
     type Provider = I;
     type Input = ();
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
-        InnerApplication::<E, H, P, V, I, St>::sync_targets(block)
+        InnerApplication::<E, H, Key, X, I, St>::sync_targets(block)
     }
 
     async fn genesis(&mut self) -> Self::Block {

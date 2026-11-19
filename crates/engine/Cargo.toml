@@ -13,10 +13,15 @@ workspace = true
 
 [features]
 default = []
-test-utils = [ "commonware-glue/test-utils", "constantinople-mempool/mocks" ]
+test-utils = [
+	"commonware-glue/test-utils",
+	"constantinople-auth/mocks",
+	"constantinople-mempool/mocks",
+]
 
 [dependencies]
 # Workspace
+constantinople-auth.workspace = true
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
 constantinople-application.workspace = true

@@ -1633,6 +1633,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "constantinople-application",
+ "constantinople-auth",
  "constantinople-mempool",
  "constantinople-primitives",
  "futures",

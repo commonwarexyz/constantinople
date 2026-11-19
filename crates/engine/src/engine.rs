@@ -15,8 +15,10 @@ use crate::{
     application::{EngineApplication, EngineReporter},
     block::ApplicationBlock,
     shard_filter::ShardFilter,
+    tags::{self, EngineChain, Gated, Shared, Tagger},
     types::*,
 };
+use bytes::Bytes;
 use commonware_coding::Config as CodingConfig;
 use commonware_consensus::{
     Reporter, Reporters,
@@ -35,11 +37,8 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{
     Committable, Digest, Digested, Hasher, PublicKey, Signer,
-    bls12381::{
-        dkg::feldman_desmedt::Output,
-        primitives::{group, variant::Variant},
-    },
     certificate::{ConstantProvider, Verifier},
+    ed25519,
 };
 use commonware_glue::stateful::{
     Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
@@ -62,7 +61,10 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
+use commonware_utils::{
+    NZU16, NZU64, NZUsize, channel::mpsc, non_empty_range, ordered::Set, union,
+};
+use constantinople_auth::{Reports, VerdictsConfig};
 use constantinople_application::consensus::{
     Application, StateSyncTarget, TransactionHistoryTarget,
 };
@@ -77,8 +79,16 @@ use std::{
 };
 use tracing::{error, info, warn};
 
-/// The fixed threshold scheme used by simplex and marshal.
-pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::Scheme<P, V>;
+/// The vote scheme used by simplex and marshal: ed25519 signatures over a
+/// subject and the voter's report, under the `n >= 5f + 1` fault model.
+pub use constantinople_auth::Scheme;
+
+// Validators sign votes with ed25519 keys.
+type P = ed25519::PublicKey;
+
+/// Senders whose shared keys a validator keeps, each saving one Diffie-Hellman
+/// per transaction it compares a tag for.
+const SHARED_KEY_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 16);
 
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
@@ -117,8 +127,10 @@ pub const TRANSACTION_RESOLVER_CHANNEL: u64 = 6;
 /// State-sync probe channel id.
 pub const PROBE_CHANNEL: u64 = 7;
 
+/// Column channel id.
+pub const COLUMN_CHANNEL: u64 = 8;
 /// All channel ids used by the engine, including the state-sync probe.
-pub const CHANNELS: [u64; 8] = [
+pub const CHANNELS: [u64; 9] = [
     VOTE_CHANNEL,
     CERTIFICATE_CHANNEL,
     RESOLVER_CHANNEL,
@@ -127,6 +139,7 @@ pub const CHANNELS: [u64; 8] = [
     STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL,
     PROBE_CHANNEL,
+    COLUMN_CHANNEL,
 ];
 
 /// Registered physical channels required by the engine.
@@ -144,6 +157,8 @@ where
     pub marshal_resolver: (S, R),
     pub state_resolver: (S, R),
     pub transaction_resolver: (S, R),
+    /// Proposers send each validator its tags for a block here.
+    pub columns: (S, R),
 }
 
 /// Requested engine startup behavior.
@@ -157,22 +172,23 @@ pub enum StartupMode {
     StateSync,
 }
 
-pub struct Config<C, M, B, V, St, I, H, O>
+pub struct Config<M, B, St, I, H, O>
 where
-    C: Signer,
-    M: Manager<PublicKey = C::PublicKey>,
-    B: Blocker<PublicKey = C::PublicKey>,
-    V: Variant,
+    M: Manager<PublicKey = P>,
+    B: Blocker<PublicKey = P>,
     St: Strategy,
     H: Hasher,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
+    O: Reporter<Activity = EngineActivity<P, H>>,
 {
-    pub signer: C,
+    /// The key this node signs votes with, if it is a validator.
+    pub signer: ed25519::PrivateKey,
+    /// The X25519 secret this validator shares keys with users under.
+    pub secret: constantinople_auth::PrivateKey,
     pub manager: M,
     pub blocker: B,
     pub namespace: Vec<u8>,
-    pub output: Output<V, C::PublicKey>,
-    pub share: Option<group::Share>,
+    /// The validators. A node whose key is not among them only follows.
+    pub participants: Set<P>,
     pub input: I,
     pub partition_prefix: String,
     pub strategy: St,
@@ -182,7 +198,7 @@ where
     pub allow_state_sync: bool,
     pub sync_config: SyncEngineConfig,
     pub prune_config: Option<PruneConfig>,
-    pub genesis_leader: C::PublicKey,
+    pub genesis_leader: P,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
     pub prunable_items_per_section: NonZero<u64>,
@@ -197,7 +213,7 @@ where
     /// history witness journal, and the simplex vote journal. Separate from the
     /// state cache so backfill and replay scans cannot evict its working set.
     pub history_page_cache_bytes: usize,
-    pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
+    pub probe: Option<EngineProbeMailbox<H, P>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up, and this slot fans out alongside it via
     /// [`commonware_consensus::Reporters`]. Passing `None` forwards activity to
@@ -205,33 +221,31 @@ where
     pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
-    pub finalized_hook: Option<EngineFinalizedHook<H, C::PublicKey>>,
+    pub finalized_hook: Option<EngineFinalizedHook<H, P>>,
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, St, I, O>
+pub struct Engine<E, M, B, H, L, St, I, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
-    C: Signer,
-    M: Manager<PublicKey = C::PublicKey>,
-    B: Blocker<PublicKey = C::PublicKey>,
+    M: Manager<PublicKey = P>,
+    B: Blocker<PublicKey = P>,
     H: Hasher,
-    V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
+    L: Elector<Scheme> + Default,
     St: Strategy,
-    I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
+    I: TransactionSource<EngineCommitment<H, P>, P, H> + Clone + Sync,
+    O: Reporter<Activity = EngineActivity<P, H>>,
 {
     context: ContextCell<E>,
-    signer: C,
+    signer: ed25519::PrivateKey,
     manager: M,
     blocker: B,
-    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, St>,
-    transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, St>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, St>,
-    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
-    shard_mailbox: ShardsMailbox<H, C::PublicKey>,
+    state_resolver: StateResolverActor<E, P, M, B, H, St>,
+    transaction_resolver: TransactionResolverActor<E, P, M, B, H, St>,
+    stateful: StatefulApp<E, H, P, I, St>,
+    stateful_mailbox: AppMailbox<E, H, P, I, St>,
+    shards: ShardsEngine<E, B, M, H, P, St>,
+    shard_mailbox: ShardsMailbox<H, P>,
     coding_config: CodingConfig,
     #[expect(
         clippy::type_complexity,
@@ -239,34 +253,36 @@ where
     )]
     marshal: MarshalActor<
         E,
-        EngineVariant<H, C::PublicKey>,
-        SchemeProvider<C::PublicKey, V>,
-        PrunableArchive<EightCap, E, H::Digest, EngineFinalization<C::PublicKey, V, H>>,
-        PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
+        EngineVariant<H, P>,
+        SchemeProvider,
+        PrunableArchive<EightCap, E, H::Digest, EngineFinalization<P, H>>,
+        PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>,
         FixedEpocher,
         St,
     >,
-    marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
+    marshal_mailbox: EngineMarshalMailbox<H, P>,
     startup_processed_height: u64,
     #[cfg(all(test, feature = "test-utils"))]
-    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V, H>>,
+    startup_sync_floor: Option<EngineFinalization<P, H>>,
     #[cfg(all(test, feature = "test-utils"))]
-    genesis_commitment: EngineCommitment<H, C::PublicKey>,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, O>,
+    genesis_commitment: EngineCommitment<H, P>,
+    simplex: SimplexEngine<E, B, H, P, L, St, I, O>,
+    shared: Shared<H>,
+    /// Columns of the blocks this node proposes, on their way to its peers.
+    column_receiver: mpsc::UnboundedReceiver<(P, Bytes)>,
+    tag_bits: u32,
 }
 
-impl<E, C, M, B, H, V, L, St, I, O> Engine<E, C, M, B, H, V, L, St, I, O>
+impl<E, M, B, H, L, St, I, O> Engine<E, M, B, H, L, St, I, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
-    C: Signer,
-    M: Manager<PublicKey = C::PublicKey>,
-    B: Blocker<PublicKey = C::PublicKey>,
+    M: Manager<PublicKey = P>,
+    B: Blocker<PublicKey = P>,
     H: Hasher,
-    V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
+    L: Elector<Scheme> + Default,
     St: Strategy,
-    I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
+    I: TransactionSource<EngineCommitment<H, P>, P, H> + Clone + Sync,
+    O: Reporter<Activity = EngineActivity<P, H>>,
 {
     /// Returns the durable processed height recovered before the engine starts.
     /// Genesis and an empty processed history both return zero.
@@ -275,22 +291,22 @@ where
     }
 
     /// Returns a handle for reading finalization certificates stored by marshal.
-    pub fn finalization_reader(&self) -> FinalizationReader<H, C::PublicKey, V> {
+    pub fn finalization_reader(&self) -> FinalizationReader<H, P> {
         FinalizationReader::new(self.marshal_mailbox.clone())
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
+    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, P> {
         self.marshal_mailbox.clone()
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V, H>> {
+    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<P, H>> {
         self.startup_sync_floor.clone()
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) const fn genesis_commitment(&self) -> EngineCommitment<H, C::PublicKey> {
+    pub(crate) const fn genesis_commitment(&self) -> EngineCommitment<H, P> {
         self.genesis_commitment
     }
 
@@ -315,18 +331,29 @@ where
 
     /// Initializes the full engine stack.
     #[boxed]
-    pub async fn new(context: E, config: Config<C, M, B, V, St, I, H, O>) -> Self {
+    pub async fn new(context: E, config: Config<M, B, St, I, H, O>) -> Self {
         let state_page_cache = page_cache(&context, "state", config.state_page_cache_bytes);
         let history_page_cache = page_cache(&context, "history", config.history_page_cache_bytes);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
-        let scheme =
-            threshold_scheme::<C, V>(&consensus_namespace, &config.output, config.share.clone());
+        let participants = config.participants;
+        let verifier = Scheme::verifier(&consensus_namespace, participants.clone());
+        let scheme = Scheme::signer(
+            &consensus_namespace,
+            participants.clone(),
+            config.signer.clone(),
+            Reports::default(),
+        )
+        .unwrap_or_else(|| verifier.clone());
+        let block_codec = BlockCfg {
+            max_validators: participants.len(),
+            ..config.block_codec
+        };
         let provider =
-            ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
+            ConstantProvider::<Scheme, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
+            StateResolverActor::<_, P, _, _, H, St>::new(
                 context.child("state_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
@@ -342,7 +369,7 @@ where
                 },
             );
         let (transaction_resolver, transaction_sync_resolver) =
-            TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
+            TransactionResolverActor::<_, P, _, _, H, St>::new(
                 context.child("transaction_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
@@ -357,10 +384,10 @@ where
                     max_serve_ops: NZU64!(4096),
                 },
             );
-        let n_participants = u16::try_from(config.output.players().len())
+        let n_participants = u16::try_from(participants.len())
             .expect("participant count must fit in u16");
         let coding_config = coding_config_for_participants(n_participants);
-        let genesis_parent = EngineCommitment::<H, C::PublicKey>::from((
+        let genesis_parent = EngineCommitment::<H, P>::from((
             H::Digest::EMPTY,
             H::Digest::EMPTY,
             H::Digest::EMPTY,
@@ -369,17 +396,17 @@ where
 
         let prunable_items_per_section = config.prunable_items_per_section;
         let (finalizations_by_height, finalized_blocks) = futures::join!(
-            init_finalizations_archive::<E, H, C::PublicKey, V>(
+            init_finalizations_archive::<E, H>(
                 &context,
                 &history_page_cache,
                 &config.partition_prefix,
                 prunable_items_per_section,
             ),
-            init_finalized_blocks_archive::<E, H, C::PublicKey>(
+            init_finalized_blocks_archive::<E, H, P>(
                 &context,
                 &history_page_cache,
                 &config.partition_prefix,
-                &config.block_codec,
+                &block_codec,
                 prunable_items_per_section,
             ),
         );
@@ -391,7 +418,7 @@ where
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
         let mut startup_plan =
-            SyncPlan::<E, ThresholdScheme<C::PublicKey, V>, EngineVariant<H, C::PublicKey>>::init(
+            SyncPlan::<E, Scheme, EngineVariant<H, P>>::init(
                 stateful_startup_context,
                 stateful_partition_prefix.clone(),
             )
@@ -461,7 +488,7 @@ where
                 replay_buffer: REPLAY_BUFFER,
                 key_write_buffer: WRITE_BUFFER,
                 value_write_buffer: WRITE_BUFFER,
-                block_codec_config: config.block_codec.clone(),
+                block_codec_config: block_codec.clone(),
                 max_repair: MAX_REPAIR,
                 max_pending_acks: MAX_PENDING_ACKS,
                 strategy: config.strategy.clone(),
@@ -479,7 +506,7 @@ where
         let elector = L::default();
         let optimistic_views = elector
             .clone()
-            .build(config.output.players())
+            .build(&participants)
             .terms()
             .optimistic_views()
             .get();
@@ -497,7 +524,7 @@ where
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
                 max_block_size: MAX_BLOCK_SIZE,
-                block_codec_cfg: config.block_codec.clone(),
+                block_codec_cfg: block_codec.clone(),
                 strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
@@ -506,6 +533,7 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
+        let shared = Shared::new();
         let application = EngineApplication::new(
             Application::new(
                 context.child("application"),
@@ -516,6 +544,8 @@ where
                 config.public_key_cache,
                 application_state_target,
                 application_transactions_target,
+                verifier,
+                EngineChain::new(shared.clone(), marshal_mailbox.clone()),
             ),
             config.finalized_hook,
         );
@@ -553,10 +583,39 @@ where
                 epocher,
             },
         );
+        // Consensus may vote for a block only once this validator's report on it
+        // is recorded, so it talks to the marshaled application through a gate.
+        let tagger = Tagger::new(
+            context.child("verdicts"),
+            config.transaction_namespace,
+            config.secret,
+            participants.len(),
+            SHARED_KEY_CACHE_SIZE,
+            VerdictsConfig {
+                partition: format!("{}_verdicts", config.partition_prefix),
+                items_per_blob: ITEMS_PER_BLOB,
+                page_cache: history_page_cache.clone(),
+                write_buffer: WRITE_BUFFER,
+                replay_buffer: REPLAY_BUFFER,
+            },
+        )
+        .await;
+        let (column_sender, column_receiver) = mpsc::unbounded_channel();
+        let application = Gated::new(
+            context.child("gate"),
+            application,
+            shard_mailbox.clone(),
+            shared.clone(),
+            tagger,
+            scheme.clone(),
+            config.strategy.clone(),
+            column_sender,
+        );
+
         // Simplex activity reaches marshal through the marshaled application,
         // which retires its proposal gates on finalization before forwarding.
         // Reporting to the marshal mailbox directly would leak those gates.
-        let simplex_reporter: SimplexReporter<E, H, C::PublicKey, V, I, St, O> =
+        let simplex_reporter: SimplexReporter<E, H, I, St, O> =
             Reporters::from((application.clone(), config.simplex_observer));
 
         // Retain votes for late equivocation reports. The upstream wall-clock skip policy
@@ -612,30 +671,35 @@ where
             #[cfg(all(test, feature = "test-utils"))]
             genesis_commitment,
             simplex,
+            shared,
+            column_receiver,
+            tag_bits: constantinople_auth::tag_bits(u32::from(n_participants)),
         }
     }
 
     /// Starts all engine actors on the provided channels.
     pub fn start<Sx, Rx, Rep>(
         mut self,
-        channels: Channels<C::PublicKey, Sx, Rx>,
+        channels: Channels<P, Sx, Rx>,
         reporter: Option<Rep>,
     ) -> Handle<()>
     where
-        Sx: Sender<PublicKey = C::PublicKey> + Send + 'static,
-        Rx: Receiver<PublicKey = C::PublicKey> + Send + 'static,
-        Rep: Reporter<Activity = Update<ApplicationBlock<H, C::PublicKey>>>,
+        Sx: Sender<PublicKey = P> + Send + 'static,
+        Rx: Receiver<PublicKey = P> + Send + 'static,
+        Rep: Reporter<Activity = Update<ApplicationBlock<H, P>>>,
     {
         spawn_cell!(self.context, self.run(channels, reporter))
     }
 
-    async fn run<Sx, Rx, Rep>(self, channels: Channels<C::PublicKey, Sx, Rx>, reporter: Option<Rep>)
+    async fn run<Sx, Rx, Rep>(self, channels: Channels<P, Sx, Rx>, reporter: Option<Rep>)
     where
-        Sx: Sender<PublicKey = C::PublicKey>,
-        Rx: Receiver<PublicKey = C::PublicKey>,
-        Rep: Reporter<Activity = Update<ApplicationBlock<H, C::PublicKey>>>,
+        Sx: Sender<PublicKey = P>,
+        Rx: Receiver<PublicKey = P>,
+        Rep: Reporter<Activity = Update<ApplicationBlock<H, P>>>,
     {
         let resolver_context = self.context.into_present();
+        let columns_in_context = resolver_context.child("columns_in");
+        let columns_out_context = resolver_context.child("columns_out");
         let marshal_resolver = marshal_resolver::init(
             resolver_context,
             marshal_resolver::Config {
@@ -662,7 +726,7 @@ where
         let stateful_handle = self.stateful.start();
 
         let reporter = reporter.map(EngineReporter::new);
-        let reporters: EngineMarshalReporters<E, H, C::PublicKey, V, I, St, Rep> =
+        let reporters: EngineMarshalReporters<E, H, P, I, St, Rep> =
             EngineMarshalReporters::from((self.stateful_mailbox, reporter));
         let marshal_handle = self
             .marshal
@@ -670,6 +734,13 @@ where
         let simplex_handle =
             self.simplex
                 .start(channels.votes, channels.certificates, channels.resolver);
+        let (column_sender, column_receiver) = channels.columns;
+        let columns_in = columns_in_context.spawn({
+            let (shared, bits, blocker) = (self.shared, self.tag_bits, self.blocker.clone());
+            move |_| tags::receive(shared, bits, column_receiver, blocker)
+        });
+        let columns_out = columns_out_context
+            .spawn(move |_| tags::send(self.column_receiver, column_sender));
 
         if let Err(error) = try_join_all(vec![
             state_resolver_handle,
@@ -678,6 +749,8 @@ where
             stateful_handle,
             marshal_handle,
             simplex_handle,
+            columns_in,
+            columns_out,
         ])
         .await
         {
@@ -685,25 +758,6 @@ where
         } else {
             warn!("engine stopped");
         }
-    }
-}
-
-fn threshold_scheme<C, V>(
-    namespace: &[u8],
-    output: &Output<V, C::PublicKey>,
-    share: Option<group::Share>,
-) -> ThresholdScheme<C::PublicKey, V>
-where
-    C: Signer,
-    V: Variant,
-{
-    let participants = output.players().clone();
-    match share {
-        Some(share) => {
-            ThresholdScheme::signer(namespace, participants, output.public().clone(), share)
-                .expect("share must belong to the configured threshold output")
-        }
-        None => ThresholdScheme::verifier(namespace, participants, output.public().clone()),
     }
 }
 
@@ -747,17 +801,15 @@ where
     )
 }
 
-async fn init_finalizations_archive<E, H, P, V>(
+async fn init_finalizations_archive<E, H>(
     context: &E,
     page_cache: &CacheRef,
     partition_prefix: &str,
     items_per_section: NonZero<u64>,
-) -> PrunableArchive<EightCap, E, H::Digest, EngineFinalization<P, V, H>>
+) -> PrunableArchive<EightCap, E, H::Digest, EngineFinalization<P, H>>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
-    P: PublicKey,
-    V: Variant,
 {
     let start = Instant::now();
     let archive = prunable::Archive::init(
@@ -770,7 +822,7 @@ where
             value_partition: format!("{partition_prefix}-finalizations-by-height-value"),
             compression: FREEZER_VALUE_COMPRESSION,
             items_per_section,
-            codec_config: ThresholdScheme::<P, V>::certificate_codec_config_unbounded(),
+            codec_config: Scheme::certificate_codec_config_unbounded(),
             replay_buffer: REPLAY_BUFFER,
             key_write_buffer: WRITE_BUFFER,
             value_write_buffer: WRITE_BUFFER,
@@ -917,6 +969,8 @@ mod unit_tests {
             parent: sha256::Digest::EMPTY,
             height: 0,
             timestamp: 0,
+            parent_notarization: sha256::Digest::EMPTY,
+            parent_outcomes: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
@@ -967,6 +1021,8 @@ mod unit_tests {
             parent: sha256::Digest::EMPTY,
             height: u64::MAX,
             timestamp: u64::MAX,
+            parent_notarization: sha256::Digest::EMPTY,
+            parent_outcomes: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(u64::MAX - 1, u64::MAX),
             transactions_root: sha256::Digest::EMPTY,
@@ -977,7 +1033,9 @@ mod unit_tests {
                 .seal(&mut sha256::Sha256::default())
                 .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
-        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < 4096);
+        // The budget reserves two prefix bytes per 128 body bytes, the worst
+        // case over transaction sizes. These transactions use fewer.
+        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < MAXIMUM_BLOCK_SIZE / 256);
         type TestShard = Shard<
             EngineBlock<sha256::Sha256, ed25519::PublicKey>,
             ReedSolomon<sha256::Sha256>,
