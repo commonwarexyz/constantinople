@@ -9,9 +9,7 @@ mod traces;
 
 use crate::{config::IndexerConfig, run::CriticalTask};
 use budget::{FINALIZED_UPLOAD_AMPLIFICATION, FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, UploadBudget};
-use commonware_cryptography::{
-    bls12381::primitives::variant::MinSig, ed25519::PublicKey, sha256::Sha256,
-};
+use commonware_cryptography::{ed25519::PublicKey, sha256::Sha256};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     Clock as _, Handle, Spawner as _, Strategizer as _, Supervisor as _,
@@ -19,7 +17,7 @@ use commonware_runtime::{
 };
 use constantinople_application::consensus::FinalizedHookFn;
 use constantinople_engine::{
-    ThresholdScheme,
+    Scheme,
     types::{EngineBlock, EngineCommitment, FinalizationReader},
 };
 use constantinople_indexer::{
@@ -55,13 +53,12 @@ const DURATION_BUCKETS: [f64; 27] = [
     0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
-type EngineCertReporter =
-    CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
+type EngineCertReporter = CertificateReporter<Sha256, PublicKey, Scheme>;
 type EnginePublisher = Publisher<Sha256, PublicKey>;
-type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey, MinSig>;
-type EngineCapturedUpload = CapturedFinalizedUpload<Sha256, PublicKey, MinSig>;
+type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
+type EngineCapturedUpload = CapturedFinalizedUpload<Sha256, PublicKey>;
 type FinalizedPayloads = PayloadStore<RuntimeContext>;
-type EngineFinalizationReader = FinalizationReader<Sha256, PublicKey, MinSig>;
+type EngineFinalizationReader = FinalizationReader<Sha256, PublicKey>;
 type ValidatorFinalizedHook =
     FinalizedHookFn<EngineCommitment<Sha256, PublicKey>, Sha256, PublicKey>;
 

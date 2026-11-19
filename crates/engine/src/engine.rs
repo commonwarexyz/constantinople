@@ -64,10 +64,13 @@ use commonware_storage::{
 use commonware_utils::{
     NZU16, NZU64, NZUsize, channel::mpsc, non_empty_range, ordered::Set, union,
 };
-use constantinople_auth::{Reports, VerdictsConfig};
 use constantinople_application::consensus::{
     Application, StateSyncTarget, TransactionHistoryTarget,
 };
+/// The vote scheme used by simplex and marshal: ed25519 signatures over a
+/// subject and the voter's report, under the `n >= 5f + 1` fault model.
+pub use constantinople_auth::Scheme;
+use constantinople_auth::{Reports, VerdictsConfig};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache, proposal::MAXIMUM_BLOCK_SIZE};
 use futures::future::try_join_all;
@@ -78,10 +81,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
-
-/// The vote scheme used by simplex and marshal: ed25519 signatures over a
-/// subject and the voter's report, under the `n >= 5f + 1` fault model.
-pub use constantinople_auth::Scheme;
 
 // Validators sign votes with ed25519 keys.
 type P = ed25519::PublicKey;
@@ -349,25 +348,23 @@ where
             max_validators: participants.len(),
             ..config.block_codec
         };
-        let provider =
-            ConstantProvider::<Scheme, Epoch>::new(scheme.clone());
+        let provider = ConstantProvider::<Scheme, Epoch>::new(scheme.clone());
 
-        let (state_resolver, state_sync_resolver) =
-            StateResolverActor::<_, P, _, _, H, St>::new(
-                context.child("state_resolver"),
-                qmdb_resolver::Config {
-                    peer_provider: config.manager.clone(),
-                    blocker: config.blocker.clone(),
-                    database: None,
-                    mailbox_size: MAILBOX_SIZE,
-                    me: Some(config.signer.public_key()),
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
-                    priority_requests: false,
-                    priority_responses: false,
-                    max_serve_ops: NZU64!(4096),
-                },
-            );
+        let (state_resolver, state_sync_resolver) = StateResolverActor::<_, P, _, _, H, St>::new(
+            context.child("state_resolver"),
+            qmdb_resolver::Config {
+                peer_provider: config.manager.clone(),
+                blocker: config.blocker.clone(),
+                database: None,
+                mailbox_size: MAILBOX_SIZE,
+                me: Some(config.signer.public_key()),
+                timeout: STATE_SYNC_TIMEOUT,
+                fetch_retry_timeout: STATE_SYNC_RETRY,
+                priority_requests: false,
+                priority_responses: false,
+                max_serve_ops: NZU64!(4096),
+            },
+        );
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, P, _, _, H, St>::new(
                 context.child("transaction_resolver"),
@@ -384,8 +381,8 @@ where
                     max_serve_ops: NZU64!(4096),
                 },
             );
-        let n_participants = u16::try_from(participants.len())
-            .expect("participant count must fit in u16");
+        let n_participants =
+            u16::try_from(participants.len()).expect("participant count must fit in u16");
         let coding_config = coding_config_for_participants(n_participants);
         let genesis_parent = EngineCommitment::<H, P>::from((
             H::Digest::EMPTY,
@@ -417,12 +414,11 @@ where
         );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
-        let mut startup_plan =
-            SyncPlan::<E, Scheme, EngineVariant<H, P>>::init(
-                stateful_startup_context,
-                stateful_partition_prefix.clone(),
-            )
-            .await;
+        let mut startup_plan = SyncPlan::<E, Scheme, EngineVariant<H, P>>::init(
+            stateful_startup_context,
+            stateful_partition_prefix.clone(),
+        )
+        .await;
 
         // The durable plan distinguishes normal recovery from peer state sync. Normal recovery
         // stays floorless so marshal restores its acknowledged progress. A requested or
@@ -739,8 +735,8 @@ where
             let (shared, bits, blocker) = (self.shared, self.tag_bits, self.blocker.clone());
             move |_| tags::receive(shared, bits, column_receiver, blocker)
         });
-        let columns_out = columns_out_context
-            .spawn(move |_| tags::send(self.column_receiver, column_sender));
+        let columns_out =
+            columns_out_context.spawn(move |_| tags::send(self.column_receiver, column_sender));
 
         if let Err(error) = try_join_all(vec![
             state_resolver_handle,

@@ -108,7 +108,10 @@ impl<H: Hasher> Read for Column<H> {
 }
 
 /// A transaction authenticated by tags: its digest and its sender's key.
-type Tagged<H> = (<H as Hasher>::Digest, Option<constantinople_auth::PublicKey>);
+type Tagged<H> = (
+    <H as Hasher>::Digest,
+    Option<constantinople_auth::PublicKey>,
+);
 
 /// The transactions of `block` that are authenticated by tags, in order.
 fn tagged<H: Hasher>(block: &InnerBlock<H>) -> Vec<Tagged<H>> {
@@ -702,7 +705,10 @@ pub(crate) async fn send(
     mut sender: impl Sender<PublicKey = P>,
 ) {
     while let Some((peer, column)) = columns.recv().await {
-        if sender.send(Recipients::One(peer.clone()), column, true).is_empty() {
+        if sender
+            .send(Recipients::One(peer.clone()), column, true)
+            .is_empty()
+        {
             debug!(%peer, "column not sent");
         }
     }

@@ -5,8 +5,8 @@ mod properties;
 
 use crate::{
     CERTIFICATE_CHANNEL, COLUMN_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    StartupMode, TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
     types::{EngineCommitment, EngineFinalization, EngineVariant},
 };
 use common::{
@@ -337,7 +337,9 @@ impl EngineDefinition for TestEngineDefinition {
                 EngineCommitment<TestHasher, TestPublicKey>,
                 TestPublicKey,
                 TestHasher,
-            >::new(Vec::<Vec<constantinople_mempool::Candidate<TestHasher>>>::new());
+            >::new(
+                Vec::<Vec<constantinople_mempool::Candidate<TestHasher>>>::new()
+            );
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
@@ -556,7 +558,10 @@ fn run_restart_at_processed_height(processed_height: u64) {
                 )
                 .at(Duration::from_millis(11_000), Action::Restart(validator)),
         ))
-        .timeout(Duration::from_secs(30))
+        // A view needs five of the six validators. They start one after another,
+        // and the crash lands in the second view, so the first two views time
+        // out before the chain starts moving.
+        .timeout(Duration::from_secs(60))
         .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
         .property(RestartPreservesProcessedHeight::new(barrier))
         .run()

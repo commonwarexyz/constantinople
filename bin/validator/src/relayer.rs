@@ -11,7 +11,7 @@ use axum::{
 use commonware_actor::Feedback;
 use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_consensus::{Reporter, Viewable};
-use commonware_cryptography::{bls12381::primitives::variant::MinSig, ed25519, sha256};
+use commonware_cryptography::{ed25519, sha256};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_engine::types::EngineActivity;
@@ -50,7 +50,7 @@ const LEADER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// release it while the job runs.
 const MAX_CONCURRENT_DECODES: usize = 1;
 
-type Activity = EngineActivity<ed25519::PublicKey, MinSig>;
+type Activity = EngineActivity<ed25519::PublicKey>;
 
 #[derive(Clone)]
 pub struct Observer {

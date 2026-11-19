@@ -458,6 +458,8 @@ mod tests {
         let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
+                notarization: None,
+                outcomes: Default::default(),
                 body: vec![lazy],
             },
             sha256::Digest::EMPTY,
@@ -497,6 +499,8 @@ mod tests {
         EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(leader, transactions_range),
+                notarization: None,
+                outcomes: Default::default(),
                 body,
             },
             sha256::Digest::EMPTY,
@@ -553,6 +557,8 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 7,
             timestamp: 1_000,
+            parent_notarization: sha256::Digest::EMPTY,
+            parent_outcomes: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
             transactions_root: sha256::Digest::EMPTY,

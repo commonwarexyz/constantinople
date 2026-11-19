@@ -568,22 +568,17 @@ mod tests {
     use super::*;
     use commonware_codec::Encode as _;
     use commonware_consensus::{
-        simplex::{
-            scheme::bls12381_threshold::standard,
-            types::{Context as SimplexContext, Finalization, Finalize, Proposal},
-        },
+        simplex::types::{Context as SimplexContext, Finalization, Finalize, Proposal},
         types::{Round, View},
     };
     use commonware_cryptography::{
-        Digest as _, Signer as _,
-        bls12381::primitives::variant::MinSig,
-        ed25519,
+        Digest as _, Signer as _, ed25519,
         sha256::{Digest as Sha256Digest, Sha256},
     };
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, telemetry::metrics::has_metric_value};
     use commonware_utils::{NZU16, non_empty_range};
-    use constantinople_engine::ThresholdScheme;
+    use constantinople_engine::Scheme;
     use constantinople_primitives::{
         Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
@@ -591,11 +586,7 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
     use std::{num::NonZeroU64, time::Duration};
 
-    type TestReporter = CertificateReporter<
-        Sha256,
-        ed25519::PublicKey,
-        ThresholdScheme<ed25519::PublicKey, MinSig>,
-    >;
+    type TestReporter = CertificateReporter<Sha256, ed25519::PublicKey, Scheme>;
     type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
 
     #[test]
@@ -868,12 +859,7 @@ mod tests {
                 .expect("simplex namespace"),
             );
             let (tx, rx) = mpsc::channel(2);
-            let uploader = tokio::spawn(run_uploader::<
-                _,
-                Sha256,
-                ed25519::PublicKey,
-                ThresholdScheme<ed25519::PublicKey, MinSig>,
-            >(
+            let uploader = tokio::spawn(run_uploader::<_, Sha256, ed25519::PublicKey, Scheme>(
                 context.child("uploader"),
                 client,
                 rx,
@@ -946,6 +932,8 @@ mod tests {
             parent: Sha256Digest::EMPTY,
             height,
             timestamp: 0,
+            parent_notarization: Sha256Digest::EMPTY,
+            parent_outcomes: Sha256Digest::EMPTY,
             state_root: Sha256Digest::EMPTY,
             state_range: non_empty_range!(0, 2),
             transactions_root: Sha256Digest::EMPTY,
@@ -957,9 +945,9 @@ mod tests {
 
     fn test_finalization(
         block: &EngineBlock<Sha256, ed25519::PublicKey>,
-    ) -> Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, TestCommitment> {
+    ) -> Finalization<Scheme, TestCommitment> {
         let mut rng = StdRng::from_seed([7; 32]);
-        let fixture = standard::fixture::<MinSig, _>(&mut rng, b"indexer-test", 4);
+        let fixture = constantinople_auth::fixture(&mut rng, b"indexer-test", 6);
         let commitment = TestCommitment::from((
             *block.seal(),
             Sha256Digest::EMPTY,

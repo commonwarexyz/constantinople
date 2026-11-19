@@ -1,19 +1,12 @@
 //! YAML-serializable validator configuration.
 
 use ahash::AHashMap;
-use commonware_codec::{Copying, Encode, Read as CodecRead, ReadExt};
-use commonware_cryptography::{
-    Signer,
-    bls12381::{
-        dkg::feldman_desmedt as dkg,
-        primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
-    },
-    ed25519,
-};
+use commonware_codec::{Copying, Encode, ReadExt};
+use commonware_cryptography::{Signer, ed25519};
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
-use commonware_utils::{NZU32, NZUsize};
+use commonware_utils::NZUsize;
 use constantinople_primitives::proposal::{MAXIMUM_BLOCK_SIZE, max_transaction_bytes};
 use serde::Deserialize;
 use std::{fmt, net::SocketAddr, num::NonZeroUsize, path::Path};
@@ -107,11 +100,9 @@ pub enum StartupModeConfig {
 pub struct ValidatorConfig {
     /// Hex-encoded ed25519 private key.
     pub private_key: String,
-    /// Hex-encoded DKG output (threshold public material).
-    pub dkg_output: String,
-    /// Hex-encoded DKG share for this validator. Empty string `""` indicates
-    /// a secondary (non-voting) validator that holds no share.
-    pub dkg_share: String,
+    /// Hex-encoded X25519 private key. Users derive the keys they share with
+    /// this validator from its public half.
+    pub tag_private_key: String,
     /// Startup sync mode.
     #[serde(default)]
     pub startup: StartupModeConfig,
@@ -121,12 +112,14 @@ pub struct ValidatorConfig {
     pub genesis_leader: String,
     /// Storage partition prefix for this validator.
     pub partition_prefix: String,
-    /// Number of primary validators (DKG participant count).
-    pub num_validators: u32,
-    /// Hex-encoded ed25519 public keys of the primary (voting) validators,
-    /// in DKG order. Must be identical across every validator config in the
-    /// deployment so all peers agree on the discovery bitvec ordering.
+    /// Hex-encoded ed25519 public keys of the primary (voting) validators.
+    /// Must be identical across every validator config in the deployment so
+    /// all peers agree on the discovery bitvec ordering. A node votes iff its
+    /// own key is listed here.
     pub primary_validators: Vec<String>,
+    /// Hex-encoded X25519 public keys of the primary validators, in the order
+    /// of `primary_validators`.
+    pub primary_tag_keys: Vec<String>,
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     pub secondary_validators: Vec<String>,
@@ -221,17 +214,17 @@ pub struct DecodedConfig {
     pub signer: ed25519::PrivateKey,
     /// This validator's ed25519 public key.
     pub public_key: ed25519::PublicKey,
-    /// Decoded DKG output (threshold public material).
-    pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
-    /// DKG share for this validator. `None` for secondary (non-voting) validators.
-    pub share: Option<Share>,
+    /// This node's X25519 secret.
+    pub tag_secret: constantinople_auth::PrivateKey,
+    /// Whether this node is a primary (voting) validator.
+    pub voter: bool,
     /// Genesis leader public key.
     pub genesis_leader: ed25519::PublicKey,
     /// Local p2p bind address.
     pub listen_bind: SocketAddr,
     /// Advertised p2p address other peers dial.
     pub listen_advertise: SocketAddr,
-    /// Primary (voting) validators in DKG order.
+    /// Primary (voting) validators, as listed in the config.
     pub primary_participants: Vec<ed25519::PublicKey>,
     /// Secondary (non-voting) validators.
     pub secondary_participants: Vec<ed25519::PublicKey>,
@@ -289,26 +282,15 @@ fn decode_private_key(hex_str: &str) -> ed25519::PrivateKey {
     ed25519::PrivateKey::read(&mut Copying(&bytes)).expect("failed to decode private key")
 }
 
-fn decode_dkg_output(
-    hex_str: &str,
-    num_validators: u32,
-) -> dkg::Output<MinSig, ed25519::PublicKey> {
-    let bytes = decode_hex("dkg_output", hex_str);
-    dkg::Output::read_cfg(
-        &mut Copying(&bytes),
-        &(NZU32!(num_validators), ModeVersion::v0()),
-    )
-    .expect("failed to decode DKG output")
+fn decode_tag_secret(hex_str: &str) -> constantinople_auth::PrivateKey {
+    let bytes = decode_hex("tag_private_key", hex_str);
+    constantinople_auth::PrivateKey::read(&mut Copying(&bytes))
+        .expect("failed to decode tag private key")
 }
 
-/// Decode an optional DKG share. Returns `None` for the empty string, which is
-/// how secondary validators are marked in the YAML schema.
-fn decode_share_opt(hex_str: &str) -> Option<Share> {
-    if hex_str.is_empty() {
-        return None;
-    }
-    let bytes = decode_hex("dkg_share", hex_str);
-    Some(Share::read(&mut Copying(&bytes)).expect("failed to decode DKG share"))
+fn decode_tag_key(hex_str: &str) -> constantinople_auth::PublicKey {
+    let bytes = decode_hex("primary_tag_keys", hex_str);
+    constantinople_auth::PublicKey::read(&mut Copying(&bytes)).expect("failed to decode tag key")
 }
 
 fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
@@ -361,7 +343,30 @@ fn decode_with_network(
 ) -> LoadedConfig {
     let signer = decode_private_key(&config.private_key);
     let public_key = signer.public_key();
-    let dkg_output = decode_dkg_output(&config.dkg_output, config.num_validators);
+    let tag_secret = decode_tag_secret(&config.tag_private_key);
+    let primary_tag_keys = config
+        .primary_tag_keys
+        .iter()
+        .map(|key| decode_tag_key(key))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_tag_keys.len(),
+        primary_participants.len(),
+        "primary_tag_keys must list one key per primary validator",
+    );
+
+    // Users compute this validator's tags under the key listed for it, so a
+    // list that disagrees with the secret would have it reject every tag.
+    let voter = primary_participants
+        .iter()
+        .position(|key| *key == public_key);
+    if let Some(index) = voter {
+        assert!(
+            primary_tag_keys[index] == tag_secret.public_key(),
+            "tag_private_key does not match this validator's entry in primary_tag_keys",
+        );
+    }
+    let voter = voter.is_some();
     assert!(
         config.max_propose_bytes <= MAXIMUM_BLOCK_SIZE,
         "max_propose_bytes {} exceeds encoded block limit {MAXIMUM_BLOCK_SIZE}",
@@ -372,8 +377,7 @@ fn decode_with_network(
         "max_propose_bytes {} is too small for an encoded empty block",
         config.max_propose_bytes,
     );
-    let share = decode_share_opt(&config.dkg_share);
-    if share.is_some() && config.relayer.is_some() {
+    if voter && config.relayer.is_some() {
         panic!("relayer config is only valid on secondary validators");
     }
     if config.indexer.is_some() && config.relayer.is_some() {
@@ -394,8 +398,8 @@ fn decode_with_network(
         decoded: DecodedConfig {
             signer,
             public_key,
-            dkg_output,
-            share,
+            tag_secret,
+            voter,
             genesis_leader,
             listen_bind,
             listen_advertise: public_listen,
@@ -576,18 +580,9 @@ mod tests {
         default_upload_max_in_flight, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
-    use commonware_cryptography::{
-        Signer,
-        bls12381::{
-            dkg::feldman_desmedt as dkg,
-            primitives::{group::Share, sharing::Mode, variant::MinSig},
-        },
-        ed25519,
-    };
+    use commonware_cryptography::{Signer, ed25519};
     use commonware_formatting::hex;
-    use commonware_utils::{N3f1, TryCollect};
     use std::{
-        collections::BTreeMap,
         fs,
         net::SocketAddr,
         path::PathBuf,
@@ -646,8 +641,13 @@ mod tests {
         primary_keys: Vec<ed25519::PublicKey>,
         secondary_signers: Vec<ed25519::PrivateKey>,
         secondary_keys: Vec<ed25519::PublicKey>,
-        dkg_output_hex: String,
-        shares: BTreeMap<ed25519::PublicKey, Share>,
+    }
+
+    /// The X25519 secret of the node whose signing key has seed `seed`.
+    fn tag_secret(seed: u64) -> constantinople_auth::PrivateKey {
+        let mut bytes = [0x5a; 32];
+        bytes[..8].copy_from_slice(&seed.to_be_bytes());
+        constantinople_auth::PrivateKey::from(bytes)
     }
 
     impl Cluster {
@@ -667,20 +667,11 @@ mod tests {
                 .map(Signer::public_key)
                 .collect::<Vec<_>>();
 
-            let participants = primary_keys.clone().into_iter().try_collect().unwrap();
-            let mut rng = commonware_utils::test_rng();
-            let (dkg_output, raw_shares) =
-                dkg::deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
-                    .expect("DKG deal failed");
-            let shares = raw_shares.into_iter().collect();
-
             Self {
                 primary_signers,
                 primary_keys,
                 secondary_signers,
                 secondary_keys,
-                dkg_output_hex: hex(&dkg_output.encode()),
-                shares,
             }
         }
 
@@ -688,6 +679,12 @@ mod tests {
             self.primary_keys
                 .iter()
                 .map(|pk| hex(&pk.encode()))
+                .collect()
+        }
+
+        fn primary_tag_key_list(&self) -> Vec<String> {
+            (0..self.primary_keys.len() as u64)
+                .map(|seed| hex(&tag_secret(seed).public_key().encode()))
                 .collect()
         }
 
@@ -706,17 +703,15 @@ mod tests {
             bootstrappers: Vec<NamedBootstrapperEntry>,
         ) -> ValidatorConfig {
             let signer = &self.primary_signers[index];
-            let share = self.shares.get(&self.primary_keys[index]).expect("share");
             ValidatorConfig {
                 private_key: hex(&signer.encode()),
-                dkg_output: self.dkg_output_hex.clone(),
-                dkg_share: hex(&share.encode()),
+                tag_private_key: hex(&tag_secret(index as u64).encode()),
                 startup,
                 listen_port: 9000,
                 genesis_leader: hex(&self.primary_keys[0].encode()),
                 partition_prefix: format!("validator-{index}"),
-                num_validators: self.primary_keys.len() as u32,
                 primary_validators: self.primary_hex_list(),
+                primary_tag_keys: self.primary_tag_key_list(),
                 secondary_validators: self.secondary_hex_list(),
                 log_level: "info".to_string(),
                 worker_threads: 2,
@@ -735,7 +730,7 @@ mod tests {
             }
         }
 
-        /// Build a [`ValidatorConfig`] for secondary slot `index` (no share).
+        /// Build a [`ValidatorConfig`] for secondary slot `index`.
         fn secondary_config(
             &self,
             index: usize,
@@ -745,14 +740,13 @@ mod tests {
             let signer = &self.secondary_signers[index];
             ValidatorConfig {
                 private_key: hex(&signer.encode()),
-                dkg_output: self.dkg_output_hex.clone(),
-                dkg_share: String::new(),
+                tag_private_key: hex(&tag_secret(1_000_000 + index as u64).encode()),
                 startup,
                 listen_port: 9000,
                 genesis_leader: hex(&self.primary_keys[0].encode()),
                 partition_prefix: format!("secondary-{index}"),
-                num_validators: self.primary_keys.len() as u32,
                 primary_validators: self.primary_hex_list(),
+                primary_tag_keys: self.primary_tag_key_list(),
                 secondary_validators: self.secondary_hex_list(),
                 log_level: "info".to_string(),
                 worker_threads: 2,
@@ -795,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_maximum_proposal_budget_independent_of_dkg_count() {
+    fn accepts_maximum_proposal_budget_independent_of_validator_count() {
         for validators in [4, 7] {
             let cluster = Cluster::new(validators, 0);
             let loaded = decode_proposal_config(&cluster, super::MAXIMUM_BLOCK_SIZE);
@@ -804,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_proposal_budgets_independent_of_dkg_count() {
+    fn rejects_oversized_proposal_budgets_independent_of_validator_count() {
         let maximum = super::MAXIMUM_BLOCK_SIZE;
         for validators in [4, 7] {
             let cluster = Cluster::new(validators, 0);
@@ -925,7 +919,7 @@ mod tests {
             loaded.decoded.listen_advertise,
             "127.0.0.1:9000".parse::<SocketAddr>().unwrap()
         );
-        assert!(loaded.decoded.share.is_some());
+        assert!(loaded.decoded.voter);
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert!(loaded.decoded.primary_participants.contains(self_key));
         assert!(loaded.decoded.primary_participants.contains(peer_key));
@@ -993,7 +987,7 @@ hosts:
             loaded.decoded.listen_advertise,
             "203.0.113.1:9000".parse::<SocketAddr>().unwrap()
         );
-        assert!(loaded.decoded.share.is_some());
+        assert!(loaded.decoded.voter);
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert!(loaded.decoded.primary_participants.contains(self_key));
         assert!(loaded.decoded.primary_participants.contains(peer_key));
@@ -1291,7 +1285,7 @@ hosts:
         let _ = fs::remove_file(hosts_path);
     }
 
-    /// Secondary validator: empty `dkg_share` must decode to `None`.
+    /// A node outside `primary_validators` does not vote.
     #[test]
     fn deployer_config_secondary_has_no_share() {
         let cluster = Cluster::new(2, 1);
@@ -1338,7 +1332,7 @@ hosts:
         let loaded = load_deployer_config(&hosts_path, &config_path);
 
         // Secondary node: no share.
-        assert!(loaded.decoded.share.is_none());
+        assert!(!loaded.decoded.voter);
         // Primary set has the 2 primaries, secondary set has the one secondary.
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert!(loaded.decoded.primary_participants.contains(primary0_key));
@@ -1425,7 +1419,7 @@ hosts:
                 .contains(secondary1_key)
         );
         // Primary has a share.
-        assert!(loaded.decoded.share.is_some());
+        assert!(loaded.decoded.voter);
     }
 
     /// Non-validator hosts (spammer, monitoring) and unlisted hex-named hosts
@@ -1553,7 +1547,7 @@ secondaries:
 
         let loaded = load_local_config(&peers_path, &config_path);
 
-        assert!(loaded.decoded.share.is_none());
+        assert!(!loaded.decoded.voter);
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert_eq!(loaded.decoded.secondary_participants.len(), 1);
         assert!(loaded.decoded.secondary_participants.contains(self_key));

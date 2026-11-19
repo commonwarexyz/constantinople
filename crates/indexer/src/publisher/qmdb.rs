@@ -16,9 +16,7 @@ use commonware_codec::{
     Buf, Codec, Copying, DecodeExt as _, Encode, EncodeSize, Error as CodecError, FixedSize,
     RangeCfg, Read, ReadExt, Write,
 };
-use commonware_cryptography::{
-    Digest, Hasher, PublicKey, bls12381::primitives::variant::Variant, sha256::Sha256,
-};
+use commonware_cryptography::{Digest, Hasher, PublicKey, sha256::Sha256};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Handle, Spawner};
 use commonware_storage::{
@@ -66,7 +64,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{Instrument as _, Span, debug, info_span, instrument::WithSubscriber as _, warn};
 
 const QUEUE_MAGIC: u32 = 0x4351_5545;
-const QUEUE_FORMAT_VERSION: u16 = 1;
+// Version 2: finalizations are certificates of votes with reports, and blocks
+// carry a notarization of their parent and outcome bits.
+const QUEUE_FORMAT_VERSION: u16 = 2;
 const MAX_BUFFERED_UPLOADS: usize = 64;
 
 // Split byte-heavy SQL chunks to reduce encoding, compression, and transfer time.
@@ -258,39 +258,36 @@ impl<D: Digest> Read for QueuedAuthenticatedRange<D> {
 ///
 /// The default form holds decoded operation bytes. [CapturedFinalizedUpload]
 /// holds typed operations. Both forms encode to identical bytes.
-pub struct QueuedFinalizedUpload<H, P, V, S = Vec<Vec<u8>>, T = Vec<Vec<u8>>>
+pub struct QueuedFinalizedUpload<H, P, S = Vec<Vec<u8>>, T = Vec<Vec<u8>>>
 where
     H: Hasher,
     P: PublicKey,
-    V: Variant,
 {
     block: EngineBlock<H, P>,
-    finalization: Option<EngineFinalization<P, V, H>>,
+    finalization: Option<EngineFinalization<P, H>>,
     finalized_ts_micros: i64,
     state: QueuedAuthenticatedRange<H::Digest, S>,
     transactions: QueuedAuthenticatedRange<H::Digest, T>,
 }
 
 /// Queue payload built in the finalized hook from captured artifacts.
-pub type CapturedFinalizedUpload<H, P, V> = QueuedFinalizedUpload<
+pub type CapturedFinalizedUpload<H, P> = QueuedFinalizedUpload<
     H,
     P,
-    V,
     Arc<Vec<CapturedStateOperation>>,
     Arc<Vec<TransactionHistoryOperation<H>>>,
 >;
 
-impl<H, P, V> CapturedFinalizedUpload<H, P, V>
+impl<H, P> CapturedFinalizedUpload<H, P>
 where
     H: Hasher,
     H::Digest: Codec,
     P: PublicKey,
-    V: Variant,
 {
     /// Build an entry from the exact pre-apply handoff.
     pub fn from_finalized_artifacts(
         block: &EngineBlock<H, P>,
-        finalization: Option<EngineFinalization<P, V, H>>,
+        finalization: Option<EngineFinalization<P, H>>,
         finalized_ts_micros: i64,
         artifacts: FinalizedArtifacts<H>,
     ) -> Result<Self, PublishError> {
@@ -320,12 +317,11 @@ where
     }
 }
 
-impl<H, P, V, S, T> QueuedFinalizedUpload<H, P, V, S, T>
+impl<H, P, S, T> QueuedFinalizedUpload<H, P, S, T>
 where
     H: Hasher,
     H::Digest: Codec,
     P: PublicKey,
-    V: Variant,
     S: OperationList,
     T: OperationList,
 {
@@ -337,7 +333,7 @@ where
         &self.block
     }
 
-    pub const fn finalization(&self) -> Option<&EngineFinalization<P, V, H>> {
+    pub const fn finalization(&self) -> Option<&EngineFinalization<P, H>> {
         self.finalization.as_ref()
     }
 
@@ -394,14 +390,13 @@ fn validate_range<D: Digest, Ops: OperationList>(
     Ok(())
 }
 
-impl<P, V, S, T> EncodeSize for QueuedFinalizedUpload<Sha256, P, V, S, T>
+impl<P, S, T> EncodeSize for QueuedFinalizedUpload<Sha256, P, S, T>
 where
     P: PublicKey,
-    V: Variant,
     S: OperationList,
     T: OperationList,
     EngineBlock<Sha256, P>: EncodeSize,
-    EngineFinalization<P, V, Sha256>: EncodeSize,
+    EngineFinalization<P, Sha256>: EncodeSize,
 {
     fn encode_size(&self) -> usize {
         QUEUE_MAGIC.encode_size()
@@ -414,14 +409,13 @@ where
     }
 }
 
-impl<P, V, S, T> Write for QueuedFinalizedUpload<Sha256, P, V, S, T>
+impl<P, S, T> Write for QueuedFinalizedUpload<Sha256, P, S, T>
 where
     P: PublicKey,
-    V: Variant,
     S: OperationList,
     T: OperationList,
     EngineBlock<Sha256, P>: Write,
-    EngineFinalization<P, V, Sha256>: Write,
+    EngineFinalization<P, Sha256>: Write,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         QUEUE_MAGIC.write(buf);
@@ -434,12 +428,11 @@ where
     }
 }
 
-impl<P, V> Read for QueuedFinalizedUpload<Sha256, P, V>
+impl<P> Read for QueuedFinalizedUpload<Sha256, P>
 where
     P: PublicKey,
-    V: Variant,
     EngineBlock<Sha256, P>: Read<Cfg = BlockCfg>,
-    EngineFinalization<P, V, Sha256>: Read<Cfg = ()>,
+    EngineFinalization<P, Sha256>: Read<Cfg = usize>,
 {
     type Cfg = QueuedFinalizedUploadCfg;
 
@@ -452,7 +445,10 @@ where
         }
         let upload = Self {
             block: EngineBlock::<Sha256, P>::read_cfg(buf, &cfg.block)?,
-            finalization: Option::<EngineFinalization<P, V, Sha256>>::read(buf)?,
+            finalization: Option::<EngineFinalization<P, Sha256>>::read_cfg(
+                buf,
+                &cfg.block.max_validators,
+            )?,
             finalized_ts_micros: i64::read(buf)?,
             state: QueuedAuthenticatedRange::read_cfg(buf, &cfg.state)?,
             transactions: QueuedAuthenticatedRange::read_cfg(buf, &cfg.transactions)?,
@@ -646,13 +642,11 @@ where
         Ok((publisher, join))
     }
 
-    pub async fn enqueue_queued_finalized<V>(
+    pub async fn enqueue_queued_finalized(
         &self,
-        upload: QueuedFinalizedUpload<H, P, V>,
+        upload: QueuedFinalizedUpload<H, P>,
     ) -> Result<UploadCompletion, PublishError>
-    where
-        V: Variant,
-    {
+where {
         let enqueued_at = Instant::now();
         let height = upload.height();
         let span = Span::current();
@@ -1376,16 +1370,11 @@ mod tests {
     use bytes::Bytes;
     use commonware_codec::Decode as _;
     use commonware_consensus::{
-        simplex::{
-            scheme::bls12381_threshold::standard,
-            types::{Context as SimplexContext, Finalization, Finalize, Proposal},
-        },
+        simplex::types::{Context as SimplexContext, Finalization, Finalize, Proposal},
         types::{Round, View},
     };
     use commonware_cryptography::{
-        Signer as _,
-        bls12381::primitives::variant::MinSig,
-        ed25519,
+        Signer as _, ed25519,
         sha256::{Digest as Sha256Digest, Sha256},
     };
     use commonware_parallel::Sequential;
@@ -1395,7 +1384,7 @@ mod tests {
     };
     use commonware_storage::merkle::mem::Mem;
     use commonware_utils::{NZU16, non_empty_range};
-    use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
+    use constantinople_engine::{Scheme, types::EngineCommitment};
     use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
     use exoware_qmdb::adapter::{Keyless, Unordered};
     use rand::{SeedableRng, rngs::StdRng};
@@ -1408,8 +1397,7 @@ mod tests {
     use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
     type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
-    type TestFinalization =
-        Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, TestCommitment>;
+    type TestFinalization = Finalization<Scheme, TestCommitment>;
 
     #[derive(Clone, Debug)]
     struct CapturedSpan {
@@ -1514,7 +1502,7 @@ mod tests {
         let upload = queued_upload(1, state, transactions);
         let encoded = upload.encode();
         assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 1]);
-        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
         )
@@ -1534,7 +1522,7 @@ mod tests {
             let mut unsupported = encoded.to_vec();
             unsupported[index] ^= u8::MAX;
             assert!(
-                QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+                QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
                     Bytes::from(unsupported),
                     &QueuedFinalizedUploadCfg::default(),
                 )
@@ -1560,7 +1548,7 @@ mod tests {
         );
         upload.finalization = None;
         let encoded = upload.encode();
-        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
         )
@@ -1635,7 +1623,7 @@ mod tests {
         };
 
         let captured =
-            CapturedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::from_finalized_artifacts(
+            CapturedFinalizedUpload::<Sha256, ed25519::PublicKey>::from_finalized_artifacts(
                 &block,
                 Some(finalization.clone()),
                 1,
@@ -1646,7 +1634,7 @@ mod tests {
         assert_eq!(captured.encode(), decoded.encode());
         assert_eq!(captured.encode_size(), decoded.encode_size());
 
-        let round_trip = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+        let round_trip = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
             captured.encode(),
             &QueuedFinalizedUploadCfg::default(),
         )
@@ -1662,12 +1650,11 @@ mod tests {
                 .await
                 .expect("spawn observed Store");
             let (reporter, certificate_uploader) =
-                crate::CertificateReporter::<
-                    Sha256,
-                    ed25519::PublicKey,
-                    ThresholdScheme<ed25519::PublicKey, MinSig>,
-                >::connect(
-                    context.child("simplex"), &store.url, Some("writer-key"), 2
+                crate::CertificateReporter::<Sha256, ed25519::PublicKey, Scheme>::connect(
+                    context.child("simplex"),
+                    &store.url,
+                    Some("writer-key"),
+                    2,
                 )
                 .expect("certificate reporter connects");
             let (publisher, worker) = Publisher::<Sha256, ed25519::PublicKey>::connect(
@@ -2678,19 +2665,18 @@ mod tests {
                     Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
                         .seal(&mut Sha256::default()),
                 );
-                let upload = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig> {
+                let upload = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey> {
                     block,
                     finalization: None,
                     finalized_ts_micros: 1,
                     state,
                     transactions,
                 };
-                let decoded =
-                    QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
-                        upload.encode(),
-                        &QueuedFinalizedUploadCfg::default(),
-                    )
-                    .expect("queue entry preserves distinct floors and operation starts");
+                let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
+                    upload.encode(),
+                    &QueuedFinalizedUploadCfg::default(),
+                )
+                .expect("queue entry preserves distinct floors and operation starts");
                 let (_, state_end, transaction_end) = prepare_data_batch(
                     state_qmdb_client(&store).unwrap(),
                     transactions_qmdb_client(&store).unwrap(),
@@ -3304,7 +3290,7 @@ mod tests {
         height: u64,
         state: QueuedAuthenticatedRange<Sha256Digest>,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
-    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey, MinSig> {
+    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {
         let block = test_block(height, &state, &transactions);
         let finalization = test_finalization(&block);
         queued_upload_from(block, finalization, state, transactions)
@@ -3315,7 +3301,7 @@ mod tests {
         finalization: TestFinalization,
         state: QueuedAuthenticatedRange<Sha256Digest>,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
-    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey, MinSig> {
+    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {
         let upload = QueuedFinalizedUpload {
             finalized_ts_micros: i64::try_from(block.header.height).expect("height fits timestamp"),
             block,
@@ -3344,6 +3330,8 @@ mod tests {
             parent: Sha256Digest::EMPTY,
             height,
             timestamp: height,
+            parent_notarization: Sha256Digest::EMPTY,
+            parent_outcomes: Sha256Digest::EMPTY,
             state_root,
             state_range: non_empty_range!(state.start, state.end),
             transactions_root,
@@ -3401,7 +3389,7 @@ mod tests {
 
     fn test_finalization(block: &EngineBlock<Sha256, ed25519::PublicKey>) -> TestFinalization {
         let mut rng = StdRng::from_seed([7; 32]);
-        let fixture = standard::fixture::<MinSig, _>(&mut rng, b"qmdb-test", 4);
+        let fixture = constantinople_auth::fixture(&mut rng, b"qmdb-test", 6);
         let commitment = test_commitment(*block.seal());
         let proposal = Proposal::new(block.header.context.round, View::zero(), commitment);
         let finalizes = fixture

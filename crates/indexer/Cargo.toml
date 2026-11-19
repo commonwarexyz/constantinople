@@ -17,6 +17,7 @@ chain-indexer = ["dep:exoware-simulator"]
 [dependencies]
 # Workspace
 constantinople-application.workspace = true
+constantinople-auth.workspace = true
 constantinople-engine.workspace = true
 constantinople-primitives.workspace = true
 
@@ -62,6 +63,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
+constantinople-auth = { workspace = true, features = ["mocks"] }
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-coding.workspace = true
 commonware-glue.workspace = true

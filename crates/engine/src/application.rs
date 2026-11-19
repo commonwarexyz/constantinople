@@ -25,8 +25,7 @@ use std::{
     task::{Context, Poll},
 };
 
-type InnerApplication<E, H, P, X, I, St> =
-    Application<E, H, EngineCommitment<H, P>, X, P, I, St>;
+type InnerApplication<E, H, P, X, I, St> = Application<E, H, EngineCommitment<H, P>, X, P, I, St>;
 
 // An engine block and its inner block share one digest. Pairing the inner block
 // with the marshal's digest keeps this conversion synchronous.

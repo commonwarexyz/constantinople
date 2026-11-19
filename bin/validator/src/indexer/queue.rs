@@ -3,7 +3,6 @@
 use super::{FinalizedPayloads, payloads::PayloadDescriptor};
 use commonware_codec::{Buf, FixedSize, Read, ReadExt as _, Write};
 use commonware_cryptography::{
-    bls12381::primitives::variant::MinSig,
     ed25519::PublicKey,
     sha256::{Digest, Sha256},
 };
@@ -84,7 +83,7 @@ pub(super) struct LatestCaptureReceipt {
 
 impl LatestCaptureReceipt {
     pub(super) fn from_upload<S: OperationList, T: OperationList>(
-        upload: &QueuedFinalizedUpload<Sha256, PublicKey, MinSig, S, T>,
+        upload: &QueuedFinalizedUpload<Sha256, PublicKey, S, T>,
     ) -> Self {
         Self {
             height: upload.height(),

@@ -9,7 +9,6 @@ use commonware_codec::Encode;
 use commonware_consensus::{simplex::elector::RoundRobin, types::Epoch};
 use commonware_cryptography::{
     ChaCha20Poly1305,
-    bls12381::primitives::variant::MinSig,
     certificate::ConstantProvider,
     ed25519::{self, PublicKey},
     sha256::Sha256,
@@ -40,9 +39,9 @@ use commonware_utils::{
     NZDuration, NZU32, NZU64, NZUsize, Probability, TryCollect, ordered::Set, union,
 };
 use constantinople_engine::{
-    CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, types::EngineCommitment,
+    CERTIFICATE_CHANNEL, COLUMN_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, Scheme,
+    StartupMode, TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, types::EngineCommitment,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::{
@@ -282,6 +281,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .into_iter()
             .try_collect()
             .unwrap();
+        let participants = primary.clone();
         oracle.track(0, TrackedPeers::new(primary, secondary));
 
         let channels = Channels {
@@ -292,14 +292,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota),
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota),
             transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota),
+            columns: network.register(COLUMN_CHANNEL, quota),
         };
         let probe_network = network.register(PROBE_CHANNEL, quota);
-        let provider =
-            ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
-                &union(b"constantinople", b"_CONSENSUS"),
-                decoded.dkg_output.players().clone(),
-                decoded.dkg_output.public().clone(),
-            ));
+        let provider = ConstantProvider::new(Scheme::verifier(
+            &union(b"constantinople", b"_CONSENSUS"),
+            participants.clone(),
+        ));
         let (probe, probe_mailbox) = Probe::new(ProbeConfig {
             context: context.child("probe"),
             provider,
@@ -337,7 +336,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             mempool_receiver,
             account_reader.clone(),
         );
-        let is_primary = decoded.share.is_some();
+        let is_primary = decoded.voter;
         let mempool_handle: Pin<Box<dyn Future<Output = ()> + Send>> = if is_primary {
             let listener = tokio::net::TcpListener::bind(http_listen)
                 .await
@@ -392,46 +391,36 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .map(|indexer| indexer.finalized_hook.clone());
 
         info!("initializing engine");
-        let engine = Engine::<
-            _,
-            _,
-            _,
-            _,
-            Sha256,
-            MinSig,
-            RoundRobin<Sha256>,
-            Rayon,
-            _,
-            crate::relayer::Observer,
-        >::new(
-            context.child("engine"),
-            EngineConfig {
-                signer: decoded.signer,
-                manager: oracle.clone(),
-                blocker: oracle,
-                namespace: b"constantinople".to_vec(),
-                output: decoded.dkg_output,
-                share: decoded.share,
-                input: mempool_mailbox.clone(),
-                partition_prefix: decoded.partition_prefix,
-                strategy,
-                public_key_cache,
-                startup,
-                allow_state_sync: indexer_handle.is_none(),
-                sync_config: production_sync_config(),
-                prune_config: Some(PRUNE_CONFIG),
-                genesis_leader: decoded.genesis_leader,
-                transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                block_codec: Default::default(),
-                prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
-                state_page_cache_bytes,
-                history_page_cache_bytes,
-                probe: Some(probe_mailbox.clone()),
-                simplex_observer: relayer_observer,
-                finalized_hook,
-            },
-        )
-        .await;
+        let engine =
+            Engine::<_, _, _, Sha256, RoundRobin<Sha256>, Rayon, _, crate::relayer::Observer>::new(
+                context.child("engine"),
+                EngineConfig {
+                    signer: decoded.signer,
+                    secret: decoded.tag_secret,
+                    manager: oracle.clone(),
+                    blocker: oracle,
+                    namespace: b"constantinople".to_vec(),
+                    participants,
+                    input: mempool_mailbox.clone(),
+                    partition_prefix: decoded.partition_prefix,
+                    strategy,
+                    public_key_cache,
+                    startup,
+                    allow_state_sync: indexer_handle.is_none(),
+                    sync_config: production_sync_config(),
+                    prune_config: Some(PRUNE_CONFIG),
+                    genesis_leader: decoded.genesis_leader,
+                    transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
+                    block_codec: Default::default(),
+                    prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+                    state_page_cache_bytes,
+                    history_page_cache_bytes,
+                    probe: Some(probe_mailbox.clone()),
+                    simplex_observer: relayer_observer,
+                    finalized_hook,
+                },
+            )
+            .await;
 
         if let Some(indexer) = &indexer_handle {
             indexer.validate_startup(engine.startup_processed_height());
