@@ -516,10 +516,8 @@ where
     true
 }
 
-/// Merkleizes the staged state and transaction batches into a child block
-/// execution. `transaction_batch` is a future so a still-draining history
-/// append can overlap the state merkleize; callers holding a finished batch
-/// pass it via [`ready`].
+/// The range a header commits to for a database with `bounds`: from its
+/// inactivity floor to its tip.
 fn range_from_bounds<F, D>(bounds: &Bounds<F, D>) -> commonware_utils::range::NonEmptyRange<u64>
 where
     F: Family,

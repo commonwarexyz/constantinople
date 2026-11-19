@@ -1600,6 +1600,7 @@ dependencies = [
  "commonware-formatting",
  "commonware-math",
  "commonware-utils",
+ "constantinople-auth",
  "constantinople-primitives",
  "http",
  "mimalloc",

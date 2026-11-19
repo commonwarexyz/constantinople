@@ -306,6 +306,7 @@ impl<H: Hasher> Chain<Commitment<H>, P, H> for EngineChain<H> {
         }
         let context = &block.header.context;
         let round = Round::new(context.round.epoch(), context.parent.0);
+        debug!(height, %round, "parent of replayed block is not stored: fetching it");
         self.marshal
             .subscribe_by_commitment(context.parent.1, CommitmentFallback::FetchByRound { round })
             .await

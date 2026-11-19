@@ -110,16 +110,13 @@ fn build_validators(
 
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
+    let primary_tag_keys = material.primary_tag_keys_hex();
     let secondary_validators = material.secondary_hex();
 
     for index in 0..args.validators {
         let validator_index = index as usize;
         let public_key = &material.public_keys[validator_index];
         let public_key_hex = hex(&public_key.encode());
-        let share = material
-            .shares
-            .get(public_key)
-            .expect("missing share for validator");
         let listen_port = local
             .base_port
             .checked_add(index as u16)
@@ -135,14 +132,13 @@ fn build_validators(
 
         let config = ValidatorConfig {
             private_key: hex(&material.signers[validator_index].encode()),
-            dkg_output: hex(&material.dkg_output.encode()),
-            dkg_share: hex(&share.encode()),
+            tag_private_key: hex(&material.tag_secrets[validator_index].encode()),
             startup: args.startup,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
-            num_validators: args.validators,
             primary_validators: primary_validators.clone(),
+            primary_tag_keys: primary_tag_keys.clone(),
             secondary_validators: secondary_validators.clone(),
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
@@ -184,6 +180,7 @@ fn build_secondaries(
     let mut secondaries = Vec::with_capacity(roles.len());
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
+    let primary_tag_keys = material.primary_tag_keys_hex();
     let secondary_validators = material.secondary_hex();
     // Secondary ports start after the primary range to avoid collisions on
     // the same loopback host.
@@ -212,14 +209,13 @@ fn build_secondaries(
         let (worker_threads, rayon_threads) = secondary_runtime_threads(args, role);
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
-            dkg_output: hex(&material.dkg_output.encode()),
-            dkg_share: String::new(),
+            tag_private_key: hex(&material.secondary_tag_secrets[secondary_index].encode()),
             startup: args.startup,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("secondary-{index}"),
-            num_validators: args.validators,
             primary_validators: primary_validators.clone(),
+            primary_tag_keys: primary_tag_keys.clone(),
             secondary_validators: secondary_validators.clone(),
             log_level: args.log_level.clone(),
             worker_threads,

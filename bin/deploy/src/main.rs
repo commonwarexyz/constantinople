@@ -5,27 +5,15 @@ mod ports;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
-use commonware_codec::{Copying, Encode, Read as CodecRead};
-use commonware_cryptography::{
-    Signer,
-    bls12381::{
-        dkg::feldman_desmedt as dkg,
-        primitives::{
-            group::Share,
-            sharing::{Mode, ModeVersion},
-            variant::MinSig,
-        },
-    },
-    ed25519,
-};
+use commonware_codec::{Copying, Encode, ReadExt as _};
+use commonware_cryptography::{Signer, ed25519};
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
-use commonware_utils::{N3f1, NZU32, NZUsize, TryCollect};
+use commonware_utils::NZUsize;
 use constantinople_primitives::proposal::{MAXIMUM_BLOCK_SIZE, max_transaction_bytes};
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -96,7 +84,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct SimplexVerificationMaterialArgs {
-    /// Generated validator or secondary YAML containing `dkg_output`.
+    /// Generated validator or secondary YAML containing `primary_validators`.
     #[arg(long)]
     config: PathBuf,
 }
@@ -450,11 +438,9 @@ pub(crate) struct NamedBootstrapperEntry {
 pub(crate) struct ValidatorConfig {
     /// Hex-encoded ed25519 private key.
     private_key: String,
-    /// Hex-encoded DKG output (threshold public material).
-    dkg_output: String,
-    /// Hex-encoded DKG share for this validator. Empty string `""` indicates
-    /// a secondary (non-voting) validator that holds no share.
-    dkg_share: String,
+    /// Hex-encoded X25519 private key. Users derive the keys they share with
+    /// this validator from its public half.
+    tag_private_key: String,
     /// Startup sync mode.
     startup: StartupModeConfig,
     /// p2p listen port.
@@ -463,12 +449,13 @@ pub(crate) struct ValidatorConfig {
     genesis_leader: String,
     /// Storage partition prefix for this validator.
     partition_prefix: String,
-    /// Number of primary validators (DKG participant count).
-    num_validators: u32,
-    /// Hex-encoded ed25519 public keys of the primary (voting) validators,
-    /// in DKG order. Must be identical across every validator config in the
-    /// deployment so all peers agree on the discovery bitvec ordering.
+    /// Hex-encoded ed25519 public keys of the primary (voting) validators.
+    /// Must be identical across every validator config in the deployment so
+    /// all peers agree on the discovery bitvec ordering.
     primary_validators: Vec<String>,
+    /// Hex-encoded X25519 public keys of the primary validators, in the order
+    /// of `primary_validators`.
+    primary_tag_keys: Vec<String>,
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     secondary_validators: Vec<String>,
@@ -579,25 +566,34 @@ pub(crate) struct PeersConfig {
 
 #[derive(Debug, Deserialize)]
 struct SimplexMaterialConfig {
-    /// Hex-encoded DKG output.
-    dkg_output: String,
-    /// Number of primary validators.
-    num_validators: u32,
+    /// Hex-encoded ed25519 public keys of the primary validators.
+    primary_validators: Vec<String>,
+}
+
+/// What verifies a simplex certificate: the validators' ed25519 public keys,
+/// concatenated in participant order (sorted), hex-encoded.
+fn simplex_verification_material(mut validators: Vec<ed25519::PublicKey>) -> String {
+    validators.sort();
+    let mut material = Vec::with_capacity(validators.len() * 32);
+    for validator in &validators {
+        material.extend_from_slice(&validator.encode());
+    }
+    hex(&material)
 }
 
 pub(crate) struct ClusterMaterial {
     /// Primary (voting) validator private keys.
     pub signers: Vec<ed25519::PrivateKey>,
-    /// Primary (voting) validator public keys, in DKG order.
+    /// Primary (voting) validator public keys.
     pub public_keys: Vec<ed25519::PublicKey>,
+    /// X25519 secret of each primary validator, in the same order.
+    pub tag_secrets: Vec<constantinople_auth::PrivateKey>,
     /// Secondary (non-voting) validator private keys.
     pub secondary_signers: Vec<ed25519::PrivateKey>,
     /// Secondary (non-voting) validator public keys.
     pub secondary_public_keys: Vec<ed25519::PublicKey>,
-    /// DKG output over the primary validators.
-    pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
-    /// DKG share per primary validator.
-    pub shares: BTreeMap<ed25519::PublicKey, Share>,
+    /// X25519 secret of each secondary validator, in the same order.
+    pub secondary_tag_secrets: Vec<constantinople_auth::PrivateKey>,
     /// Hex-encoded genesis leader public key.
     pub genesis_leader: String,
 }
@@ -617,8 +613,17 @@ impl ClusterMaterial {
             .collect()
     }
 
+    /// Hex-encoded X25519 public keys of the primary validators, in the order
+    /// of [`Self::primary_hex`].
+    pub fn primary_tag_keys_hex(&self) -> Vec<String> {
+        self.tag_secrets
+            .iter()
+            .map(|secret| hex(&secret.public_key().encode()))
+            .collect()
+    }
+
     pub fn simplex_verification_material_hex(&self) -> String {
-        hex(&self.dkg_output.public().public().encode())
+        simplex_verification_material(self.public_keys.clone())
     }
 }
 
@@ -743,7 +748,8 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
-    assert!(args.validators >= 4, "--validators must be at least 4");
+    // One fault needs six validators under `n >= 5f + 1`.
+    assert!(args.validators >= 6, "--validators must be at least 6");
     u16::try_from(args.validators).expect("--validators must be at most 65535");
     assert!(
         args.max_propose_bytes <= MAXIMUM_BLOCK_SIZE,
@@ -805,23 +811,24 @@ fn build_cluster_material(
         .map(Signer::public_key)
         .collect::<Vec<_>>();
 
-    // DKG runs over primary validators only; secondaries hold ed25519 identities
-    // but no threshold share. The resulting polynomial's total must equal the
-    // primary count or `threshold_scheme` will panic at validator load.
-    let participants = public_keys.clone().into_iter().try_collect().unwrap();
-    let (dkg_output, raw_shares) =
-        dkg::deal::<MinSig, _, N3f1>(rng, Mode::NonZeroCounter, participants)
-            .expect("DKG deal failed");
-    let shares = raw_shares.into_iter().collect();
+    // Every node has an X25519 key. Users share keys with the primary
+    // validators, which compare their tags.
+    let mut tag_secrets = |count: usize| {
+        (0..count)
+            .map(|_| constantinople_auth::PrivateKey::random(rng))
+            .collect::<Vec<_>>()
+    };
+    let secondary_tag_secrets = tag_secrets(secondary_signers.len());
+    let tag_secrets = tag_secrets(signers.len());
     let genesis_leader = hex(&public_keys[0].encode());
 
     ClusterMaterial {
         signers,
         public_keys,
         secondary_signers,
+        tag_secrets,
         secondary_public_keys,
-        dkg_output,
-        shares,
+        secondary_tag_secrets,
         genesis_leader,
     }
 }
@@ -843,13 +850,15 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
     let raw = fs::read_to_string(config_path).expect("failed to read validator config");
     let config: SimplexMaterialConfig =
         serde_yaml::from_str(&raw).expect("failed to parse validator config");
-    let bytes = from_hex(&config.dkg_output).expect("bad dkg_output hex");
-    let dkg_output = dkg::Output::<MinSig, ed25519::PublicKey>::read_cfg(
-        &mut Copying(&bytes),
-        &(NZU32!(config.num_validators), ModeVersion::v0()),
-    )
-    .expect("failed to decode dkg_output");
-    hex(&dkg_output.public().public().encode())
+    let validators = config
+        .primary_validators
+        .iter()
+        .map(|key| {
+            let bytes = from_hex(key).expect("bad primary_validators hex");
+            ed25519::PublicKey::read(&mut Copying(&bytes)).expect("failed to decode public key")
+        })
+        .collect();
+    simplex_verification_material(validators)
 }
 
 pub(crate) fn default_bootstrappers(
@@ -908,9 +917,7 @@ mod tests {
         simplex_verification_material_from_config, write_simplex_verification_material,
     };
     use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
-    use commonware_codec::Encode;
     use commonware_deployer::aws;
-    use commonware_formatting::hex;
     use std::{
         fs,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -939,7 +946,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "remote",
@@ -991,7 +998,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "remote",
@@ -1354,7 +1361,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "remote",
@@ -1393,7 +1400,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "remote",
@@ -1426,7 +1433,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--spammer-accounts-jitter",
@@ -1448,7 +1455,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--spammer-seed-offset",
@@ -1470,7 +1477,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--spammer-presigned-batches",
@@ -1492,7 +1499,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--spammer-rayon-threads",
@@ -1509,8 +1516,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "--validators must be at least 4")]
-    fn rejects_validator_count_below_coding_minimum() {
+    #[should_panic(expected = "--validators must be at least 6")]
+    fn rejects_validator_count_below_one_fault() {
         let cli = parse_cli([
             "constantinople-deploy",
             "generate",
@@ -1551,7 +1558,7 @@ mod tests {
 
     #[test]
     fn accepts_maximum_proposal_budget_independent_of_validator_count() {
-        for validators in [4, 7, u32::from(u16::MAX)] {
+        for validators in [6, 7, u32::from(u16::MAX)] {
             let args = proposal_args(validators, super::MAXIMUM_BLOCK_SIZE);
             super::validate_generate_args(&args);
         }
@@ -1560,7 +1567,7 @@ mod tests {
     #[test]
     fn rejects_oversized_proposal_budgets_independent_of_validator_count() {
         let maximum = super::MAXIMUM_BLOCK_SIZE;
-        for validators in [4, 7] {
+        for validators in [6, 7] {
             for budget in [maximum + 1, usize::MAX] {
                 let args = proposal_args(validators, budget);
                 let error = std::panic::catch_unwind(|| super::validate_generate_args(&args))
@@ -1580,7 +1587,7 @@ mod tests {
             .find(|&budget| super::max_transaction_bytes(budget).is_some())
             .expect("empty block fits within the consensus limit");
         for budget in [0, 1, minimum - 1] {
-            let args = proposal_args(4, budget);
+            let args = proposal_args(6, budget);
             let error = std::panic::catch_unwind(|| super::validate_generate_args(&args))
                 .expect_err("budget below empty block size should fail");
             let message = error.downcast_ref::<String>().expect("panic message");
@@ -1589,7 +1596,7 @@ mod tests {
                 &format!("--max-propose-bytes {budget} is too small for an encoded empty block"),
             );
         }
-        super::validate_generate_args(&proposal_args(4, minimum));
+        super::validate_generate_args(&proposal_args(6, minimum));
     }
 
     #[test]
@@ -1606,7 +1613,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--indexer",
@@ -1630,7 +1637,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--spammer-submitters",
@@ -1652,7 +1659,7 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--output-dir",
             "out",
             "--spammer-accounts-jitter",
@@ -1690,8 +1697,8 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "dkg_output: {}\nnum_validators: 4\n",
-                hex(&material.dkg_output.encode())
+                "primary_validators: [{}]\n",
+                material.primary_hex().join(", ")
             ),
         )
         .expect("failed to write config");

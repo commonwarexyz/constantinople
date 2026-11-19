@@ -67,13 +67,17 @@ mod tests {
             "constantinople-deploy",
             "generate",
             "--validators",
-            "4",
+            "6",
             "--indexer",
             "--output-dir",
             output_dir.to_str().expect("UTF-8 output path"),
             "local",
+            // Six nodes and the indexer secondary take metrics ports 8083 to
+            // 8089, which puts the chain indexer's on its Store port.
+            "--base-http-port",
+            "7000",
             "--base-metrics-port",
-            "8085",
+            "8083",
         ])
         .expect("parse deploy arguments");
         let Command::Generate(args) = cli.command else {
