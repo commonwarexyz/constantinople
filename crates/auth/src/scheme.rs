@@ -897,6 +897,56 @@ mod tests {
         assert_eq!(outcome.unwrap_err().invalid.len(), 2);
     }
 
+    /// Certificates as the explorer's verifier reads them, with the committee that
+    /// signed them. `explorer/tests/certificate.test.ts` verifies the same bytes.
+    ///
+    /// Run with `UPDATE_VECTORS=1` to rewrite the file after a format change.
+    #[test]
+    fn certificates_match_the_shared_vectors() {
+        use commonware_consensus::simplex::types::Finalization;
+        use commonware_formatting::hex;
+
+        let mut rng = test_rng();
+        let fixture = fixture(&mut rng, NAMESPACE, 6);
+        let proposal = proposal(2);
+        let scheme = &fixture.schemes[0];
+
+        // Validators 0, 1, 2, 4 and 5 vote. Of three tagged transactions, all
+        // approve the first, validators 0 to 2 the second and 0 to 1 the third.
+        let verdicts: Vec<Vec<bool>> = (0..6).map(|i| vec![true, i < 3, i < 2]).collect();
+        let votes = notarizes(&fixture, &proposal, &verdicts);
+        let quorum = [&votes[0], &votes[1], &votes[2], &votes[4], &votes[5]];
+        let notarization =
+            Notarization::from_notarizes(scheme, non_empty![@quorum], &Sequential).unwrap();
+        let finalizes: Vec<_> = [0, 1, 2, 4, 5]
+            .map(|i| Finalize::sign(&fixture.schemes[i], proposal.clone()).unwrap())
+            .into();
+        let finalization =
+            Finalization::from_finalizes(scheme, non_empty![@finalizes.iter()], &Sequential)
+                .unwrap();
+
+        // A stored artifact is a certificate followed by the certified header.
+        let artifact = |certificate: Bytes| hex(&[certificate.as_ref(), b"header"].concat());
+        let validators: Vec<u8> = fixture
+            .participants
+            .iter()
+            .flat_map(|key| key.encode().to_vec())
+            .collect();
+        let vectors = format!(
+            "{{\n  \"namespace\": \"{}\",\n  \"validators\": \"{}\",\n  \"payloadBytes\": 32,\n  \"notarization\": \"{}\",\n  \"finalization\": \"{}\"\n}}\n",
+            hex(NAMESPACE),
+            hex(&validators),
+            artifact(notarization.encode()),
+            artifact(finalization.encode()),
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/certificates.json");
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::write(path, &vectors).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), vectors);
+    }
+
     #[test]
     fn vote_decodes_from_the_network() {
         let mut rng = test_rng();

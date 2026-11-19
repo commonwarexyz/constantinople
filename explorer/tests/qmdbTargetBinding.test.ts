@@ -1986,6 +1986,8 @@ function chainHeader(height: bigint, parent: Uint8Array, transactionsTip = 8n): 
     return concat(
         new Uint8Array([0, Number(chainView(height))]), new Uint8Array(32), new Uint8Array([8]),
         new Uint8Array(100), parent, u64(height), u64(0n),
+        // Digests of the parent's notarization and of the parent's outcome bits.
+        new Uint8Array(64),
         chainStateRoot(height), u64(1n), u64(10n),
         chainTransactionsRoot(height), u64(2n), u64(transactionsTip),
     );

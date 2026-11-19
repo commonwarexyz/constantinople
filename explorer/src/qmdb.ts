@@ -1025,7 +1025,7 @@ async function verifiedSimplexClient(
         throw new Error('Simplex verification material is not configured');
     }
     return new SimplexClient<VerifiedCertificate, VerifiedCertificate>(simplexStore(storeUrl), {
-        verifier: simplexFinalizationVerifier(simplexVerificationMaterial),
+        verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
     });
 }
 
@@ -1037,9 +1037,9 @@ function simplexStore(storeUrl: string): StoreClient {
 
 // The verification material is the validators' ed25519 public keys, concatenated in
 // participant order.
-function simplexFinalizationVerifier(
+async function simplexFinalizationVerifier(
     simplexVerificationMaterial: string,
-): SimplexCertificateVerifier<VerifiedCertificate, VerifiedCertificate> {
+): Promise<SimplexCertificateVerifier<VerifiedCertificate, VerifiedCertificate>> {
     return createCertificateVerifier({
         namespace: CONSENSUS_NAMESPACE,
         validators: fromHex(simplexVerificationMaterial),
