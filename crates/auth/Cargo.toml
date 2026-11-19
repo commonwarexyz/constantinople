@@ -1,0 +1,40 @@
+[package]
+name = "constantinople-auth"
+description = "MAC authentication of transactions for constantinople"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Commonware
+commonware-codec.workspace = true
+commonware-consensus.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-formatting.workspace = true
+commonware-parallel.workspace = true
+commonware-runtime.workspace = true
+commonware-storage.workspace = true
+commonware-utils.workspace = true
+
+# Other
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+rand.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[features]
+mocks = [ "commonware-consensus/mocks", "commonware-cryptography/mocks" ]
+
+[dev-dependencies]
+commonware-consensus = { workspace = true, features = ["mocks"] }
+commonware-cryptography = { workspace = true, features = ["mocks"] }
+rand = { workspace = true, features = ["std_rng"] }

@@ -1569,6 +1569,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-auth"
+version = "2026.7.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "commonware-codec",
+ "commonware-consensus",
+ "commonware-cryptography",
+ "commonware-formatting",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
+ "futures",
+ "rand 0.10.2",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "constantinople-deploy"
 version = "2026.7.0"
 dependencies = [
