@@ -1,0 +1,208 @@
+[package]
+name = "commonware-cryptography"
+edition = "2024"
+publish = true
+version = "2026.9.0"
+license = "MIT OR Apache-2.0"
+description = "Generate keys, sign arbitrary messages, and deterministically verify signatures."
+readme = "README.md"
+homepage = "https://commonware.xyz"
+repository = "https://github.com/commonwarexyz/monorepo/tree/main/cryptography"
+documentation = "https://docs.rs/commonware-cryptography"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(full_bench)", "cfg(huge_bench)", "cfg(benchmark_tracking)", "cfg(generate_conformance_tests)", "cfg(commonware_stability_BETA)", "cfg(commonware_stability_GAMMA)", "cfg(commonware_stability_DELTA)", "cfg(commonware_stability_EPSILON)", "cfg(commonware_stability_RESERVED)"] }
+unused-must-use = "deny"
+rust-2018-idioms = "deny"
+warnings = "deny"
+
+[lints.clippy]
+missing-const-for-fn = "warn"
+use-self = "warn"
+redundant-clone = "warn"
+option-if-let-else = "warn"
+disallowed_types = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_inherent_impl = "deny"
+unused-async = "warn"
+large_futures = "warn"
+suspicious_op_assign_impl = "allow"
+
+[dependencies]
+ahash = { version = "0.8.12", default-features = false, features = ["no-rng"] }
+anyhow = { version = "1.0.103", default-features = false, optional = true }
+arbitrary = { version = "1.4.2", optional = true, features = ["derive"] }
+blake3 = { version = "1.8.7", default-features = false, features = ["zeroize"] }
+blst = { version = "0.3.16", default-features = false, optional = true, features = ["no-threads"] }
+bytes = { version = "1.12.1", default-features = false }
+cfg-if = { version = "1.0.4" }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+commonware-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false }
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"], optional = true }
+ctutils = { version = "0.4.2" }
+curve25519-dalek = { version = "5.0.0", features = ["digest"] }
+ecdsa = { version = "0.17.0", default-features = false }
+fixedbitset = { version = "0.5.7", default-features = false }
+hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
+num-rational = { version = "0.4.2", features = ["num-bigint"], optional = true }
+num-traits = { version = "0.2.19", default-features = false, optional = true }
+once_cell = { version = "1.21.4", default-features = false, features = ["alloc", "race"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
+rand = { version = "0.10.2", default-features = false }
+rand_chacha = { version = "0.10.0", default-features = false }
+rand_core = { version = "0.10.1", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
+sha3 = { version = "0.11.0", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+# aws-lc-rs provides optimized P-256 verification and ChaCha20-Poly1305 on x86_64 and aarch64.
+aws-lc-rs = { version = "1.17.1" }
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+cpufeatures = { version = "0.3.1" }
+
+[target.'cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies.chacha20poly1305]
+version = "0.11.0"
+default-features = false
+features = ["alloc"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+# Enable the JS backend for transitive dependencies that use getrandom on WASM.
+version = "0.4.3"
+features = ["wasm_js"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom_v2]
+# Enable the JS backend for transitive dependencies that still use getrandom 0.2 on WASM.
+package = "getrandom"
+version = "0.2"
+features = ["js"]
+
+[dev-dependencies]
+anyhow = { version = "1.0.103", default-features = false }
+arbitrary = { version = "1.4.2", features = ["derive"] }
+commonware-conformance = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
+commonware-invariants = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99" }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo", rev = "2fd3af88f2cdeb6424d82f45961f803d812d6c99", default-features = false, features = ["arbitrary"] }
+crc = { version = "3.4.0" }
+criterion = { version = "0.8.2" }
+ecdsa = { version = "0.17.0", default-features = false, features = ["alloc"] }
+rayon = { version = "1.12.0", default-features = false }
+rstest = { version = "0.26.1" }
+
+[lib]
+bench = false
+
+[features]
+default = [ "std" ]
+bls12381 = [ "dep:blst" ]
+mocks = [ "std" ]
+arbitrary = [
+	"commonware-codec/arbitrary",
+	"commonware-math/arbitrary",
+	"commonware-utils/arbitrary",
+	"dep:anyhow",
+	"dep:arbitrary",
+	"std",
+]
+fuzz = [ "arbitrary", "std" ]
+std = [
+	"ahash/std",
+	"anyhow?/std",
+	"blake3/std",
+	"bls12381",
+	"bytes/std",
+	"chacha20poly1305/getrandom",
+	"commonware-codec/std",
+	"commonware-formatting/std",
+	"commonware-macros/std",
+	"commonware-math/std",
+	"commonware-parallel/std",
+	"commonware-utils/std",
+	"crc-fast",
+	"crc-fast?/std",
+	"ecdsa/std",
+	"fixedbitset/std",
+	"getrandom/std",
+	"getrandom_v2/std",
+	"num-rational",
+	"num-traits",
+	"num-traits?/std",
+	"once_cell/std",
+	"p256/std",
+	"rand/std",
+	"rand/std_rng",
+	"rand_chacha/std",
+	"thiserror/std",
+	"zeroize/std",
+]
+
+[[bench]]
+name = "bls12381"
+harness = false
+path = "src/bls12381/benches/bench.rs"
+required-features = [ "std" ]
+
+[[bench]]
+name = "ed25519"
+harness = false
+path = "src/ed25519/benches/bench.rs"
+
+[[bench]]
+name = "secp256r1"
+harness = false
+path = "src/secp256r1/benches/bench.rs"
+
+[[bench]]
+name = "sha256"
+harness = false
+path = "src/sha256/benches/bench.rs"
+
+[[bench]]
+name = "sha512"
+harness = false
+path = "src/sha512/benches/bench.rs"
+
+[[bench]]
+name = "blake3"
+harness = false
+path = "src/blake3/benches/bench.rs"
+
+[[bench]]
+name = "chacha20_poly1305"
+harness = false
+path = "src/chacha20_poly1305/benches/bench.rs"
+
+[[bench]]
+name = "lthash"
+harness = false
+path = "src/lthash/benches/bench.rs"
+
+[[bench]]
+name = "reed_solomon"
+harness = false
+path = "src/reed_solomon/benches/bench.rs"
+
+[[bench]]
+name = "sake"
+harness = false
+path = "src/handshake/sake/benches/bench.rs"
+
+[[bench]]
+name = "bloomfilter"
+harness = false
+path = "src/bloomfilter/benches/bench.rs"
+
+[[bench]]
+name = "bulletproofs"
+harness = false
+path = "src/zk/bulletproofs/benches/bench.rs"
+required-features = [ "std" ]

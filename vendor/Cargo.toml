@@ -1,0 +1,103 @@
+[workspace]
+members = ["commonware-consensus", "commonware-cryptography"]
+resolver = "2"
+
+[patch."https://github.com/commonwarexyz/monorepo"]
+commonware-consensus = { path = "commonware-consensus" }
+commonware-cryptography = { path = "commonware-cryptography" }
+
+[profile.bench]
+# Because we enable overflow checks in "release", we should benchmark with them.
+overflow-checks = true
+# Gungraun requires debug symbols for bench targets.
+debug = true
+
+[profile.dev]
+# Although overflow checks are enabled by default in "dev", we explicitly
+# enable them here for clarity.
+overflow-checks = true
+# Keep line tables for file:line in panics and backtraces, but skip variable-level
+# debuginfo to speed up codegen and linking. Use `debug = 2` for debugger sessions.
+debug = "line-tables-only"
+
+[profile.release]
+# To guard against unexpected behavior in production, we enable overflow checks in
+# "release" although they incur some performance penalty.
+overflow-checks = true
+
+[profile.release-with-debug]
+inherits = "release"
+# Setting debug to true instructs cargo to include debug symbols in the release
+# binary (not to disable optimizations).
+debug = true
+
+[profile.test]
+# Although overflow checks are enabled by default in "test", we explicitly
+# enable them here for clarity.
+overflow-checks = true
+# Keep line tables for file:line in panics and backtraces, but skip variable-level
+# debuginfo to speed up codegen and linking. Use `debug = 2` for debugger sessions.
+debug = "line-tables-only"
+
+[profile.test.package.curve25519-dalek]
+opt-level = 3
+
+[profile.test.package.aws-lc-rs]
+opt-level = 3
+
+[profile.test.package.aws-lc-sys]
+opt-level = 3
+
+[profile.test.package.blake3]
+opt-level = 3
+
+[profile.test.package.blst]
+opt-level = 3
+
+[profile.test.package.chacha20poly1305]
+opt-level = 3
+
+[profile.test.package.crc]
+opt-level = 3
+
+[profile.test.package.crc-fast]
+opt-level = 3
+
+[profile.test.package.ctutils]
+opt-level = 3
+
+[profile.test.package.crypto-bigint]
+opt-level = 3
+
+[profile.test.package.ecdsa]
+opt-level = 3
+
+[profile.test.package.elliptic-curve]
+opt-level = 3
+
+[profile.test.package.num-bigint]
+opt-level = 3
+
+[profile.test.package.num-integer]
+opt-level = 3
+
+[profile.test.package.num-rational]
+opt-level = 3
+
+[profile.test.package.num-traits]
+opt-level = 3
+
+[profile.test.package.p256]
+opt-level = 3
+
+[profile.test.package.primeorder]
+opt-level = 3
+
+[profile.test.package.rand_chacha]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3
+
+[profile.test.package.x25519-dalek]
+opt-level = 3

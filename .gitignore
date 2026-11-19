@@ -9,3 +9,6 @@
 # Dust
 mprocs.log
 .DS_Store
+
+# Vendored commonware workspace
+/vendor/target

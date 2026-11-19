@@ -22,6 +22,9 @@ members = [
   "bin/spammer",
   "bin/validator",
 ]
+# Patched copies of two commonware crates (see vendor/README.md). They keep the
+# upstream lints and tests and are checked from their own workspace.
+exclude = ["vendor"]
 
 [workspace.lints.rust]
 unused-must-use = "deny"
@@ -105,6 +108,11 @@ derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.25", default-features = false }
 tracing-subscriber = "0.3"
 url = "2.5.8"
+
+# Every crate in the graph, the exoware ones included, uses the patched copies.
+[patch."https://github.com/commonwarexyz/monorepo"]
+commonware-consensus = { path = "vendor/commonware-consensus" }
+commonware-cryptography = { path = "vendor/commonware-cryptography" }
 
 [profile.samply]
 inherits = "release"

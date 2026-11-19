@@ -1,0 +1,102 @@
+#[cfg(target_arch = "aarch64")]
+use crate::reed_solomon::engine::Neon;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::reed_solomon::engine::{Avx2, Avx512};
+use crate::reed_solomon::engine::{
+    Engine, GF_ORDER, GfElement, SHARD_CHUNK_BYTES, Scalar, ShardsRefMut,
+};
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
+/// [`Engine`] that selects the best available engine at runtime.
+pub struct DefaultEngine(Box<dyn Engine + Send + Sync>);
+
+impl DefaultEngine {
+    /// Creates new [`DefaultEngine`] by choosing and initializing the underlying engine.
+    ///
+    /// On x86(-64) the engine is chosen in the following order of preference:
+    /// 1. `Avx512` (requires GFNI)
+    /// 2. `Avx2`
+    /// 3. [`Scalar`]
+    ///
+    /// On `AArch64` the engine is chosen in the following order of preference:
+    /// 1. `Neon`
+    /// 2. [`Scalar`]
+    pub fn new() -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if super::cpu_features::avx512() {
+                return Self(Box::new(Avx512::new()));
+            }
+
+            if super::cpu_features::avx2() {
+                return Self(Box::new(Avx2::new()));
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::cpu_features::neon() {
+                return Self(Box::new(Neon::new()));
+            }
+        }
+
+        Self(Box::new(Scalar::new()))
+    }
+}
+
+impl Default for DefaultEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Engine for DefaultEngine {
+    fn fft(
+        &self,
+        data: &mut ShardsRefMut<'_>,
+        pos: usize,
+        size: usize,
+        truncated_size: usize,
+        skew_delta: usize,
+    ) {
+        self.0.fft(data, pos, size, truncated_size, skew_delta);
+    }
+
+    fn ifft(
+        &self,
+        data: &mut ShardsRefMut<'_>,
+        pos: usize,
+        size: usize,
+        truncated_size: usize,
+        skew_delta: usize,
+    ) {
+        self.0.ifft(data, pos, size, truncated_size, skew_delta);
+    }
+
+    fn mul(&self, x: &mut [[u8; SHARD_CHUNK_BYTES]], log_m: GfElement) {
+        self.0.mul(x, log_m);
+    }
+
+    fn eval_poly(erasures: &mut [GfElement; GF_ORDER], truncated_size: usize) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if super::cpu_features::avx512() {
+                return Avx512::eval_poly(erasures, truncated_size);
+            }
+
+            if super::cpu_features::avx2() {
+                return Avx2::eval_poly(erasures, truncated_size);
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::cpu_features::neon() {
+                return Neon::eval_poly(erasures, truncated_size);
+            }
+        }
+
+        Scalar::eval_poly(erasures, truncated_size);
+    }
+}
