@@ -558,17 +558,18 @@ fn run_restart_at_processed_height(processed_height: u64) {
     PlanBuilder::new(engine)
         .link(default_link())
         .seed(0)
+        // A view needs five of the six validators. They start one after another,
+        // and the first two views time out before the chain starts moving, so
+        // the crash comes later than that: the test needs blocks finalized
+        // before it.
         .crash(Crash::Schedule(
             Schedule::new()
                 .at(
-                    Duration::from_millis(10_000),
+                    Duration::from_millis(25_000),
                     Action::Crash(validator.clone()),
                 )
-                .at(Duration::from_millis(11_000), Action::Restart(validator)),
+                .at(Duration::from_millis(26_000), Action::Restart(validator)),
         ))
-        // A view needs five of the six validators. They start one after another,
-        // and the crash lands in the second view, so the first two views time
-        // out before the chain starts moving.
         .timeout(Duration::from_secs(60))
         .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
         .property(RestartPreservesProcessedHeight::new(barrier))
