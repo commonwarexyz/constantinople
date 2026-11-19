@@ -8,7 +8,8 @@ use commonware_codec::{
 use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
 
-/// A signed transaction accepted by the canonical block format.
+/// A transaction as the canonical block format holds it: with its signature, or
+/// with none if its sender is an X25519 account (see [`TransactionSignature`]).
 #[derive(Debug)]
 pub struct SignedTransaction<H>
 where
@@ -51,6 +52,19 @@ where
         signature: TransactionSignature,
     ) -> Self {
         Self { inner, signature }
+    }
+
+    /// Wraps a transaction of an X25519 account, which carries no signature.
+    pub const fn new_mac(inner: Sealed<Transaction<H::Digest>, H>) -> Self {
+        Self {
+            inner,
+            signature: TransactionSignature::Mac,
+        }
+    }
+
+    /// Whether the transaction is authenticated by tags instead of a signature.
+    pub const fn is_mac(&self) -> bool {
+        matches!(self.signature, TransactionSignature::Mac)
     }
 
     /// Returns the inner sealed transaction.
@@ -126,7 +140,12 @@ where
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let inner = Sealed::<Transaction<H::Digest>, H>::read(buf)?;
-        let signature = TransactionSignature::read(buf)?;
+        // The sender's scheme says whether a signature follows. An undecodable
+        // sender is left to signature verification, which rejects it.
+        let signature = match inner.sender() {
+            Some(TransactionPublicKey::X25519 { .. }) => TransactionSignature::Mac,
+            _ => TransactionSignature::read(buf)?,
+        };
         Ok(Self { inner, signature })
     }
 }
@@ -181,6 +200,12 @@ impl<D: Digest> Transaction<D> {
     pub fn hash_slow<H: Hasher>(&self, hasher: &mut H) -> H::Digest {
         hasher.update(&self.encode());
         crate::finalize_in_place(hasher)
+    }
+
+    /// Seals this transaction of an X25519 account. Its sender authenticates it
+    /// with tags, outside the block.
+    pub fn seal_for_mac<H: Hasher<Digest = D>>(self, hasher: &mut H) -> SignedTransaction<H> {
+        SignedTransaction::new_mac(self.seal(hasher))
     }
 
     /// Seals and signs this transaction with a supported transaction signer.
@@ -363,6 +388,74 @@ mod test {
 
         let result = Transaction::<sha256::Digest>::decode(buf);
         assert!(result.is_err(), "zero-value transactions must be rejected");
+    }
+
+    #[test]
+    fn mac_transaction_carries_no_signature() {
+        let sender = TransactionPublicKey::x25519([3; 32].into());
+        let transaction = Transaction::<sha256::Digest>::new(
+            sender.clone(),
+            test_sender(),
+            NonZeroU64::new(5).expect("test value should be non-zero"),
+            1,
+        );
+        let unsigned = transaction.seal_for_mac(&mut sha256::Sha256::default());
+        assert!(unsigned.is_mac());
+        assert_eq!(unsigned.encode_size(), Transaction::<sha256::Digest>::SIZE);
+
+        let decoded = SignedTransaction::<sha256::Sha256>::decode(unsigned.encode())
+            .expect("decoding should succeed");
+        assert_eq!(decoded, unsigned);
+        assert!(decoded.is_mac());
+        assert_eq!(decoded.value().sender(), Some(&sender));
+        assert_eq!(decoded.message_digest(), unsigned.message_digest());
+    }
+
+    #[test]
+    fn signed_transaction_needs_its_signature() {
+        let signer = ed25519::PrivateKey::random(&mut StdRng::from_seed([8u8; 32]));
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let transaction = Transaction::<sha256::Digest>::new(
+            sender,
+            test_sender(),
+            NonZeroU64::new(5).expect("test value should be non-zero"),
+            1,
+        );
+        let signed = transaction.clone().seal_and_sign(
+            &signer,
+            crate::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
+        assert!(!signed.is_mac());
+
+        // Without the signature the bytes are not a transaction of this sender.
+        let result = SignedTransaction::<sha256::Sha256>::decode(transaction.encode());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn x25519_key_roundtrips_and_checks_padding() {
+        let key = TransactionPublicKey::x25519([3; 32].into());
+        assert_eq!(key.as_x25519(), Some([3; 32].into()));
+        assert_eq!(TransactionPublicKey::decode(key.encode()).unwrap(), key);
+        assert_eq!(test_sender().as_x25519(), None);
+
+        let mut padded = key.encode().to_vec();
+        *padded.last_mut().unwrap() = 1;
+        assert!(TransactionPublicKey::decode(Copying(&padded)).is_err());
+
+        // The account is keyed by a hash of the encoded key.
+        assert_eq!(
+            AccountKey::from_public_key(&key),
+            AccountKey::from_public_key_bytes(&key).unwrap()
+        );
+        let same_bytes = ed25519::PublicKey::decode(Copying(&[3u8; 32][..]));
+        if let Ok(same_bytes) = same_bytes {
+            assert_ne!(
+                AccountKey::from_public_key(&key),
+                AccountKey::from_public_key(&TransactionPublicKey::ed25519(same_bytes))
+            );
+        }
     }
 
     #[test]

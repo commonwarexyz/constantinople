@@ -1,11 +1,11 @@
 //! `commonware_glue::stateful` trait integration.
 
 use super::{
-    Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
-    history::header_range_to_target,
+    Application, Chain, FinalizedArtifacts, FinalizedRange, db::Databases,
+    genesis_block_with_parent, history::header_range_to_target,
 };
 use commonware_consensus::marshal::ancestry::Ancestry;
-use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
+use commonware_cryptography::{Digest, Hasher, ed25519};
 use commonware_glue::stateful::{
     Application as CApplication, Input as CInput, Proposed, db::DatabaseSet,
 };
@@ -19,17 +19,19 @@ use futures::{FutureExt, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::sync::Arc;
 
-impl<E, H, C, S, P, I, St> CApplication<E> for Application<E, H, C, S, P, I, St>
+// Validators sign votes with ed25519 keys (see `constantinople_auth::Scheme`).
+type P = ed25519::PublicKey;
+
+impl<E, H, C, X, I, St> CApplication<E> for Application<E, H, C, X, P, I, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
     C: Digest,
-    S: Scheme<PublicKey = P>,
-    P: PublicKey,
+    X: Chain<C, P, H>,
     I: TransactionSource<C, P, H> + Clone + Sync,
     St: Strategy,
 {
-    type SigningScheme = S;
+    type SigningScheme = constantinople_auth::Scheme;
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;

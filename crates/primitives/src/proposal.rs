@@ -1,9 +1,9 @@
 //! Proposal budgets for the canonical SHA-256 and Ed25519 validator stack.
 
-use crate::{Transaction, TransactionSignature};
+use crate::{Outcomes, ParentNotarization, Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
 use commonware_consensus::types::coding::COMMITMENT_SIZE;
-use commonware_cryptography::{ed25519, sha256};
+use commonware_cryptography::{Digest, ed25519, sha256};
 
 /// Maximum encoded block size accepted by consensus, including its header and body framing.
 pub const MAXIMUM_BLOCK_SIZE: usize = 16 * 1024 * 1024;
@@ -13,20 +13,38 @@ pub const MAXIMUM_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 
 /// Transaction-byte budget after reserving space for block framing.
 ///
+/// The budget covers a block that carries no notarization of its parent and no
+/// outcome bits. A proposer knows both before it selects transactions, and
+/// counts their size ([`parent_bytes`]) against this budget.
+///
 /// Returns `None` if the block budget exceeds the consensus limit or cannot
 /// accommodate the largest header and an empty body.
 pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
     if block_bytes > MAXIMUM_BLOCK_SIZE {
         return None;
     }
-    let body_bytes = block_bytes.checked_sub(maximum_header_size())?;
+    let body_bytes = block_bytes
+        .checked_sub(maximum_header_size())?
+        .checked_sub(parent_bytes::<sha256::Digest>(None, &Outcomes::new()))?;
 
-    // Counting minimum-size transactions reserves enough two-byte prefixes for any signature mix.
+    // A transaction's length prefix takes one byte below 128 bytes and two bytes
+    // above. With the smallest transaction at 82 bytes, `a` short and `b` long
+    // transactions that fit in the body have `a + 2b <= body / 64` prefix bytes.
     let minimum_transaction = Transaction::<sha256::Digest>::SIZE + TransactionSignature::MIN_SIZE;
     let max_transaction_count = body_bytes / minimum_transaction;
-    let framing = max_transaction_count.encode_size()
-        + max_transaction_count * minimum_transaction.encode_size();
+    let framing = max_transaction_count.encode_size() + body_bytes / 64;
     body_bytes.checked_sub(framing)
+}
+
+/// Encoded size of what a block carries about its parent: the notarization and
+/// the outcome bits.
+pub fn parent_bytes<C: Digest>(
+    notarization: Option<&ParentNotarization<C>>,
+    outcomes: &Outcomes,
+) -> usize {
+    notarization.map_or(false.encode_size(), |notarization| {
+        true.encode_size() + notarization.encode_size()
+    }) + outcomes.encode_size()
 }
 
 fn maximum_header_size() -> usize {
@@ -34,7 +52,7 @@ fn maximum_header_size() -> usize {
     3 * UInt(u64::MAX).encode_size()
         + ed25519::PublicKey::SIZE
         + COMMITMENT_SIZE
-        + 3 * sha256::Digest::SIZE
+        + 5 * sha256::Digest::SIZE
         + 6 * u64::SIZE
 }
 
@@ -72,6 +90,8 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: u64::MAX,
             timestamp: u64::MAX,
+            parent_notarization: sha256::Digest::EMPTY,
+            parent_outcomes: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(u64::MAX - 1, u64::MAX),
             transactions_root: sha256::Digest::EMPTY,
@@ -79,7 +99,15 @@ mod tests {
         }
     }
 
-    fn signature_size_extremes() -> [SignedTransaction<sha256::Sha256>; 2] {
+    fn signature_size_extremes() -> [SignedTransaction<sha256::Sha256>; 3] {
+        let key = TransactionPublicKey::x25519([9; 32].into());
+        let unsigned = Transaction::new(key.clone(), key, NonZeroU64::MIN, 0)
+            .seal_for_mac(&mut sha256::Sha256::default());
+        assert_eq!(
+            unsigned.signature().encode_size(),
+            TransactionSignature::MIN_SIZE
+        );
+
         let signer = ed25519::PrivateKey::from_seed(1);
         let key = TransactionPublicKey::ed25519(signer.public_key());
         let transaction = Transaction::new(key.clone(), key, NonZeroU64::MIN, 0);
@@ -90,7 +118,7 @@ mod tests {
         );
         assert_eq!(
             minimum.signature().encode_size(),
-            TransactionSignature::MIN_SIZE
+            TransactionSignature::MIN_SIGNED_SIZE
         );
 
         let signer = secp256r1::PrivateKey::random(commonware_utils::test_rng());
@@ -107,14 +135,16 @@ mod tests {
         .expect("maximum WebAuthn fields should encode");
         assert_eq!(signature.encode_size(), TransactionSignature::MAX_SIZE);
         let maximum = SignedTransaction::new_unchecked(transaction, signature);
-        [minimum, maximum]
+        [unsigned, minimum, maximum]
     }
 
     #[test]
     fn empty_block_bound_matches_maximum_header_codec() {
         let block = Block::<_, _, sha256::Sha256>::new(maximum_header(), Vec::new());
         assert_eq!(
-            maximum_header_size() + 0usize.encode_size(),
+            maximum_header_size()
+                + parent_bytes::<Commitment>(None, &Outcomes::new())
+                + 0usize.encode_size(),
             block.encode().len()
         );
         assert_eq!(max_transaction_bytes(block.encode().len()), Some(0));
@@ -124,13 +154,23 @@ mod tests {
     #[test]
     fn selection_budget_fits_encoded_blocks() {
         let transactions = signature_size_extremes();
-        let minimum_size = transactions[0].encode_size();
-        let maximum_size = transactions[1].encode_size();
-        assert_eq!(minimum_size.encode_size(), 2);
-        assert_eq!(maximum_size.encode_size(), 2);
+        let sizes = transactions
+            .each_ref()
+            .map(|t| t.encode_size().encode_size());
+        assert_eq!(sizes, [1, 2, 2]);
 
-        for pattern in [&transactions[..1], &transactions[1..], &transactions[..]] {
-            for block_budget in [307, 512, 8192, 19232, 19381, MAXIMUM_BLOCK_SIZE] {
+        // A transaction of 127 bytes is the largest with a one-byte prefix, and one
+        // of 128 bytes pays the most for its two-byte prefix. No transaction has
+        // these sizes, so the bound has room to spare.
+        let patterns = [
+            &transactions[..1],
+            &transactions[1..2],
+            &transactions[2..],
+            &transactions[..2],
+            &transactions[..],
+        ];
+        for pattern in patterns {
+            for block_budget in [380, 512, 8192, 19232, 19381, MAXIMUM_BLOCK_SIZE] {
                 let budget = max_transaction_bytes(block_budget).unwrap();
                 let mut filled = 0;
                 let mut body = Vec::new();

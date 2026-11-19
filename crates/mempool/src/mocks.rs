@@ -1,11 +1,11 @@
 //! Mock transaction sources for tests.
 
-use crate::TransactionSource;
+use crate::{Candidate, TransactionSource};
 use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
-use constantinople_primitives::{Header, VerifiedTransaction};
+use constantinople_primitives::Header;
 use core::{
     future::{Future, ready},
     marker::PhantomData,
@@ -22,7 +22,7 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    proposals: Arc<Mutex<VecDeque<Vec<VerifiedTransaction<H>>>>>,
+    proposals: Arc<Mutex<VecDeque<Vec<Candidate<H>>>>>,
     _marker: PhantomData<(C, P)>,
 }
 
@@ -46,19 +46,23 @@ where
     H: Hasher,
 {
     /// Creates a new static source from queued proposal batches.
-    pub fn new(proposals: Vec<Vec<VerifiedTransaction<H>>>) -> Self {
+    pub fn new<T: Into<Candidate<H>>>(proposals: Vec<Vec<T>>) -> Self {
+        let proposals = proposals
+            .into_iter()
+            .map(|batch| batch.into_iter().map(Into::into).collect())
+            .collect();
         Self {
-            proposals: Arc::new(Mutex::new(proposals.into())),
+            proposals: Arc::new(Mutex::new(proposals)),
             _marker: PhantomData,
         }
     }
 
     /// Appends another proposal batch to the queue.
-    pub fn push(&mut self, transactions: Vec<VerifiedTransaction<H>>) {
+    pub fn push<T: Into<Candidate<H>>>(&mut self, transactions: Vec<T>) {
         self.proposals
             .lock()
             .expect("static transaction source lock poisoned")
-            .push_back(transactions);
+            .push_back(transactions.into_iter().map(Into::into).collect());
     }
 }
 
@@ -75,7 +79,7 @@ where
         _parent: &Header<C, H::Digest, P>,
         _round: Round,
         _filled: usize,
-    ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
+    ) -> impl Future<Output = Vec<Candidate<H>>> + Send {
         let transactions = self
             .proposals
             .lock()
@@ -158,6 +162,8 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 0,
             timestamp: 0,
+            parent_notarization: sha256::Digest::EMPTY,
+            parent_outcomes: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
@@ -170,9 +176,9 @@ mod tests {
         let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].value().nonce, tx1.value().nonce);
+        assert_eq!(first[0].transaction.value().nonce, tx1.value().nonce);
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].value().nonce, 1);
+        assert_eq!(second[0].transaction.value().nonce, 1);
         assert!(third.is_empty());
     }
 }

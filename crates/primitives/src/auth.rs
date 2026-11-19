@@ -18,6 +18,7 @@ use rand::CryptoRng;
 
 pub(crate) const ED25519_SCHEME: u8 = 0;
 pub(crate) const SECP256R1_SCHEME: u8 = 1;
+pub(crate) const X25519_SCHEME: u8 = 2;
 const KEY_BYTES: usize = secp256r1::PublicKey::SIZE;
 const SIGNATURE_BYTES: usize = ed25519::Signature::SIZE;
 const ED25519_SIGNATURE_BYTES: usize = 1 + SIGNATURE_BYTES;
@@ -27,10 +28,15 @@ const WEBAUTHN_USER_VERIFIED_FLAG: u8 = 0x04;
 
 /// A transaction account public key.
 ///
-/// The first byte is the signature scheme. The remaining bytes hold the
-/// scheme's canonical compressed public key bytes. Ed25519 keys are padded with
-/// one trailing zero byte to keep this type compatible with Commonware's
+/// The first byte is the scheme. The remaining bytes hold the scheme's
+/// canonical compressed public key bytes. Ed25519 and X25519 keys are padded
+/// with one trailing zero byte to keep this type compatible with Commonware's
 /// fixed-size public-key traits.
+///
+/// The scheme decides how the account's transactions are authenticated: an
+/// Ed25519 or secp256r1 account signs them, and an X25519 account sends tags
+/// for them to a validator (see `constantinople-auth`), so they carry no
+/// signature.
 ///
 /// Decoding is intentionally cheap: it validates only the scheme byte and (for
 /// Ed25519) the trailing padding. The expensive compressed-to-decompressed
@@ -49,9 +55,34 @@ pub enum TransactionPublicKey {
         /// Fixed transaction encoding.
         encoded: [u8; Self::SIZE],
     },
+    /// X25519, for transactions authenticated by tags.
+    X25519 {
+        /// Fixed transaction encoding.
+        encoded: [u8; Self::SIZE],
+    },
 }
 
 impl TransactionPublicKey {
+    /// Creates an X25519 transaction public key.
+    pub fn x25519(key: constantinople_auth::PublicKey) -> Self {
+        let mut encoded = [0; Self::SIZE];
+        encoded[0] = X25519_SCHEME;
+        encoded[1..1 + constantinople_auth::PublicKey::SIZE].copy_from_slice(key.as_ref());
+        Self::X25519 { encoded }
+    }
+
+    /// The X25519 key of an account whose transactions are authenticated by tags.
+    pub fn as_x25519(&self) -> Option<constantinople_auth::PublicKey> {
+        match self {
+            Self::X25519 { encoded } => {
+                let mut key = [0; constantinople_auth::PublicKey::SIZE];
+                key.copy_from_slice(&encoded[1..1 + constantinople_auth::PublicKey::SIZE]);
+                Some(key.into())
+            }
+            _ => None,
+        }
+    }
+
     /// Creates an Ed25519 transaction public key.
     pub fn ed25519(key: ed25519::PublicKey) -> Self {
         let mut encoded = [0; Self::SIZE];
@@ -96,6 +127,15 @@ impl Read for TransactionPublicKey {
                 Ok(Self::Ed25519 { encoded })
             }
             SECP256R1_SCHEME => Ok(Self::Secp256r1 { encoded }),
+            X25519_SCHEME => {
+                if encoded[1 + constantinople_auth::PublicKey::SIZE..]
+                    .iter()
+                    .any(|byte| *byte != 0)
+                {
+                    return Err(Error::Invalid("TransactionPublicKey", "non-zero padding"));
+                }
+                Ok(Self::X25519 { encoded })
+            }
             _ => Err(Error::Invalid("TransactionPublicKey", "unknown scheme")),
         }
     }
@@ -113,6 +153,7 @@ impl AsRef<[u8]> for TransactionPublicKey {
         match self {
             Self::Ed25519 { encoded } => encoded,
             Self::Secp256r1 { encoded } => encoded,
+            Self::X25519 { encoded } => encoded,
         }
     }
 }
@@ -152,7 +193,18 @@ impl From<secp256r1::PublicKey> for TransactionPublicKey {
     }
 }
 
-/// A transaction signature.
+impl From<constantinople_auth::PublicKey> for TransactionPublicKey {
+    fn from(key: constantinople_auth::PublicKey) -> Self {
+        Self::x25519(key)
+    }
+}
+
+/// How a transaction in a block is authenticated.
+///
+/// A transaction of an Ed25519 or secp256r1 account carries a signature. A
+/// transaction of an X25519 account carries nothing: [`TransactionSignature::Mac`]
+/// has an empty encoding, and the transaction's status comes from the reports of
+/// the validators that compared its tags.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TransactionSignature {
     /// Commonware Ed25519.
@@ -173,11 +225,15 @@ pub enum TransactionSignature {
         /// Transaction encoding.
         encoded: Vec<u8>,
     },
+    /// No signature: the sender is an X25519 account.
+    Mac,
 }
 
 impl TransactionSignature {
-    /// Minimum encoded transaction signature size.
-    pub const MIN_SIZE: usize = 1 + SIGNATURE_BYTES;
+    /// Minimum encoded size: a transaction authenticated by tags carries nothing.
+    pub const MIN_SIZE: usize = 0;
+    /// Minimum encoded size of a signature.
+    pub const MIN_SIGNED_SIZE: usize = 1 + SIGNATURE_BYTES;
     /// Maximum encoded transaction signature size.
     pub const MAX_SIZE: usize = 1
         + SIGNATURE_BYTES
@@ -245,6 +301,8 @@ impl Write for TransactionSignature {
 impl Read for TransactionSignature {
     type Cfg = ();
 
+    /// Reads a signature. Whether a transaction carries one depends on its sender,
+    /// so this never returns [`TransactionSignature::Mac`].
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         if buf.remaining() < 1 + SIGNATURE_BYTES {
             return Err(Error::EndOfBuffer);
@@ -322,6 +380,7 @@ impl AsRef<[u8]> for TransactionSignature {
         match self {
             Self::Ed25519 { encoded, .. } => encoded,
             Self::Secp256r1 { encoded, .. } => encoded,
+            Self::Mac => &[],
         }
     }
 }
@@ -387,7 +446,8 @@ impl<'a> TransactionBatchVerifier<'a> {
     /// The sender public key must already be decompressed (see
     /// [`PublicKeyCache::decompress`](crate::PublicKeyCache::decompress)),
     /// which lets batch callers resolve keys in parallel before queueing.
-    /// Returns `false` if the key and signature schemes do not match.
+    /// Returns `false` if the key and signature schemes do not match. A
+    /// transaction of an X25519 account has no signature to verify.
     pub fn add(
         &mut self,
         namespace: &'a [u8],
@@ -426,6 +486,7 @@ impl<'a> TransactionBatchVerifier<'a> {
                 });
                 true
             }
+            (DecompressedPublicKey::X25519, TransactionSignature::Mac) => true,
             _ => false,
         }
     }

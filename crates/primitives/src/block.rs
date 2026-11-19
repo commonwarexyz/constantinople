@@ -4,6 +4,14 @@
 //!
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
+//!
+//! A block's transactions are executed one block later. Block `h` carries its
+//! own transactions, a notarization of block `h - 1` and one outcome bit per
+//! transaction of block `h - 1`. The reports in the notarization fix which of
+//! the parent's transactions authenticated by tags are authentic, and the
+//! state the header commits to is the parent's state with the parent's
+//! authentic transactions applied. An outcome bit says whether a transaction
+//! was applied.
 
 use crate::{
     LazySignedTransaction, Sealable, Sealed, SignedTransaction, proposal::MAXIMUM_BLOCK_SIZE,
@@ -12,10 +20,42 @@ use commonware_codec::{
     Buf, Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write,
 };
 use commonware_consensus::{
-    Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
+    Block as ConsensusBlock, CertifiableBlock, Heightable,
+    simplex::types::{Context, Notarization},
+    types::Height,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_utils::range::NonEmptyRange;
+use commonware_utils::{bitmap::BitMap, range::NonEmptyRange};
+use constantinople_auth::{MAX_ENTRIES, Scheme};
+
+/// The notarization of its parent that a block carries (`R` in the paper).
+pub type ParentNotarization<C> = Notarization<Scheme, C>;
+
+/// One bit per transaction of a block's parent, in order: whether it was applied.
+pub type Outcomes = BitMap<1>;
+
+/// The value of [`Header::parent_notarization`] for `notarization`.
+pub fn notarization_digest<C: Digest, H: Hasher>(
+    notarization: Option<&ParentNotarization<C>>,
+    hasher: &mut H,
+) -> H::Digest {
+    match notarization {
+        Some(notarization) => {
+            hasher.update(&[1]);
+            hasher.update(notarization.encode().as_ref());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    crate::finalize_in_place(hasher)
+}
+
+/// The value of [`Header::parent_outcomes`] for `outcomes`.
+pub fn outcomes_digest<H: Hasher>(outcomes: &Outcomes, hasher: &mut H) -> H::Digest {
+    hasher.update(outcomes.encode().as_ref());
+    crate::finalize_in_place(hasher)
+}
 
 /// A block header containing metadata, consensus context, and state commitment roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,11 +73,19 @@ where
     pub height: u64,
     /// The timestamp of the block.
     pub timestamp: u64,
-    /// The canonical root of the chain state after applying this block.
+    /// Digest of the notarization of the parent carried by the block
+    /// (see [`notarization_digest`]).
+    pub parent_notarization: D,
+    /// Digest of the outcome bits of the parent's transactions
+    /// (see [`outcomes_digest`]).
+    pub parent_outcomes: D,
+    /// The canonical root of the chain state after applying the parent's
+    /// authentic transactions to the parent's state.
     pub state_root: D,
     /// The retained range needed to sync the state database.
     pub state_range: NonEmptyRange<u64>,
     /// A root of all transactions in the history, including those within this block.
+    /// It pins the block's body.
     pub transactions_root: D,
     /// The active range of the transactions database.
     pub transactions_range: NonEmptyRange<u64>,
@@ -84,6 +132,8 @@ where
             + self.parent.encode_size()
             + self.height.encode_size()
             + self.timestamp.encode_size()
+            + self.parent_notarization.encode_size()
+            + self.parent_outcomes.encode_size()
             + self.state_root.encode_size()
             + self.state_range.encode_size()
             + self.transactions_root.encode_size()
@@ -102,6 +152,8 @@ where
         self.parent.write(buf);
         self.height.write(buf);
         self.timestamp.write(buf);
+        self.parent_notarization.write(buf);
+        self.parent_outcomes.write(buf);
         self.state_root.write(buf);
         self.state_range.write(buf);
         self.transactions_root.write(buf);
@@ -123,6 +175,8 @@ where
             parent: D::read(buf)?,
             height: u64::read(buf)?,
             timestamp: u64::read(buf)?,
+            parent_notarization: D::read(buf)?,
+            parent_outcomes: D::read(buf)?,
             state_root: D::read(buf)?,
             state_range: NonEmptyRange::read(buf)?,
             transactions_root: D::read(buf)?,
@@ -144,6 +198,8 @@ where
             parent: u.arbitrary()?,
             height: u.arbitrary()?,
             timestamp: u.arbitrary()?,
+            parent_notarization: u.arbitrary()?,
+            parent_outcomes: u.arbitrary()?,
             state_root: u.arbitrary()?,
             state_range: u.arbitrary()?,
             transactions_root: u.arbitrary()?,
@@ -157,12 +213,15 @@ where
 pub struct BlockCfg {
     /// Maximum number of transactions in the block body.
     pub max_transactions: RangeCfg<usize>,
+    /// Maximum number of validators that sign the parent's notarization.
+    pub max_validators: usize,
 }
 
 impl Default for BlockCfg {
     fn default() -> Self {
         Self {
             max_transactions: RangeCfg::new(0..=usize::MAX),
+            max_validators: u16::MAX as usize,
         }
     }
 }
@@ -177,6 +236,12 @@ where
 {
     /// The execution header.
     pub header: Header<C, H::Digest, P>,
+    /// A notarization of the parent. Its reports determine which of the
+    /// parent's transactions authenticated by tags are authentic. A child of
+    /// the genesis block carries none.
+    pub notarization: Option<ParentNotarization<C>>,
+    /// Whether each of the parent's transactions was applied.
+    pub outcomes: Outcomes,
     /// Ordered transactions included in this execution payload.
     ///
     /// Each transaction is held in a [`LazySignedTransaction`] so block
@@ -195,6 +260,8 @@ where
     fn clone(&self) -> Self {
         Self {
             header: self.header.clone(),
+            notarization: self.notarization.clone(),
+            outcomes: self.outcomes.clone(),
             body: self.body.clone(),
         }
     }
@@ -216,6 +283,8 @@ where
         let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
+            notarization: None,
+            outcomes: Outcomes::new(),
             body: body.into_iter().map(LazySignedTransaction::new).collect(),
         })
     }
@@ -228,7 +297,10 @@ where
     H: Hasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.header == other.header && self.body == other.body
+        self.header == other.header
+            && self.notarization == other.notarization
+            && self.outcomes == other.outcomes
+            && self.body == other.body
     }
 }
 
@@ -247,12 +319,34 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    /// Creates a new block from already-decoded transactions.
+    /// Creates a new block from already-decoded transactions, without a
+    /// notarization of its parent and without outcomes.
     pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
+        Self::with_parent(header, None, Outcomes::new(), body)
+    }
+
+    /// Creates a new block from already-decoded transactions.
+    ///
+    /// The header must hold the digests of `notarization` and `outcomes`.
+    pub fn with_parent(
+        header: Header<C, H::Digest, P>,
+        notarization: Option<ParentNotarization<C>>,
+        outcomes: Outcomes,
+        body: Vec<SignedTransaction<H>>,
+    ) -> Self {
         Self {
             header,
+            notarization,
+            outcomes,
             body: body.into_iter().map(LazySignedTransaction::new).collect(),
         }
+    }
+
+    /// Whether the header holds the digests of the notarization and of the
+    /// outcomes that the block carries.
+    pub fn commits_to_parent(&self, hasher: &mut H) -> bool {
+        notarization_digest(self.notarization.as_ref(), hasher) == self.header.parent_notarization
+            && outcomes_digest(&self.outcomes, hasher) == self.header.parent_outcomes
     }
 }
 
@@ -263,7 +357,10 @@ where
     H: Hasher,
 {
     fn encode_size(&self) -> usize {
-        self.header.encode_size() + self.body.encode_size()
+        self.header.encode_size()
+            + self.notarization.encode_size()
+            + self.outcomes.encode_size()
+            + self.body.encode_size()
     }
 }
 
@@ -275,6 +372,8 @@ where
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.header.write(buf);
+        self.notarization.write(buf);
+        self.outcomes.write(buf);
         self.body.write(buf);
     }
 }
@@ -293,6 +392,8 @@ where
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
             header: Header::read_cfg(&mut buf, &())?,
+            notarization: Option::read_cfg(&mut buf, &cfg.max_validators)?,
+            outcomes: Outcomes::read_cfg(&mut buf, &RangeCfg::new(..=MAX_ENTRIES as u64))?,
             body: Vec::read_cfg(&mut buf, &tx_vec_cfg)?,
         })
     }
@@ -415,6 +516,8 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 42,
             timestamp: 1000,
+            parent_notarization: sha256::Digest::EMPTY,
+            parent_outcomes: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
@@ -463,12 +566,25 @@ mod tests {
 
     fn encoded_block_with_size(size: usize) -> Vec<u8> {
         let mut encoded = test_header().encode().to_vec();
+        false.write(&mut encoded);
+        Outcomes::new().write(&mut encoded);
         let minimum_transaction =
             crate::Transaction::<sha256::Digest>::SIZE + crate::TransactionSignature::MIN_SIZE;
         let framed_transaction = minimum_transaction + minimum_transaction.encode_size();
         let body_bytes = size - encoded.len();
         let count = body_bytes / framed_transaction;
-        let count = (body_bytes - count.encode_size()) / framed_transaction;
+        let mut count = (body_bytes - count.encode_size()) / framed_transaction;
+
+        // The last transaction takes the bytes the others leave. No transaction
+        // fills exactly 129 bytes with its prefix, so one fewer leaves it more.
+        let last_size = loop {
+            let left = body_bytes - count.encode_size() - (count - 1) * framed_transaction;
+            let last_size = if left <= 128 { left - 1 } else { left - 2 };
+            if last_size.encode_size() + last_size == left {
+                break last_size;
+            }
+            count -= 1;
+        };
         count.write(&mut encoded);
 
         // Deferred transaction bodies isolate the block framing check from signature validation.
@@ -476,7 +592,6 @@ mod tests {
             minimum_transaction.write(&mut encoded);
             encoded.resize(encoded.len() + minimum_transaction, 0);
         }
-        let last_size = size - encoded.len() - minimum_transaction.encode_size();
         assert!(
             last_size
                 <= crate::Transaction::<sha256::Digest>::SIZE
@@ -514,6 +629,106 @@ mod tests {
         let mut buf = Vec::new();
         block.write(&mut buf);
         assert_eq!(buf.len(), expected);
+    }
+
+    /// A notarization of a block with payload `payload` by five of six validators,
+    /// each reporting `verdicts` on its transactions authenticated by tags.
+    fn test_notarization(
+        payload: sha256::Digest,
+        verdicts: &[bool],
+    ) -> ParentNotarization<sha256::Digest> {
+        use commonware_consensus::simplex::types::{Notarize, Proposal};
+        use constantinople_auth::Report;
+
+        let fixture = constantinople_auth::fixture(&mut commonware_utils::test_rng(), b"test", 6);
+        let proposal = Proposal::new(
+            Round::new(Epoch::zero(), View::new(3)),
+            View::new(2),
+            payload,
+        );
+        let votes: Vec<_> = fixture.schemes[..5]
+            .iter()
+            .map(|scheme| {
+                scheme.reports().insert(
+                    proposal.round,
+                    proposal.payload.as_ref(),
+                    Report::new(verdicts),
+                );
+                Notarize::sign(scheme, proposal.clone()).expect("report was recorded")
+            })
+            .collect();
+        Notarization::from_notarizes(
+            &fixture.schemes[0],
+            commonware_utils::non_empty![@votes.iter()],
+            &commonware_parallel::Sequential,
+        )
+        .expect("five of six votes are a quorum")
+    }
+
+    #[test]
+    fn block_carries_parent_notarization_and_outcomes() {
+        type TestBlock = Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+        let hasher = &mut sha256::Sha256::default();
+
+        let notarization = test_notarization(sha256::Digest::EMPTY, &[true, false, true]);
+        let mut outcomes = Outcomes::new();
+        for applied in [true, false, false, true] {
+            outcomes.push(applied);
+        }
+        let mut header = test_header();
+        header.parent_notarization = notarization_digest(Some(&notarization), hasher);
+        header.parent_outcomes = outcomes_digest(&outcomes, hasher);
+        let block = TestBlock::with_parent(
+            header,
+            Some(notarization.clone()),
+            outcomes.clone(),
+            Vec::new(),
+        );
+        assert!(block.commits_to_parent(hasher));
+
+        let encoded = block.encode();
+        assert_eq!(encoded.len(), block.encode_size());
+        let config = BlockCfg {
+            max_validators: 6,
+            ..Default::default()
+        };
+        let decoded = TestBlock::decode_cfg(encoded.clone(), &config).expect("block decodes");
+        assert_eq!(decoded, block);
+        assert_eq!(decoded.notarization, Some(notarization));
+        assert_eq!(decoded.outcomes, outcomes);
+
+        // A committee of five has no sixth signer.
+        let config = BlockCfg {
+            max_validators: 5,
+            ..Default::default()
+        };
+        assert!(TestBlock::decode_cfg(encoded, &config).is_err());
+
+        // The header pins both: another notarization or other outcomes do not match.
+        let mut other = block.clone();
+        other.notarization = Some(test_notarization(
+            sha256::Digest::EMPTY,
+            &[true, true, true],
+        ));
+        assert!(!other.commits_to_parent(hasher));
+        let mut other = block.clone();
+        other.outcomes.flip(0);
+        assert!(!other.commits_to_parent(hasher));
+        let mut other = block;
+        other.notarization = None;
+        assert!(!other.commits_to_parent(hasher));
+    }
+
+    #[test]
+    fn block_without_a_parent_notarization_commits_to_none() {
+        type TestBlock = Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+        let hasher = &mut sha256::Sha256::default();
+        let mut header = test_header();
+        assert!(!TestBlock::new(header.clone(), vec![]).commits_to_parent(hasher));
+
+        header.parent_notarization = notarization_digest::<sha256::Digest, _>(None, hasher);
+        header.parent_outcomes = outcomes_digest(&Outcomes::new(), hasher);
+        assert!(TestBlock::new(header, vec![]).commits_to_parent(hasher));
     }
 
     #[test]

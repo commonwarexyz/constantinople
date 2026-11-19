@@ -9,7 +9,7 @@
 
 use crate::{
     PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
-    TransactionSignature,
+    TransactionPublicKey, TransactionSignature,
 };
 use bytes::{BufMut, Bytes};
 use commonware_codec::{
@@ -429,8 +429,9 @@ where
     transaction.value().sender().is_some()
 }
 
-/// Verifies a slice of lazily-encoded signed transactions using batch
-/// verification.
+/// Verifies the signatures of a slice of lazily-encoded transactions using
+/// batch verification. Transactions of X25519 accounts carry no signature and
+/// are only checked for being well-formed.
 ///
 /// Calling `.get()` on each [`Lazy`] forces the underlying
 /// [`SignedTransaction`] to be decoded and its seal digest computed.
@@ -456,6 +457,10 @@ where
     // account set exceeds the cache capacity, misses dominate and would
     // otherwise pay their curve decompression serially in the queueing
     // loop below.
+    //
+    // A transaction of an X25519 account has no signature. Its tags are checked
+    // by each validator when it votes, and its status comes from those votes.
+    let mut signed = Vec::with_capacity(transactions.len());
     let mut senders = Vec::with_capacity(transactions.len());
     for lazy in transactions {
         let Some(transaction) = lazy.get() else {
@@ -464,7 +469,17 @@ where
         let Some(sender) = transaction.value().sender() else {
             return false;
         };
+        if transaction.is_mac() {
+            if !matches!(sender, TransactionPublicKey::X25519 { .. }) {
+                return false;
+            }
+            continue;
+        }
+        signed.push(transaction);
         senders.push(sender);
+    }
+    if signed.is_empty() {
+        return true;
     }
     let Some(keys) = cache.decompress(&senders, signature_strategy) else {
         return false;
@@ -474,11 +489,8 @@ where
     // resolved above. The expensive per-signature challenge hashing and the
     // serial-vs-parallel split happen inside `verify`, which shards the batch
     // across `signature_strategy` internally.
-    let mut verifier = TransactionBatchVerifier::new(transactions.len());
-    for (lazy, key) in transactions.iter().zip(&keys) {
-        let Some(transaction) = lazy.get() else {
-            return false;
-        };
+    let mut verifier = TransactionBatchVerifier::new(signed.len());
+    for (transaction, key) in signed.into_iter().zip(&keys) {
         if !verifier.add(
             namespace,
             transaction.message_digest().as_ref(),

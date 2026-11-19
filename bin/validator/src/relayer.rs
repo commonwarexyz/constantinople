@@ -511,7 +511,7 @@ const fn min_signed_transaction_bytes() -> usize {
         + constantinople_primitives::TransactionPublicKey::SIZE
         + 1
         + 1
-        + constantinople_primitives::TransactionSignature::MIN_SIZE
+        + constantinople_primitives::TransactionSignature::MIN_SIGNED_SIZE
 }
 
 fn requested_target_leader(headers: &HeaderMap) -> Option<String> {

@@ -1,17 +1,16 @@
 //! Propose, verify, and apply entry points.
 
 use super::{
-    Application,
+    Application, Chain, Databases, INVALID_NOTARIZATION, OUTCOMES_MISMATCH,
+    PARENT_COMMITMENT_MISMATCH, Result,
     body::{verify_signatures, wait_for_timestamp},
-    execution::{
-        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
-    },
+    execution::{ParentEntries, body_digests, commitments_match, execute, prepare_parent},
     history::parent_transactions_inactivity_floor,
     reject_verify, time,
 };
 use commonware_codec::EncodeSize as _;
 use commonware_consensus::simplex::types::Context;
-use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
+use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme as _};
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
     db::{DatabaseSet, Merkleized as _},
@@ -21,23 +20,81 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _,
 };
-use commonware_storage::mmr;
+use commonware_storage::{mmr, translator::EightCap};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
-    Block, Header, Sealable, SealedBlock, proposal::MAXIMUM_BLOCK_SIZE,
+    Block, Header, Outcomes, ParentNotarization, Sealable, SealedBlock, SignedTransaction,
+    notarization_digest, outcomes_digest,
+    proposal::{MAXIMUM_BLOCK_SIZE, parent_bytes},
 };
 use rand::{CryptoRng, Rng};
-use std::{future::Future, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc};
 use tracing::{Instrument as _, error, info, info_span, warn};
 
-impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
+/// Whether `notarization` is what a child with consensus context `context` must
+/// carry about `parent`: a notarization of the parent's proposal, or none if
+/// the parent is the genesis block.
+///
+/// The signatures in the notarization are not checked here.
+fn notarizes_parent<C, P, H>(
+    notarization: Option<&ParentNotarization<C>>,
+    parent: &Header<C, H::Digest, P>,
+    context: &Context<C, P>,
+) -> bool
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    match notarization {
+        None => parent.height == 0,
+        Some(notarization) => {
+            parent.height != 0
+                && notarization.proposal.round == parent.context.round
+                && notarization.proposal.parent == parent.context.parent.0
+                && notarization.proposal.payload == context.parent.1
+        }
+    }
+}
+
+impl<E, H, C, X, P, I, St> Application<E, H, C, X, P, I, St>
 where
     E: BufferPooler + Storage + Metrics + Clock,
     C: Digest,
     H: Hasher,
     P: PublicKey,
+    X: Chain<C, P, H>,
     St: Strategy,
 {
+    /// The number of validators whose reports fix the status of a transaction.
+    fn validators(&self) -> u32 {
+        u32::try_from(self.scheme.participants().len()).expect("validator count fits in u32")
+    }
+
+    /// Decides which of `parent`'s transactions are authentic, off this task.
+    async fn prepare_parent(
+        &self,
+        parent: Arc<SealedBlock<C, P, H>>,
+        notarization: Option<ParentNotarization<C>>,
+    ) -> Result<ParentEntries> {
+        let span = info_span!(
+            "application.execute.prepare",
+            txs = parent.body.len().traced()
+        );
+        let validators = self.validators();
+        let work_size = parent.body.len();
+
+        // The last parent reference destroys the whole body, so it is released
+        // on the strategy's pool with the rest of this job.
+        self.strategy
+            .spawn(work_size, move |strategy| {
+                span.in_scope(|| {
+                    prepare_parent(&strategy, &parent.body, notarization.as_ref(), validators)
+                })
+            })
+            .await
+    }
+
     /// Proposes a child block from an already fetched parent.
     #[doc(hidden)]
     #[boxed]
@@ -60,57 +117,103 @@ where
     ) -> Option<Proposed<Self, E>>
     where
         E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
-        S: Scheme<PublicKey = P>,
+        Self: CApplication<E, Block = SealedBlock<C, P, H>, Databases = Databases<E, H, EightCap, St>>,
         I: TransactionSource<C, P, H> + Sync,
-        St: Strategy,
     {
         let parent_digest = parent.digest();
-        let parent_height = parent.header.height;
+        let parent_header = parent.header.clone();
 
-        // Select from the mempool, then execute the selection best effort
-        // against the parent's state: anything inapplicable there fails its
-        // nonce or balance check and is dropped, and the block tops up from
-        // the live mempool toward the proposal budget.
-        let seed = input
-            .propose(&parent.header, context.round, 0)
+        // The block must carry a notarization of its parent. Consensus proposes
+        // on a parent it holds a notarization for, so one is missing only if
+        // this node learned of the parent some other way.
+        let notarization = if parent_header.height == 0 {
+            None
+        } else {
+            let notarization = self
+                .chain
+                .notarization(parent_header.context.round, context.parent.1)
+                .instrument(info_span!("application.propose.notarization"))
+                .await;
+            if !notarization
+                .as_ref()
+                .is_some_and(|n| notarizes_parent::<C, P, H>(Some(n), &parent_header, &context))
+            {
+                warn!(
+                    height = parent_header.height + 1,
+                    parent_round = %parent_header.context.round,
+                    "application.propose.missing_notarization"
+                );
+                return None;
+            }
+            notarization
+        };
+
+        // Apply the parent's authentic transactions to the parent's state.
+        let transaction_floor = parent_transactions_inactivity_floor(&parent);
+        let entries = self
+            .prepare_parent(parent, notarization.clone())
+            .await
+            .inspect_err(|&reason| error!(reason, "application.propose.parent"))
+            .ok()?;
+
+        // Select this block's transactions. They execute with the next block, so
+        // nothing here depends on the state: a transaction is left out only if
+        // it is listed twice or lacks what its kind requires.
+        //
+        // The byte budget of the transaction source assumes a block that says
+        // nothing about its parent. What this block says takes from it.
+        let reserved = parent_bytes(notarization.as_ref(), &Outcomes::zeroes(entries.len()))
+            - parent_bytes::<C>(None, &Outcomes::new());
+        let candidates = input
+            .propose(&parent_header, context.round, reserved)
             .instrument(info_span!("application.propose.input"))
             .await;
+        let validators = self.validators() as usize;
+        let bits = constantinople_auth::tag_bits(self.validators());
+        let mut seen = HashSet::with_capacity(candidates.len());
+        let mut body: Vec<SignedTransaction<H>> = Vec::with_capacity(candidates.len());
+        let mut authenticators = Vec::new();
+        for candidate in candidates {
+            let tagged = candidate.transaction.is_mac();
+            let authenticator = match (tagged, candidate.authenticator) {
+                (false, _) => None,
+                (true, Some(tags)) if tags.len() == validators && tags.bits() == bits => Some(tags),
+                (true, _) => continue,
+            };
+            if !seen.insert(*candidate.transaction.message_digest()) {
+                continue;
+            }
+            body.push(candidate.transaction);
+            authenticators.extend(authenticator);
+        }
+        let digests = body.iter().map(|tx| *tx.message_digest()).collect();
+
         let (state_batch, transaction_batch) = batches;
-        let execution = execute_proposal(
+        let execution = execute(
             self.strategy.clone(),
-            &runtime,
             state_batch,
             transaction_batch,
-            parent_transactions_inactivity_floor(&parent),
-            &parent.header,
-            context.round,
-            seed,
-            input,
+            transaction_floor,
+            entries,
+            digests,
         )
         .await;
 
-        // The last parent reference destroys the whole body. Bypass adaptive
-        // scheduling because transaction count cannot predict that ownership
-        // change. A multi-worker Rayon strategy keeps cleanup off this task.
-        let drop_span = info_span!("application.propose.drop_parent");
-        let drop_work = parent.body.len();
-        drop(
-            self.strategy
-                .manual()
-                .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
-        );
-
+        let hasher = &mut H::default();
         let header = Header {
             context,
             parent: parent_digest,
-            height: parent_height + 1,
+            height: parent_header.height + 1,
             timestamp: time::timestamp_ms(&runtime),
-            state_root: execution.block.state.root(),
-            state_range: execution.block.state_sync_range.clone(),
-            transactions_root: execution.block.transactions.root(),
-            transactions_range: execution.block.transactions_range.clone(),
+            parent_notarization: notarization_digest(notarization.as_ref(), hasher),
+            parent_outcomes: outcomes_digest(&execution.outcomes, hasher),
+            state_root: execution.state.root(),
+            state_range: execution.state_sync_range.clone(),
+            transactions_root: execution.transactions.root(),
+            transactions_range: execution.transactions_range.clone(),
         };
-        let block = Block::new(header, execution.body);
+        let transaction_count = body.len();
+        let block = Block::with_parent(header, notarization, execution.outcomes.clone(), body);
         let encoded_size = block.encode_size();
 
         // A transaction source may exceed its budget. Trimming here would
@@ -125,22 +228,23 @@ where
             return None;
         }
 
-        let block = block.seal(&mut H::default());
-        self.proposed_transactions
-            .inc_by(execution.block.transaction_count as u64);
+        let block = block.seal(hasher);
+        self.chain.built(block.digest(), authenticators);
+        self.proposed_transactions.inc_by(transaction_count as u64);
 
         info!(
             epoch = block.header.context.round.epoch().get(),
             view = block.header.context.round.view().get(),
             height = block.header.height,
-            txs = execution.block.transaction_count,
+            txs = transaction_count,
+            parent_applied = execution.applied,
             timestamp = block.header.timestamp,
             "application.propose.complete"
         );
 
         Some(Proposed {
             block,
-            merkleized: execution.block.into_merkleized(),
+            merkleized: execution.into_merkleized(),
         })
     }
 
@@ -157,16 +261,15 @@ where
     )]
     pub async fn verify_child(
         &mut self,
-        (runtime, _context): (E, Context<C, P>),
+        (runtime, context): (E, Context<C, P>),
         block: Arc<SealedBlock<C, P, H>>,
         parent: impl Future<Output = Option<Arc<SealedBlock<C, P, H>>>> + Send,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
         E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
-        S: Scheme<PublicKey = P>,
+        Self: CApplication<E, Block = SealedBlock<C, P, H>, Databases = Databases<E, H, EightCap, St>>,
         I: TransactionSource<C, P, H> + Sync,
-        St: Strategy,
     {
         let encoded_size = block.encode_size();
         if encoded_size > MAXIMUM_BLOCK_SIZE {
@@ -184,12 +287,18 @@ where
         // header and lazy body are cloned out of the shared reference
         // (per-transaction refcount bumps) instead of moved.
         let header = block.header.clone();
+        if !block.commits_to_parent(&mut H::default()) {
+            reject_verify(header.height, PARENT_COMMITMENT_MISMATCH);
+            return None;
+        }
+        let notarization = block.notarization.clone();
+        let outcomes = block.outcomes.clone();
         let body = Arc::new(block.body.clone());
         drop(block);
 
-        // Signature verification needs only the block body, so it starts
-        // before the parent fetch and can overlap it when offloaded. The
-        // child context supplies an owned CryptoRng for verification.
+        // Signature verification and the block's own digests need only the
+        // block body, so they start before the parent fetch and can overlap it
+        // when offloaded. The child context supplies an owned CryptoRng.
         let (state_batch, transaction_batch) = batches;
         let signatures = verify_signatures::<E, H, St>(
             runtime.child("verify_signatures"),
@@ -198,6 +307,10 @@ where
             Arc::clone(&body),
             &self.strategy,
         );
+        let digests_span = info_span!("application.verify.digests", txs = body.len().traced());
+        let digests = self.strategy.spawn(body.len(), move |strategy| {
+            digests_span.in_scope(|| body_digests(&strategy, &body))
+        });
 
         let parent = parent
             .instrument(info_span!("application.verify.parent"))
@@ -215,39 +328,60 @@ where
             return None;
         }
 
-        // Join verification with execution so offloaded signature work can
-        // overlap execution and the timestamp wait. The adaptive strategy
-        // may already have completed signature verification inline.
-        let execution = execute_body(
-            self.strategy.clone(),
-            state_batch,
-            transaction_batch,
-            parent_transactions_inactivity_floor(&parent),
-            body,
-        );
+        // The block's notarization of its parent decides which of the parent's
+        // transactions are authentic, so it must be one: the votes of a quorum
+        // for the parent's proposal.
+        if !notarizes_parent::<C, P, H>(notarization.as_ref(), &parent.header, &context) {
+            reject_verify(header.height, INVALID_NOTARIZATION);
+            return None;
+        }
+        let certificate = {
+            let notarization = notarization.clone();
+            let scheme = self.scheme.clone();
+            let mut rng = runtime.child("verify_notarization");
+            let span = info_span!("application.verify.notarization");
+            self.strategy
+                .spawn(scheme.participants().len(), move |strategy| {
+                    span.in_scope(|| {
+                        notarization
+                            .is_none_or(|n| n.verify(&mut rng, &scheme, &strategy))
+                            .then_some(())
+                            .ok_or(INVALID_NOTARIZATION)
+                    })
+                })
+        };
+
+        // Join the checks with execution so offloaded work can overlap
+        // execution and the timestamp wait.
+        let transaction_floor = parent_transactions_inactivity_floor(&parent);
+        let strategy = self.strategy.clone();
+        let entries = self.prepare_parent(parent, notarization);
+        let execution = async move {
+            let (entries, digests) = futures::try_join!(entries, digests)?;
+            Ok(execute(
+                strategy,
+                state_batch,
+                transaction_batch,
+                transaction_floor,
+                entries,
+                digests,
+            )
+            .await)
+        };
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
-        let result = futures::try_join!(signatures, execution, wait);
-
-        // The last parent reference destroys the whole body. Bypass adaptive
-        // scheduling because transaction count cannot predict that ownership
-        // change. A multi-worker Rayon strategy keeps cleanup off this task.
-        let drop_span = info_span!("application.verify.drop_parent");
-        let drop_work = parent.body.len();
-        drop(
-            self.strategy
-                .manual()
-                .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
-        );
-
-        let execution = match result {
-            Ok(((), execution, ())) => execution,
+        let execution = match futures::try_join!(signatures, certificate, execution, wait) {
+            Ok(((), (), execution, ())) => execution,
             Err(reason) => {
                 reject_verify(header.height, reason);
                 return None;
             }
         };
 
+        if execution.outcomes != outcomes {
+            reject_verify(header.height, OUTCOMES_MISMATCH);
+            return None;
+        }
         if !commitments_match(&header, &execution) {
             return None;
         }
@@ -256,7 +390,7 @@ where
             epoch = header.context.round.epoch().get(),
             view = header.context.round.view().get(),
             height = header.height,
-            txs = execution.transaction_count,
+            parent_applied = execution.applied,
             timestamp = header.timestamp,
             "application.verify.complete"
         );
@@ -265,6 +399,9 @@ where
     }
 
     /// Replays a block into speculative batches.
+    ///
+    /// The block is finalized, so its signatures and the signatures in its
+    /// notarization of the parent are not checked again. Its commitments are.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(
@@ -274,40 +411,77 @@ where
     )]
     pub async fn apply_block(
         &mut self,
-        (_, _): (E, Context<C, P>),
+        (_, context): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
         E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
-        S: Scheme<PublicKey = P>,
+        Self: CApplication<E, Block = SealedBlock<C, P, H>, Databases = Databases<E, H, EightCap, St>>,
         I: TransactionSource<C, P, H> + Sync,
-        St: Strategy,
     {
+        let height = block.header.height;
+        let reject = |reason: &'static str| error!(height, reason, "application.apply.reject");
+        if !block.commits_to_parent(&mut H::default()) {
+            reject(PARENT_COMMITMENT_MISMATCH);
+            return None;
+        }
+
+        // The parent's transactions execute with this block. The child of the
+        // genesis block has none to execute.
+        let entries = if height <= 1 {
+            if block.notarization.is_some() {
+                reject(INVALID_NOTARIZATION);
+                return None;
+            }
+            ParentEntries::empty()
+        } else {
+            let parent = self
+                .chain
+                .parent(block)
+                .instrument(info_span!("application.apply.parent"))
+                .await?;
+            if parent.digest() != block.header.parent
+                || !notarizes_parent::<C, P, H>(
+                    block.notarization.as_ref(),
+                    &parent.header,
+                    &context,
+                )
+            {
+                reject(INVALID_NOTARIZATION);
+                return None;
+            }
+            self.prepare_parent(parent, block.notarization.clone())
+                .await
+                .inspect_err(|&reason| reject(reason))
+                .ok()?
+        };
+
         let strategy = self.strategy.clone();
         let body = block.body.clone();
-        let work_size = body.len();
-        let height = block.header.height;
-        let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
-        let (body, digests) = strategy
-            .spawn(work_size, move |s| {
-                prepare_span.in_scope(|| prepare_lazy(&s, &body))
+        let digests_span = info_span!("application.apply.digests", txs = body.len().traced());
+        let digests = strategy
+            .spawn(body.len(), move |s| {
+                digests_span.in_scope(|| body_digests(&s, &body))
             })
             .await
-            .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
+            .inspect_err(|&reason| reject(reason))
             .ok()?;
 
         let (state_batch, transaction_batch) = batches;
-        apply_prepared_body::<E, H, St>(
+        let execution = execute(
+            strategy,
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
-            body,
+            entries,
             digests,
-            strategy,
         )
-        .await
-        .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
-        .ok()
+        .await;
+        if execution.outcomes != block.outcomes {
+            reject(OUTCOMES_MISMATCH);
+            return None;
+        }
+        Some(execution.into_merkleized())
     }
 }

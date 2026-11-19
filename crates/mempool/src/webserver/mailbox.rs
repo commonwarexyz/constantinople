@@ -1,7 +1,7 @@
 //! Mailbox for the mempool webserver actor.
 
 use super::actor::{IngestStatus, StoredBatchStatus, TxStatus};
-use crate::TransactionSource;
+use crate::{Candidate, TransactionSource};
 use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
@@ -186,7 +186,7 @@ where
         parent: &Header<C, H::Digest, P>,
         _round: Round,
         filled: usize,
-    ) -> Vec<VerifiedTransaction<H>> {
+    ) -> Vec<Candidate<H>> {
         let height = parent.height + 1;
         self.sender
             .request(|response| Message::Propose {
@@ -196,6 +196,9 @@ where
             })
             .await
             .expect("mempool actor mailbox closed")
+            .into_iter()
+            .map(Candidate::from)
+            .collect()
     }
 }
 

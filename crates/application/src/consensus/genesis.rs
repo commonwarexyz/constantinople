@@ -7,7 +7,9 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
+use constantinople_primitives::{
+    Block, Header, Outcomes, Sealable, SealedBlock, notarization_digest, outcomes_digest,
+};
 
 /// Creates the genesis block.
 pub fn genesis_block<C, P, H>(
@@ -55,6 +57,8 @@ where
         parent: H::Digest::EMPTY,
         height: 0,
         timestamp,
+        parent_notarization: notarization_digest::<C, H>(None, hasher),
+        parent_outcomes: outcomes_digest(&Outcomes::new(), hasher),
         state_root: state_target.root,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transactions_target.root,

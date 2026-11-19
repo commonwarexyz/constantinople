@@ -1,31 +1,46 @@
 //! Consensus-facing application integration.
 //!
 //! This module is the boundary between consensus and the application state
-//! transition. Consensus supplies candidate or certified block bodies; the
-//! application prepares those bodies into account transfers, executes them
-//! against QMDB-backed state, appends transaction-history entries, and returns
-//! the commitments consensus proposes, verifies, or applies.
+//! transition.
 //!
-//! Account execution is based on block-start state. A sender spends only the
-//! balance it had at the start of the block, and credits created by the same
-//! block cannot fund later debits in that block. The executor therefore builds
-//! deterministic account effects first, then applies those effects to loaded
-//! accounts all or nothing.
+//! # A block's transactions execute one block later
 //!
-//! The executor builds one account-touch plan for each block. Transfers whose
-//! non-self sender/recipient accounts are unique in the block stay on a discrete
-//! lane and can write their sender and recipient accounts directly. Transfers
-//! that touch contended accounts go through the general account-owned lane: each
-//! affected account is loaded once, receives its accumulated nonce/debit/credit
-//! effect, and writes once. If any lane fails a nonce check, balance check, or
-//! checked credit addition, the whole block body is invalid and no partial state
-//! is applied.
+//! A block lists transactions of two kinds. A signed transaction is authentic
+//! if its signature verifies, which every validator checks before it votes to
+//! finalize the block. A transaction of an X25519 account carries no
+//! signature: each validator compares a short tag and reports the result with
+//! its vote. Whether such a transaction is authentic is therefore not known
+//! when its block is proposed. It is fixed by the notarization of the block
+//! that the next block carries: the transaction is authentic iff at least
+//! `2f + 1` of the reports in that notarization approve it.
 //!
-//! Touched accounts are staged out of the unordered state QMDB in one read,
-//! and final account values are recorded against the staged read indices, so
+//! So block `h` commits to the state reached by applying the authentic
+//! transactions of block `h - 1` to the state of block `h - 1`:
+//!
+//! ```text
+//! state(h) = apply(state(h - 1), authentic transactions of body(h - 1))
+//! ```
+//!
+//! and carries one outcome bit per transaction of block `h - 1`, saying
+//! whether it was applied. The transaction history is different: block `h`
+//! appends the digests of its own transactions, so its transaction root pins
+//! its body.
+//!
+//! # Applying transactions
+//!
+//! The authentic transactions of a block are applied in order against the
+//! state at the start, each one all or nothing: a transaction with a stale
+//! nonce, a debit its sender cannot afford from its balance at the start, or a
+//! credit that overflows is skipped and leaves no trace. Credits created by
+//! the block cannot fund debits in the same block. This is
+//! [`SelectiveExecutor`](crate::executor::SelectiveExecutor)'s rule, and a
+//! block is valid whatever the outcome of the transactions it lists.
+//!
+//! Touched accounts are staged out of the unordered state QMDB, and final
+//! account values are recorded against the staged read indices, so
 //! merkleization reuses each key's resolved location. The state commitment
 //! depends on the final key/value set. Transaction history is append-only, so
-//! transaction digests are still appended in block order.
+//! transaction digests are appended in block order.
 
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -38,6 +53,7 @@ use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 mod body;
+mod chain;
 mod db;
 mod execution;
 mod genesis;
@@ -48,6 +64,7 @@ mod lifecycle;
 mod tests;
 mod time;
 
+pub use chain::Chain;
 pub use db::{
     DatabaseReaders, Databases, StateBatch, StateDatabase, StateOperation, StateStaged,
     StateSyncTarget, StateUpdates, TransactionDatabase, TransactionHistoryDb,
@@ -93,10 +110,15 @@ type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
-const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
+const DUPLICATE_TRANSACTION: &str = "duplicate transaction";
+const INVALID_NOTARIZATION: &str = "invalid parent notarization";
+const PARENT_COMMITMENT_MISMATCH: &str = "parent notarization or outcomes do not match header";
+const OUTCOMES_MISMATCH: &str = "outcomes mismatch";
 
 /// Core Constantinople application.
-pub struct Application<E, H, C, S, P, I, St>
+///
+/// `X` is the application's view of the chain ([`Chain`]).
+pub struct Application<E, H, C, X, P, I, St>
 where
     H: Hasher,
     E: BufferPooler + Storage + Clock + Metrics,
@@ -111,17 +133,21 @@ where
     public_key_cache: PublicKeyCache,
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
+    /// Verifies the notarization of its parent that a block carries.
+    scheme: constantinople_auth::Scheme,
+    chain: X,
     proposed_transactions: Counter,
-    _marker: PhantomData<(E, C, S, I)>,
+    _marker: PhantomData<(E, C, I)>,
 }
 
-impl<E, H, C, S, P, I, St> Clone for Application<E, H, C, S, P, I, St>
+impl<E, H, C, X, P, I, St> Clone for Application<E, H, C, X, P, I, St>
 where
     H: Hasher,
     E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     P: Clone,
+    X: Clone,
     St: Strategy,
 {
     fn clone(&self) -> Self {
@@ -133,13 +159,15 @@ where
             public_key_cache: self.public_key_cache.clone(),
             genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
+            scheme: self.scheme.clone(),
+            chain: self.chain.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
+impl<E, H, C, X, P, I, St> Application<E, H, C, X, P, I, St>
 where
     H: Hasher,
     E: BufferPooler + Storage + Clock + Metrics,
@@ -161,6 +189,8 @@ where
         public_key_cache: PublicKeyCache,
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
+        scheme: constantinople_auth::Scheme,
+        chain: X,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
@@ -175,6 +205,8 @@ where
             public_key_cache,
             genesis_state_target,
             genesis_transactions_target,
+            scheme,
+            chain,
             proposed_transactions,
             _marker: PhantomData,
         }

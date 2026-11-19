@@ -110,7 +110,7 @@ const fn min_signed_transaction_bytes() -> usize {
         + TransactionPublicKey::SIZE
         + MIN_U64_VARINT_BYTES
         + MIN_U64_VARINT_BYTES
-        + TransactionSignature::MIN_SIZE
+        + TransactionSignature::MIN_SIGNED_SIZE
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {

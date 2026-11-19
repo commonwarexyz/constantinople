@@ -28,6 +28,8 @@ pub enum DecompressedPublicKey {
     Ed25519(ed25519::PublicKey),
     /// A decompressed secp256r1 verifying key.
     Secp256r1(VerifyingKey),
+    /// An X25519 key. It verifies no signature and needs no decompression.
+    X25519,
 }
 
 /// A shared, fixed-capacity cache mapping a [`TransactionPublicKey`] to its
@@ -148,6 +150,7 @@ impl PublicKeyCache {
                 let parsed = VerifyingKey::from_sec1_bytes(bytes).ok()?;
                 Some(DecompressedPublicKey::Secp256r1(parsed))
             }
+            TransactionPublicKey::X25519 { .. } => Some(DecompressedPublicKey::X25519),
         }
     }
 

@@ -12,6 +12,9 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+# Workspace
+constantinople-auth.workspace = true
+
 # Commonware
 commonware-math.workspace = true
 commonware-codec.workspace = true
@@ -32,6 +35,9 @@ derive_more = { workspace = true, features = ["full"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+# Workspace
+constantinople-auth = { workspace = true, features = ["mocks"] }
+
 # Commonware
 commonware-coding.workspace = true
 commonware-math = { workspace = true, features = ["arbitrary"] }

@@ -2,7 +2,7 @@
 
 use crate::{
     TransactionPublicKey,
-    auth::{ED25519_SCHEME, SECP256R1_SCHEME},
+    auth::{ED25519_SCHEME, SECP256R1_SCHEME, X25519_SCHEME},
 };
 use bytes::BufMut;
 use commonware_codec::{Buf, Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
@@ -18,8 +18,8 @@ pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 /// Number of future nonce uses tracked on each account.
 pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
 
-// Account keys keep the legacy Ed25519 public-key width. Secp256r1 accounts
-// are hashed into this same fixed-width state key.
+// Account keys keep the legacy Ed25519 public-key width. Secp256r1 and X25519
+// accounts are hashed into this same fixed-width state key.
 const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
 
 /// Fixed-width account identifier derived from a transaction public key.
@@ -42,7 +42,8 @@ impl AccountKey {
                 Self::try_from(&encoded[1..1 + Self::SIZE])
                     .expect("ed25519 account-key slice has account-key length")
             }
-            TransactionPublicKey::Secp256r1 { encoded } => {
+            TransactionPublicKey::Secp256r1 { encoded }
+            | TransactionPublicKey::X25519 { encoded } => {
                 Self::try_from(sha256::Sha256::hash(&[encoded]).as_ref())
                     .expect("sha256 digest has account-key length")
             }
@@ -57,7 +58,9 @@ impl AccountKey {
 
         match bytes[0] {
             ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
-            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(&[bytes]).as_ref()).ok(),
+            SECP256R1_SCHEME | X25519_SCHEME => {
+                Self::try_from(sha256::Sha256::hash(&[bytes]).as_ref()).ok()
+            }
             _ => None,
         }
     }

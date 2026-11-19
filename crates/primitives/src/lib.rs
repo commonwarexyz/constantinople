@@ -21,7 +21,10 @@ mod cache;
 pub use cache::{DecompressedPublicKey, PublicKeyCache};
 
 mod block;
-pub use block::{Block, BlockCfg, Header, SealedBlock};
+pub use block::{
+    Block, BlockCfg, Header, Outcomes, ParentNotarization, SealedBlock, notarization_digest,
+    outcomes_digest,
+};
 
 pub mod proposal;
 
