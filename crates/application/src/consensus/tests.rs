@@ -42,11 +42,19 @@ use std::{collections::HashMap, num::NonZeroU64, sync::Arc, time::Duration};
 const VALIDATORS: u32 = 6;
 const CONSENSUS_NS: &[u8] = b"constantinople-application-test-consensus";
 
+type TestNotarization = ParentNotarization<sha256::Digest>;
+
+/// The tags a proposer handed over for a block, by block digest.
+type Built = (sha256::Digest, Vec<Tags>);
+
+/// A validator's report on the tagged transactions of a block, by validator.
+type Verdicts = fn(usize) -> Vec<bool>;
+
 /// The chain as the tests present it to the application.
 #[derive(Clone, Default)]
 struct TestChain {
-    notarizations: Arc<Mutex<HashMap<(Round, sha256::Digest), ParentNotarization<sha256::Digest>>>>,
-    built: Arc<Mutex<Vec<(sha256::Digest, Vec<Tags>)>>>,
+    notarizations: Arc<Mutex<HashMap<(Round, sha256::Digest), TestNotarization>>>,
+    built: Arc<Mutex<Vec<Built>>>,
     blocks: Arc<Mutex<HashMap<sha256::Digest, Arc<TestBlock>>>>,
 }
 
@@ -993,7 +1001,7 @@ fn transactions_execute_one_block_later() {
 fn a_tagged_transaction_is_applied_iff_enough_reports_approve() {
     // Each case gives the report of validator `i` on the one tagged transaction
     // and whether the transaction is applied. Three approvals are needed.
-    let cases: [(fn(usize) -> Vec<bool>, bool); 4] = [
+    let cases: [(Verdicts, bool); 4] = [
         (|_| vec![true], true),
         (|validator| vec![validator < 3], true),
         (|validator| vec![validator < 2], false),

@@ -13,10 +13,9 @@ import {
     finalizedByHeightKey,
     headerByDigestKey,
     rangeForKind,
-    type VerifiedSimplexCertificate,
     type SimplexCertificateVerifier,
 } from '@exowarexyz/simplex';
-import { createWasmSimplexVerifier } from '@exowarexyz/simplex/wasm';
+import { createCertificateVerifier, type VerifiedCertificate } from './certificate.ts';
 import {
     QmdbOperationLogClient,
     type VerifiedFixedKeylessAppendProof,
@@ -25,7 +24,6 @@ import {
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
-const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
 const SIMPLEX_STORE_PREFIX = new Uint8Array([0x02]);
 const ACCOUNT_PAGE_SIZE = 10;
 const ACCOUNT_KEY_BYTES = 32;
@@ -775,7 +773,7 @@ async function fetchFinalizedTransactionTarget(
 }
 
 async function certifiedTarget(
-    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    simplex: SimplexClient<VerifiedCertificate, VerifiedCertificate>,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
@@ -795,7 +793,7 @@ async function certifiedTarget(
 
 async function descendantFinalizedTarget(
     source: FinalizationSource,
-    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    simplex: SimplexClient<VerifiedCertificate, VerifiedCertificate>,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
@@ -845,7 +843,7 @@ async function descendantFinalizedTarget(
 
 async function descendantTarget(
     source: FinalizationSource,
-    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    simplex: SimplexClient<VerifiedCertificate, VerifiedCertificate>,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
@@ -1022,12 +1020,12 @@ function missingFinalization(height: bigint): Error {
 async function verifiedSimplexClient(
     storeUrl: string,
     simplexVerificationMaterial: string,
-): Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
+): Promise<SimplexClient<VerifiedCertificate, VerifiedCertificate>> {
     if (simplexVerificationMaterial.trim().length === 0) {
         throw new Error('Simplex verification material is not configured');
     }
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(simplexStore(storeUrl), {
-        verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
+    return new SimplexClient<VerifiedCertificate, VerifiedCertificate>(simplexStore(storeUrl), {
+        verifier: simplexFinalizationVerifier(simplexVerificationMaterial),
     });
 }
 
@@ -1037,20 +1035,20 @@ function simplexStore(storeUrl: string): StoreClient {
     );
 }
 
+// The verification material is the validators' ed25519 public keys, concatenated in
+// participant order.
 function simplexFinalizationVerifier(
     simplexVerificationMaterial: string,
-): Promise<SimplexCertificateVerifier<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
-    return createWasmSimplexVerifier({
-        scheme: SIMPLEX_SCHEME,
-        payload: 'coding-commitment',
-        identity: 'ed25519',
+): SimplexCertificateVerifier<VerifiedCertificate, VerifiedCertificate> {
+    return createCertificateVerifier({
         namespace: CONSENSUS_NAMESPACE,
-        verificationMaterial: fromHex(simplexVerificationMaterial),
+        validators: fromHex(simplexVerificationMaterial),
+        payloadBytes: COMMITMENT_BYTES,
     });
 }
 
 async function finalizedTargetFromCertificate(
-    certificate: VerifiedSimplexCertificate,
+    certificate: VerifiedCertificate,
 ): Promise<AuthenticatedTarget> {
     const certified = certificate.header;
     if (certificate.payload.length !== COMMITMENT_BYTES) {
@@ -1103,7 +1101,8 @@ interface DecodedBlockHeader {
 
 // Header<Commitment, Sha256, Ed25519> encodes its context (round epoch and view,
 // leader, and parent view and commitment), then the parent digest, height,
-// timestamp, state target, and transaction target. This parser stays narrow.
+// timestamp, the digests of the parent's notarization and of the parent's outcome
+// bits, state target, and transaction target. This parser stays narrow.
 // Callers bind the exact encoded bytes to a certified digest before trusting fields.
 function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeader {
     const epoch = readVarint(bytes, offset);
@@ -1116,7 +1115,7 @@ function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeade
     offset = skip(bytes, offset, DIGEST_BYTES);
     const height = readHeaderU64(bytes, offset);
     const timestamp = readHeaderU64(bytes, height.offset);
-    offset = timestamp.offset;
+    offset = skip(bytes, timestamp.offset, 2 * DIGEST_BYTES);
 
     const stateRoot = readBytes(bytes, offset, DIGEST_BYTES);
     offset = skip(bytes, offset, DIGEST_BYTES);

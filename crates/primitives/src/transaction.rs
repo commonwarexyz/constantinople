@@ -413,7 +413,7 @@ mod test {
 
     #[test]
     fn signed_transaction_needs_its_signature() {
-        let signer = ed25519::PrivateKey::random(&mut StdRng::from_seed([8u8; 32]));
+        let signer = ed25519::PrivateKey::random(StdRng::from_seed([8u8; 32]));
         let sender = TransactionPublicKey::ed25519(signer.public_key());
         let transaction = Transaction::<sha256::Digest>::new(
             sender,

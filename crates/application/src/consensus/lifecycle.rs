@@ -46,15 +46,12 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    match notarization {
-        None => parent.height == 0,
-        Some(notarization) => {
-            parent.height != 0
-                && notarization.proposal.round == parent.context.round
-                && notarization.proposal.parent == parent.context.parent.0
-                && notarization.proposal.payload == context.parent.1
-        }
-    }
+    notarization.map_or(parent.height == 0, |notarization| {
+        parent.height != 0
+            && notarization.proposal.round == parent.context.round
+            && notarization.proposal.parent == parent.context.parent.0
+            && notarization.proposal.payload == context.parent.1
+    })
 }
 
 impl<E, H, C, X, P, I, St> Application<E, H, C, X, P, I, St>

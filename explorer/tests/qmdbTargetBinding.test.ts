@@ -65,7 +65,7 @@ test('account target retries when publication precedes its Simplex certificate',
         () => fetchLatestProofTarget({
             storeUrl: `http://store/${storeId}`,
             sqlUrl: 'http://sql',
-            simplexVerificationMaterial: '11',
+            simplexVerificationMaterial: '11'.repeat(32),
             publishedTarget: {
                 height: HEIGHT,
                 blockDigest: certificate.payload.slice(0, 32),
@@ -908,7 +908,7 @@ test('certificate cache is scoped by store, verification material, and height', 
     await prefetchFinalizedCertificate(options);
     await prefetchFinalizedCertificate({ ...options, storeUrl: `${options.storeUrl}/` });
     await prefetchFinalizedCertificate({ ...options, storeUrl: `${options.storeUrl}/other` });
-    await prefetchFinalizedCertificate({ ...options, simplexVerificationMaterial: '22' });
+    await prefetchFinalizedCertificate({ ...options, simplexVerificationMaterial: '22'.repeat(32) });
     await prefetchFinalizedCertificate({ ...options, height: HEIGHT + 1n });
     assert.equal(read.mock.callCount(), 4);
 });
@@ -1027,7 +1027,7 @@ function transactionProofOptions(digest: string) {
         qmdbUrl: 'http://qmdb',
         storeUrl: `http://store/${storeId}`,
         sqlUrl: 'http://sql',
-        simplexVerificationMaterial: '11',
+        simplexVerificationMaterial: '11'.repeat(32),
         digest,
         publishedTarget: { height: HEIGHT + 1n, blockDigest: new Uint8Array(32), sequenceNumber: FLOOR },
     };
@@ -1071,6 +1071,8 @@ function fixtureHeader(
     return concat(
         new Uint8Array([0, 9]), new Uint8Array(32), new Uint8Array([8]),
         new Uint8Array(100), parentDigest, u64(height), u64(0n),
+        // Digests of the parent's notarization and of the parent's outcome bits.
+        new Uint8Array(64),
         target.stateRoot, u64(target.stateStart), u64(target.stateTip),
         target.transactionsRoot, u64(transactionsStart), u64(transactionsTip),
     );

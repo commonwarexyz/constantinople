@@ -462,10 +462,11 @@ where
         // Simplex adopts the peer floor only for state sync. Otherwise it independently replays
         // its journal from canonical genesis while marshal restores application progress.
         let genesis_commitment = coded_genesis.commitment();
-        let simplex_floor = startup_plan.floor().map_or_else(
-            || SimplexFloor::Genesis(genesis_commitment),
-            |finalization| SimplexFloor::Finalized(finalization.clone()),
-        );
+        let simplex_floor = startup_plan
+            .floor()
+            .map_or(SimplexFloor::Genesis(genesis_commitment), |finalization| {
+                SimplexFloor::Finalized(finalization.clone())
+            });
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
         let (marshal, marshal_mailbox, marshal_floor) = MarshalActor::init(
