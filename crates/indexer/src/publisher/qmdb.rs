@@ -1501,7 +1501,7 @@ mod tests {
         let transactions = queued_range(&encode_operations(&transaction_operations), 1, 2);
         let upload = queued_upload(1, state, transactions);
         let encoded = upload.encode();
-        assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 1]);
+        assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 2]);
         let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
