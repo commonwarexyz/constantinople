@@ -551,6 +551,14 @@ macro_rules! impl_certificate_ed25519 {
         impl $crate::certificate::Scheme for Scheme {
             type Signature = $crate::ed25519::Signature;
 
+            fn read_signature(
+                reader: &mut impl commonware_codec::Buf,
+            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
+            {
+                // Fixed-size: defer decoding.
+                commonware_codec::Read::read_cfg(reader, &())
+            }
+
             fn me(&self) -> Option<commonware_utils::Participant> {
                 self.generic.me()
             }

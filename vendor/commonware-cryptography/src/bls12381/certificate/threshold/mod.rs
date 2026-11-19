@@ -702,6 +702,14 @@ macro_rules! impl_certificate_bls12381_threshold {
         > $crate::certificate::Scheme for Scheme<P, V> {
             type Signature = V::Signature;
 
+            fn read_signature(
+                reader: &mut impl commonware_codec::Buf,
+            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
+            {
+                // Fixed-size: defer decoding.
+                commonware_codec::Read::read_cfg(reader, &())
+            }
+
             fn me(&self) -> Option<commonware_utils::Participant> {
                 self.generic.me()
             }

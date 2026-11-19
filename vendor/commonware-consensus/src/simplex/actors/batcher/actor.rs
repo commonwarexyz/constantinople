@@ -26,7 +26,7 @@ use commonware_runtime::{
         traces::TracedExt as _,
     },
 };
-use commonware_utils::{N3f1, ordered::Quorum};
+use commonware_utils::ordered::Quorum;
 use rand_core::CryptoRng;
 use std::{
     collections::BTreeMap,
@@ -132,7 +132,7 @@ where
             "number of optimistic assembly attempts returning attestation verification results",
         );
         let (sender, receiver) = mailbox::new(context.child("mailbox"), cfg.mailbox_size);
-        let mut required_active = participants.quorum::<N3f1>() as usize;
+        let mut required_active = participants.quorum::<S::Faults>() as usize;
         if scheme.me().is_some() {
             // We are live by construction (we never observe our own messages).
             required_active = required_active

@@ -703,6 +703,11 @@ impl<P: PublicKey, V: Variant> certificate::Verifier for Scheme<P, V> {
 impl<P: PublicKey, V: Variant> certificate::Scheme for Scheme<P, V> {
     type Signature = Signature<V>;
 
+    fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, Error> {
+        // Fixed-size: defer decoding.
+        Lazy::read_cfg(reader, &())
+    }
+
     fn me(&self) -> Option<Participant> {
         match &self.role {
             Role::Signer { share, .. } => Some(share.index),

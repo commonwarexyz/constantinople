@@ -1,0 +1,257 @@
+--- a/consensus/src/simplex/actors/batcher/actor.rs
++++ b/consensus/src/simplex/actors/batcher/actor.rs
+@@ -26,7 +26,7 @@
+         traces::TracedExt as _,
+     },
+ };
+-use commonware_utils::{N3f1, ordered::Quorum};
++use commonware_utils::ordered::Quorum;
+ use rand_core::CryptoRng;
+ use std::{
+     collections::BTreeMap,
+@@ -132,7 +132,7 @@
+             "number of optimistic assembly attempts returning attestation verification results",
+         );
+         let (sender, receiver) = mailbox::new(context.child("mailbox"), cfg.mailbox_size);
+-        let mut required_active = participants.quorum::<N3f1>() as usize;
++        let mut required_active = participants.quorum::<S::Faults>() as usize;
+         if scheme.me().is_some() {
+             // We are live by construction (we never observe our own messages).
+             required_active = required_active
+--- a/consensus/src/simplex/actors/batcher/round.rs
++++ b/consensus/src/simplex/actors/batcher/round.rs
+@@ -18,7 +18,7 @@
+ use commonware_cryptography::Digest;
+ use commonware_p2p::Blocker;
+ use commonware_parallel::Strategy;
+-use commonware_utils::{N3f1, ordered::Quorum};
++use commonware_utils::ordered::Quorum;
+ use rand_core::CryptoRng;
+ use std::sync::Arc;
+ use tracing::Span;
+@@ -67,7 +67,7 @@
+         reporter: R,
+         track_historical_votes: bool,
+     ) -> Self {
+-        let quorum = scheme.participants().quorum::<N3f1>();
++        let quorum = scheme.participants().quorum::<S::Faults>();
+         let len = scheme.participants().len();
+         Self {
+             blocker,
+--- a/consensus/src/simplex/mocks/wrapped.rs
++++ b/consensus/src/simplex/mocks/wrapped.rs
+@@ -3,7 +3,7 @@
+     types::Round,
+ };
+ use bytes::Bytes;
+-use commonware_codec::{Encode, Read, types::lazy::Lazy};
++use commonware_codec::{Buf, Encode, Error, Read, types::lazy::Lazy};
+ use commonware_cryptography::{
+     Digest, Hasher as _,
+     certificate::{
+@@ -189,6 +189,10 @@
+ {
+     type Signature = S::Signature;
+ 
++    fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, Error> {
++        S::read_signature(reader)
++    }
++
+     fn me(&self) -> Option<Participant> {
+         self.inner.me()
+     }
+--- a/consensus/src/simplex/scheme/bls12381_threshold/vrf.rs
++++ b/consensus/src/simplex/scheme/bls12381_threshold/vrf.rs
+@@ -703,6 +703,11 @@
+ impl<P: PublicKey, V: Variant> certificate::Scheme for Scheme<P, V> {
+     type Signature = Signature<V>;
+ 
++    fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, Error> {
++        // Fixed-size: defer decoding.
++        Lazy::read_cfg(reader, &())
++    }
++
+     fn me(&self) -> Option<Participant> {
+         match &self.role {
+             Role::Signer { share, .. } => Some(share.index),
+--- a/consensus/src/simplex/scheme/mod.rs
++++ b/consensus/src/simplex/scheme/mod.rs
+@@ -52,7 +52,7 @@
+         Subject as CertificateSubject, Verifier,
+     },
+ };
+-use commonware_utils::{N3f1, union};
++use commonware_utils::union;
+ 
+ pub mod bls12381_multisig;
+ pub mod bls12381_threshold;
+@@ -117,24 +117,25 @@
+ 
+ /// Marker trait for certificate verifiers compatible with `simplex`.
+ ///
+-/// This trait binds a [`Verifier`] to the [`Subject`] subject type and [`N3f1`]
+-/// fault model used by the simplex protocol. It is automatically implemented
+-/// for any compatible verifier.
++/// This trait binds a [`Verifier`] to the [`Subject`] subject type used by the
++/// simplex protocol. It is automatically implemented for any compatible verifier.
++///
++/// The verifier chooses the fault model ([`Verifier::Faults`]): every quorum in the
++/// protocol is `n - f` under that model. The schemes in this module use `N3f1`.
+ pub trait CertificateVerifier<D: Digest>:
+-    for<'a> Verifier<Subject<'a, D> = Subject<'a, D>, Faults = N3f1>
++    for<'a> Verifier<Subject<'a, D> = Subject<'a, D>>
+ {
+ }
+ 
+ impl<D: Digest, S> CertificateVerifier<D> for S where
+-    S: for<'a> Verifier<Subject<'a, D> = Subject<'a, D>, Faults = N3f1>
++    S: for<'a> Verifier<Subject<'a, D> = Subject<'a, D>>
+ {
+ }
+ 
+ /// Marker trait for signing schemes compatible with `simplex`.
+ ///
+-/// This trait binds a [`CertificateScheme`] to the [`Subject`] subject type and
+-/// [`N3f1`] fault model used by the simplex protocol. It is automatically
+-/// implemented for any compatible scheme.
++/// This trait binds a [`CertificateScheme`] to the [`Subject`] subject type used by
++/// the simplex protocol. It is automatically implemented for any compatible scheme.
+ pub trait Scheme<D: Digest>:
+     CertificateVerifier<D> + for<'a> CertificateScheme<Subject<'a, D> = Subject<'a, D>>
+ {
+--- a/cryptography/src/bls12381/certificate/multisig/mod.rs
++++ b/cryptography/src/bls12381/certificate/multisig/mod.rs
+@@ -586,6 +586,14 @@
+         > $crate::certificate::Scheme for Scheme<P, V> {
+             type Signature = V::Signature;
+ 
++            fn read_signature(
++                reader: &mut impl commonware_codec::Buf,
++            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
++            {
++                // Fixed-size: defer decoding.
++                commonware_codec::Read::read_cfg(reader, &())
++            }
++
+             fn me(&self) -> Option<commonware_utils::Participant> {
+                 self.generic.me()
+             }
+--- a/cryptography/src/bls12381/certificate/threshold/mod.rs
++++ b/cryptography/src/bls12381/certificate/threshold/mod.rs
+@@ -702,6 +702,14 @@
+         > $crate::certificate::Scheme for Scheme<P, V> {
+             type Signature = V::Signature;
+ 
++            fn read_signature(
++                reader: &mut impl commonware_codec::Buf,
++            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
++            {
++                // Fixed-size: defer decoding.
++                commonware_codec::Read::read_cfg(reader, &())
++            }
++
+             fn me(&self) -> Option<commonware_utils::Participant> {
+                 self.generic.me()
+             }
+--- a/cryptography/src/certificate/mocks.rs
++++ b/cryptography/src/certificate/mocks.rs
+@@ -648,6 +648,14 @@
+         {
+             type Signature = commonware_utils::sequence::U64;
+ 
++            fn read_signature(
++                reader: &mut impl commonware_codec::Buf,
++            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
++            {
++                // Fixed-size: defer decoding.
++                commonware_codec::Read::read_cfg(reader, &())
++            }
++
+             fn me(&self) -> Option<commonware_utils::Participant> {
+                 self.generic.me()
+             }
+--- a/cryptography/src/certificate.rs
++++ b/cryptography/src/certificate.rs
+@@ -72,7 +72,7 @@
+ use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
+ use bytes::{BufMut, Bytes};
+ use commonware_codec::{
+-    Buf, Codec, CodecFixed, EncodeSize, Error as CodecError, Read, ReadExt, Write,
++    Buf, Codec, EncodeSize, Error as CodecError, Read, ReadExt, Write,
+     types::lazy::Lazy,
+ };
+ use commonware_parallel::Strategy;
+@@ -126,7 +126,7 @@
+ 
+     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+         let signer = Participant::read(reader)?;
+-        let signature = ReadExt::read(reader)?;
++        let signature = S::read_signature(reader)?;
+ 
+         Ok(Self { signer, signature })
+     }
+@@ -352,7 +352,18 @@
+ /// provided defaults to take advantage of scheme-specific batching strategies.
+ pub trait Scheme: Verifier {
+     /// Signature emitted by individual participants.
+-    type Signature: Clone + Debug + Eq + Hash + Send + Sync + CodecFixed<Cfg = ()>;
++    ///
++    /// The encoding may be variable-size. A decoder bounds it without a configuration.
++    type Signature: Clone + Debug + Eq + Hash + Send + Sync + Codec<Cfg = ()>;
++
++    /// Reads the signature of an [`Attestation`].
++    ///
++    /// The default decodes the signature immediately, which is the only way to find the end
++    /// of a variable-size encoding. A scheme with a fixed-size signature overrides this to
++    /// defer decoding (and with it any expensive validation) until the signature is used.
++    fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, CodecError> {
++        Self::Signature::read(reader).map(Lazy::new)
++    }
+ 
+     /// Returns the index of "self" in the participant set, if available.
+     /// Returns `None` if the scheme is a verifier-only instance.
+@@ -1556,6 +1567,10 @@
+     impl<S: Scheme> Scheme for Recording<S> {
+         type Signature = S::Signature;
+ 
++        fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, CodecError> {
++            S::read_signature(reader)
++        }
++
+         fn me(&self) -> Option<Participant> {
+             self.inner.me()
+         }
+--- a/cryptography/src/ed25519/certificate/mod.rs
++++ b/cryptography/src/ed25519/certificate/mod.rs
+@@ -551,6 +551,14 @@
+         impl $crate::certificate::Scheme for Scheme {
+             type Signature = $crate::ed25519::Signature;
+ 
++            fn read_signature(
++                reader: &mut impl commonware_codec::Buf,
++            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
++            {
++                // Fixed-size: defer decoding.
++                commonware_codec::Read::read_cfg(reader, &())
++            }
++
+             fn me(&self) -> Option<commonware_utils::Participant> {
+                 self.generic.me()
+             }
+--- a/cryptography/src/secp256r1/certificate/mod.rs
++++ b/cryptography/src/secp256r1/certificate/mod.rs
+@@ -484,6 +484,14 @@
+         impl<P: $crate::PublicKey> $crate::certificate::Scheme for Scheme<P> {
+             type Signature = $crate::secp256r1::standard::Signature;
+ 
++            fn read_signature(
++                reader: &mut impl commonware_codec::Buf,
++            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
++            {
++                // Fixed-size: defer decoding.
++                commonware_codec::Read::read_cfg(reader, &())
++            }
++
+             fn me(&self) -> Option<commonware_utils::Participant> {
+                 self.generic.me()
+             }

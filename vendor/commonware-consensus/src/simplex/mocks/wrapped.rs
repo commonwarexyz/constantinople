@@ -3,7 +3,7 @@ use crate::{
     types::Round,
 };
 use bytes::Bytes;
-use commonware_codec::{Encode, Read, types::lazy::Lazy};
+use commonware_codec::{Buf, Encode, Error, Read, types::lazy::Lazy};
 use commonware_cryptography::{
     Digest, Hasher as _,
     certificate::{
@@ -188,6 +188,10 @@ where
     S: CertificateScheme,
 {
     type Signature = S::Signature;
+
+    fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, Error> {
+        S::read_signature(reader)
+    }
 
     fn me(&self) -> Option<Participant> {
         self.inner.me()

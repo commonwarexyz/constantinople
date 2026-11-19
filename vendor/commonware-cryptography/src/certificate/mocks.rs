@@ -648,6 +648,14 @@ macro_rules! impl_certificate_mock {
         {
             type Signature = commonware_utils::sequence::U64;
 
+            fn read_signature(
+                reader: &mut impl commonware_codec::Buf,
+            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
+            {
+                // Fixed-size: defer decoding.
+                commonware_codec::Read::read_cfg(reader, &())
+            }
+
             fn me(&self) -> Option<commonware_utils::Participant> {
                 self.generic.me()
             }

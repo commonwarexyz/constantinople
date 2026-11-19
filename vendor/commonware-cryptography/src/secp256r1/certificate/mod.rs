@@ -484,6 +484,14 @@ macro_rules! impl_certificate_secp256r1 {
         impl<P: $crate::PublicKey> $crate::certificate::Scheme for Scheme<P> {
             type Signature = $crate::secp256r1::standard::Signature;
 
+            fn read_signature(
+                reader: &mut impl commonware_codec::Buf,
+            ) -> Result<commonware_codec::types::lazy::Lazy<Self::Signature>, commonware_codec::Error>
+            {
+                // Fixed-size: defer decoding.
+                commonware_codec::Read::read_cfg(reader, &())
+            }
+
             fn me(&self) -> Option<commonware_utils::Participant> {
                 self.generic.me()
             }

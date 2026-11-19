@@ -72,7 +72,7 @@ use crate::{Digest, PublicKey};
 use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
 use bytes::{BufMut, Bytes};
 use commonware_codec::{
-    Buf, Codec, CodecFixed, EncodeSize, Error as CodecError, Read, ReadExt, Write,
+    Buf, Codec, EncodeSize, Error as CodecError, Read, ReadExt, Write,
     types::lazy::Lazy,
 };
 use commonware_parallel::Strategy;
@@ -126,7 +126,7 @@ impl<S: Scheme> Read for Attestation<S> {
 
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
         let signer = Participant::read(reader)?;
-        let signature = ReadExt::read(reader)?;
+        let signature = S::read_signature(reader)?;
 
         Ok(Self { signer, signature })
     }
@@ -352,7 +352,18 @@ pub trait Verifier: Clone + Debug + Send + Sync + 'static {
 /// provided defaults to take advantage of scheme-specific batching strategies.
 pub trait Scheme: Verifier {
     /// Signature emitted by individual participants.
-    type Signature: Clone + Debug + Eq + Hash + Send + Sync + CodecFixed<Cfg = ()>;
+    ///
+    /// The encoding may be variable-size. A decoder bounds it without a configuration.
+    type Signature: Clone + Debug + Eq + Hash + Send + Sync + Codec<Cfg = ()>;
+
+    /// Reads the signature of an [`Attestation`].
+    ///
+    /// The default decodes the signature immediately, which is the only way to find the end
+    /// of a variable-size encoding. A scheme with a fixed-size signature overrides this to
+    /// defer decoding (and with it any expensive validation) until the signature is used.
+    fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, CodecError> {
+        Self::Signature::read(reader).map(Lazy::new)
+    }
 
     /// Returns the index of "self" in the participant set, if available.
     /// Returns `None` if the scheme is a verifier-only instance.
@@ -1555,6 +1566,10 @@ mod tests {
     #[cfg(feature = "bls12381")]
     impl<S: Scheme> Scheme for Recording<S> {
         type Signature = S::Signature;
+
+        fn read_signature(reader: &mut impl Buf) -> Result<Lazy<Self::Signature>, CodecError> {
+            S::read_signature(reader)
+        }
 
         fn me(&self) -> Option<Participant> {
             self.inner.me()
