@@ -1,16 +1,26 @@
-use crate::{Scheme, block::ApplicationBlock, types::EngineMarshalMailbox};
+use crate::{
+    Scheme,
+    block::ApplicationBlock,
+    types::{EngineCommitment, EngineMarshalMailbox},
+};
 use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
     marshal::{self, Identifier},
     types::Height,
 };
-use commonware_cryptography::{Digestible, Signer, ed25519, sha256::Sha256};
+use commonware_cryptography::{
+    Digestible, Signer, ed25519,
+    sha256::{self, Sha256},
+};
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
 use commonware_runtime::Quota;
 use commonware_utils::{
     Acknowledgement, TryCollect, acknowledgement::Exact, channel::mpsc, ordered::Set, sync::Mutex,
 };
+use constantinople_auth::{Submission, Tags};
+use constantinople_mempool::{Candidate, TransactionSource};
+use constantinople_primitives::{Header, Transaction, TransactionPublicKey};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -99,14 +109,19 @@ impl RestartBarrier {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct TestReporter {
     restart_barrier: Option<RestartBarrier>,
+    /// Checks the outcomes that finalized blocks carry.
+    source: TestSource,
 }
 
 impl TestReporter {
-    pub(crate) const fn new(restart_barrier: Option<RestartBarrier>) -> Self {
-        Self { restart_barrier }
+    pub(crate) const fn new(restart_barrier: Option<RestartBarrier>, source: TestSource) -> Self {
+        Self {
+            restart_barrier,
+            source,
+        }
     }
 }
 
@@ -121,6 +136,7 @@ impl Reporter for TestReporter {
                 }
             }
             marshal::Update::Block(block, response) => {
+                self.source.finalized(Arc::new(block.inner().clone()));
                 if let Some(barrier) = &self.restart_barrier {
                     barrier.acknowledge(block.height().get(), response);
                 } else {
@@ -241,4 +257,201 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
         .collect();
 
     (signers, participants, secrets)
+}
+
+/// How a test transaction is authenticated, and what must become of it.
+///
+/// A transaction's value says which kind it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// Signed. Applied.
+    Signed = 1,
+    /// Tagged by its sender for every validator. Applied.
+    Tagged,
+    /// Tagged by a faulty sender, with wrong tags for four of six validators.
+    /// At most two validators approve it, so it is never applied.
+    Mistagged,
+    /// Listed by a proposer that does not hold the sender's keys, with tags of
+    /// another sender. Never applied.
+    Forged,
+}
+
+pub(crate) const KINDS: [Kind; 4] = [Kind::Signed, Kind::Tagged, Kind::Mistagged, Kind::Forged];
+
+/// Seed of the account that sends the transaction of kind `kind` in the block
+/// validator `validator` proposes at height `height`.
+///
+/// Every transaction has its own account, which starts with the default
+/// balance, so an authentic one always applies.
+const fn account_seed(validator: usize, kind: Kind, height: u64) -> u64 {
+    (height << 16) | ((validator as u64) << 4) | kind as u64
+}
+
+/// The number of transactions whose outcome bit was checked, by [`Kind`],
+/// over all the nodes of a test.
+pub(crate) type Checked = Arc<Mutex<[u64; 5]>>;
+
+/// Proposes one transaction of each [`Kind`] per block and checks the outcome
+/// of each as blocks finalize.
+#[derive(Clone)]
+pub(crate) struct TestSource {
+    /// This node's index among the test's signers.
+    index: usize,
+    /// This node's index among the validators, if it is one.
+    me: Option<commonware_utils::Participant>,
+    /// The validators' X25519 public keys, in participant order.
+    validators: Arc<Vec<constantinople_auth::PublicKey>>,
+    /// The last finalized block, whose transactions the next one executes.
+    last: Arc<Mutex<Option<Arc<TestBlock>>>>,
+    checked: Checked,
+}
+
+impl TestSource {
+    /// `signers` are all the test's nodes, `participants` the validators among
+    /// them, and `secrets` every node's X25519 secret.
+    pub(crate) fn new(
+        index: usize,
+        signers: &[TestPrivateKey],
+        participants: &Set<TestPublicKey>,
+        secrets: &BTreeMap<TestPublicKey, constantinople_auth::PrivateKey>,
+        checked: Checked,
+    ) -> Self {
+        let me = participants
+            .position(&signers[index].public_key())
+            .map(commonware_utils::Participant::from_usize);
+        let validators = participants
+            .iter()
+            .map(|validator| secrets[validator].public_key())
+            .collect();
+        Self {
+            index,
+            me,
+            validators: Arc::new(validators),
+            last: Arc::default(),
+            checked,
+        }
+    }
+
+    /// The authenticator the holder of `secret` computes for a transaction with
+    /// digest `digest` that it submits to this validator.
+    fn authenticator(&self, secret: &constantinople_auth::PrivateKey, digest: &[u8]) -> Tags {
+        let keys: Vec<_> = self
+            .validators
+            .iter()
+            .map(|validator| {
+                secret
+                    .with_validator(TRANSACTION_NAMESPACE, validator)
+                    .expect("test keys are not low order")
+            })
+            .collect();
+        let proposer = self.me.expect("only validators propose");
+        Submission::new(&keys, proposer, (), digest).authenticator
+    }
+
+    /// The transaction of kind `kind` for this validator's block at `height`.
+    fn candidate(&self, kind: Kind, height: u64) -> Candidate<TestHasher> {
+        let seed = account_seed(self.index, kind, height);
+        let recipient =
+            TransactionPublicKey::ed25519(TestPrivateKey::from_seed(u64::MAX).public_key());
+        let value = std::num::NonZeroU64::new(kind as u64).expect("kinds start at one");
+        let hasher = &mut TestHasher::default();
+        if kind == Kind::Signed {
+            let signer = TestPrivateKey::from_seed(seed);
+            let sender = TransactionPublicKey::ed25519(signer.public_key());
+            return Transaction::new(sender, recipient, value, 0)
+                .seal_and_sign(&signer, TRANSACTION_NAMESPACE, hasher)
+                .into();
+        }
+
+        let sender = TransactionPublicKey::x25519(secret(seed).public_key());
+        let transaction = Transaction::new(sender, recipient, value, 0).seal_for_mac(hasher);
+        let digest = *transaction.message_digest();
+        let authenticator = match kind {
+            // The proposer does not hold the sender's secret.
+            Kind::Forged => self.authenticator(&secret(!seed), digest.as_ref()),
+            Kind::Mistagged => {
+                // The sender's tags for another transaction, for the four
+                // validators after the proposer.
+                let right = self.authenticator(&secret(seed), digest.as_ref());
+                let other = self.authenticator(&secret(seed), &[0xff; 32]);
+                let me = usize::from(self.me.expect("only validators propose"));
+                let n = self.validators.len();
+                let wrong: Vec<_> = (1..=4).map(|offset| (me + offset) % n).collect();
+                let mut mixed = Tags::with_capacity(right.bits(), n);
+                mixed.extend((0..n).map(|validator| {
+                    let tags = if wrong.contains(&validator) {
+                        &other
+                    } else {
+                        &right
+                    };
+                    tags.get(validator).expect("one tag per validator")
+                }));
+                mixed
+            }
+            _ => self.authenticator(&secret(seed), digest.as_ref()),
+        };
+        Candidate {
+            transaction,
+            authenticator: Some(authenticator),
+        }
+    }
+
+    /// Records a finalized block and checks the outcome bits it carries for the
+    /// transactions of the block before it.
+    ///
+    /// Blocks arrive in order, but a restart replays some and a state sync
+    /// skips some: only a block that follows the last one is checked.
+    pub(crate) fn finalized(&self, block: Arc<TestBlock>) {
+        let mut last = self.last.lock();
+        let height = block.header.height;
+        match &*last {
+            Some(last) if last.header.height >= height => return,
+            Some(previous) if previous.header.height + 1 == height => {
+                let mut checked = self.checked.lock();
+                assert_eq!(previous.body.len() as u64, block.outcomes.len());
+                for (position, lazy) in previous.body.iter().enumerate() {
+                    let transaction = lazy.get().expect("finalized transactions decode");
+                    let kind = KINDS[transaction.value().value.get() as usize - 1];
+                    let applied = block.outcomes.get(position as u64);
+                    assert_eq!(
+                        applied,
+                        matches!(kind, Kind::Signed | Kind::Tagged),
+                        "{kind:?} transaction of height {}",
+                        previous.header.height
+                    );
+                    checked[kind as usize] += 1;
+                }
+            }
+            _ => {}
+        }
+        *last = Some(block);
+    }
+}
+
+impl TransactionSource<EngineCommitment<TestHasher, TestPublicKey>, TestPublicKey, TestHasher>
+    for TestSource
+{
+    async fn propose(
+        &mut self,
+        parent: &Header<EngineCommitment<TestHasher, TestPublicKey>, sha256::Digest, TestPublicKey>,
+        _round: commonware_consensus::types::Round,
+        _filled: usize,
+    ) -> Vec<Candidate<TestHasher>> {
+        KINDS
+            .iter()
+            .map(|kind| self.candidate(*kind, parent.height + 1))
+            .collect()
+    }
+}
+
+impl Reporter for TestSource {
+    type Activity = marshal::Update<TestBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        if let marshal::Update::Block(block, acknowledgement) = activity {
+            self.finalized(Arc::new(block.inner().clone()));
+            acknowledgement.acknowledge();
+        }
+        Feedback::Ok
+    }
 }

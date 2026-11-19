@@ -11,7 +11,7 @@ use crate::{
 };
 use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
-    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, secret,
+    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, TestSource, ValidatorState, secret,
     validator_fixture,
 };
 use commonware_consensus::{
@@ -44,7 +44,6 @@ use commonware_utils::{
     NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, non_empty, ordered::Set, probability,
     sync::Mutex, union,
 };
-use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::PublicKeyCache;
 use properties::{
     BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
@@ -81,6 +80,8 @@ struct TestEngineDefinition {
     participants: Set<TestPublicKey>,
     /// Each node's X25519 secret.
     secrets: BTreeMap<TestPublicKey, constantinople_auth::PrivateKey>,
+    /// Outcome bits checked by all nodes, by kind of transaction.
+    checked: common::Checked,
     enable_state_sync: bool,
     /// When `true`, every node re-tracks peer set 0 during `init` as
     /// `TrackedPeers::new(primary, secondary)` — primary = the validators,
@@ -105,6 +106,7 @@ impl TestEngineDefinition {
             signers,
             participants,
             secrets,
+            checked: Default::default(),
             enable_state_sync: false,
             use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
@@ -238,6 +240,9 @@ impl EngineDefinition for TestEngineDefinition {
         let public_key = public_key.clone();
         let signer = self.signers[index].clone();
         let secret = self.secrets[&public_key].clone();
+        let signers = self.signers.clone();
+        let secrets = self.secrets.clone();
+        let checked = self.checked.clone();
         let partition_prefix = format!("validator-{index}");
         let validators = self.participants.clone();
         let sync_heights = self.sync_heights.clone();
@@ -333,17 +338,11 @@ impl EngineDefinition for TestEngineDefinition {
                 columns,
             };
 
-            let input = StaticTransactionSource::<
-                EngineCommitment<TestHasher, TestPublicKey>,
-                TestPublicKey,
-                TestHasher,
-            >::new(
-                Vec::<Vec<constantinople_mempool::Candidate<TestHasher>>>::new()
-            );
+            let input = TestSource::new(index, &signers, &validators, &secrets, checked);
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
-                TestReporter::new(restart_barrier.clone()),
+                TestReporter::new(restart_barrier.clone(), input.clone()),
             );
             let allow_state_sync = pending_sync_floor.is_none();
             if let Some(floor) = pending_sync_floor {
@@ -485,6 +484,7 @@ fn delay_first(engine: &TestEngineDefinition, view: u64) -> Crash<TestPublicKey>
 }
 
 fn run_finalize(engine: TestEngineDefinition) {
+    let checked = engine.checked.clone();
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
@@ -492,6 +492,14 @@ fn run_finalize(engine: TestEngineDefinition) {
         .property(BlockAgreementAtHeight::new(100))
         .run()
         .unwrap();
+
+    // Every block carries one transaction of each kind, and every node checks
+    // the outcome of each as the next block finalizes: signed and tagged
+    // transactions are applied, mistagged and forged ones are not.
+    let checked = checked.lock();
+    for kind in common::KINDS {
+        assert!(checked[kind as usize] >= 500, "{kind:?}: {checked:?}");
+    }
 }
 
 fn run_determinism(engine: TestEngineDefinition) {
