@@ -2,7 +2,8 @@
 
 `constantinople-deploy` generates deployment artifacts for local and remote Constantinople clusters.
 
-At least four validators are required for erasure coding. The consensus maximum
+At least six validators are required: consensus tolerates `f` faults among
+`5f + 1` validators. The consensus maximum
 is 16 MiB for a complete encoded block, independent of validator count.
 `--max-propose-bytes` sets the local encoded block budget, including framing.
 It defaults to 8 MiB. Deployment generation and validator startup reject budgets
@@ -50,7 +51,7 @@ Generate a local bundle:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
+  --validators 6 \
   --output-dir ./local \
   --worker-threads 2 \
   --rayon-threads 2 \
@@ -94,7 +95,7 @@ Add `--spammer` to include a spam bot in the `mprocs` command:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
+  --validators 6 \
   --output-dir ./local \
   --relayer \
   --spammer \
@@ -121,7 +122,7 @@ visibly varying throughput stream:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 --indexer --relayer --output-dir ./local \
+  --validators 6 --indexer --relayer --output-dir ./local \
   --spammer --spammer-accounts-jitter 0.25 \
   local
 ```
@@ -146,8 +147,8 @@ You can also run the spammer manually against an existing local cluster:
 ```sh
 PRIMARY_TARGETS=$(yq -r '.validators[].name' ./local/peers.yaml | paste -sd, -)
 cargo run --bin constantinople-spammer -- \
-  --relayer-url http://127.0.0.1:8084 \
-  --relayer-submitters 4 \
+  --relayer-url http://127.0.0.1:8086 \
+  --relayer-submitters 6 \
   --relayer-targets "$PRIMARY_TARGETS" \
   --accounts 10 \
   --value 1 \
@@ -161,7 +162,7 @@ Add `--relayer` to include a transaction relayer secondary:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
+  --validators 6 \
   --relayer \
   --output-dir ./local \
   local \
@@ -182,6 +183,11 @@ This spends additional verification and
 tracking work to reach upcoming leaders promptly. The public relayer is intended
 for interactive traffic and has no global limit on outstanding forwarding tasks.
 
+By default the spammer's accounts sign their transactions. With `--spammer-mode macs`
+they share a key with every validator instead and send tags, and the generated command
+adds `--mode macs --tag-keys <primary-tag-keys>`. Everything else is the same in both
+modes, so the two can be compared.
+
 When `--spammer` is set, the generated spammer command uses `--relayer-url`,
 `--relayer-submitters <validators>`, and `--relayer-targets <primary-keys>`.
 Each relayed submitter pins an exact primary validator target and uses its
@@ -201,7 +207,7 @@ the React explorer dev server alongside the validators:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
+  --validators 6 \
   --indexer \
   --relayer \
   --output-dir ./local \
@@ -216,7 +222,7 @@ relayer is `secondary-1`.
 
 The printed `mprocs` command list grows by four entries:
 
-- `cargo run --release -p constantinople-indexer --features chain-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
+- `cargo run --release -p constantinople-indexer --features chain-indexer --bin chain-indexer -- --port 8090 --metrics-port 9099 --data-dir ./local/chain-indexer`
   runs the simulator-backed shared store. `--chain-indexer-port` overrides the Store port.
   The metrics port follows the validator, secondary, and spammer metrics range
   starting at `--base-metrics-port`. Direct invocations accept `--metrics-port`,
@@ -260,7 +266,7 @@ npm --prefix explorer install
 
 # 2. generate the bundle and run the printed mprocs command
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 --indexer --relayer \
+  --validators 6 --indexer --relayer \
   --output-dir ./local \
   --spammer \
   local
@@ -467,7 +473,7 @@ The generated bundle now also includes:
 - `chain-indexer.yaml` — deployer config for the shared store instance.
 - `metadata-indexer.yaml` — deployer config for the metadata query/stream service.
 - `qmdb-indexer.yaml` — deployer config for the QMDB query facade.
-- `simplex-verification-material.hex` — explorer verification material derived from DKG output.
+- `simplex-verification-material.hex` — explorer verification material: the primary validators' public keys.
 - three extra deployer instances in `config.yaml`: `chain-indexer`, `metadata-indexer`, and
   `qmdb-indexer`.
 
@@ -655,8 +661,8 @@ npm --prefix explorer run dev
 ## Secondary Validators
 
 Secondary validators join the P2P network and observe consensus, but do **not** participate in
-consensus. They receive an ed25519 identity during setup but **no DKG share**, so they cannot sign
-consensus messages. They are registered through the `p2p::discovery` secondary peer set, which
+consensus. They receive an ed25519 identity during setup but are not in the validator list, so their
+consensus messages count for nothing. They are registered through the `p2p::discovery` secondary peer set, which
 every node (primary and secondary) tracks identically.
 
 Secondaries do **not** run the mempool HTTP webserver — since they cannot propose blocks, they
@@ -667,7 +673,7 @@ either local or remote bundles:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
+  --validators 6 \
   --indexer \
   --relayer \
   --output-dir ./local \
@@ -699,8 +705,8 @@ Notes:
 - Every node in the deployment (primary and secondary) must agree on the full primary+secondary
   set. The deploy tool emits identical lists into every YAML to guarantee this. Editing one
   config in isolation will break `discovery`.
-- The DKG polynomial is sized to the primary count only — adding secondaries does not change
-  consensus quorum thresholds.
+- Quorums are sized to the primary count only — adding secondaries does not change them. A
+  deployment needs at least 6 primaries: consensus tolerates `f` faults among `5f + 1`.
 
 ## Runtime Interfaces
 

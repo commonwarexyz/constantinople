@@ -29,7 +29,7 @@ Constantinople is a high-throughput account-model blockchain example built on to
 
 | Primitive                                                                                                    | Role                                                     |
 |--------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|
-| [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (simplex) | Single-epoch BFT consensus with BLS threshold signatures |
+| [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (simplex) | Single-epoch BFT consensus with ed25519 votes             |
 | [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (marshal) | Erasure-coded broadcast and backfill of finalized blocks |
 | [`commonware-storage`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-storage) (QMDB)        | Merkleized key-value database for state and transactions |
 | [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful)          | Speculative state management and sync                    |
