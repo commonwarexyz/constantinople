@@ -67,6 +67,15 @@ test('transaction status responses parse every relayer outcome', () => {
         },
     );
     assert.deepEqual(parseTxStatus({ status: 'dropped' }), { status: 'dropped' });
+    assert.deepEqual(parseTxStatus({ status: 'rejected', height: 9 }), {
+        status: 'rejected',
+        height: 9,
+    });
+    assert.deepEqual(singleTransactionOutcome({ status: 'rejected', height: 9 }), {
+        kind: 'rejected',
+        height: 9,
+    });
+    assert.throws(() => parseTxStatus({ status: 'rejected' }));
 });
 
 test('invalid transaction status responses remain ambiguous', () => {

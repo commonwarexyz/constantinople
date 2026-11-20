@@ -1764,6 +1764,7 @@ dependencies = [
  "commonware-parallel",
  "commonware-runtime",
  "commonware-utils",
+ "constantinople-auth",
  "constantinople-mempool",
  "constantinople-primitives",
  "mimalloc",

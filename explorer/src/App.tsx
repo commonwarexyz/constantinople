@@ -1139,6 +1139,12 @@ export default function App() {
                     'validator reported transaction dropped before finalization',
                 );
             }
+            if (outcome.kind === 'rejected') {
+                throw new TransactionSubmissionError(
+                    'rejected',
+                    `transaction was finalized in block ${outcome.height} but not applied`,
+                );
+            }
             if (outcome.kind === 'ambiguous') {
                 throw new TransactionSubmissionError('ambiguous', outcome.detail);
             }

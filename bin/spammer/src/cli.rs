@@ -38,6 +38,17 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub relayer_targets: Vec<String>,
 
+    /// How transactions are authenticated: by signatures, or by tags under
+    /// keys shared with the validators.
+    #[arg(long, value_enum, default_value_t = crate::config::Mode::Signatures)]
+    pub mode: crate::config::Mode,
+
+    /// Hex-encoded X25519 keys of the primary validators, in the order of
+    /// `--relayer-targets`. Required with `--mode macs`, where
+    /// `--relayer-targets` must list every primary validator.
+    #[arg(long, value_delimiter = ',')]
+    pub tag_keys: Vec<String>,
+
     /// Number of spam accounts per relayer submitter.
     #[arg(long, default_value_t = 10)]
     pub accounts: u32,
@@ -152,6 +163,33 @@ mod tests {
         .expect("relayer invocation should parse");
 
         assert_eq!(cli.relayer_targets, vec!["aa", "bb"]);
+    }
+
+    #[test]
+    fn parses_mode_and_tag_keys() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+        ])
+        .expect("relayer invocation should parse");
+        assert_eq!(cli.mode, crate::config::Mode::Signatures);
+        assert!(cli.tag_keys.is_empty());
+
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--mode",
+            "macs",
+            "--relayer-targets",
+            "aa,bb",
+            "--tag-keys",
+            "cc,dd",
+        ])
+        .expect("relayer invocation should parse");
+        assert_eq!(cli.mode, crate::config::Mode::Macs);
+        assert_eq!(cli.tag_keys, vec!["cc", "dd"]);
     }
 
     #[test]

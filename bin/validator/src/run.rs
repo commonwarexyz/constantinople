@@ -36,7 +36,9 @@ use commonware_stream::{
     sake::{self, Sake},
 };
 use commonware_utils::{
-    NZDuration, NZU32, NZU64, NZUsize, Probability, TryCollect, ordered::Set, union,
+    NZDuration, NZU32, NZU64, NZUsize, Probability, TryCollect,
+    ordered::{Quorum as _, Set},
+    union,
 };
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, COLUMN_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
@@ -59,6 +61,8 @@ use std::{
 use tracing::info;
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
+/// Senders of tagged transactions whose shared key the mempool keeps.
+const SUBMISSION_KEY_CACHE_SIZE: NonZeroUsize = NZUsize!(1 << 16);
 
 const STATE_SYNC_APPLY_BATCH_SIZE: NonZeroU64 = NZU64!(1024);
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
@@ -332,6 +336,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 drop_grace_blocks: mempool_drop_grace_blocks,
                 strategy: strategy.clone(),
                 public_key_cache: public_key_cache.clone(),
+                admission: participants.index(&decoded.public_key).map(|validator| {
+                    webserver::Admission {
+                        validator,
+                        validators: participants.len() as u32,
+                        secret: decoded.tag_secret.clone(),
+                        key_cache_size: SUBMISSION_KEY_CACHE_SIZE,
+                    }
+                }),
             },
             mempool_mailbox.clone(),
             mempool_receiver,
@@ -354,6 +366,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             Box::pin(crate::relayer::serve(crate::relayer::ServerConfig {
                 listen: http_listen,
                 relayer: relayer_config,
+                participants: participants.iter().map(|key| hex(&key.encode())).collect(),
                 account_reader: account_reader.clone(),
                 view_clock,
                 strategy: strategy.clone(),

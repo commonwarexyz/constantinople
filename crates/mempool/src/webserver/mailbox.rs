@@ -35,12 +35,12 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    /// A batch of verified transactions submitted by an HTTP handler.
+    /// A batch of admitted transactions submitted by an HTTP handler.
     Submit {
         lane: SubmissionLane,
         batch_id: String,
         digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<H>>,
+        transactions: Vec<Candidate<H>>,
         result: Option<oneshot::Sender<TxStatus>>,
         ingest_result: Option<oneshot::Sender<IngestStatus>>,
     },
@@ -55,7 +55,7 @@ where
     Propose {
         height: u64,
         filled: usize,
-        response: oneshot::Sender<Vec<VerifiedTransaction<H>>>,
+        response: oneshot::Sender<Vec<Candidate<H>>>,
     },
     /// Consensus reports a finalized or tip block.
     Report(Update<SealedBlock<C, P, H>>),
@@ -115,6 +115,7 @@ where
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
     ) -> Option<oneshot::Receiver<TxStatus>> {
+        let transactions = transactions.into_iter().map(Candidate::from).collect();
         self.try_submit_in_lane(SubmissionLane::Foreground, batch_id, digests, transactions)
     }
 
@@ -123,7 +124,7 @@ where
         lane: SubmissionLane,
         batch_id: String,
         digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<H>>,
+        transactions: Vec<Candidate<H>>,
     ) -> Option<oneshot::Receiver<TxStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
@@ -147,7 +148,7 @@ where
         &self,
         batch_id: String,
         digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<H>>,
+        transactions: Vec<Candidate<H>>,
     ) -> Option<oneshot::Receiver<IngestStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
@@ -196,9 +197,6 @@ where
             })
             .await
             .expect("mempool actor mailbox closed")
-            .into_iter()
-            .map(Candidate::from)
-            .collect()
     }
 }
 

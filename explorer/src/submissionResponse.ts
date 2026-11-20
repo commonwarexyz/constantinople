@@ -6,12 +6,16 @@ export type TxStatus =
           readonly included: number;
           readonly filtered: number;
       }
+    // A finalized block lists the batch and none of it was applied.
+    | { readonly status: 'rejected'; readonly height: number }
     | { readonly status: 'dropped' };
 
 export type SubmissionResult = TxStatus | { readonly status: 'pending' };
 
 export type SingleTransactionOutcome =
     | { readonly kind: 'finalized'; readonly height: number }
+    // Finalized in the block at `height`, and not applied.
+    | { readonly kind: 'rejected'; readonly height: number }
     | { readonly kind: 'dropped' }
     | { readonly kind: 'ambiguous'; readonly detail: string };
 
@@ -47,6 +51,9 @@ export function parseTxStatus(value: unknown): TxStatus {
     if (status.status === 'finalized' && isUnsignedSafeInteger(status.height)) {
         return { status: 'finalized', height: status.height };
     }
+    if (status.status === 'rejected' && isUnsignedSafeInteger(status.height)) {
+        return { status: 'rejected', height: status.height };
+    }
     if (
         status.status === 'partially_finalized' &&
         isUnsignedSafeInteger(status.height) &&
@@ -68,6 +75,7 @@ export function singleTransactionOutcome(status: TxStatus): SingleTransactionOut
     if (status.status === 'finalized') {
         return { kind: 'finalized', height: status.height };
     }
+    if (status.status === 'rejected') return { kind: 'rejected', height: status.height };
     if (status.status === 'dropped') return { kind: 'dropped' };
     if (status.included === 1 && status.filtered === 0) {
         return { kind: 'finalized', height: status.height };

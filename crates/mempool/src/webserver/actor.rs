@@ -5,9 +5,10 @@
 //! consensus layer via the [`Mailbox`].
 
 use super::{
-    AccountReader, ActorReceiver, Mailbox, http,
+    AccountReader, ActorReceiver, Admission, Mailbox, http,
     mailbox::{Message, SubmissionLane},
 };
+use crate::Candidate;
 use ahash::{AHashMap, AHashSet};
 use commonware_codec::EncodeSize;
 use commonware_consensus::marshal::Update;
@@ -15,7 +16,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
-use constantinople_primitives::{PublicKeyCache, VerifiedTransaction};
+use constantinople_primitives::{Outcomes, PublicKeyCache};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -27,6 +28,13 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::warn;
 
 const MAX_STATUS_ENTRIES: usize = 1_000_000;
+
+/// Number of times a transaction authenticated by tags returns to the pool
+/// after a proposal that carried it did not reach a finalized block.
+///
+/// Its tags are of use to this validator only, so its sender cannot hand it to
+/// another one the way a relayer does with a signed transaction.
+const MAX_TAGGED_RETURNS: u8 = 3;
 
 /// Shared cell that lets the mempool answer account lookups once the
 /// validator's state database is attached. The cell is populated after engine
@@ -40,15 +48,22 @@ pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxStatus {
-    /// The batch's block was finalized.
+    /// Every transaction of the batch was finalized and applied. `height` is
+    /// the block that lists the last of them.
     Finalized { height: u64 },
-    /// The batch's block was finalized, but some transactions were filtered.
+    /// Some transactions of the batch were finalized and applied. The others
+    /// were filtered: they were not applied, or never reached a finalized
+    /// block.
     PartiallyFinalized {
         height: u64,
         included: u64,
         filtered: u64,
     },
-    /// The batch was proposed but its block was not finalized.
+    /// No transaction of the batch was applied, and the finalized block at
+    /// `height` lists at least one of them: too few validators approved its
+    /// tags, or it could not apply.
+    Rejected { height: u64 },
+    /// No transaction of the batch reached a finalized block.
     Dropped,
 }
 
@@ -63,15 +78,19 @@ pub enum TxStatus {
 pub enum BatchStatus {
     /// The batch is accepted by this validator but has not resolved yet.
     Accepted,
-    /// The batch's block was finalized.
+    /// Every transaction of the batch was finalized and applied.
     Finalized { height: u64 },
-    /// The batch's block was finalized, but some transactions were filtered.
+    /// Some transactions of the batch were finalized and applied, the others
+    /// were filtered.
     PartiallyFinalized {
         height: u64,
         included: Vec<String>,
         filtered: Vec<String>,
     },
-    /// The batch was proposed but its block was not finalized.
+    /// No transaction of the batch was applied, and a finalized block lists at
+    /// least one of them.
+    Rejected { height: u64 },
+    /// No transaction of the batch reached a finalized block.
     Dropped,
 }
 
@@ -89,6 +108,9 @@ pub(super) enum StoredBatchStatus<D> {
         height: u64,
         included: Vec<D>,
         filtered: Vec<D>,
+    },
+    Rejected {
+        height: u64,
     },
     Dropped,
 }
@@ -108,6 +130,7 @@ impl<D: Display> StoredBatchStatus<D> {
                 included: included.iter().map(ToString::to_string).collect(),
                 filtered: filtered.iter().map(ToString::to_string).collect(),
             },
+            Self::Rejected { height } => BatchStatus::Rejected { height: *height },
             Self::Dropped => BatchStatus::Dropped,
         }
     }
@@ -142,11 +165,14 @@ pub struct Config<St: Strategy> {
     pub strategy: St,
     /// Shared cache of decompressed transaction public keys.
     pub public_key_cache: PublicKeyCache,
+    /// What this validator needs to admit transactions authenticated by tags.
+    /// Without it, the validator admits signed transactions only.
+    pub admission: Option<Admission>,
 }
 
 /// A batch of transactions waiting in the pool.
 struct PoolEntry<H: Hasher> {
-    transactions: Vec<VerifiedTransaction<H>>,
+    transactions: Vec<Candidate<H>>,
     total_bytes: usize,
 }
 
@@ -172,8 +198,20 @@ struct ProposedBatch<D> {
 
 #[derive(Clone, Copy)]
 enum DigestOutcome {
+    /// Listed in the finalized block at `height` and applied.
     Finalized { height: u64 },
+    /// Listed in the finalized block at `height` and not applied.
+    Rejected { height: u64 },
+    /// Not listed in a finalized block.
     Dropped,
+}
+
+/// A proposed transaction authenticated by tags, kept until its outcome is
+/// known in case it has to return to the pool.
+struct Tagged<H: Hasher> {
+    candidate: Candidate<H>,
+    /// Times the transaction returned to the pool.
+    returns: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,9 +223,9 @@ pub(super) enum IngestStatus {
 const fn ingest_status_from_batch<D>(status: &StoredBatchStatus<D>) -> IngestStatus {
     match status {
         StoredBatchStatus::Accepted | StoredBatchStatus::Finalized { .. } => IngestStatus::Accepted,
-        StoredBatchStatus::PartiallyFinalized { .. } | StoredBatchStatus::Dropped => {
-            IngestStatus::Dropped
-        }
+        StoredBatchStatus::PartiallyFinalized { .. }
+        | StoredBatchStatus::Rejected { .. }
+        | StoredBatchStatus::Dropped => IngestStatus::Dropped,
     }
 }
 
@@ -236,6 +274,7 @@ where
     let mut included = Vec::new();
     let mut filtered = Vec::new();
     let mut finalized_height = 0;
+    let mut rejected_height = None;
 
     for digest in digests {
         match outcomes.get(digest) {
@@ -243,13 +282,21 @@ where
                 finalized_height = finalized_height.max(*height);
                 included.push(*digest);
             }
+            Some(DigestOutcome::Rejected { height }) => {
+                rejected_height = rejected_height.max(Some(*height));
+                filtered.push(*digest);
+            }
             Some(DigestOutcome::Dropped) => filtered.push(*digest),
             None => return None,
         }
     }
 
     if included.is_empty() {
-        return Some(StoredBatchStatus::Dropped);
+        return Some(
+            rejected_height.map_or(StoredBatchStatus::Dropped, |height| {
+                StoredBatchStatus::Rejected { height }
+            }),
+        );
     }
 
     if filtered.is_empty() {
@@ -278,6 +325,7 @@ const fn tx_status_from_batch<D>(status: &StoredBatchStatus<D>) -> Option<TxStat
             included: included.len() as u64,
             filtered: filtered.len() as u64,
         }),
+        StoredBatchStatus::Rejected { height } => Some(TxStatus::Rejected { height: *height }),
         StoredBatchStatus::Dropped => Some(TxStatus::Dropped),
     }
 }
@@ -413,7 +461,7 @@ fn pop_lane_proposal<H>(
     height: u64,
     filled: usize,
     max_propose_bytes: usize,
-) -> (Vec<VerifiedTransaction<H>>, usize)
+) -> (Vec<Candidate<H>>, usize)
 where
     H: Hasher,
 {
@@ -429,8 +477,8 @@ where
         pool.bytes -= entry.total_bytes;
         batch_bytes += entry.total_bytes;
         let mut digests = Vec::with_capacity(entry.transactions.len());
-        for tx in &entry.transactions {
-            digests.push(*tx.message_digest());
+        for candidate in &entry.transactions {
+            digests.push(*candidate.transaction.message_digest());
         }
         proposed.push_back(ProposedBatch { height, digests });
         batch_txs.extend(entry.transactions);
@@ -445,7 +493,7 @@ fn pop_proposal<H>(
     height: u64,
     filled: usize,
     max_propose_bytes: usize,
-) -> Vec<VerifiedTransaction<H>>
+) -> Vec<Candidate<H>>
 where
     H: Hasher,
 {
@@ -462,38 +510,49 @@ where
     transactions
 }
 
-/// Applies one finalized block's digest set to the outstanding proposed
-/// batches, recording per-digest outcomes and pruning `known_digests`.
+/// Applies the outcomes of one finalized block's transactions to the
+/// outstanding proposed batches, recording per-digest outcomes and pruning
+/// `known_digests`.
+///
+/// `height` is the block that lists the transactions. `applied` holds those
+/// that were applied and `rejected` those that were not: both are final.
 ///
 /// A partial match does not prove the unmatched digests are dead: a
 /// speculative reuse can split one selection across two finalized blocks (the
 /// filtered digests land in the parent, the remainder in the next block this
-/// node proposes). Matched digests finalize immediately; the remainder stays
-/// outstanding until its own block is reported or the grace window expires.
+/// node proposes). The remainder stays outstanding until its own block is
+/// reported or the grace window expires.
+///
+/// A digest that expires is dropped, unless `returns` says it goes back to the
+/// pool: it then keeps its place in `known_digests` and gets no outcome.
 ///
 /// Returns the batch ids whose digests gained outcomes, for terminal-status
-/// resolution by the caller.
+/// resolution by the caller, and the digests that go back to the pool.
+#[allow(clippy::too_many_arguments)]
 fn resolve_proposed_batches<D>(
     proposed: &mut VecDeque<ProposedBatch<D>>,
-    finalized: &AHashSet<D>,
+    applied: &AHashSet<D>,
+    rejected: &AHashSet<D>,
     height: u64,
     drop_grace_blocks: u64,
     known_digests: &mut AHashSet<D>,
     digest_outcomes: &mut AHashMap<D, DigestOutcome>,
     digest_watchers: &AHashMap<D, Vec<Arc<str>>>,
-) -> AHashSet<Arc<str>>
+    returns: impl Fn(&D) -> bool,
+) -> (AHashSet<Arc<str>>, Vec<D>)
 where
     D: Copy + Eq + Hash,
 {
     let mut affected: AHashSet<Arc<str>> = AHashSet::new();
+    let mut returned = Vec::new();
     let mut remaining = VecDeque::new();
     for batch in proposed.drain(..) {
         let expired = height >= batch.height + drop_grace_blocks;
-        let any_finalized = batch
+        let any_listed = batch
             .digests
             .iter()
-            .any(|digest| finalized.contains(digest));
-        if !any_finalized && !expired {
+            .any(|digest| applied.contains(digest) || rejected.contains(digest));
+        if !any_listed && !expired {
             remaining.push_back(batch);
             continue;
         }
@@ -501,15 +560,21 @@ where
         affected.extend(watched_batches_for(&batch.digests, digest_watchers));
         let mut outstanding = Vec::new();
         for digest in &batch.digests {
-            if finalized.contains(digest) {
-                digest_outcomes.insert(*digest, DigestOutcome::Finalized { height });
-                known_digests.remove(digest);
-            } else if expired {
-                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
-                known_digests.remove(digest);
-            } else {
+            let outcome = if applied.contains(digest) {
+                DigestOutcome::Finalized { height }
+            } else if rejected.contains(digest) {
+                DigestOutcome::Rejected { height }
+            } else if !expired {
                 outstanding.push(*digest);
-            }
+                continue;
+            } else if returns(digest) {
+                returned.push(*digest);
+                continue;
+            } else {
+                DigestOutcome::Dropped
+            };
+            digest_outcomes.insert(*digest, outcome);
+            known_digests.remove(digest);
         }
         if !outstanding.is_empty() {
             remaining.push_back(ProposedBatch {
@@ -519,7 +584,37 @@ where
         }
     }
     *proposed = remaining;
-    affected
+    (affected, returned)
+}
+
+/// Splits the transactions of the last finalized block into those the block at
+/// `height` reports as applied and those it reports as not applied.
+///
+/// `included` holds the last block's height and its transactions' digests in
+/// block order. Both sets are empty if the two blocks are not consecutive.
+fn executed<D>(
+    included: Option<(u64, Vec<D>)>,
+    height: u64,
+    outcomes: &Outcomes,
+) -> (AHashSet<D>, AHashSet<D>)
+where
+    D: Copy + Eq + Hash,
+{
+    let mut applied = AHashSet::new();
+    let mut rejected = AHashSet::new();
+    if let Some((parent, listed)) = included
+        && parent + 1 == height
+        && listed.len() as u64 == outcomes.len()
+    {
+        for (position, digest) in listed.into_iter().enumerate() {
+            if outcomes.get(position as u64) {
+                applied.insert(digest);
+            } else {
+                rejected.insert(digest);
+            }
+        }
+    }
+    (applied, rejected)
 }
 
 fn resolve_batch_if_terminal<D>(
@@ -561,16 +656,16 @@ fn resolve_batch_if_terminal<D>(
 }
 
 fn new_transactions<H>(
-    transactions: Vec<VerifiedTransaction<H>>,
+    transactions: Vec<Candidate<H>>,
     known_digests: &mut AHashSet<H::Digest>,
-) -> Vec<VerifiedTransaction<H>>
+) -> Vec<Candidate<H>>
 where
     H: Hasher,
     H::Digest: Copy + Eq + Hash,
 {
     let mut accepted = Vec::with_capacity(transactions.len());
     for transaction in transactions {
-        if !known_digests.insert(*transaction.message_digest()) {
+        if !known_digests.insert(*transaction.transaction.message_digest()) {
             continue;
         }
         accepted.push(transaction);
@@ -578,23 +673,24 @@ where
     accepted
 }
 
-fn remove_known_digests<H>(
-    transactions: &[VerifiedTransaction<H>],
-    known_digests: &mut AHashSet<H::Digest>,
-) where
+fn remove_known_digests<H>(transactions: &[Candidate<H>], known_digests: &mut AHashSet<H::Digest>)
+where
     H: Hasher,
     H::Digest: Eq + Hash,
 {
     for transaction in transactions {
-        known_digests.remove(transaction.message_digest());
+        known_digests.remove(transaction.transaction.message_digest());
     }
 }
 
-fn total_bytes_for<H>(transactions: &[VerifiedTransaction<H>]) -> usize
+fn total_bytes_for<H>(transactions: &[Candidate<H>]) -> usize
 where
     H: Hasher,
 {
-    transactions.iter().map(EncodeSize::encode_size).sum()
+    transactions
+        .iter()
+        .map(|candidate| candidate.transaction.encode_size())
+        .sum()
 }
 
 fn can_admit_submission(
@@ -651,6 +747,7 @@ where
     drop_grace_blocks: u64,
     strategy: St,
     public_key_cache: PublicKeyCache,
+    admission: Option<Admission>,
     account_reader: AccountReaderCell,
 }
 
@@ -693,6 +790,7 @@ where
             drop_grace_blocks: config.drop_grace_blocks,
             strategy: config.strategy,
             public_key_cache: config.public_key_cache,
+            admission: config.admission,
             account_reader,
         }
     }
@@ -716,6 +814,7 @@ where
             drop_grace_blocks,
             strategy,
             public_key_cache,
+            admission,
             account_reader,
         } = self;
 
@@ -725,6 +824,7 @@ where
             max_batch_bytes: max_propose_bytes,
             strategy: strategy.clone(),
             public_key_cache,
+            admission: admission.map(http::Admitter::new),
             account_reader,
             ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
         });
@@ -742,6 +842,13 @@ where
         let mut pending_waiters: AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>> =
             AHashMap::new();
         let mut known_digests: AHashSet<H::Digest> = AHashSet::new();
+        // Height and transaction digests of the last finalized block, kept
+        // while this node has proposals outstanding: the next block says which
+        // of them were applied.
+        let mut included: Option<(u64, Vec<H::Digest>)> = None;
+        // The proposed transactions authenticated by tags whose outcome is
+        // not known yet.
+        let mut tagged: AHashMap<H::Digest, Tagged<H>> = AHashMap::new();
 
         while let Some(message) = rx.recv().await {
             match message {
@@ -843,6 +950,16 @@ where
                         filled,
                         max_propose_bytes,
                     );
+                    for candidate in &batch_txs {
+                        if candidate.authenticator.is_some() {
+                            tagged
+                                .entry(*candidate.transaction.message_digest())
+                                .or_insert_with(|| Tagged {
+                                    candidate: candidate.clone(),
+                                    returns: 0,
+                                });
+                        }
+                    }
                     response.send_lossy(batch_txs);
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
@@ -851,6 +968,7 @@ where
                     // the full-body decode is skipped otherwise. Adaptive
                     // scheduling may release a small block inline.
                     if proposed.is_empty() {
+                        included = None;
                         let work_size = block.inner().body.len();
                         drop(strategy.spawn(work_size, move |_: St| drop(block)));
                         acknowledgement.acknowledge();
@@ -860,30 +978,64 @@ where
                     let height = block.inner().header.height;
                     let work_size = block.inner().body.len();
 
-                    // Deriving the finalized set decodes any transaction the
+                    // Deriving the digests decodes any transaction the
                     // application has not already materialized. The strategy
                     // schedules that work and block release together, but may
                     // run small jobs inline.
-                    let finalized: AHashSet<H::Digest> = strategy
+                    let (digests, outcomes): (Vec<H::Digest>, _) = strategy
                         .spawn(work_size, move |_: St| {
-                            block
-                                .inner()
+                            let block = block.inner();
+                            let digests = block
                                 .body
                                 .iter()
                                 .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
-                                .collect()
+                                .collect();
+                            (digests, block.outcomes.clone())
                         })
                         .await;
 
-                    let affected = resolve_proposed_batches(
+                    // A block's transactions execute with the next block, which
+                    // carries one outcome bit for each. Only then is the fate
+                    // of a listed transaction known: applied, or not (too few
+                    // validators approved its tags, or it could not apply).
+                    let (applied, rejected) = executed(included.take(), height, &outcomes);
+                    included = Some((height, digests));
+
+                    let (affected, returned) = resolve_proposed_batches(
                         &mut proposed,
-                        &finalized,
-                        height,
+                        &applied,
+                        &rejected,
+                        height.saturating_sub(1),
                         drop_grace_blocks,
                         &mut known_digests,
                         &mut digest_outcomes,
                         &digest_watchers,
+                        |digest| {
+                            tagged
+                                .get(digest)
+                                .is_some_and(|tagged| tagged.returns < MAX_TAGGED_RETURNS)
+                        },
                     );
+
+                    // A transaction authenticated by tags that was proposed
+                    // and reached no finalized block goes back to the head of
+                    // the pool, each as its own entry so that it fits wherever
+                    // it fitted before.
+                    for digest in returned.into_iter().rev() {
+                        let Some(tagged) = tagged.get_mut(&digest) else {
+                            continue;
+                        };
+                        tagged.returns += 1;
+                        let transactions = vec![tagged.candidate.clone()];
+                        let total_bytes = total_bytes_for(&transactions);
+                        foreground_pool.bytes += total_bytes;
+                        foreground_pool.entries.push_front(PoolEntry {
+                            transactions,
+                            total_bytes,
+                        });
+                    }
+                    tagged.retain(|digest, _| known_digests.contains(digest));
+
                     for batch_id in affected {
                         resolve_batch_if_terminal(
                             &batch_id,
@@ -910,9 +1062,9 @@ mod tests {
     use super::{
         Actor, ActorReceiver, Config, DigestOutcome, IngestStatus, Mailbox, Message, PoolEntry,
         PoolLane, ProposedBatch, StoredBatchStatus, SubmissionLane, TxStatus,
-        batch_status_from_outcomes, can_admit_submission, ingest_status_from_batch,
+        batch_status_from_outcomes, can_admit_submission, executed, ingest_status_from_batch,
         new_transactions, pop_lane_proposal, pop_proposal, resolve_proposed_batches,
-        status_for_finalized_block, total_bytes_for,
+        status_for_finalized_block, total_bytes_for, tx_status_from_batch,
     };
     use ahash::{AHashMap, AHashSet};
     use commonware_cryptography::{Signer, ed25519, sha256};
@@ -921,7 +1073,7 @@ mod tests {
     use commonware_runtime::{Runner as _, Supervisor as _};
     use commonware_utils::NZUsize;
     use constantinople_primitives::{
-        PublicKeyCache, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+        Outcomes, PublicKeyCache, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
@@ -947,6 +1099,7 @@ mod tests {
                     context.child("public_key_cache"),
                     NZUsize!(16),
                 ),
+                admission: None,
             };
 
             let _actor = Actor::new(
@@ -1035,7 +1188,7 @@ mod tests {
         let duplicate = transaction.clone();
         let mut known: AHashSet<_> = AHashSet::new();
 
-        let accepted = new_transactions(vec![transaction, duplicate], &mut known);
+        let accepted = new_transactions(vec![transaction.into(), duplicate.into()], &mut known);
 
         assert_eq!(accepted.len(), 1);
         assert_eq!(known.len(), 1);
@@ -1102,11 +1255,13 @@ mod tests {
         resolve_proposed_batches(
             &mut proposed,
             &parent_body,
+            &AHashSet::new(),
             2,
             10,
             &mut known,
             &mut outcomes,
             &watchers,
+            |_| false,
         );
         assert_eq!(proposed.len(), 1, "remainder must stay outstanding");
         assert_eq!(proposed[0].digests, vec![reused]);
@@ -1121,11 +1276,13 @@ mod tests {
         resolve_proposed_batches(
             &mut proposed,
             &reuse_body,
+            &AHashSet::new(),
             3,
             10,
             &mut known,
             &mut outcomes,
             &watchers,
+            |_| false,
         );
         assert!(proposed.is_empty());
         assert!(known.is_empty());
@@ -1154,11 +1311,13 @@ mod tests {
         resolve_proposed_batches(
             &mut proposed,
             &first_body,
+            &AHashSet::new(),
             2,
             3,
             &mut known,
             &mut outcomes,
             &watchers,
+            |_| false,
         );
         assert_eq!(proposed.len(), 1);
 
@@ -1167,11 +1326,13 @@ mod tests {
         resolve_proposed_batches(
             &mut proposed,
             &empty_body,
+            &AHashSet::new(),
             5,
             3,
             &mut known,
             &mut outcomes,
             &watchers,
+            |_| false,
         );
         assert!(proposed.is_empty());
         assert_eq!(
@@ -1204,11 +1365,13 @@ mod tests {
         resolve_proposed_batches(
             &mut proposed,
             &body,
+            &AHashSet::new(),
             2,
             10,
             &mut known,
             &mut outcomes,
             &AHashMap::new(),
+            |_| false,
         );
         assert!(proposed.is_empty());
         assert_eq!(
@@ -1227,25 +1390,145 @@ mod tests {
         resolve_proposed_batches(
             &mut proposed,
             &AHashSet::new(),
+            &AHashSet::new(),
             3,
             3,
             &mut known,
             &mut outcomes,
             &AHashMap::new(),
+            |_| false,
         );
         assert_eq!(proposed.len(), 1, "still within grace");
         resolve_proposed_batches(
             &mut proposed,
+            &AHashSet::new(),
             &AHashSet::new(),
             5,
             3,
             &mut known,
             &mut outcomes,
             &AHashMap::new(),
+            |_| false,
         );
         assert!(proposed.is_empty());
         assert_eq!(
             batch_status_from_outcomes(&[c], &outcomes),
+            Some(StoredBatchStatus::Dropped),
+        );
+    }
+
+    #[test]
+    fn outcome_bits_split_the_last_block_into_applied_and_rejected() {
+        let mut rng = StdRng::from_seed([29; 32]);
+        let digests: Vec<_> = (0..3).map(|_| sha256::Digest::random(&mut rng)).collect();
+        let mut outcomes = Outcomes::zeroes(3);
+        outcomes.set(0, true);
+        outcomes.set(2, true);
+
+        let (applied, rejected) = executed(Some((4, digests.clone())), 5, &outcomes);
+        assert_eq!(applied, [digests[0], digests[2]].into_iter().collect());
+        assert_eq!(rejected, [digests[1]].into_iter().collect());
+
+        // Outcome bits say nothing about a block that is not the parent, or
+        // that this node did not see.
+        for included in [
+            None,
+            Some((3, digests.clone())),
+            Some((4, digests[..2].to_vec())),
+        ] {
+            let (applied, rejected) = executed(included, 5, &outcomes);
+            assert!(applied.is_empty() && rejected.is_empty());
+        }
+    }
+
+    /// A transaction that a finalized block lists gets its outcome with the
+    /// next block, without waiting for the grace window.
+    #[test]
+    fn a_listed_transaction_resolves_as_applied_or_rejected() {
+        let mut rng = StdRng::from_seed([31; 32]);
+        let applied = sha256::Digest::random(&mut rng);
+        let rejected = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![applied, rejected],
+        }]);
+        let mut known: AHashSet<_> = [applied, rejected].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+
+        let (_, returned) = resolve_proposed_batches(
+            &mut proposed,
+            &[applied].into_iter().collect(),
+            &[rejected].into_iter().collect(),
+            2,
+            10,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+            |_| true,
+        );
+        assert!(returned.is_empty());
+        assert!(proposed.is_empty());
+        assert!(known.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[applied, rejected], &outcomes),
+            Some(StoredBatchStatus::PartiallyFinalized {
+                height: 2,
+                included: vec![applied],
+                filtered: vec![rejected],
+            }),
+        );
+        assert_eq!(
+            batch_status_from_outcomes(&[rejected], &outcomes),
+            Some(StoredBatchStatus::Rejected { height: 2 }),
+        );
+        assert_eq!(
+            tx_status_from_batch(&StoredBatchStatus::<sha256::Digest>::Rejected { height: 2 }),
+            Some(TxStatus::Rejected { height: 2 }),
+        );
+    }
+
+    /// A proposed transaction that reached no finalized block goes back to
+    /// the pool if the caller says so, and is dropped otherwise.
+    #[test]
+    fn an_unlisted_transaction_returns_or_drops_after_grace() {
+        let mut rng = StdRng::from_seed([37; 32]);
+        let returning = sha256::Digest::random(&mut rng);
+        let dropping = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![returning, dropping],
+        }]);
+        let mut known: AHashSet<_> = [returning, dropping].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+
+        for (height, expired) in [(4, false), (5, true)] {
+            let (_, returned) = resolve_proposed_batches(
+                &mut proposed,
+                &AHashSet::new(),
+                &AHashSet::new(),
+                height,
+                3,
+                &mut known,
+                &mut outcomes,
+                &AHashMap::new(),
+                |digest| *digest == returning,
+            );
+            if !expired {
+                assert!(returned.is_empty());
+                assert_eq!(proposed.len(), 1, "still within grace");
+                continue;
+            }
+            assert_eq!(returned, vec![returning]);
+            assert!(proposed.is_empty());
+        }
+
+        // The returned transaction is still pending and still known, so a
+        // second submission of it is a duplicate.
+        assert!(known.contains(&returning));
+        assert!(!known.contains(&dropping));
+        assert_eq!(batch_status_from_outcomes(&[returning], &outcomes), None);
+        assert_eq!(
+            batch_status_from_outcomes(&[dropping], &outcomes),
             Some(StoredBatchStatus::Dropped),
         );
     }
@@ -1266,6 +1549,7 @@ mod tests {
                     TRANSACTION_NAMESPACE,
                     &mut sha256::Sha256::default(),
                 )
+                .into()
             })
             .collect();
         PoolEntry {
@@ -1347,7 +1631,10 @@ mod tests {
     fn actor_drops_oversized_batches_without_retaining_digests() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let transactions = pool_entry(1, 2, 0).transactions;
-            let digests: Vec<_> = transactions.iter().map(|tx| *tx.message_digest()).collect();
+            let digests: Vec<_> = transactions
+                .iter()
+                .map(|tx| *tx.transaction.message_digest())
+                .collect();
             let max_propose_bytes = total_bytes_for(&transactions[..1]);
             let (sender, rx) = mpsc::channel(8);
             let mailbox = Mailbox::new(sender.clone());
@@ -1361,6 +1648,7 @@ mod tests {
                     drop_grace_blocks: 3,
                     strategy: Sequential,
                     public_key_cache,
+                    admission: None,
                 },
                 mailbox.clone(),
                 ActorReceiver { rx },
@@ -1373,7 +1661,10 @@ mod tests {
                 .try_submit(
                     "oversized-submit".into(),
                     digests.clone(),
-                    transactions.clone(),
+                    transactions
+                        .iter()
+                        .map(|candidate| candidate.transaction.clone())
+                        .collect(),
                 )
                 .unwrap();
             assert_eq!(result.await.unwrap(), TxStatus::Dropped);
@@ -1408,7 +1699,7 @@ mod tests {
                 .unwrap();
             let proposal = result.await.unwrap();
             assert_eq!(proposal.len(), 1);
-            assert_eq!(*proposal[0].message_digest(), digests[0]);
+            assert_eq!(*proposal[0].transaction.message_digest(), digests[0]);
             assert_eq!(total_bytes_for(&proposal), max_propose_bytes);
         });
     }
@@ -1416,7 +1707,9 @@ mod tests {
     #[test]
     fn foreground_consumes_proposal_before_background() {
         let foreground_entry = pool_entry(4, 1, 1_000);
-        let foreground_digest = *foreground_entry.transactions[0].message_digest();
+        let foreground_digest = *foreground_entry.transactions[0]
+            .transaction
+            .message_digest();
         let mut foreground_pool = PoolLane {
             entries: VecDeque::from([foreground_entry]),
             bytes: 1_000,
@@ -1437,7 +1730,10 @@ mod tests {
         );
 
         assert_eq!(transactions.len(), 1);
-        assert_eq!(*transactions[0].message_digest(), foreground_digest);
+        assert_eq!(
+            *transactions[0].transaction.message_digest(),
+            foreground_digest
+        );
         assert!(foreground_pool.entries.is_empty());
         assert_eq!(foreground_pool.bytes, 0);
         assert_eq!(background_pool.entries.len(), 1);

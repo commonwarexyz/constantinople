@@ -60,6 +60,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) -> Result<(), Str
         args,
         local,
         &material.primary_hex(),
+        &material.primary_tag_keys_hex(),
         &material.simplex_verification_material_hex(),
     )
 }
@@ -289,6 +290,7 @@ fn print_local_run_commands(
     args: &GenerateArgs,
     local: &LocalArgs,
     relayer_targets: &[String],
+    tag_keys: &[String],
     simplex_verification_material: &str,
 ) -> Result<(), String> {
     let commands = local_run_commands(
@@ -296,6 +298,7 @@ fn print_local_run_commands(
         args,
         local,
         relayer_targets,
+        tag_keys,
         simplex_verification_material,
     )?;
     let mprocs = commands
@@ -320,6 +323,7 @@ fn local_run_commands(
     args: &GenerateArgs,
     local: &LocalArgs,
     relayer_targets: &[String],
+    tag_keys: &[String],
     simplex_verification_material: &str,
 ) -> Result<Vec<String>, String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
@@ -411,13 +415,21 @@ fn local_run_commands(
             args.spammer_submitters.unwrap_or(args.validators as usize),
             targets,
         );
+        // The spammer tags a transaction under the key of every validator, in
+        // the order of its targets.
+        let mode = match args.spammer_mode {
+            crate::SpammerMode::Signatures => String::new(),
+            mode @ crate::SpammerMode::Macs => {
+                format!(" --mode {} --tag-keys {}", mode.flag(), tag_keys.join(","))
+            }
+        };
 
         // Place the spammer's metrics port past the primary and secondary ranges
         // so it does not collide with any validator on the loopback host.
         let metrics_port = local_spammer_metrics_port(args, local)?;
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
-             {network_source} \
+             {network_source}{mode} \
              --accounts {} \
              --value {}{} \
              --rayon-threads {} \
@@ -518,6 +530,7 @@ mod tests {
             spammer_accounts_jitter: 0.0,
             spammer_submitters: None,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_mode: crate::SpammerMode::Signatures,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -738,6 +751,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -755,6 +769,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -769,6 +784,28 @@ mod tests {
         assert!(!commands[3].contains("--seed-offset"));
         assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
+        assert!(!commands[3].contains("--mode"));
+    }
+
+    #[test]
+    fn local_spammer_command_carries_the_tag_keys_in_mac_mode() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_mode = crate::SpammerMode::Macs;
+        let targets = ["aa", "bb"].map(str::to_string);
+        let tag_keys = ["cc", "dd"].map(str::to_string);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &targets,
+            &tag_keys,
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        )
+        .unwrap();
+
+        let spammer = commands.last().expect("spammer command");
+        assert!(spammer.contains("--relayer-targets aa,bb --mode macs --tag-keys cc,dd "));
     }
 
     #[test]
@@ -780,6 +817,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -801,6 +839,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -820,6 +859,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -837,6 +877,7 @@ mod tests {
             &args,
             local_args(&args),
             &targets,
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -861,6 +902,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -877,6 +919,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -895,6 +938,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -911,6 +955,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -930,6 +975,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -977,6 +1023,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -1112,6 +1159,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -1148,6 +1196,7 @@ mod tests {
                 &args,
                 local_args(&args),
                 &[],
+                &[],
                 TEST_SIMPLEX_VERIFICATION_MATERIAL,
             )
             .unwrap();
@@ -1170,6 +1219,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -1195,6 +1245,7 @@ mod tests {
             &args,
             local_args(&args),
             &[],
+            &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
         .unwrap();
@@ -1217,6 +1268,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )
@@ -1243,6 +1295,7 @@ mod tests {
             Path::new("/tmp/configs"),
             &args,
             local_args(&args),
+            &[],
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         )

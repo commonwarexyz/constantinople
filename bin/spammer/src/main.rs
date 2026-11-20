@@ -1,7 +1,9 @@
 //! Constantinople spam bot binary.
 //!
 //! Generates accounts and submits ring-transfer transactions to the relayer in
-//! a continuous loop.
+//! a continuous loop. The accounts either sign their transactions or tag them
+//! under keys they share with the validators ([`Mode`]), with everything else
+//! the same, so the two can be compared.
 //!
 //! Each target gets its own independent account set. A local signer keeps one
 //! batch ready while the submitter has one batch in flight, hiding signing
@@ -13,15 +15,17 @@ mod config;
 mod signer;
 mod submitter;
 
-use accounts::{SpamAccount, generate_accounts, resolve_seed_offset};
+use accounts::{generate_accounts, generate_tagged_accounts, resolve_seed_offset};
 use clap::Parser;
 use cli::Cli;
+use commonware_formatting::from_hex;
 use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
-use commonware_utils::NZUsize;
+use commonware_utils::{NZUsize, Participant};
+use config::Mode;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
-use signer::{Tx, sign_batch};
+use signer::{Accounts, Batch};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -48,6 +52,8 @@ fn main() {
         primary_validators,
         rayon_threads,
         accounts_jitter,
+        mode,
+        tag_keys,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
@@ -69,6 +75,8 @@ fn main() {
             },
             cfg.rayon_threads,
             cfg.accounts_jitter,
+            cfg.mode,
+            cfg.primary_tag_keys,
         )
     } else {
         (
@@ -83,7 +91,13 @@ fn main() {
             cli.relayer_targets.clone(),
             cli.rayon_threads,
             cli.accounts_jitter,
+            cli.mode,
+            cli.tag_keys.clone(),
         )
+    };
+    let committee = match mode {
+        Mode::Signatures => None,
+        Mode::Macs => Some(Committee::new(&primary_validators, &tag_keys)),
     };
     assert!(
         (0.0..=1.0).contains(&accounts_jitter),
@@ -145,6 +159,7 @@ fn main() {
             relayer_submitters,
             presigned_batches,
             relayer_targets: primary_validators,
+            committee,
         };
         let stats = Arc::new(Stats::new(context.child("spammer")));
         run_relayer_mode(config, strategy, stats).await;
@@ -160,6 +175,72 @@ struct RelayerModeConfig {
     relayer_submitters: usize,
     presigned_batches: usize,
     relayer_targets: Vec<String>,
+    /// The validators, if accounts tag their transactions.
+    committee: Option<Committee>,
+}
+
+/// The validators as the sender of a tagged transaction needs them: it names
+/// the proposer by its index, and computes one tag for each validator in index
+/// order.
+struct Committee {
+    /// Lowercase hex ed25519 keys, in participant order.
+    validators: Vec<String>,
+    /// The X25519 key of each validator, in the same order.
+    tag_keys: Vec<constantinople_auth::PublicKey>,
+}
+
+impl Committee {
+    /// Orders the validators as consensus does, by public key.
+    ///
+    /// `tag_keys[i]` is the X25519 key of `validators[i]`. Both are hex.
+    fn new(validators: &[String], tag_keys: &[String]) -> Self {
+        assert!(
+            !validators.is_empty(),
+            "MAC mode needs every primary validator as a relayer target"
+        );
+        assert_eq!(
+            validators.len(),
+            tag_keys.len(),
+            "MAC mode needs one tag key per primary validator"
+        );
+        let mut pairs: Vec<_> = validators
+            .iter()
+            .zip(tag_keys)
+            .map(|(validator, tag_key)| {
+                let validator = validator.to_lowercase();
+                let sort_key = from_hex(&validator)
+                    .unwrap_or_else(|| panic!("validator key must be hex: {validator}"));
+                let tag_key = from_hex(tag_key)
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .map(constantinople_auth::PublicKey::from)
+                    .unwrap_or_else(|| panic!("tag key must be 32 hex-encoded bytes: {tag_key}"));
+                (sort_key, validator, tag_key)
+            })
+            .collect();
+        pairs.sort();
+        for pair in pairs.windows(2) {
+            assert_ne!(pair[0].0, pair[1].0, "validator keys must be unique");
+        }
+        let (validators, tag_keys) = pairs
+            .into_iter()
+            .map(|(_, validator, tag_key)| (validator, tag_key))
+            .unzip();
+        Self {
+            validators,
+            tag_keys,
+        }
+    }
+
+    /// The index of the validator with hex public key `validator`.
+    fn index(&self, validator: &str) -> Participant {
+        let validator = validator.to_lowercase();
+        let index = self
+            .validators
+            .iter()
+            .position(|known| *known == validator)
+            .expect("relayer target is a primary validator");
+        Participant::from_usize(index)
+    }
 }
 
 async fn run_relayer_mode(
@@ -176,6 +257,7 @@ async fn run_relayer_mode(
         relayer_submitters,
         presigned_batches,
         relayer_targets,
+        committee,
     } = config;
 
     assert!(
@@ -191,6 +273,7 @@ async fn run_relayer_mode(
         accounts_jitter,
         %relayer_url,
         presigned_batches,
+        macs = committee.is_some(),
         "starting spammer relayer mode"
     );
 
@@ -200,8 +283,19 @@ async fn run_relayer_mode(
         let account_index =
             u64::try_from(index).expect("submitter count checked during seed selection");
         let account_offset = seed_offset + account_index * u64::from(accounts_count);
-        let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
+        let accounts = committee.as_ref().map_or_else(
+            || Accounts::Signed(generate_accounts(accounts_count, account_offset)),
+            |committee| Accounts::Tagged {
+                accounts: generate_tagged_accounts(
+                    &strategy,
+                    accounts_count,
+                    account_offset,
+                    &committee.tag_keys,
+                ),
+                proposer: committee.index(target.as_deref().expect("targets are not empty")),
+            },
+        );
         let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         let strategy = strategy.clone();
         let batches = spawn_presigner(
@@ -228,6 +322,7 @@ async fn run_relayer_mode(
         info!(
             finalized = totals.finalized,
             filtered = totals.filtered,
+            rejected = totals.rejected,
             dropped = totals.dropped,
             errors = totals.errors,
             finalization_tps = format!("{finalization_tps:.0}"),
@@ -239,18 +334,18 @@ async fn run_relayer_mode(
 
 fn spawn_presigner<St>(
     strategy: St,
-    accounts: Vec<SpamAccount>,
+    accounts: Accounts,
     value: NonZeroU64,
     accounts_jitter: f64,
     account_offset: u64,
     presigned_batches: usize,
-) -> mpsc::Receiver<Vec<Tx>>
+) -> mpsc::Receiver<Batch>
 where
     St: commonware_parallel::Strategy + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel(presigned_batches);
     // Keep the synchronous producer and bounded-channel backpressure off Tokio
-    // worker threads; `sign_batch` uses the shared Rayon strategy for CPU parallelism.
+    // worker threads; building a batch uses the shared Rayon strategy for CPU parallelism.
     tokio::task::spawn_blocking(move || {
         let mut rng = JitterRng::new(account_offset.wrapping_add(1));
         let mut nonces = vec![0; accounts.len()];
@@ -258,14 +353,7 @@ where
 
         loop {
             let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
-            let batch = sign_batch(
-                &strategy,
-                &accounts,
-                value,
-                &mut nonces,
-                &mut cursor,
-                batch_size,
-            );
+            let batch = accounts.batch(&strategy, value, &mut nonces, &mut cursor, batch_size);
             if sender.blocking_send(batch).is_err() {
                 return;
             }
@@ -274,10 +362,7 @@ where
     receiver
 }
 
-async fn submit_presigned_batches(
-    submitter: RelayerSubmitter,
-    mut batches: mpsc::Receiver<Vec<Tx>>,
-) {
+async fn submit_presigned_batches(submitter: RelayerSubmitter, mut batches: mpsc::Receiver<Batch>) {
     while let Some(batch) = batches.recv().await {
         submitter.submit(batch).await;
     }
@@ -342,7 +427,10 @@ mod tests {
     use super::{
         JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for, spawn_presigner,
     };
-    use crate::accounts::generate_accounts;
+    use crate::{
+        accounts::generate_accounts,
+        signer::{Accounts, Batch},
+    };
     use commonware_parallel::Sequential;
     use core::num::NonZeroU64;
     use std::time::Duration;
@@ -406,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn committee_is_in_consensus_order() {
+        let tag_key = |byte: u8| commonware_formatting::hex(&[byte; 32]);
+        let validators = ["0B", "01", "0a"].map(str::to_string);
+        let tag_keys = [tag_key(3), tag_key(1), tag_key(2)];
+        let committee = super::Committee::new(&validators, &tag_keys);
+
+        assert_eq!(committee.validators, ["01", "0a", "0b"]);
+        let expected: Vec<_> = [1u8, 2, 3]
+            .map(|byte| constantinople_auth::PublicKey::from([byte; 32]))
+            .to_vec();
+        assert_eq!(committee.tag_keys, expected);
+        assert_eq!(committee.index("0A"), commonware_utils::Participant::new(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "one tag key per primary validator")]
+    fn committee_needs_a_tag_key_per_validator() {
+        super::Committee::new(&["01".to_string()], &[]);
+    }
+
+    #[test]
     fn relayer_targets_are_selected_by_submitter_index() {
         let targets = vec!["primary-0".to_string(), "primary-1".to_string()];
 
@@ -426,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn presigner_keeps_one_batch_ready_without_unbounded_local_queue() {
-        let accounts = generate_accounts(3, 1000);
+        let accounts = Accounts::Signed(generate_accounts(3, 1000));
         let value = NonZeroU64::new(1).expect("non-zero value");
         let presigned_batches = 4;
         let mut batches =
@@ -446,7 +555,7 @@ mod tests {
     }
 
     async fn wait_for_presigned_batches(
-        batches: &tokio::sync::mpsc::Receiver<Vec<super::Tx>>,
+        batches: &tokio::sync::mpsc::Receiver<Batch>,
         expected: usize,
     ) {
         for _ in 0..50 {
@@ -458,7 +567,10 @@ mod tests {
         panic!("presigner did not fill the local queue");
     }
 
-    fn batch_nonces(batch: &[super::Tx]) -> Vec<u64> {
+    fn batch_nonces(batch: &Batch) -> Vec<u64> {
+        let Batch::Signed(batch) = batch else {
+            panic!("accounts sign their transactions");
+        };
         batch
             .iter()
             .map(|transaction| transaction.value().nonce)

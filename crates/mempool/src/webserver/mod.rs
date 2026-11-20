@@ -1,6 +1,6 @@
 //! Mempool webserver actor.
 //!
-//! Accepts signed transactions over HTTP, verifies them, and serves
+//! Accepts transactions over HTTP, verifies their signatures or tags, and serves
 //! batches to the consensus layer via [`TransactionSource`](crate::TransactionSource).
 //!
 //! # Architecture
@@ -25,6 +25,7 @@ mod mailbox;
 pub use mailbox::{ActorReceiver, Mailbox};
 
 mod http;
+pub use http::{Admission, max_submission_request_bytes};
 
 /// Error returned by mempool submission calls.
 #[derive(Debug, Display)]

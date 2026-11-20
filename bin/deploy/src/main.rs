@@ -171,6 +171,9 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// How the spammer's transactions are authenticated.
+    #[arg(long, value_enum, default_value_t = SpammerMode::Signatures)]
+    spammer_mode: SpammerMode,
 
     /// Deployment target (local or remote).
     #[command(subcommand)]
@@ -320,6 +323,38 @@ pub(crate) struct RemoteArgs {
     spammer_storage_size: i32,
 }
 
+/// How the spammer's transactions are authenticated.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerMode {
+    /// Accounts sign their transactions.
+    #[default]
+    Signatures,
+    /// Accounts tag their transactions under keys they share with the
+    /// validators.
+    Macs,
+}
+
+impl SpammerMode {
+    /// The value of the spammer's `--mode` flag.
+    pub(crate) const fn flag(self) -> &'static str {
+        match self {
+            Self::Signatures => "signatures",
+            Self::Macs => "macs",
+        }
+    }
+}
+
 /// Spammer configuration, written as YAML by deploy and read by the spammer binary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SpammerConfig {
@@ -350,6 +385,13 @@ pub(crate) struct SpammerConfig {
     /// the spammer target only primaries.
     #[serde(default)]
     pub primary_validators: Vec<String>,
+    /// How transactions are authenticated.
+    #[serde(default)]
+    pub mode: SpammerMode,
+    /// Hex-encoded X25519 public keys of the primary validators, in the order
+    /// of `primary_validators`. The spammer tags transactions under them.
+    #[serde(default)]
+    pub primary_tag_keys: Vec<String>,
     /// Fractional account-count jitter per submitted batch.
     ///
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.

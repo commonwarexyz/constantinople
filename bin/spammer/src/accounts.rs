@@ -1,6 +1,9 @@
 //! Spammer account generation and seed selection.
 
-use commonware_cryptography::{Signer, ed25519};
+use commonware_cryptography::{Hasher as _, Sha256, Signer, ed25519};
+use commonware_parallel::Strategy;
+use constantinople_auth::SharedKey;
+use constantinople_primitives::TRANSACTION_NAMESPACE;
 use rand::{Rng, RngExt};
 
 /// A spam account with its signing key.
@@ -22,6 +25,48 @@ pub fn generate_accounts(count: u32, seed_offset: u64) -> Vec<SpamAccount> {
             }
         })
         .collect()
+}
+
+/// A spam account whose transactions are authenticated by tags.
+pub struct TaggedAccount {
+    pub public_key: constantinople_auth::PublicKey,
+    /// The key the account shares with each validator, in participant order.
+    pub keys: Vec<SharedKey>,
+}
+
+/// Generates `count` deterministic X25519 spam accounts from sequential seeds
+/// starting at `seed_offset`, and derives the key each one shares with every
+/// validator. `validators` holds the validators' X25519 keys in participant
+/// order.
+///
+/// The keys are derived once: every later transaction of an account costs a
+/// keyed hash per validator.
+pub fn generate_tagged_accounts<St: Strategy>(
+    strategy: &St,
+    count: u32,
+    seed_offset: u64,
+    validators: &[constantinople_auth::PublicKey],
+) -> Vec<TaggedAccount> {
+    strategy.map_collect_vec(0..count, |i| {
+        let seed = seed_offset + u64::from(i);
+        let secret: [u8; 32] = Sha256::hash(&[&seed.to_be_bytes()])
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 digests are 32 bytes");
+        let secret = constantinople_auth::PrivateKey::from(secret);
+        let keys = validators
+            .iter()
+            .map(|validator| {
+                secret
+                    .with_validator(TRANSACTION_NAMESPACE, validator)
+                    .expect("validator tag key must not be a low-order point")
+            })
+            .collect();
+        TaggedAccount {
+            public_key: secret.public_key(),
+            keys,
+        }
+    })
 }
 
 /// Selects a seed range large enough for every submitter account.

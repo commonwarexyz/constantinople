@@ -9,13 +9,16 @@ use axum::{
     routing::{get, post},
 };
 use commonware_actor::Feedback;
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{
+    Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, Read as _, ReadExt as _,
+};
 use commonware_consensus::{Reporter, Viewable};
 use commonware_cryptography::{ed25519, sha256};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
+use commonware_utils::Participant;
 use constantinople_engine::types::EngineActivity;
-use constantinople_mempool::webserver::{AccountReader, TxStatus};
+use constantinople_mempool::webserver::{AccountReader, TxStatus, max_submission_request_bytes};
 use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
@@ -110,6 +113,9 @@ fn activity_view(activity: &Activity) -> u64 {
 pub struct ServerConfig<St: Strategy> {
     pub listen: SocketAddr,
     pub relayer: RelayerConfig,
+    /// Hex-encoded public keys of the primary validators, in participant
+    /// order. A submission names its proposer by position in this list.
+    pub participants: Vec<String>,
     pub account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     pub view_clock: ViewClock,
     pub strategy: St,
@@ -121,6 +127,7 @@ pub struct ServerConfig<St: Strategy> {
 #[derive(Clone)]
 struct AppState<St: Strategy> {
     leaders: Arc<Vec<Leader>>,
+    participants: Arc<Vec<String>>,
     max_batch_bytes: usize,
     account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     view_clock: ViewClock,
@@ -150,6 +157,13 @@ type RelayResponse = (StatusCode, String);
 pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
     let state = AppState {
         leaders: Arc::new(normalize_leaders(config.relayer.leaders)),
+        participants: Arc::new(
+            config
+                .participants
+                .iter()
+                .map(|key| key.to_lowercase())
+                .collect(),
+        ),
         max_batch_bytes: config.max_batch_bytes,
         account_reader: config.account_reader,
         view_clock: config.view_clock,
@@ -180,11 +194,13 @@ fn router<St: Strategy>(state: AppState<St>) -> Router {
 
     Router::new()
         .route("/transactions", post(submit_transactions::<St>))
+        .route("/submissions", post(submit_tagged::<St>))
         .route("/account/{public_key}", get(account::<St>))
         .route("/health", get(health))
         .route("/ready", get(ready::<St>))
-        .layer(DefaultBodyLimit::max(max_request_bytes(
+        .layer(DefaultBodyLimit::max(max_submission_request_bytes(
             state.max_batch_bytes,
+            state.participants.len(),
         )))
         .layer(cors)
         .with_state(state)
@@ -234,6 +250,47 @@ async fn submit_transactions<St: Strategy>(
     submit_to_public_leaders(&state, body, fanout).await
 }
 
+/// Forwards a batch of submissions to the validator its sender named as
+/// proposer and answers with that validator's reply.
+///
+/// The tags of a submission are of use to that validator only, so there is no
+/// fan-out. A request that also pins a leader goes through the background
+/// lane, like a pinned batch of signed transactions.
+async fn submit_tagged<St: Strategy>(
+    State(state): State<AppState<St>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, String) {
+    let limit = max_submission_request_bytes(state.max_batch_bytes, state.participants.len());
+    if body.len() > limit {
+        return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
+    }
+    let Some(leader) = named_proposer(&body)
+        .and_then(|proposer| state.participants.get(proposer))
+        .and_then(|public_key| leader_by_id(&state.leaders, public_key))
+    else {
+        return (StatusCode::BAD_REQUEST, String::new());
+    };
+    let path = match requested_target_leader(&headers) {
+        Some(target) if target != leader.public_key => {
+            return (StatusCode::BAD_REQUEST, String::new());
+        }
+        Some(_) => "/submissions/background",
+        None => "/submissions",
+    };
+    forward_reply(&state.http, leader, path, body).await
+}
+
+/// The proposer that the first submission of an encoded batch names.
+///
+/// The named validator checks every submission of the batch, so the relayer
+/// reads no further.
+fn named_proposer(body: &Bytes) -> Option<usize> {
+    let mut buf = body.clone();
+    usize::read_cfg(&mut buf, &RangeCfg::new(1..)).ok()?;
+    Participant::read(&mut buf).ok().map(usize::from)
+}
+
 async fn submit_to_pinned_leader<St: Strategy>(
     state: &AppState<St>,
     body: Bytes,
@@ -242,7 +299,7 @@ async fn submit_to_pinned_leader<St: Strategy>(
     let Some(leader) = leader_by_id(&state.leaders, target).cloned() else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
-    submit_background_to_leader(&state.http, &leader, body).await
+    forward_reply(&state.http, &leader, "/transactions/background", body).await
 }
 
 async fn submit_to_public_leaders<St: Strategy>(
@@ -312,7 +369,11 @@ async fn forward_to_targets(
                 let candidate = (included, Reverse(filtered), height);
                 partial = Some(partial.map_or(candidate, |current| current.max(candidate)));
             }
-            LeaderResponse::Terminal(TxStatus::Dropped) => dropped += 1,
+            // A leader that listed the batch without applying it does not rule
+            // out another copy: it counts like a copy that was never listed.
+            LeaderResponse::Terminal(TxStatus::Rejected { .. } | TxStatus::Dropped) => {
+                dropped += 1;
+            }
             LeaderResponse::Deterministic(status) => {
                 rejection = Some(status);
                 rejected += 1;
@@ -453,13 +514,15 @@ async fn forward_to_leader(http: &reqwest::Client, leader: &Leader, body: Bytes)
     )
 }
 
-async fn submit_background_to_leader(
+/// Posts `body` to `path` on `leader` and returns its reply as is.
+async fn forward_reply(
     http: &reqwest::Client,
     leader: &Leader,
+    path: &str,
     body: Bytes,
 ) -> (StatusCode, String) {
     let response = match http
-        .post(format!("{}/transactions/background", leader.url))
+        .post(format!("{}{path}", leader.url))
         .header("content-type", "application/octet-stream")
         .body(body)
         .send()
@@ -638,6 +701,12 @@ mod tests {
     ) -> AppState<commonware_parallel::Sequential> {
         let (_, view_clock) = Observer::new();
         AppState {
+            participants: Arc::new(
+                leaders
+                    .iter()
+                    .map(|leader| leader.public_key.clone())
+                    .collect(),
+            ),
             leaders: Arc::new(leaders),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             account_reader: Arc::new(OnceLock::new()),
@@ -754,6 +823,56 @@ mod tests {
                 url: "http://second".to_string(),
             },
         ]);
+    }
+
+    /// A leader that answers a submission with the path it was posted to.
+    fn echo_leader(name: &'static str) -> Router {
+        let reply = move |path: &'static str| {
+            post(move || async move { (StatusCode::OK, format!("{name}{path}")) })
+        };
+        Router::new()
+            .route("/submissions", reply("/submissions"))
+            .route("/submissions/background", reply("/submissions/background"))
+    }
+
+    #[tokio::test]
+    async fn submissions_go_to_the_named_proposer_only() {
+        let state = test_state(
+            vec![
+                mock_leader("00", spawn_mock_leader(echo_leader("first")).await),
+                mock_leader("01", spawn_mock_leader(echo_leader("second")).await),
+            ],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        // The relayer reads the batch length and the first proposer.
+        let batch = |proposer: u32| vec![Participant::new(proposer)].encode();
+        let pinned = |leader: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(TARGET_LEADER_HEADER, HeaderValue::from_static(leader));
+            headers
+        };
+
+        let reply = submit_tagged(State(state.clone()), HeaderMap::new(), batch(1)).await;
+        assert_eq!(reply, (StatusCode::OK, "second/submissions".to_string()));
+        let reply = submit_tagged(State(state.clone()), HeaderMap::new(), batch(0)).await;
+        assert_eq!(reply, (StatusCode::OK, "first/submissions".to_string()));
+
+        // A pinned request takes the background lane of the same validator.
+        let reply = submit_tagged(State(state.clone()), pinned("01"), batch(1)).await;
+        assert_eq!(
+            reply,
+            (StatusCode::OK, "second/submissions/background".to_string())
+        );
+
+        // Tags for one validator are of no use to another.
+        let reply = submit_tagged(State(state.clone()), pinned("00"), batch(1)).await;
+        assert_eq!(reply.0, StatusCode::BAD_REQUEST);
+        // No such validator, and no batch.
+        for body in [batch(2), Bytes::new(), Bytes::from_static(&[0])] {
+            let reply = submit_tagged(State(state.clone()), HeaderMap::new(), body).await;
+            assert_eq!(reply.0, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

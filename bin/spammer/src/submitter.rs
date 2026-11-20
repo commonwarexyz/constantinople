@@ -3,8 +3,7 @@
 //! Each relayer stream submits one batch at a time and advances to the next
 //! pre-signed batch after finalization or drop.
 
-use crate::signer::Tx;
-use commonware_codec::Encode;
+use crate::signer::Batch;
 use commonware_runtime::{
     Metrics as RuntimeMetrics,
     telemetry::metrics::{Counter, MetricsExt as _},
@@ -20,6 +19,7 @@ struct Metrics {
     submitted_transactions: Counter,
     finalized_transactions: Counter,
     filtered_transactions: Counter,
+    rejected_transactions: Counter,
     dropped_transactions: Counter,
     submit_errors: Counter,
 }
@@ -35,6 +35,10 @@ impl Metrics {
                 .counter("finalized_transactions", "Finalized transactions"),
             filtered_transactions: context
                 .counter("filtered_transactions", "Filtered transactions"),
+            rejected_transactions: context.counter(
+                "rejected_transactions",
+                "Transactions of batches that were finalized and not applied",
+            ),
             dropped_transactions: context.counter("dropped_transactions", "Dropped transactions"),
             submit_errors: context.counter("submit_errors", "Relayer submit errors"),
         }
@@ -51,6 +55,7 @@ pub struct Stats {
 pub struct Totals {
     pub finalized: u64,
     pub filtered: u64,
+    pub rejected: u64,
     pub dropped: u64,
     pub errors: u64,
 }
@@ -66,6 +71,7 @@ impl Stats {
         Totals {
             finalized: self.metrics.finalized_transactions.get(),
             filtered: self.metrics.filtered_transactions.get(),
+            rejected: self.metrics.rejected_transactions.get(),
             dropped: self.metrics.dropped_transactions.get(),
             errors: self.metrics.submit_errors.get(),
         }
@@ -82,6 +88,10 @@ impl Stats {
 
     fn record_filtered(&self, count: u64) {
         self.metrics.filtered_transactions.inc_by(count);
+    }
+
+    fn record_rejected(&self, count: u64) {
+        self.metrics.rejected_transactions.inc_by(count);
     }
 
     fn record_dropped(&self, count: u64) {
@@ -114,15 +124,17 @@ impl RelayerSubmitter {
         }
     }
 
-    /// Submits one signed batch until its final outcome is known.
-    pub async fn submit(&self, batch: Vec<Tx>) {
+    /// Submits one batch until its final outcome is known.
+    pub async fn submit(&self, batch: impl Into<Batch>) {
+        let batch = batch.into();
         let count = batch.len() as u64;
+        let path = batch.path();
         let body = batch.encode();
         self.stats.record_submitted(count);
 
         let mut failures = 0;
         loop {
-            match self.submit_encoded(body.clone()).await {
+            match self.submit_encoded(path, body.clone()).await {
                 Ok(TxStatus::Finalized { height }) => {
                     self.stats.record_finalized(count);
                     debug!(height, count, "relayed batch finalized");
@@ -138,6 +150,14 @@ impl RelayerSubmitter {
                     info!(
                         height,
                         included, filtered, "relayed batch partially finalized, advancing"
+                    );
+                    return;
+                }
+                Ok(TxStatus::Rejected { height }) => {
+                    self.stats.record_rejected(count);
+                    info!(
+                        height,
+                        count, "relayed batch finalized but not applied, advancing"
                     );
                     return;
                 }
@@ -166,10 +186,14 @@ impl RelayerSubmitter {
         }
     }
 
-    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<TxStatus, SubmitError> {
+    async fn submit_encoded(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+    ) -> Result<TxStatus, SubmitError> {
         let mut request = self
             .http
-            .post(format!("{}/transactions", self.url))
+            .post(format!("{}{path}", self.url))
             .header("content-type", "application/octet-stream");
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);

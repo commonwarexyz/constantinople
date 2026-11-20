@@ -5,6 +5,7 @@ use super::{
     actor::{AccountReaderCell, IngestStatus},
     mailbox::SubmissionLane,
 };
+use crate::Candidate;
 use axum::{
     Router,
     body::Bytes,
@@ -17,12 +18,13 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
-use commonware_utils::sys_rng;
+use commonware_utils::{Participant, cache::Cache, sync::Mutex, sys_rng};
+use constantinople_auth::{Mac, PrivateKey, SharedKey, Submission, Tags, tag_bits};
 use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
-    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    TransactionSignature, verify_transaction_chunks,
 };
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, num::NonZeroUsize, sync::Arc};
 use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info_span;
@@ -39,6 +41,10 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 /// Minimum bytes needed to encode a `u64` varint.
 const MIN_U64_VARINT_BYTES: usize = 1;
 
+/// Minimum and maximum bytes needed to encode a validator's index.
+const MIN_PARTICIPANT_BYTES: usize = 1;
+const MAX_PARTICIPANT_BYTES: usize = 5;
+
 /// Maximum ingress batches admitted to CPU verification concurrently, shared
 /// across all POST endpoints.
 ///
@@ -53,6 +59,74 @@ const MIN_U64_VARINT_BYTES: usize = 1;
 /// job runs.
 pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
 
+/// What a validator needs to admit transactions authenticated by tags.
+pub struct Admission {
+    /// This validator's index among the validators.
+    pub validator: Participant,
+    /// Number of validators.
+    pub validators: u32,
+    /// This validator's X25519 secret.
+    pub secret: PrivateKey,
+    /// Number of senders whose shared key is kept. A miss costs one
+    /// Diffie-Hellman.
+    pub key_cache_size: NonZeroUsize,
+}
+
+/// Checks submissions of transactions authenticated by tags.
+pub(super) struct Admitter {
+    admission: Admission,
+    /// The key this validator shares with the senders seen lately.
+    keys: Mutex<Cache<constantinople_auth::PublicKey, SharedKey>>,
+}
+
+impl Admitter {
+    pub(super) fn new(admission: Admission) -> Arc<Self> {
+        let keys = Mutex::new(Cache::new(admission.key_cache_size));
+        Arc::new(Self { admission, keys })
+    }
+
+    const fn validators(&self) -> usize {
+        self.admission.validators as usize
+    }
+
+    /// The key this validator shares with `user`.
+    fn key(&self, namespace: &[u8], user: &constantinople_auth::PublicKey) -> Option<SharedKey> {
+        if let Some(key) = self.keys.lock().get(user) {
+            return Some(key.clone());
+        }
+        let key = self.admission.secret.with_user(namespace, user)?;
+        self.keys.lock().put(*user, key.clone());
+        Some(key)
+    }
+
+    /// Admits `submission` if it names this validator as proposer, its sender
+    /// authenticated it to this validator, and its tag for this validator is
+    /// right.
+    fn admit<H: Hasher>(
+        &self,
+        namespace: &[u8],
+        submission: Submission<SignedTransaction<H>>,
+    ) -> Option<Candidate<H>> {
+        if !submission.transaction.is_mac() {
+            return None;
+        }
+        let sender = submission.transaction.value().sender()?.as_x25519()?;
+        let key = self.key(namespace, &sender)?;
+        submission
+            .admit(
+                self.admission.validator,
+                &key,
+                submission.transaction.message_digest().as_ref(),
+                self.validators(),
+            )
+            .ok()?;
+        Some(Candidate {
+            transaction: submission.transaction,
+            authenticator: Some(submission.authenticator),
+        })
+    }
+}
+
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, St>
 where
@@ -66,6 +140,7 @@ where
     pub max_batch_bytes: usize,
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
+    pub admission: Option<Arc<Admitter>>,
     pub account_reader: AccountReaderCell,
     pub ingress_permits: Arc<Semaphore>,
 }
@@ -81,7 +156,10 @@ where
     H::Digest: Display + Send + Sync,
     St: Strategy + Send + Sync + 'static,
 {
-    let max_request_bytes = max_request_bytes(state.max_batch_bytes);
+    let max_request_bytes = state.admission.as_ref().map_or_else(
+        || max_request_bytes(state.max_batch_bytes),
+        |admitter| max_submission_request_bytes(state.max_batch_bytes, admitter.validators()),
+    );
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST])
@@ -95,6 +173,11 @@ where
         )
         .route("/transactions/ingest", post(ingest_batch::<C, P, H, St>))
         .route("/transactions/{batch_id}", get(fetch_status::<C, P, H, St>))
+        .route("/submissions", post(submit_tagged_batch::<C, P, H, St>))
+        .route(
+            "/submissions/background",
+            post(submit_tagged_background_batch::<C, P, H, St>),
+        )
         .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(cors)
@@ -111,6 +194,32 @@ const fn min_signed_transaction_bytes() -> usize {
         + MIN_U64_VARINT_BYTES
         + MIN_U64_VARINT_BYTES
         + TransactionSignature::MIN_SIGNED_SIZE
+}
+
+/// Smallest encoding of a submission to a committee of `validators`.
+fn min_submission_bytes(validators: usize) -> usize {
+    let bits = tag_bits(validators as u32);
+    MIN_PARTICIPANT_BYTES + min_signed_transaction_bytes() - TransactionSignature::MIN_SIGNED_SIZE
+        + Tags::encoded_size(bits, validators)
+        + Mac::SIZE
+}
+
+/// Largest request that holds submissions whose transactions fit
+/// `max_batch_bytes`. A submission carries a proposer, one tag per validator
+/// and a MAC on top of its transaction.
+pub fn max_submission_request_bytes(max_batch_bytes: usize, validators: usize) -> usize {
+    let transaction = min_signed_transaction_bytes() - TransactionSignature::MIN_SIGNED_SIZE;
+    let overhead = min_submission_bytes(validators) - transaction - MIN_PARTICIPANT_BYTES
+        + MAX_PARTICIPANT_BYTES;
+    (max_batch_bytes / transaction)
+        .saturating_mul(overhead)
+        .saturating_add(max_request_bytes(max_batch_bytes))
+}
+
+fn max_submission_count(body_len: usize, validators: usize) -> Option<usize> {
+    let payload_len = body_len.saturating_sub(MIN_BATCH_LENGTH_PREFIX_BYTES);
+    let max_submissions = payload_len / min_submission_bytes(validators);
+    (max_submissions > 0).then_some(max_submissions)
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {
@@ -215,7 +324,62 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let batch = match verify_body::<P, H, _>(&state, body).await {
+    let batch = verify_body::<P, H, _>(&state, body).await;
+    await_outcome(&state, batch, lane).await
+}
+
+/// Accepts a batch of submissions as a commonware-codec length-prefixed
+/// vector. A submission is a transaction of an X25519 account with one tag per
+/// validator and a MAC, all computed for this validator as proposer.
+///
+/// Blocks until the outcome of every transaction is known, like
+/// [`submit_batch`]. Returns `404 Not Found` if this validator does not admit
+/// submissions, and `400 Bad Request` if any submission names another
+/// validator, was not authenticated by its sender, or carries a wrong tag for
+/// this validator.
+async fn submit_tagged_batch<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
+    body: Bytes,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let batch = admit_body::<P, H, _>(&state, body).await;
+    await_outcome(&state, batch, SubmissionLane::Foreground).await
+}
+
+/// Accepts a batch of submissions through the background lane and waits for
+/// its outcome.
+async fn submit_tagged_background_batch<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
+    body: Bytes,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let batch = admit_body::<P, H, _>(&state, body).await;
+    await_outcome(&state, batch, SubmissionLane::Background).await
+}
+
+/// Hands an admitted batch to the pool and waits for its outcome.
+async fn await_outcome<C, P, H, St>(
+    state: &AppState<C, P, H, St>,
+    batch: Result<VerifiedBatch<H>, StatusCode>,
+    lane: SubmissionLane,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let batch = match batch {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
@@ -239,7 +403,7 @@ where
     H: Hasher,
 {
     batch_id: String,
-    transactions: Vec<VerifiedTransaction<H>>,
+    transactions: Vec<Candidate<H>>,
     digests: Vec<H::Digest>,
 }
 
@@ -297,6 +461,12 @@ where
         decode.record("txs", signed.len().traced());
         drop(decode);
 
+        // A transaction without a signature needs tags, which only a
+        // submission carries.
+        if signed.iter().any(SignedTransaction::is_mac) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
         let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
         if total_bytes > max_batch_bytes {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
@@ -330,11 +500,99 @@ where
 
         Ok(VerifiedBatch {
             batch_id,
-            transactions,
+            transactions: transactions.into_iter().map(Candidate::from).collect(),
             digests,
         })
     });
     verified.await
+}
+
+/// Decodes a batch of submissions and checks each one, as [`verify_body`]
+/// does for signed transactions.
+async fn admit_body<P, H, St>(
+    state: &AppState<impl Digest, P, H, St>,
+    body: Bytes,
+) -> Result<VerifiedBatch<H>, StatusCode>
+where
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let Some(admitter) = state.admission.clone() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let validators = admitter.validators();
+    if body.len() > max_submission_request_bytes(state.max_batch_bytes, validators) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let Some(max_submissions) = max_submission_count(body.len(), validators) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    // The permit bounds ingress CPU on the shared pool, as in `verify_body`.
+    let Ok(permit) = state.ingress_permits.clone().acquire_owned().await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    let parent = tracing::Span::current();
+    let max_batch_bytes = state.max_batch_bytes;
+    let namespace = state.namespace;
+    let work_size = body.len();
+    let strategy = state.strategy.clone();
+    let admitted = state.strategy.manual().spawn(work_size, move |_| {
+        let _permit = permit;
+        let batch_id = H::hash(&[body.as_ref()]).to_string();
+
+        let decode = info_span!(
+            parent: &parent,
+            "mempool.ingress.decode",
+            bytes = body.len().traced(),
+            txs = tracing::field::Empty,
+        )
+        .entered();
+        let cfg = (RangeCfg::new(1..=max_submissions), ((), validators));
+        let submissions =
+            Vec::<Submission<SignedTransaction<H>>>::decode_cfg(Copying(body.as_ref()), &cfg)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+        decode.record("txs", submissions.len().traced());
+        drop(decode);
+
+        let total_bytes: usize = submissions
+            .iter()
+            .map(|submission| submission.transaction.encode_size())
+            .sum();
+        if total_bytes > max_batch_bytes {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        let admit = info_span!(
+            parent: &parent,
+            "mempool.ingress.admit",
+            txs = submissions.len().traced(),
+            bytes = total_bytes.traced(),
+        )
+        .entered();
+        let transactions = strategy
+            .map_collect_vec(submissions, |submission| {
+                admitter.admit(namespace, submission)
+            })
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        drop(admit);
+
+        let digests = transactions
+            .iter()
+            .map(|candidate| *candidate.transaction.message_digest())
+            .collect();
+
+        Ok(VerifiedBatch {
+            batch_id,
+            transactions,
+            digests,
+        })
+    });
+    admitted.await
 }
 
 /// Returns the latest known status for a submitted batch.
@@ -439,7 +697,7 @@ mod tests {
             TxStatus,
             mailbox::{Message, SubmissionLane},
         },
-        AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router,
+        Admission, Admitter, AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router,
     };
     use axum::{
         body::Body,
@@ -448,9 +706,10 @@ mod tests {
     use commonware_codec::Encode;
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_parallel::Sequential;
-    use commonware_runtime::{Metrics, Runner as _};
-    use commonware_utils::NZUsize;
-    use constantinople_primitives::{Transaction, TransactionPublicKey};
+    use commonware_runtime::{Metrics, Runner as _, Supervisor as _};
+    use commonware_utils::{NZUsize, Participant};
+    use constantinople_auth::{PrivateKey, Submission};
+    use constantinople_primitives::{SignedTransaction, Transaction, TransactionPublicKey};
     use core::num::NonZeroU64;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -464,12 +723,79 @@ mod tests {
         context: impl Metrics,
         max_batch_bytes: usize,
     ) -> (axum::Router, mpsc::Receiver<TestMessage>) {
+        admitting_router(context, max_batch_bytes, None)
+    }
+
+    const VALIDATORS: u32 = 6;
+    const VALIDATOR: u32 = 2;
+
+    fn validator_secret(validator: u32) -> PrivateKey {
+        PrivateKey::from([100 + validator as u8; 32])
+    }
+
+    fn admission() -> Admission {
+        Admission {
+            validator: Participant::new(VALIDATOR),
+            validators: VALIDATORS,
+            secret: validator_secret(VALIDATOR),
+            key_cache_size: NZUsize!(16),
+        }
+    }
+
+    /// A submission to validator `proposer` of a transfer by the X25519 account
+    /// with secret `[seed; 32]`.
+    fn submission(seed: u8, proposer: u32) -> Submission<SignedTransaction<sha256::Sha256>> {
+        let sender = PrivateKey::from([seed; 32]);
+        let transaction = Transaction::new(
+            TransactionPublicKey::x25519(sender.public_key()),
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(2).public_key()),
+            NonZeroU64::new(1).expect("non-zero"),
+            0,
+        )
+        .seal_for_mac(&mut sha256::Sha256::default());
+        let keys: Vec<_> = (0..VALIDATORS)
+            .map(|validator| {
+                sender
+                    .with_validator(
+                        HTTP_TEST_NAMESPACE,
+                        &validator_secret(validator).public_key(),
+                    )
+                    .expect("validator key is not low order")
+            })
+            .collect();
+        let digest = *transaction.message_digest();
+        Submission::new(
+            &keys,
+            Participant::new(proposer),
+            transaction,
+            digest.as_ref(),
+        )
+    }
+
+    async fn post(app: axum::Router, uri: &str, body: bytes::Bytes) -> StatusCode {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::from(body))
+            .expect("request should build");
+        app.oneshot(request)
+            .await
+            .expect("router should respond")
+            .status()
+    }
+
+    fn admitting_router(
+        context: impl Metrics,
+        max_batch_bytes: usize,
+        admission: Option<Admission>,
+    ) -> (axum::Router, mpsc::Receiver<TestMessage>) {
         let (sender, receiver) = mpsc::channel(1);
         let state = Arc::new(AppState {
             mailbox: super::super::mailbox::Mailbox::new(sender),
             namespace: HTTP_TEST_NAMESPACE,
             max_batch_bytes,
             strategy: Sequential,
+            admission: admission.map(Admitter::new),
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
             ingress_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS)),
@@ -538,7 +864,7 @@ mod tests {
                 owner.upgrade().is_none(),
                 "transaction retained request body"
             );
-            assert!(transaction.value().sender().is_some());
+            assert!(transaction.transaction.value().sender().is_some());
         });
     }
 
@@ -609,6 +935,135 @@ mod tests {
 
             let response = request_task.await.expect("request task should finish");
             assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn submission_endpoint_admits_a_submission_to_this_validator() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            for (uri, expected) in [
+                ("/submissions", SubmissionLane::Foreground),
+                ("/submissions/background", SubmissionLane::Background),
+            ] {
+                let (app, mut receiver) = admitting_router(
+                    context.child(expected_label(expected)),
+                    4096,
+                    Some(admission()),
+                );
+                let submissions = vec![submission(1, VALIDATOR), submission(2, VALIDATOR)];
+                let body = submissions.encode();
+                let request = tokio::spawn(async move { post(app, uri, body).await });
+
+                let Some(Message::Submit {
+                    lane,
+                    digests,
+                    transactions,
+                    result,
+                    ..
+                }) = receiver.recv().await
+                else {
+                    panic!("expected submission");
+                };
+                assert_eq!(lane, expected);
+                assert_eq!(digests.len(), 2);
+                for (candidate, submission) in transactions.iter().zip(&submissions) {
+                    assert_eq!(candidate.transaction, submission.transaction);
+                    assert_eq!(
+                        candidate.authenticator.as_ref(),
+                        Some(&submission.authenticator)
+                    );
+                }
+                result
+                    .expect("blocking submission should have a waiter")
+                    .send(TxStatus::Rejected { height: 7 })
+                    .expect("handler should await the result");
+                assert_eq!(request.await.expect("request finishes"), StatusCode::OK);
+            }
+        });
+    }
+
+    const fn expected_label(lane: SubmissionLane) -> &'static str {
+        match lane {
+            SubmissionLane::Foreground => "foreground",
+            SubmissionLane::Background => "background",
+        }
+    }
+
+    #[test]
+    fn submission_endpoint_refuses_what_its_sender_did_not_address_to_this_validator() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let refused = |label: &'static str, body: bytes::Bytes| {
+                let (app, mut receiver) =
+                    admitting_router(context.child(label), 4096, Some(admission()));
+                async move {
+                    assert_eq!(
+                        post(app, "/submissions", body).await,
+                        StatusCode::BAD_REQUEST,
+                        "{label}"
+                    );
+                    assert!(receiver.try_recv().is_err(), "{label}");
+                }
+            };
+
+            // Addressed to another validator.
+            refused("proposer", vec![submission(1, VALIDATOR + 1)].encode()).await;
+
+            // The tags of a submission to another validator, renamed.
+            let mut renamed = submission(1, VALIDATOR + 1);
+            renamed.proposer = Participant::new(VALIDATOR);
+            refused("renamed", vec![renamed].encode()).await;
+
+            // Another sender's MAC.
+            let mut forged = submission(1, VALIDATOR);
+            forged.mac = submission(2, VALIDATOR).mac;
+            refused("mac", vec![forged].encode()).await;
+
+            // A wrong tag for this validator, under a MAC that covers it.
+            let sender = PrivateKey::from([1; 32]);
+            let mut keys: Vec<_> = (0..VALIDATORS)
+                .map(|validator| {
+                    sender
+                        .with_validator(
+                            HTTP_TEST_NAMESPACE,
+                            &validator_secret(validator).public_key(),
+                        )
+                        .expect("validator key is not low order")
+                })
+                .collect();
+            keys[VALIDATOR as usize].tag = keys[0].tag.clone();
+            let honest = submission(1, VALIDATOR);
+            let digest = *honest.transaction.message_digest();
+            let mistagged = Submission::new(
+                &keys,
+                Participant::new(VALIDATOR),
+                honest.transaction.clone(),
+                digest.as_ref(),
+            );
+            refused("tag", vec![mistagged].encode()).await;
+
+            // One bad submission refuses the batch.
+            refused("batch", vec![honest, submission(2, VALIDATOR + 1)].encode()).await;
+        });
+    }
+
+    #[test]
+    fn transactions_without_tags_or_signature_are_refused() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            // A validator that admits no submissions has no such endpoint.
+            let (app, _receiver) = admitting_router(context.child("signed_only"), 4096, None);
+            let body = vec![submission(1, VALIDATOR)].encode();
+            assert_eq!(post(app, "/submissions", body).await, StatusCode::NOT_FOUND);
+
+            // A transaction of an X25519 account carries no signature, so the
+            // endpoint for signed transactions has nothing to check it by.
+            let (app, mut receiver) =
+                admitting_router(context.child("unsigned"), 4096, Some(admission()));
+            let body = vec![submission(1, VALIDATOR).transaction].encode();
+            assert_eq!(
+                post(app, "/transactions", body).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert!(receiver.try_recv().is_err());
         });
     }
 
