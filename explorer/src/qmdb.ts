@@ -39,6 +39,7 @@ const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
 
 const BLOCK_META_TABLE = 'block_meta';
+const BLOCK_META_PARENT_OUTCOMES = 'parent_outcomes';
 const BLOCK_META_HEIGHT = 'height';
 const BLOCK_META_DIGEST = 'digest';
 
@@ -80,6 +81,17 @@ export interface VerifiedFinalizationTarget {
     readonly height: bigint;
     readonly view: bigint;
 }
+
+// Where a finalized block lists a transaction.
+export interface TransactionPosition {
+    readonly height: bigint;
+    readonly index: bigint;
+}
+
+// What became of a transaction that a finalized block lists. The next block executes
+// it: a transaction is not applied if too few validators approved its tags, or if it
+// could not apply (a spent nonce, an insufficient balance).
+export type TransactionOutcome = 'applied' | 'not applied';
 
 interface TransactionProofMetadata {
     readonly height: bigint;
@@ -178,6 +190,7 @@ export async function fetchAndVerifyTransactionProof({
     finalizedHeight,
     signal,
     onFinalizationVerified,
+    onLocated,
 }: {
     qmdbUrl: string;
     storeUrl: string;
@@ -188,6 +201,8 @@ export async function fetchAndVerifyTransactionProof({
     finalizedHeight?: bigint;
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
+    // Reports the transaction's position in its block once both are authenticated.
+    onLocated?: (position: TransactionPosition) => void;
 }): Promise<VerifiedTransactionProof> {
     const coveredHeightHint = finalizedHeight !== undefined && finalizedHeight <= publishedTarget.height
         ? finalizedHeight
@@ -258,6 +273,7 @@ export async function fetchAndVerifyTransactionProof({
             throw blockInclusionError(target, metadata.location, start.value, appendsEnd);
         }
         onFinalizationVerified?.({ height: target.height, view: target.view });
+        onLocated?.({ height: target.height, index: metadata.location - start.value });
 
         const tip = transactionProofTip(target.transactionsTip);
         let verification: VerifiedFixedKeylessAppendProof;
@@ -511,6 +527,84 @@ export async function fetchAndVerifyTransactionRowProof({
     };
 }
 
+// Whether the transaction at `index` of the finalized block at `height` was applied.
+//
+// The next block carries one outcome bit for each transaction of this one, and its
+// header commits to the bits. The bits come from SQL and are checked against that
+// header, which a certificate authenticates. Returns null until the next block is
+// covered by `publishedTarget`.
+export async function fetchAndVerifyTransactionOutcome({
+    storeUrl,
+    sqlUrl,
+    simplexVerificationMaterial,
+    position,
+    publishedTarget,
+    signal,
+}: {
+    storeUrl: string;
+    sqlUrl: string;
+    simplexVerificationMaterial: string;
+    position: TransactionPosition;
+    publishedTarget: PublishedProofTarget;
+    signal?: AbortSignal;
+}): Promise<TransactionOutcome | null> {
+    const child = position.height + 1n;
+    if (child > publishedTarget.height) return null;
+
+    const source = { storeUrl, sqlUrl, simplexVerificationMaterial };
+    const [target, outcomes] = await Promise.all([
+        finalizedTransactionTarget(source, child, publishedTarget.sequenceNumber, signal),
+        fetchParentOutcomes(sqlUrl, child, publishedTarget.sequenceNumber, signal),
+    ]);
+    signal?.throwIfAborted();
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(outcomes)));
+    if (!bytesEqual(digest, target.parentOutcomes)) {
+        throw new Error(`outcome bits of block ${child} do not match its certified header`);
+    }
+    return outcomeBit(outcomes, position.index) ? 'applied' : 'not applied';
+}
+
+async function fetchParentOutcomes(
+    sqlUrl: string,
+    height: bigint,
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
+): Promise<Uint8Array> {
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${BLOCK_META_PARENT_OUTCOMES}
+            FROM ${BLOCK_META_TABLE}
+            WHERE ${BLOCK_META_HEIGHT} = ${height.toString()}
+            LIMIT 1
+        `,
+        minSequenceNumber,
+        signal,
+    );
+    const row = firstTableRow(result.table);
+    // A missing row may only be indexing lag, so it remains retryable.
+    if (!row) throw missingFinalization(height);
+    return expectVariableBytes(
+        columnValue(row, BLOCK_META_PARENT_OUTCOMES),
+        BLOCK_META_PARENT_OUTCOMES,
+    );
+}
+
+// Encoded outcome bits are a big-endian bit count, then the bits, least significant
+// bit of each byte first.
+export function outcomeBit(outcomes: Uint8Array, index: bigint): boolean {
+    if (outcomes.length < U64_BYTES) throw new Error('outcome bits are truncated');
+    const count = readU64Be(outcomes, 0);
+    if (BigInt(outcomes.length - U64_BYTES) !== (count + 7n) / 8n) {
+        throw new Error('outcome bits do not match their count');
+    }
+    if (index < 0n || index >= count) {
+        throw new Error(`block lists no transaction at index ${index}`);
+    }
+    const byte = outcomes[U64_BYTES + Number(index >> 3n)]!;
+    return (byte & (1 << Number(index & 7n))) !== 0;
+}
+
 async function fetchTransactionProofMetadata(
     sqlUrl: string,
     digest: string,
@@ -639,6 +733,8 @@ interface FinalizationSource {
 // The parent digest authenticates ancestor headers and exact transaction bounds.
 interface AuthenticatedTarget extends FinalizedTransactionTarget {
     readonly parentDigest: Uint8Array;
+    // Digest of the block's outcome bits, which report on its parent's transactions.
+    readonly parentOutcomes: Uint8Array;
 }
 
 interface PendingFinalizedTarget {
@@ -721,7 +817,7 @@ async function finalizedTransactionTarget(
 
 // Public proof targets omit the digest used for internal parent-header checks.
 function publicFinalizedTarget(target: AuthenticatedTarget): FinalizedTransactionTarget {
-    const { parentDigest: _parentDigest, ...finalized } = target;
+    const { parentDigest: _parentDigest, parentOutcomes: _parentOutcomes, ...finalized } = target;
     return finalized;
 }
 
@@ -750,6 +846,7 @@ function copyFinalizedTarget(target: AuthenticatedTarget): AuthenticatedTarget {
         ...target,
         blockDigest: target.blockDigest.slice(),
         parentDigest: target.parentDigest.slice(),
+        parentOutcomes: target.parentOutcomes.slice(),
         stateRoot: target.stateRoot.slice(),
         transactionsRoot: target.transactionsRoot.slice(),
     };
@@ -905,6 +1002,7 @@ async function ancestorTarget(
                     view: header.view,
                     blockDigest: expected,
                     parentDigest: header.parentDigest,
+                    parentOutcomes: header.parentOutcomes,
                     stateRoot: header.stateRoot,
                     stateStart: header.stateStart,
                     stateTip: header.stateTip,
@@ -1083,12 +1181,14 @@ async function finalizedTargetFromCertificate(
         stateTip: header.stateTip,
         blockDigest,
         parentDigest: header.parentDigest,
+        parentOutcomes: header.parentOutcomes,
     };
 }
 
 interface DecodedBlockHeader {
     readonly view: bigint;
     readonly parentDigest: Uint8Array;
+    readonly parentOutcomes: Uint8Array;
     readonly height: bigint;
     readonly stateRoot: Uint8Array;
     readonly stateStart: bigint;
@@ -1115,7 +1215,9 @@ function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeade
     offset = skip(bytes, offset, DIGEST_BYTES);
     const height = readHeaderU64(bytes, offset);
     const timestamp = readHeaderU64(bytes, height.offset);
-    offset = skip(bytes, timestamp.offset, 2 * DIGEST_BYTES);
+    offset = skip(bytes, timestamp.offset, DIGEST_BYTES);
+    const parentOutcomes = readBytes(bytes, offset, DIGEST_BYTES);
+    offset = skip(bytes, offset, DIGEST_BYTES);
 
     const stateRoot = readBytes(bytes, offset, DIGEST_BYTES);
     offset = skip(bytes, offset, DIGEST_BYTES);
@@ -1135,6 +1237,7 @@ function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeade
     return {
         view: view.value,
         parentDigest,
+        parentOutcomes,
         height: height.value,
         stateRoot,
         stateStart: stateStart.value,

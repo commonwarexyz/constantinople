@@ -3,6 +3,12 @@
 //! Primary keys identify immutable Store rows. Each account-state operation
 //! gets its own row keyed by account and operation location. Transaction rows
 //! record their containing height and QMDB location.
+//!
+//! A block lists transactions and the next block executes them. The rows of a
+//! block therefore say which transactions it lists, with or without a
+//! signature, and its `block_meta` row says which transactions of the block
+//! before it were applied. Account rows follow the state, so they show a
+//! transaction's effect one block after the transaction's own rows.
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::PrefixedStoreClient;
@@ -34,6 +40,14 @@ pub const BLOCK_META_TRANSACTIONS_TIP: &str = "transactions_tip";
 pub const BLOCK_META_VIEW: &str = "view";
 /// `block_meta`: finalization timestamp in microseconds since the Unix epoch.
 pub const BLOCK_META_FINALIZED_TS: &str = "finalized_ts";
+/// `block_meta`: the block's outcome bits, as the block encodes them: whether
+/// each transaction of the block at `height - 1` was applied, in block order.
+///
+/// A block's transactions execute with the next block, so this is where the
+/// fate of the transaction at index `i` of block `h` is recorded: bit `i` of
+/// this column in the row of block `h + 1`. The header of block `h + 1`
+/// commits to these bytes.
+pub const BLOCK_META_PARENT_OUTCOMES: &str = "parent_outcomes";
 
 // ---------- tx_meta columns ----------
 
@@ -101,6 +115,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                     DataType::Timestamp(TimeUnit::Microsecond, None),
                     false,
                 ),
+                TableColumnConfig::new(BLOCK_META_PARENT_OUTCOMES, DataType::Binary, false),
             ],
             vec![BLOCK_META_HEIGHT.to_string()],
             vec![],

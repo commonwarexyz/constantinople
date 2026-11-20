@@ -36,12 +36,15 @@ import {
     fetchAccountProofMetadata,
     prefetchFinalizedCertificate,
     fetchAndVerifyAccountProof,
+    fetchAndVerifyTransactionOutcome,
     fetchAndVerifyTransactionProof,
     fetchAndVerifyTransactionRowProof,
     fetchLatestProofTarget,
     type AccountActivityMode,
     type AccountTransactionRow,
     type LatestProofTarget,
+    type TransactionOutcome,
+    type TransactionPosition,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
@@ -84,6 +87,7 @@ import {
     markSubmissionReconciling,
     markSubmissionRejected,
     markTransactionFinalized,
+    markTransactionOutcome,
     markValidatorFinalizationObserved,
     normalizeSubmittedTransaction,
     prependTransaction,
@@ -145,7 +149,15 @@ interface AccountPage {
 interface AccountTxWithProof {
     readonly row: AccountTransactionRow;
     readonly proof: TransactionProofState;
+    // What became of the transaction: null until the next block reports it, and
+    // absent while unknown.
+    readonly outcome?: TransactionOutcome | null;
 }
+
+// A finalized transaction's outcome arrives with the next block. The wallet asks
+// this often, this many times, before it leaves the outcome to the account page.
+const OUTCOME_RETRY_MS = 1_000;
+const OUTCOME_ATTEMPTS = 30;
 
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
@@ -563,6 +575,16 @@ export default function App() {
             );
         };
 
+        const updateOutcome = (index: number, outcome: TransactionOutcome | null) => {
+            setAccountTransactions((current) =>
+                current.map((entry, position) =>
+                    position === index && entry.row.digest === rows[index]?.digest
+                        ? { ...entry, outcome }
+                        : entry,
+                ),
+            );
+        };
+
         rows.forEach((_row, index) => {
             updateRow(index, { status: 'fetching', detail: 'fetching transaction proof' });
         });
@@ -616,6 +638,23 @@ export default function App() {
                 .then((proof) => {
                     if (controller.signal.aborted) return;
                     updateRow(index, verifiedProofState(proof));
+
+                    // The block after the transaction's own says whether it was
+                    // applied. A failed read leaves the outcome blank.
+                    const published = publishedProofTargetRef.current;
+                    if (!published) return;
+                    fetchAndVerifyTransactionOutcome({
+                        storeUrl,
+                        sqlUrl: indexerUrl,
+                        simplexVerificationMaterial,
+                        position: { height: row.height, index: BigInt(row.blockIndex) },
+                        publishedTarget: published,
+                        signal: controller.signal,
+                    })
+                        .then((outcome) => {
+                            if (!controller.signal.aborted) updateOutcome(index, outcome);
+                        })
+                        .catch(() => {});
                 })
                 .catch((error) => {
                     if (controller.signal.aborted) return;
@@ -715,6 +754,35 @@ export default function App() {
             };
             setHistory((current) => markReconciliationFetching(tx.digest, current));
 
+            // The block after the transaction's own says whether it was applied.
+            let located: TransactionPosition | undefined;
+            const reportOutcome = async (position: TransactionPosition) => {
+                for (let attempt = 0; attempt < OUTCOME_ATTEMPTS; attempt++) {
+                    if (activeHistoryKeyRef.current !== historyKey) return;
+                    const published = publishedProofTargetRef.current;
+                    if (published) {
+                        try {
+                            const outcome = await fetchAndVerifyTransactionOutcome({
+                                storeUrl,
+                                sqlUrl: indexerUrl,
+                                simplexVerificationMaterial,
+                                position,
+                                publishedTarget: published,
+                            });
+                            if (outcome !== null) {
+                                setHistory((current) =>
+                                    markTransactionOutcome(tx.digest, outcome, current),
+                                );
+                                return;
+                            }
+                        } catch {
+                            // The next block may not be indexed yet.
+                        }
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, OUTCOME_RETRY_MS));
+                }
+            };
+
             fetchAndVerifyTransactionProof({
                 qmdbUrl,
                 storeUrl,
@@ -724,6 +792,9 @@ export default function App() {
                 publishedTarget,
                 finalizedHeight: tx.finalizedHeight === null ? undefined : BigInt(tx.finalizedHeight),
                 signal: reconciliation.controller.signal,
+                onLocated: (position) => {
+                    located = position;
+                },
                 onFinalizationVerified: (target) => {
                     if (
                         reconciliation.controller.signal.aborted ||
@@ -773,6 +844,7 @@ export default function App() {
                             current,
                         ),
                     );
+                    if (located) void reportOutcome(located);
                     if (wallet !== null && activeHistoryKeyRef.current === historyKey) {
                         fetchAccount(mempoolUrl, wallet.publicKeyHex)
                             .then((nextAccount) => {
@@ -1430,7 +1502,7 @@ function AccountPage({
                 {!activityError && transactions.length === 0 && (
                     <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
                 )}
-                {transactions.map(({ row, proof: txProof }) => (
+                {transactions.map(({ row, proof: txProof, outcome }) => (
                     <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
@@ -1454,6 +1526,7 @@ function AccountPage({
                             <span>value {row.value.toString()}</span>
                             <span>nonce {row.nonce.toString()}</span>
                             <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
+                            {outcome !== undefined && <span>{outcome ?? 'outcome pending'}</span>}
                             <span>proof</span>
                             <ProofMark proof={txProof} />
                         </div>

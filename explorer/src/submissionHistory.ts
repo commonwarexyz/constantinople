@@ -177,6 +177,20 @@ export function markTransactionFinalized(
     });
 }
 
+// Records what became of a finalized transaction, once the block after its own
+// reports it.
+export function markTransactionOutcome(
+    digest: string,
+    outcome: 'applied' | 'not applied',
+    current: SubmittedTransaction[],
+): SubmittedTransaction[] {
+    return current.map((tx) =>
+        tx.digest === digest && tx.status === 'finalized' && tx.finalizedHeight !== null
+            ? { ...tx, detail: `finalized at ${tx.finalizedHeight} · ${outcome}` }
+            : tx,
+    );
+}
+
 export function shouldReconcileTransaction(
     tx: SubmittedTransaction,
     signedInSender: string | null,

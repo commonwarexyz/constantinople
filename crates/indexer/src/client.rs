@@ -586,6 +586,7 @@ mod tests {
                             CellValue::Timestamp(
                                 i64::try_from(block_height).expect("height fits i64"),
                             ),
+                            CellValue::Binary(vec![0; 8]),
                         ],
                     )
                     .expect("stage block metadata");

@@ -9,7 +9,7 @@ use crate::publisher::{
     },
 };
 use bytes::Bytes;
-use commonware_codec::FixedSize;
+use commonware_codec::{Encode as _, FixedSize};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
@@ -53,6 +53,7 @@ where
         transactions_tip: block.header.transactions_range.end() - 1,
         view: 0,
         finalized_ts_micros,
+        parent_outcomes: block.outcomes.encode().to_vec(),
     })
 }
 
@@ -207,7 +208,9 @@ fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
 mod tests {
     use super::*;
     use crate::sql_schema::{BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
-    use commonware_codec::{Copying, DecodeExt as _, EncodeSize as _, FixedSize, Write as _};
+    use commonware_codec::{
+        Copying, Decode as _, DecodeExt as _, EncodeSize as _, FixedSize, Write as _,
+    };
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View},
@@ -222,7 +225,7 @@ mod tests {
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
     use constantinople_engine::types::{EngineBlock, EngineCommitment};
     use constantinople_primitives::{
-        Block, Header, LazySignedTransaction, Sealable, Sealed, SignedTransaction,
+        Block, Header, LazySignedTransaction, Outcomes, Sealable, Sealed, SignedTransaction,
         TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
     use core::num::NonZeroU64;
@@ -319,6 +322,79 @@ mod tests {
             };
             assert!(locations.contains(&(digest.clone(), *location)));
         }
+    }
+
+    /// A block lists signed and tagged transactions alike, and its row says
+    /// which transactions of its parent were applied.
+    #[test]
+    fn rows_cover_both_kinds_and_carry_the_parent_outcomes() {
+        let signed = transfer(1);
+        let sender = constantinople_auth::PrivateKey::from([7; 32]);
+        let tagged = Transaction::<sha256::Digest>::new(
+            TransactionPublicKey::x25519(sender.public_key()),
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(9).public_key()),
+            NonZeroU64::MIN,
+            0,
+        )
+        .seal_for_mac(&mut Sha256::default());
+        assert!(tagged.is_mac());
+        let digests = [*signed.message_digest(), *tagged.message_digest()];
+        let tagged_bytes = tagged.encode();
+
+        // The parent listed three transactions, of which the second was not applied.
+        let mut outcomes = Outcomes::zeroes(3);
+        outcomes.set(0, true);
+        outcomes.set(2, true);
+        let leader = ed25519::PrivateKey::from_seed(0).public_key();
+        let block = EngineBlock::from(Sealed::new_unchecked(
+            Block {
+                header: test_header(leader, non_empty_range!(0u64, 3u64)),
+                notarization: None,
+                outcomes: outcomes.clone(),
+                body: vec![
+                    LazySignedTransaction::new(signed),
+                    LazySignedTransaction::new(tagged),
+                ],
+            },
+            sha256::Digest::EMPTY,
+        ));
+        let rows = encode_block_rows(&block, 1_000, 0, &digests).expect("block should index");
+
+        let meta = &rows[0];
+        assert_eq!(meta.table, BLOCK_META_TABLE);
+        let Some(CellValue::Binary(recorded)) = meta.values.get(7) else {
+            panic!("block_meta parent outcomes should be binary");
+        };
+        assert_eq!(
+            Outcomes::decode_cfg(
+                Copying(recorded.as_slice()),
+                &commonware_codec::RangeCfg::new(3..=3u64)
+            )
+            .expect("outcomes decode"),
+            outcomes
+        );
+
+        let bodies: Vec<_> = rows
+            .iter()
+            .filter(|row| row.table == TX_META_TABLE)
+            .map(|row| {
+                let Some(CellValue::Binary(body)) = row.values.get(2) else {
+                    panic!("tx_meta body should be binary");
+                };
+                body.clone()
+            })
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        // A tagged transaction is stored as it is in the block: without a signature.
+        assert_eq!(bodies[1], tagged_bytes.to_vec());
+        let senders = rows
+            .iter()
+            .filter(|row| {
+                row.table == TX_ACTIVITY_TABLE
+                    && matches!(row.values.get(3), Some(CellValue::UInt64(0)))
+            })
+            .count();
+        assert_eq!(senders, 2);
     }
 
     #[test]

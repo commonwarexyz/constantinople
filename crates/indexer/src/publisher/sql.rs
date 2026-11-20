@@ -23,6 +23,9 @@ pub(crate) struct BlockMetaRow {
     pub transactions_tip: u64,
     pub view: u64,
     pub finalized_ts_micros: i64,
+    /// The block's encoded outcome bits, which report on its parent's
+    /// transactions.
+    pub parent_outcomes: Vec<u8>,
 }
 
 /// Transaction row fields stored in `tx_meta`.
@@ -92,6 +95,7 @@ pub(crate) fn encode_block_meta_row(block: BlockMetaRow) -> SqlRow {
             CellValue::UInt64(block.transactions_tip),
             CellValue::UInt64(block.view),
             CellValue::Timestamp(block.finalized_ts_micros),
+            CellValue::Binary(block.parent_outcomes),
         ],
     }
 }
