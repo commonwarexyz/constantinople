@@ -291,6 +291,9 @@ const fn account_seed(validator: usize, kind: Kind, height: u64) -> u64 {
 /// over all the nodes of a test.
 pub(crate) type Checked = Arc<Mutex<[u64; 5]>>;
 
+/// The proposers of the finalized blocks, over all the nodes of a test.
+pub(crate) type Proposers = Arc<Mutex<std::collections::BTreeSet<TestPublicKey>>>;
+
 /// Proposes one transaction of each [`Kind`] per block and checks the outcome
 /// of each as blocks finalize.
 #[derive(Clone)]
@@ -304,6 +307,7 @@ pub(crate) struct TestSource {
     /// The last finalized block, whose transactions the next one executes.
     last: Arc<Mutex<Option<Arc<TestBlock>>>>,
     checked: Checked,
+    proposers: Proposers,
 }
 
 impl TestSource {
@@ -315,6 +319,7 @@ impl TestSource {
         participants: &Set<TestPublicKey>,
         secrets: &BTreeMap<TestPublicKey, constantinople_auth::PrivateKey>,
         checked: Checked,
+        proposers: Proposers,
     ) -> Self {
         let me = participants
             .position(&signers[index].public_key())
@@ -329,6 +334,7 @@ impl TestSource {
             validators: Arc::new(validators),
             last: Arc::default(),
             checked,
+            proposers,
         }
     }
 
@@ -402,6 +408,9 @@ impl TestSource {
     /// Blocks arrive in order, but a restart replays some and a state sync
     /// skips some: only a block that follows the last one is checked.
     pub(crate) fn finalized(&self, block: Arc<TestBlock>) {
+        self.proposers
+            .lock()
+            .insert(block.header.context.leader.clone());
         let mut last = self.last.lock();
         let height = block.header.height;
         match &*last {

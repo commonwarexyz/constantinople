@@ -221,6 +221,10 @@ where
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
     pub finalized_hook: Option<EngineFinalizedHook<H, P>>,
+    /// Makes this node a faulty proposer that keeps the columns of its blocks to
+    /// itself.
+    #[cfg(all(test, feature = "test-utils"))]
+    pub withhold_columns: bool,
 }
 
 /// Fully assembled validator engine.
@@ -269,6 +273,10 @@ where
     shared: Shared<H>,
     /// Columns of the blocks this node proposes, on their way to its peers.
     column_receiver: mpsc::UnboundedReceiver<(P, Bytes)>,
+    /// Takes the columns this node sends again on request.
+    column_replies: mpsc::UnboundedSender<(P, Bytes)>,
+    /// The validators.
+    participants: Set<P>,
     tag_bits: u32,
 }
 
@@ -598,6 +606,12 @@ where
         )
         .await;
         let (column_sender, column_receiver) = mpsc::unbounded_channel();
+        #[cfg(all(test, feature = "test-utils"))]
+        let column_sender = if config.withhold_columns {
+            mpsc::unbounded_channel().0
+        } else {
+            column_sender
+        };
         let application = Gated::new(
             context.child("gate"),
             application,
@@ -606,7 +620,7 @@ where
             tagger,
             scheme.clone(),
             config.strategy.clone(),
-            column_sender,
+            column_sender.clone(),
         );
 
         // Simplex activity reaches marshal through the marshaled application,
@@ -670,6 +684,8 @@ where
             simplex,
             shared,
             column_receiver,
+            column_replies: column_sender,
+            participants: participants.clone(),
             tag_bits: constantinople_auth::tag_bits(u32::from(n_participants)),
         }
     }
@@ -734,7 +750,17 @@ where
         let (column_sender, column_receiver) = channels.columns;
         let columns_in = columns_in_context.spawn({
             let (shared, bits, blocker) = (self.shared, self.tag_bits, self.blocker.clone());
-            move |_| tags::receive(shared, bits, column_receiver, blocker)
+            let (participants, replies) = (self.participants, self.column_replies);
+            move |_| {
+                tags::receive(
+                    shared,
+                    bits,
+                    participants,
+                    replies,
+                    column_receiver,
+                    blocker,
+                )
+            }
         });
         let columns_out =
             columns_out_context.spawn(move |_| tags::send(self.column_receiver, column_sender));

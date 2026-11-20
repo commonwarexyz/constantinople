@@ -82,6 +82,10 @@ struct TestEngineDefinition {
     secrets: BTreeMap<TestPublicKey, constantinople_auth::PrivateKey>,
     /// Outcome bits checked by all nodes, by kind of transaction.
     checked: common::Checked,
+    /// The proposers of the blocks that nodes saw finalized.
+    proposers: common::Proposers,
+    /// A validator that never sends the columns of its blocks.
+    withholder: Option<usize>,
     enable_state_sync: bool,
     /// When `true`, every node re-tracks peer set 0 during `init` as
     /// `TrackedPeers::new(primary, secondary)` — primary = the validators,
@@ -107,6 +111,8 @@ impl TestEngineDefinition {
             participants,
             secrets,
             checked: Default::default(),
+            proposers: Default::default(),
+            withholder: None,
             enable_state_sync: false,
             use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
@@ -142,6 +148,12 @@ impl TestEngineDefinition {
     /// validators, secondary = the rest.
     const fn with_discovery_split(mut self) -> Self {
         self.use_discovery_split = true;
+        self
+    }
+
+    /// Makes validator `index` a faulty proposer that withholds its columns.
+    const fn with_withheld_columns(mut self, index: usize) -> Self {
+        self.withholder = Some(index);
         self
     }
 
@@ -243,6 +255,8 @@ impl EngineDefinition for TestEngineDefinition {
         let signers = self.signers.clone();
         let secrets = self.secrets.clone();
         let checked = self.checked.clone();
+        let proposers = self.proposers.clone();
+        let withhold_columns = self.withholder == Some(index);
         let partition_prefix = format!("validator-{index}");
         let validators = self.participants.clone();
         let sync_heights = self.sync_heights.clone();
@@ -338,7 +352,7 @@ impl EngineDefinition for TestEngineDefinition {
                 columns,
             };
 
-            let input = TestSource::new(index, &signers, &validators, &secrets, checked);
+            let input = TestSource::new(index, &signers, &validators, &secrets, checked, proposers);
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
@@ -404,6 +418,7 @@ impl EngineDefinition for TestEngineDefinition {
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
+                    withhold_columns,
                 },
             )
             .await;
@@ -500,6 +515,27 @@ fn run_finalize(engine: TestEngineDefinition) {
     for kind in common::KINDS {
         assert!(checked[kind as usize] >= 500, "{kind:?}: {checked:?}");
     }
+}
+
+/// A proposer that keeps its columns to itself gets no votes: the validators
+/// cannot report on its blocks, its views time out, and the chain goes on with
+/// the blocks of the others.
+fn run_withheld_columns() {
+    let engine = TestEngineDefinition::new(NUM_VALIDATORS).with_withheld_columns(1);
+    let withholder = engine.participants()[1].clone();
+    let proposers = engine.proposers.clone();
+    PlanBuilder::new(engine)
+        .link(default_link())
+        .seed(0)
+        .timeout(Duration::from_secs(600))
+        .exit_condition(FinalizedHeightAtLeast::new(30))
+        .property(BlockAgreementAtHeight::new(30))
+        .run()
+        .unwrap();
+
+    let proposers = proposers.lock();
+    assert!(!proposers.contains(&withholder));
+    assert_eq!(proposers.len(), NUM_VALIDATORS as usize - 1);
 }
 
 fn run_determinism(engine: TestEngineDefinition) {
@@ -852,6 +888,12 @@ fn run_secondaries_sync(engine: TestEngineDefinition) {
 #[test_traced("DEBUG")]
 fn all_validators_finalize_and_commit() {
     run_finalize(TestEngineDefinition::new(NUM_VALIDATORS));
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn withheld_columns_cost_the_proposer_its_blocks() {
+    run_withheld_columns();
 }
 
 #[test_group("slow")]

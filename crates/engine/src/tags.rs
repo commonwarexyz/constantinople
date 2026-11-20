@@ -46,7 +46,7 @@ use commonware_utils::{
     Participant,
     cache::Cache,
     channel::{fallible::OneshotExt as _, mpsc, oneshot},
-    ordered::Quorum as _,
+    ordered::{Quorum as _, Set},
     sync::{AsyncMutex, Mutex},
 };
 use constantinople_application::consensus::Chain;
@@ -60,6 +60,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 use tracing::{debug, warn};
 
@@ -72,6 +73,10 @@ const RETAINED_BLOCKS: usize = 8;
 /// Columns from one peer are kept for this many of its latest blocks. A column
 /// can arrive before consensus asks about its block.
 const RETAINED_COLUMNS: usize = 2;
+
+/// A validator that holds a block and not the proposer's column for it asks
+/// the proposer again this often.
+const COLUMN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
 type Commitment<H> = EngineCommitment<H, P>;
 type InnerBlock<H> = SealedBlock<Commitment<H>, P, H>;
@@ -104,6 +109,53 @@ impl<H: Hasher> Read for Column<H> {
             commitment: Commitment::<H>::read_cfg(buf, &())?,
             tags: Tags::read_cfg(buf, &(*bits, RangeCfg::new(..=MAX_ENTRIES)))?,
         })
+    }
+}
+
+/// What validators say to each other on the column channel.
+enum Message<H: Hasher> {
+    /// A proposer's tags for one validator.
+    Column(Column<H>),
+    /// A validator that holds a block of the recipient and not its column asks
+    /// for the column again. The network may drop a message, and without the
+    /// column the validator cannot vote for the block.
+    Request(Commitment<H>),
+}
+
+impl<H: Hasher> Write for Message<H> {
+    fn write(&self, buf: &mut impl BufMut) {
+        match self {
+            Self::Column(column) => {
+                0u8.write(buf);
+                column.write(buf);
+            }
+            Self::Request(commitment) => {
+                1u8.write(buf);
+                commitment.write(buf);
+            }
+        }
+    }
+}
+
+impl<H: Hasher> EncodeSize for Message<H> {
+    fn encode_size(&self) -> usize {
+        1 + match self {
+            Self::Column(column) => column.encode_size(),
+            Self::Request(commitment) => commitment.encode_size(),
+        }
+    }
+}
+
+impl<H: Hasher> Read for Message<H> {
+    /// The tag length in bits.
+    type Cfg = u32;
+
+    fn read_cfg(buf: &mut impl Buf, bits: &Self::Cfg) -> Result<Self, Error> {
+        match u8::read_cfg(buf, &())? {
+            0 => Ok(Self::Column(Column::read_cfg(buf, bits)?)),
+            1 => Ok(Self::Request(Commitment::<H>::read_cfg(buf, &())?)),
+            kind => Err(Error::InvalidEnum(kind)),
+        }
     }
 }
 
@@ -505,9 +557,23 @@ where
             let column = if tagged.is_empty() {
                 Tags::new(self.tagger.bits)
             } else {
-                match self.shared.column(leader.clone(), commitment).await {
-                    Ok(column) => column,
-                    Err(_) => return false,
+                // The column normally arrives with the proposal, ahead of the
+                // block. If the network dropped it, the leader sends it again
+                // on request, for as long as consensus waits for this verdict.
+                let mut column = self.shared.column(leader.clone(), commitment);
+                loop {
+                    select! {
+                        column = &mut column => match column {
+                            Ok(column) => break column,
+                            Err(_) => return false,
+                        },
+                        _ = self.context.sleep(COLUMN_REQUEST_INTERVAL) => {
+                            let request = Message::<H>::Request(commitment).encode();
+                            if self.columns.send((leader.clone(), request)).is_err() {
+                                return false;
+                            }
+                        },
+                    }
                 }
             };
             (tagged, column)
@@ -537,10 +603,10 @@ where
             if Some(validator) == me {
                 continue;
             }
-            let column = Column::<H> {
+            let column = Message::Column(Column::<H> {
                 commitment,
                 tags: column_for(&authenticators, validator, self.tagger.bits),
-            };
+            });
             if self.columns.send((peer.clone(), column.encode())).is_err() {
                 debug!("column sender stopped");
                 return;
@@ -683,18 +749,39 @@ where
     }
 }
 
-/// Receives columns from peers until the channel closes.
+/// Receives columns and requests for columns from peers until the channel
+/// closes. `replies` takes the columns this node sends again on request.
 pub(crate) async fn receive<H: Hasher>(
     shared: Shared<H>,
     bits: u32,
+    participants: Set<P>,
+    replies: mpsc::UnboundedSender<(P, Bytes)>,
     mut receiver: impl Receiver<PublicKey = P>,
     mut blocker: impl Blocker<PublicKey = P>,
 ) {
     while let Ok((peer, message)) = receiver.recv().await {
-        match Column::<H>::decode_cfg(message, &bits) {
-            Ok(column) => shared.received(peer, column.commitment, column.tags),
+        match Message::<H>::decode_cfg(message, &bits) {
+            Ok(Message::Column(column)) => shared.received(peer, column.commitment, column.tags),
+            Ok(Message::Request(commitment)) => {
+                // Only a validator has a column, and only for a block this
+                // node built and still holds.
+                let Some(validator) = participants.index(&peer) else {
+                    continue;
+                };
+                let Some(Built { authenticators, .. }) = shared.own(&commitment.block()) else {
+                    continue;
+                };
+                let column = Message::Column(Column::<H> {
+                    commitment,
+                    tags: column_for(&authenticators, validator, bits),
+                });
+                if replies.send((peer, column.encode())).is_err() {
+                    debug!("column sender stopped");
+                    return;
+                }
+            }
             Err(error) => {
-                commonware_p2p::block!(blocker, peer, ?error, "malformed column");
+                commonware_p2p::block!(blocker, peer, ?error, "malformed column message");
             }
         }
     }
