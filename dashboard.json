@@ -639,6 +639,644 @@
         "x": 0,
         "y": 25
       },
+      "id": 92,
+      "panels": [],
+      "title": "Load and Cost per Transaction",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 26
+      },
+      "id": 93,
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_finalized_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "finalized",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        },
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_submitted_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "submitted",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
+        }
+      ],
+      "title": "Spammer TPS",
+      "type": "timeseries",
+      "description": "Transactions the spammer submitted and saw finalized. In either mode a transaction counts as finalized once the block after its own reports it applied."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 26
+      },
+      "id": 94,
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_rejected_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "rejected",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        },
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_dropped_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "dropped",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
+        },
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_filtered_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "filtered",
+          "range": true,
+          "refId": "C",
+          "useBackend": false
+        },
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_submit_errors_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "submit errors",
+          "range": true,
+          "refId": "D",
+          "useBackend": false
+        }
+      ],
+      "title": "Spammer Rejected, Dropped and Filtered",
+      "type": "timeseries",
+      "description": "Transactions per second that did not finalize: rejected (a tagged transaction that too few validators approved), dropped, filtered, and failed submissions."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 26
+      },
+      "id": 95,
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(engine_application_proposed_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "proposed",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        },
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(spammer_finalized_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "finalized",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
+        }
+      ],
+      "title": "Proposed vs Finalized TPS",
+      "type": "timeseries",
+      "description": "Transactions in proposals against transactions the spammer saw finalized. Proposals of views that were nullified count as proposed, and so does a tagged transaction each time it is proposed again."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 34
+      },
+      "id": 96,
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(node_cpu_seconds_total{mode!=\"idle\", deployer_name=~\"$Validator\", deployer_name=~\"[0-9a-f]{64}\", deployer_region=~\"$Region\"}[1m])) / sum(rate(spammer_finalized_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "cpu per transaction",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Node CPU per Finalized Transaction",
+      "type": "timeseries",
+      "description": "CPU time of every node that runs the validator binary (validators and secondaries), divided by the transactions the spammer saw finalized. The spammer is closed-loop, so this, not TPS, is where signatures and MACs differ."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 34
+      },
+      "id": 97,
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(runtime_outbound_bandwidth_total{deployer_name=~\"$Validator\", deployer_name=~\"[0-9a-f]{64}\", deployer_region=~\"$Region\"}[1m])) / sum(rate(spammer_finalized_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "bytes per transaction",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Outbound Bytes per Finalized Transaction",
+      "type": "timeseries",
+      "description": "Bytes sent by validators and secondaries, divided by the transactions the spammer saw finalized."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 34
+      },
+      "id": 98,
+      "options": {
+        "tooltip": {
+          "mode": "single",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "engine_verdicts_size{deployer_name=~\"$Validator\", deployer_name=~\"[0-9a-f]{64}\", deployer_region=~\"$Region\"}",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "{{deployer_name}}",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Rejected Tags Recorded",
+      "type": "timeseries",
+      "description": "Tagged transactions each validator has recorded a durable 'no' verdict for. Flat at zero when every tag matches."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 42
+      },
       "id": 36,
       "panels": [],
       "title": "Application",
@@ -709,7 +1347,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 26
+        "y": 43
       },
       "id": 31,
       "options": {
@@ -808,7 +1446,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 26
+        "y": 43
       },
       "id": 30,
       "options": {
@@ -907,7 +1545,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 26
+        "y": 43
       },
       "id": 32,
       "options": {
@@ -1006,7 +1644,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 34
+        "y": 51
       },
       "id": 33,
       "options": {
@@ -1105,7 +1743,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 34
+        "y": 51
       },
       "id": 34,
       "options": {
@@ -1204,7 +1842,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 34
+        "y": 51
       },
       "id": 35,
       "options": {
@@ -1234,7 +1872,7 @@
           "useBackend": false
         }
       ],
-      "title": "Block Verify Duration (p75)",
+      "title": "Block Verify Duration (p99)",
       "transparent": true,
       "type": "timeseries"
     },
@@ -1303,7 +1941,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 42
+        "y": 59
       },
       "id": 1,
       "options": {
@@ -1406,7 +2044,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 42
+        "y": 59
       },
       "id": 8,
       "options": {
@@ -1509,7 +2147,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 42
+        "y": 59
       },
       "id": 9,
       "options": {
@@ -1612,7 +2250,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 50
+        "y": 67
       },
       "id": 10,
       "options": {
@@ -1637,7 +2275,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "histogram_quantile(0.5, rate(engine_shards_erasure_decode_duration_bucket[$__rate_interval]))",
+          "expr": "histogram_quantile(0.5, rate(engine_shards_reconstruction_duration_bucket[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "__auto",
@@ -1646,7 +2284,7 @@
           "useBackend": false
         }
       ],
-      "title": "Erasure Decode Duration (p50)",
+      "title": "Block Reconstruction Duration (p50)",
       "transparent": true,
       "type": "timeseries"
     },
@@ -1715,7 +2353,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 50
+        "y": 67
       },
       "id": 11,
       "options": {
@@ -1740,7 +2378,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "histogram_quantile(0.75, rate(engine_shards_erasure_decode_duration_bucket[$__rate_interval]))",
+          "expr": "histogram_quantile(0.75, rate(engine_shards_reconstruction_duration_bucket[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "__auto",
@@ -1749,7 +2387,7 @@
           "useBackend": false
         }
       ],
-      "title": "Erasure Decode Duration (p75)",
+      "title": "Block Reconstruction Duration (p75)",
       "transparent": true,
       "type": "timeseries"
     },
@@ -1818,7 +2456,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 50
+        "y": 67
       },
       "id": 12,
       "options": {
@@ -1843,7 +2481,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "histogram_quantile(0.99, rate(engine_shards_erasure_decode_duration_bucket[$__rate_interval]))",
+          "expr": "histogram_quantile(0.99, rate(engine_shards_reconstruction_duration_bucket[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "__auto",
@@ -1852,7 +2490,7 @@
           "useBackend": false
         }
       ],
-      "title": "Erasure Decode Duration (p99)",
+      "title": "Block Reconstruction Duration (p99)",
       "transparent": true,
       "type": "timeseries"
     },
@@ -1920,7 +2558,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 58
+        "y": 75
       },
       "id": 41,
       "options": {
@@ -1960,7 +2598,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 83
       },
       "id": 56,
       "panels": [],
@@ -2031,7 +2669,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 67
+        "y": 84
       },
       "id": 48,
       "options": {
@@ -2133,7 +2771,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 67
+        "y": 84
       },
       "id": 49,
       "options": {
@@ -2235,7 +2873,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 67
+        "y": 84
       },
       "id": 50,
       "options": {
@@ -2337,7 +2975,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 67
+        "y": 84
       },
       "id": 51,
       "options": {
@@ -2438,112 +3076,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
-        "y": 75
-      },
-      "id": 52,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "histogram_quantile(0.75, rate(engine_simplex_batcher_verify_latency_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "legendFormat": "{{deployer_name}} ({{deployer_ip}})",
-          "range": true,
-          "refId": "A",
-          "useBackend": false
-        }
-      ],
-      "title": "Batch Verify Latency (p75)",
-      "transparent": true,
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 6,
-        "y": 75
+        "y": 92
       },
       "id": 53,
       "options": {
@@ -2568,7 +3103,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "histogram_quantile(0.75, rate(engine_simplex_batcher_recover_latency_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "histogram_quantile(0.75, rate(engine_simplex_batcher_construct_latency_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{deployer_name}} ({{deployer_ip}})",
@@ -2577,7 +3112,7 @@
           "useBackend": false
         }
       ],
-      "title": "Recover Latency (p75)",
+      "title": "Certificate Construct Latency (p75)",
       "transparent": true,
       "type": "timeseries"
     },
@@ -2644,9 +3179,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 75
+        "w": 8,
+        "x": 8,
+        "y": 92
       },
       "id": 54,
       "options": {
@@ -2747,9 +3282,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 75
+        "w": 8,
+        "x": 16,
+        "y": 92
       },
       "id": 55,
       "options": {
@@ -2793,7 +3328,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 100
       },
       "id": 43,
       "panels": [],
@@ -2832,7 +3367,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 101
       },
       "id": 47,
       "options": {
@@ -2934,7 +3469,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 91
+        "y": 108
       },
       "id": 46,
       "options": {
@@ -3049,7 +3584,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 91
+        "y": 108
       },
       "id": 42,
       "options": {
@@ -3089,7 +3624,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 99
+        "y": 116
       },
       "id": 14,
       "panels": [],
@@ -3161,7 +3696,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 100
+        "y": 117
       },
       "id": 27,
       "options": {
@@ -3264,7 +3799,7 @@
         "h": 9,
         "w": 8,
         "x": 8,
-        "y": 100
+        "y": 117
       },
       "id": 28,
       "options": {
@@ -3366,7 +3901,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 100
+        "y": 117
       },
       "id": 18,
       "options": {
@@ -3468,7 +4003,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 109
+        "y": 126
       },
       "id": 15,
       "options": {
@@ -3570,7 +4105,7 @@
         "h": 9,
         "w": 8,
         "x": 8,
-        "y": 109
+        "y": 126
       },
       "id": 16,
       "options": {
@@ -3641,7 +4176,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 109
+        "y": 126
       },
       "id": 17,
       "options": {
@@ -3756,7 +4291,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 118
+        "y": 135
       },
       "id": 19,
       "options": {
@@ -3859,7 +4394,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 118
+        "y": 135
       },
       "id": 59,
       "options": {
@@ -3898,7 +4433,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 127
+        "y": 144
       },
       "id": 26,
       "panels": [],
@@ -3969,7 +4504,7 @@
         "h": 9,
         "w": 6,
         "x": 0,
-        "y": 128
+        "y": 145
       },
       "id": 21,
       "options": {
@@ -4068,7 +4603,7 @@
         "h": 9,
         "w": 6,
         "x": 6,
-        "y": 128
+        "y": 145
       },
       "id": 20,
       "options": {
@@ -4168,7 +4703,7 @@
         "h": 9,
         "w": 6,
         "x": 12,
-        "y": 128
+        "y": 145
       },
       "id": 22,
       "options": {
@@ -4266,7 +4801,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 128
+        "y": 145
       },
       "id": 40,
       "options": {
@@ -4365,7 +4900,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 154
       },
       "id": 24,
       "options": {
@@ -4406,7 +4941,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 145
+        "y": 162
       },
       "id": 37,
       "panels": [],
@@ -4477,7 +5012,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 163
       },
       "id": 38,
       "options": {
@@ -4575,7 +5110,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 146
+        "y": 163
       },
       "id": 39,
       "options": {
@@ -4615,7 +5150,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 154
+        "y": 171
       },
       "id": 25,
       "panels": [],
@@ -4687,7 +5222,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 155
+        "y": 172
       },
       "id": 23,
       "options": {
@@ -4727,7 +5262,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 164
+        "y": 181
       },
       "id": 65,
       "panels": [],
@@ -4799,7 +5334,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 165
+        "y": 182
       },
       "id": 66,
       "options": {
@@ -4902,7 +5437,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 165
+        "y": 182
       },
       "id": 67,
       "options": {
@@ -4927,7 +5462,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum by(size_class) (rate(runtime_network_buffer_pool_buffer_pool_exhausted_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum by(size_class) (rate(runtime_network_buffer_pool_buffer_pool_exhausted_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{size_class}}B",
@@ -5005,7 +5540,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 165
+        "y": 182
       },
       "id": 68,
       "options": {
@@ -5030,7 +5565,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate(runtime_network_buffer_pool_buffer_pool_oversized_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum(rate(runtime_network_buffer_pool_buffer_pool_oversized_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "network",
@@ -5045,7 +5580,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate(runtime_storage_buffer_pool_buffer_pool_oversized_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum(rate(runtime_storage_buffer_pool_buffer_pool_oversized_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "storage",
@@ -5123,7 +5658,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 165
+        "y": 182
       },
       "id": 69,
       "options": {
@@ -5226,7 +5761,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 173
+        "y": 190
       },
       "id": 70,
       "options": {
@@ -5251,7 +5786,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate(runtime_storage_buffer_pool_buffer_pool_exhausted_total_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum(rate(runtime_storage_buffer_pool_buffer_pool_exhausted_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "storage exhausted",
@@ -5331,7 +5866,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 173
+        "y": 190
       },
       "id": 71,
       "options": {
@@ -5434,7 +5969,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 173
+        "y": 190
       },
       "id": 72,
       "options": {
@@ -5537,7 +6072,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 173
+        "y": 190
       },
       "id": 73,
       "options": {
@@ -5588,7 +6123,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 181
+        "y": 198
       },
       "id": 44,
       "options": {
@@ -5633,7 +6168,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 191
+        "y": 208
       },
       "id": 45,
       "options": {
@@ -5670,7 +6205,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 200
+        "y": 217
       },
       "id": 74,
       "panels": [],
@@ -5685,7 +6220,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 201
+        "y": 218
       },
       "fieldConfig": {
         "defaults": {
@@ -5796,7 +6331,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 201
+        "y": 218
       },
       "fieldConfig": {
         "defaults": {
@@ -5916,7 +6451,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 201
+        "y": 218
       },
       "fieldConfig": {
         "defaults": {
@@ -6037,7 +6572,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 209
+        "y": 226
       },
       "fieldConfig": {
         "defaults": {
@@ -6203,7 +6738,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 209
+        "y": 226
       },
       "fieldConfig": {
         "defaults": {
@@ -6325,7 +6860,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 209
+        "y": 226
       },
       "fieldConfig": {
         "defaults": {
@@ -6424,7 +6959,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 217
+        "y": 234
       },
       "fieldConfig": {
         "defaults": {
@@ -6721,7 +7256,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 217
+        "y": 234
       },
       "fieldConfig": {
         "defaults": {
@@ -6843,7 +7378,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 217
+        "y": 234
       },
       "fieldConfig": {
         "defaults": {
@@ -6964,7 +7499,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 225
+        "y": 242
       },
       "fieldConfig": {
         "defaults": {
@@ -7095,7 +7630,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 225
+        "y": 242
       },
       "fieldConfig": {
         "defaults": {
@@ -7216,7 +7751,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 225
+        "y": 242
       },
       "fieldConfig": {
         "defaults": {
@@ -7325,7 +7860,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 233
+        "y": 250
       },
       "fieldConfig": {
         "defaults": {
@@ -7457,7 +7992,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 233
+        "y": 250
       },
       "fieldConfig": {
         "defaults": {
@@ -7578,7 +8113,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 233
+        "y": 250
       },
       "fieldConfig": {
         "defaults": {
@@ -7689,7 +8224,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 241
+        "y": 258
       },
       "fieldConfig": {
         "defaults": {
@@ -7811,7 +8346,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 241
+        "y": 258
       },
       "fieldConfig": {
         "defaults": {

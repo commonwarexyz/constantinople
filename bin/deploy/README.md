@@ -632,6 +632,39 @@ The script builds only locally managed adapter binaries. The managed
 chain-indexer Intel build remains last because both chain-indexer recipes
 write `deploy/chain-indexer`.
 
+### Comparing Signatures and MACs on One Deployment
+
+Validators accept signed and tagged transactions alike, so one deployment can
+run each mode in turn. The mode belongs to the spammer alone: `mode` in
+`spammer.yaml`, which lists the validators' tag keys in either mode.
+
+To switch a running deployment, restart only the spammer:
+
+```sh
+cd deploy
+yq '.instances |= map(select(.name == "spammer"))' config.yaml > spammer-only.yaml
+yq -i '.mode = "signatures"' spammer.yaml
+deployer aws update --config spammer-only.yaml
+```
+
+`deployer aws update` restarts each instance its config names and logs
+`instance config not found in config file` for every other instance of the
+deployment, which it leaves running. With the full `config.yaml` it restarts
+every instance at once. The cluster recovers from that, but tagged
+transactions waiting on a restarted proposer are rejected, and the two modes
+are no longer measured on the same uninterrupted chain.
+
+The spammer picks fresh accounts whenever it starts, so the second run does
+not reuse the first run's nonces. Size `--spammer-accounts` and
+`--spammer-submitters` once, at generation: both modes then offer the same
+load.
+
+The spammer waits for each batch before sending the next, so throughput
+follows the offered load in both modes until validators saturate. Compare the
+cost of a transaction instead: the dashboard's `Load and Cost per Transaction`
+row divides node CPU and outbound bytes by the transactions the spammer saw
+finalized, and shows rejected, dropped, and filtered transactions.
+
 ### Local Explorer Against Remote
 
 After the remote deployment has completed, run the explorer locally against the
