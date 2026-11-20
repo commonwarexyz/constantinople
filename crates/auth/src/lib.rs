@@ -4,6 +4,9 @@
 mod keys;
 pub use keys::{ChannelKey, Mac, PrivateKey, PublicKey, SharedKey};
 
+mod shared;
+pub use shared::SharedKeys;
+
 mod tag;
 pub use tag::{SECURITY_BITS, TRANSACTIONS_LOG2, Tag, TagKey, Tags, tag_bits};
 

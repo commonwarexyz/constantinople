@@ -41,17 +41,18 @@ use commonware_cryptography::{
 use commonware_macros::select;
 use commonware_p2p::{Blocker, Receiver, Recipients, Sender};
 use commonware_parallel::Strategy;
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _,
+};
 use commonware_utils::{
     Participant,
-    cache::Cache,
     channel::{fallible::OneshotExt as _, mpsc, oneshot},
     ordered::{Quorum as _, Set},
     sync::{AsyncMutex, Mutex},
 };
 use constantinople_application::consensus::Chain;
 use constantinople_auth::{
-    MAX_ENTRIES, PrivateKey, Report, SharedKey, Tags, Verdicts, VerdictsConfig, tag_bits,
+    MAX_ENTRIES, PrivateKey, Report, SharedKeys, Tags, Verdicts, VerdictsConfig, tag_bits,
 };
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
@@ -62,7 +63,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tracing::{debug, warn};
+use tracing::{Instrument as _, Span, debug, info_span, warn};
 
 /// Notarizations are kept for this many of the latest rounds.
 const RETAINED_NOTARIZATIONS: usize = 256;
@@ -375,10 +376,8 @@ where
 {
     /// Namespace of the keys users share with validators.
     namespace: &'static [u8],
-    /// This validator's X25519 secret.
-    secret: PrivateKey,
     /// `K(u, i)` for the senders seen lately. A miss costs one Diffie-Hellman.
-    keys: Mutex<Cache<constantinople_auth::PublicKey, SharedKey>>,
+    keys: SharedKeys,
     verdicts: AsyncMutex<Verdicts<E, H::Digest>>,
     /// Length of a tag in bits.
     bits: u32,
@@ -402,21 +401,10 @@ where
             .expect("verdict store must open");
         Self {
             namespace,
-            secret,
-            keys: Mutex::new(Cache::new(key_cache)),
+            keys: SharedKeys::new(secret, key_cache),
             verdicts: AsyncMutex::new(verdicts),
             bits: tag_bits(u32::try_from(validators).expect("validator count fits in u32")),
         }
-    }
-
-    /// The key this validator shares with `user`.
-    fn key(&self, user: &constantinople_auth::PublicKey) -> Option<SharedKey> {
-        if let Some(key) = self.keys.lock().get(user) {
-            return Some(key.clone());
-        }
-        let key = self.secret.with_user(self.namespace, user)?;
-        self.keys.lock().put(*user, key.clone());
-        Some(key)
     }
 
     /// This validator's report on a block by `proposer` with the tagged
@@ -435,21 +423,45 @@ where
             return Report::empty();
         }
         let shaped = column.len() == tagged.len() && column.bits() == self.bits;
-        let work: Vec<_> = tagged.into_iter().enumerate().collect();
-        let entries = strategy.map_collect_vec(work, |(position, (digest, sender))| {
-            let own = sender
-                .and_then(|sender| self.key(&sender))
-                .map(|key| key.tag.tag(proposer, digest.as_ref(), self.bits));
-            let matches = shaped && own.is_some() && own == column.get(position);
-            (digest, matches)
-        });
-        let verdicts = self
-            .verdicts
-            .lock()
-            .await
-            .check(proposer, entries)
-            .await
-            .expect("verdict store must record rejections");
+
+        // The keys of all the block's senders are looked up at once. A lookup
+        // for each transaction, from every thread that compares tags, would
+        // have the threads queue on the cache (see [`SharedKeys`]).
+        let senders: Vec<_> = tagged.iter().filter_map(|(_, sender)| *sender).collect();
+        let mut keys = {
+            let _span = info_span!("engine.tags.keys", senders = senders.len().traced()).entered();
+            self.keys
+                .resolve(self.namespace, &senders, strategy)
+                .into_iter()
+        };
+        let work: Vec<_> = tagged
+            .into_iter()
+            .enumerate()
+            .map(|(position, (digest, sender))| {
+                // `keys` has one entry for each transaction that names a
+                // sender, in block order.
+                let key = sender.and_then(|_| keys.next().flatten());
+                (position, digest, key)
+            })
+            .collect();
+        let entries = {
+            let _span = info_span!("engine.tags.compare", txs = work.len().traced()).entered();
+            strategy.map_collect_vec(work, |(position, digest, key)| {
+                let own = key.map(|key| key.tag.tag(proposer, digest.as_ref(), self.bits));
+                let matches = shaped && own.is_some() && own == column.get(position);
+                (digest, matches)
+            })
+        };
+        let verdicts: Vec<bool> = async {
+            self.verdicts
+                .lock()
+                .await
+                .check(proposer, entries)
+                .await
+                .expect("verdict store must record rejections")
+        }
+        .instrument(info_span!("engine.tags.verdicts"))
+        .await;
         Report::new(&verdicts)
     }
 }
@@ -549,7 +561,12 @@ where
             let column = column_for(&built.authenticators, me, self.tagger.bits);
             (built.tagged, column)
         } else {
-            let Ok(block) = self.shards.subscribe(commitment).await else {
+            let rebuilt = self
+                .shards
+                .subscribe(commitment)
+                .instrument(info_span!("engine.tags.block_wait"))
+                .await;
+            let Ok(block) = rebuilt else {
                 return false;
             };
             let block: &EngineBlock<H, P> = block.inner();
@@ -557,24 +574,30 @@ where
             let column = if tagged.is_empty() {
                 Tags::new(self.tagger.bits)
             } else {
-                // The column normally arrives with the proposal, ahead of the
-                // block. If the network dropped it, the leader sends it again
-                // on request, for as long as consensus waits for this verdict.
+                // The leader sends the column right after the block's shards,
+                // so it normally arrives before the block is rebuilt. If the
+                // network dropped it, the leader sends it again on request,
+                // for as long as consensus waits for this verdict.
                 let mut column = self.shared.column(leader.clone(), commitment);
-                loop {
-                    select! {
-                        column = &mut column => match column {
-                            Ok(column) => break column,
-                            Err(_) => return false,
-                        },
-                        _ = self.context.sleep(COLUMN_REQUEST_INTERVAL) => {
-                            let request = Message::<H>::Request(commitment).encode();
-                            if self.columns.send((leader.clone(), request)).is_err() {
-                                return false;
-                            }
-                        },
+                let arrived = async {
+                    loop {
+                        select! {
+                            column = &mut column => break column.ok(),
+                            _ = self.context.sleep(COLUMN_REQUEST_INTERVAL) => {
+                                let request = Message::<H>::Request(commitment).encode();
+                                if self.columns.send((leader.clone(), request)).is_err() {
+                                    break None;
+                                }
+                            },
+                        }
                     }
                 }
+                .instrument(info_span!("engine.tags.column_wait"))
+                .await;
+                let Some(column) = arrived else {
+                    return false;
+                };
+                column
             };
             (tagged, column)
         };
@@ -590,6 +613,10 @@ where
 
     /// Sends every other validator its column for the block with `commitment`,
     /// which this node built.
+    ///
+    /// A column takes a pass over the block's authenticators, and there is one
+    /// for each validator. They are built together on the pool, in a task of
+    /// their own, so that the caller is not held up for them.
     fn send_columns(&self, commitment: Commitment<H>) {
         let Some(Built { authenticators, .. }) = self.shared.own(&commitment.block()) else {
             return;
@@ -598,20 +625,40 @@ where
             return;
         }
         let me = self.scheme.me();
-        for (index, peer) in self.scheme.participants().iter().enumerate() {
-            let validator = Participant::from_usize(index);
-            if Some(validator) == me {
-                continue;
+        let peers: Vec<_> = self
+            .scheme
+            .participants()
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| (Participant::from_usize(index), peer.clone()))
+            .filter(|(validator, _)| Some(*validator) != me)
+            .collect();
+        let span = info_span!(
+            "engine.tags.columns",
+            txs = authenticators.len().traced(),
+            validators = peers.len().traced(),
+        );
+        let strategy = self.strategy.clone();
+        let columns = self.columns.clone();
+        let bits = self.tagger.bits;
+        self.context.child("columns").spawn(move |_| async move {
+            let built = {
+                let _span = span.entered();
+                strategy.map_collect_vec(peers, |(validator, peer)| {
+                    let column = Message::Column(Column::<H> {
+                        commitment,
+                        tags: column_for(&authenticators, validator, bits),
+                    });
+                    (peer, column.encode())
+                })
+            };
+            for column in built {
+                if columns.send(column).is_err() {
+                    debug!("column sender stopped");
+                    return;
+                }
             }
-            let column = Message::Column(Column::<H> {
-                commitment,
-                tags: column_for(&authenticators, validator, self.tagger.bits),
-            });
-            if self.columns.send((peer.clone(), column.encode())).is_err() {
-                debug!("column sender stopped");
-                return;
-            }
-        }
+        });
     }
 }
 
@@ -641,12 +688,21 @@ where
         let built = self.inner.propose(context.clone()).await;
         let (mut sender, receiver) = oneshot::channel();
         let this = self.clone();
+        let parent = Span::current();
         self.context.child("report_own").spawn(move |_| async move {
             select! {
                 _ = sender.closed() => {},
                 recorded = async {
                     let commitment = built.await.ok()?;
+                    // The proposal is not released before this node's own
+                    // report on it is recorded.
+                    let span = info_span!(
+                        parent: &parent,
+                        "engine.tags.report_own",
+                        view = context.round.view().get().traced(),
+                    );
                     this.record(context.round, commitment, &context.leader)
+                        .instrument(span)
                         .await
                         .then_some(commitment)
                 } => {
@@ -668,6 +724,7 @@ where
         let verified = self.inner.verify(context.clone(), payload).await;
         let (mut sender, receiver) = oneshot::channel();
         let this = self.clone();
+        let parent = Span::current();
         self.context.child("report").spawn(move |_| async move {
             select! {
                 _ = sender.closed() => {},
@@ -677,7 +734,13 @@ where
                         return Some(false);
                     }
                     // No column or no block means no vote: the view times out.
+                    let span = info_span!(
+                        parent: &parent,
+                        "engine.tags.report",
+                        view = context.round.view().get().traced(),
+                    );
                     this.record(context.round, payload, &context.leader)
+                        .instrument(span)
                         .await
                         .then_some(true)
                 } => {
@@ -722,10 +785,15 @@ where
     type Plan = Plan<P>;
 
     fn broadcast(&mut self, commitment: Self::Digest, plan: Self::Plan) -> Feedback {
-        if matches!(plan, Plan::Propose { .. }) {
+        // The block goes out first. A validator can do nothing with its column
+        // before it has rebuilt the block, which takes longer than the column
+        // takes to follow.
+        let propose = matches!(plan, Plan::Propose { .. });
+        let feedback = self.inner.broadcast(commitment, plan);
+        if propose {
             self.send_columns(commitment);
         }
-        self.inner.broadcast(commitment, plan)
+        feedback
     }
 }
 
@@ -799,5 +867,108 @@ pub(crate) async fn send(
         {
             debug!(%peer, "column not sent");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::Sha256;
+    use commonware_parallel::{Rayon, Sequential};
+    use commonware_runtime::{
+        Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+    };
+    use commonware_utils::{NZU16, NZU64, NZUsize, test_rng};
+    use constantinople_auth::PublicKey as TagPublicKey;
+
+    const NAMESPACE: &[u8] = b"chain";
+    const VALIDATORS: usize = 6;
+
+    /// A validator says yes to exactly the transactions whose tag in its
+    /// column is the one it computes with their own sender's key. That holds
+    /// when some transactions name no sender or a sender with no key, when a
+    /// sender has several transactions, and when the block has more senders
+    /// than the validator keeps keys for.
+    #[test]
+    fn report_checks_each_transaction_under_its_own_senders_key() {
+        deterministic::Runner::default().start(|context| async move {
+            let secret = PrivateKey::from([7; 32]);
+            let tagger = Tagger::<_, Sha256>::new(
+                context.child("tagger"),
+                NAMESPACE,
+                secret.clone(),
+                VALIDATORS,
+                NZUsize!(4),
+                VerdictsConfig {
+                    partition: "verdicts".into(),
+                    items_per_blob: NZU64!(64),
+                    page_cache: CacheRef::from_pooler(
+                        &context.child("cache"),
+                        NZU16!(64),
+                        NZUsize!(16),
+                    ),
+                    write_buffer: NZUsize!(1024),
+                    replay_buffer: NZUsize!(1024),
+                },
+            )
+            .await;
+            let bits = tagger.bits;
+            let proposer = Participant::new(4);
+
+            let mut rng = test_rng();
+            let users: Vec<_> = (0..12).map(|_| PrivateKey::random(&mut rng)).collect();
+            let low_order = TagPublicKey::from([0; 32]);
+            let digest = |byte: u8| <Sha256 as Hasher>::Digest::from([byte; 32]);
+
+            // Sixty transactions by twelve users, in turn. Some name no sender,
+            // some a sender whose key is a low-order point, and some carry the
+            // tag of another transaction.
+            let mut tagged = Vec::new();
+            let mut column = Tags::new(bits);
+            let mut expected = Vec::new();
+            for position in 0..60u8 {
+                let user = &users[position as usize % users.len()];
+                let own = user
+                    .with_validator(NAMESPACE, &secret.public_key())
+                    .expect("validator key is not low order");
+                let (sender, approved) = match position % 5 {
+                    0 => (None, false),
+                    1 => (Some(low_order), false),
+                    _ => (Some(user.public_key()), position % 3 != 0),
+                };
+                let tag_of = if position % 3 == 0 {
+                    position + 100
+                } else {
+                    position
+                };
+                column.push(&own.tag.tag(proposer, digest(tag_of).as_ref(), bits));
+                tagged.push((digest(position), sender));
+                expected.push(approved);
+            }
+            assert!(expected.iter().any(|approved| *approved));
+            assert!(expected.iter().any(|approved| !*approved));
+
+            // From one thread and from a pool, twice each: the second time
+            // some keys are cached.
+            let pool = Rayon::new(NZUsize!(3)).expect("pool starts");
+            for _ in 0..2 {
+                let one = tagger
+                    .report(&Sequential, proposer, tagged.clone(), &column)
+                    .await;
+                assert_eq!(one, Report::new(&expected));
+                let many = tagger
+                    .report(&pool, proposer, tagged.clone(), &column)
+                    .await;
+                assert_eq!(many, Report::new(&expected));
+            }
+
+            // A column of another length matches nothing.
+            let mut short = Tags::new(bits);
+            short.push(&column.get(0).expect("column has tags"));
+            let none = tagger
+                .report(&Sequential, proposer, tagged.clone(), &short)
+                .await;
+            assert_eq!(none, Report::new(&vec![false; tagged.len()]));
+        });
     }
 }

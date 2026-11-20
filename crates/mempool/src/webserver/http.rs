@@ -18,8 +18,8 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
-use commonware_utils::{Participant, cache::Cache, sync::Mutex, sys_rng};
-use constantinople_auth::{Mac, PrivateKey, SharedKey, Submission, Tags, tag_bits};
+use commonware_utils::{Participant, sys_rng};
+use constantinople_auth::{Mac, PrivateKey, SharedKey, SharedKeys, Submission, Tags, tag_bits};
 use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
     TransactionSignature, verify_transaction_chunks,
@@ -76,12 +76,12 @@ pub struct Admission {
 pub(super) struct Admitter {
     admission: Admission,
     /// The key this validator shares with the senders seen lately.
-    keys: Mutex<Cache<constantinople_auth::PublicKey, SharedKey>>,
+    keys: SharedKeys,
 }
 
 impl Admitter {
     pub(super) fn new(admission: Admission) -> Arc<Self> {
-        let keys = Mutex::new(Cache::new(admission.key_cache_size));
+        let keys = SharedKeys::new(admission.secret.clone(), admission.key_cache_size);
         Arc::new(Self { admission, keys })
     }
 
@@ -89,33 +89,53 @@ impl Admitter {
         self.admission.validators as usize
     }
 
-    /// The key this validator shares with `user`.
-    fn key(&self, namespace: &[u8], user: &constantinople_auth::PublicKey) -> Option<SharedKey> {
-        if let Some(key) = self.keys.lock().get(user) {
-            return Some(key.clone());
-        }
-        let key = self.admission.secret.with_user(namespace, user)?;
-        self.keys.lock().put(*user, key.clone());
-        Some(key)
-    }
-
-    /// Admits `submission` if it names this validator as proposer, its sender
-    /// authenticated it to this validator, and its tag for this validator is
-    /// right.
-    fn admit<H: Hasher>(
-        &self,
-        namespace: &[u8],
-        submission: Submission<SignedTransaction<H>>,
-    ) -> Option<Candidate<H>> {
+    /// The sender of a submission's transaction, if it is one that
+    /// authenticates its transactions by tags.
+    fn sender<H: Hasher>(
+        submission: &Submission<SignedTransaction<H>>,
+    ) -> Option<constantinople_auth::PublicKey> {
         if !submission.transaction.is_mac() {
             return None;
         }
-        let sender = submission.transaction.value().sender()?.as_x25519()?;
-        let key = self.key(namespace, &sender)?;
+        submission.transaction.value().sender()?.as_x25519()
+    }
+
+    /// Admits every submission of a batch, or none: see [`Self::admit`].
+    ///
+    /// The keys of all the senders are looked up at once and the submissions
+    /// are then checked on `strategy`. A lookup for each submission from
+    /// every thread of the pool would have the threads queue on the cache.
+    fn admit_all<H: Hasher>(
+        &self,
+        namespace: &[u8],
+        submissions: Vec<Submission<SignedTransaction<H>>>,
+        strategy: &impl Strategy,
+    ) -> Option<Vec<Candidate<H>>> {
+        let senders = submissions
+            .iter()
+            .map(Self::sender)
+            .collect::<Option<Vec<_>>>()?;
+        let keys = self.keys.resolve(namespace, &senders, strategy);
+        strategy
+            .map_collect_vec(submissions.into_iter().zip(keys), |(submission, key)| {
+                self.admit(submission, &key?)
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Admits `submission` if it names this validator as proposer, its sender
+    /// authenticated it to this validator under `key`, the key the two share,
+    /// and its tag for this validator is right.
+    fn admit<H: Hasher>(
+        &self,
+        submission: Submission<SignedTransaction<H>>,
+        key: &SharedKey,
+    ) -> Option<Candidate<H>> {
         submission
             .admit(
                 self.admission.validator,
-                &key,
+                key,
                 submission.transaction.message_digest().as_ref(),
                 self.validators(),
             )
@@ -572,12 +592,8 @@ where
             bytes = total_bytes.traced(),
         )
         .entered();
-        let transactions = strategy
-            .map_collect_vec(submissions, |submission| {
-                admitter.admit(namespace, submission)
-            })
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
+        let transactions = admitter
+            .admit_all(namespace, submissions, &strategy)
             .ok_or(StatusCode::BAD_REQUEST)?;
         drop(admit);
 
@@ -972,6 +988,46 @@ mod tests {
                         candidate.authenticator.as_ref(),
                         Some(&submission.authenticator)
                     );
+                }
+                result
+                    .expect("blocking submission should have a waiter")
+                    .send(TxStatus::Rejected { height: 7 })
+                    .expect("handler should await the result");
+                assert_eq!(request.await.expect("request finishes"), StatusCode::OK);
+            }
+        });
+    }
+
+    /// A batch from more senders than the key cache holds is admitted whole,
+    /// each submission under its own sender's key and in the order sent.
+    #[test]
+    fn submission_endpoint_admits_more_senders_than_it_caches() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let admission = admission();
+            let senders = 3 * admission.key_cache_size.get() as u8;
+            let (app, mut receiver) =
+                admitting_router(context.child("many"), 1 << 20, Some(admission));
+            let submissions: Vec<_> = (1..=senders)
+                .map(|seed| submission(seed, VALIDATOR))
+                .collect();
+
+            // The same batch twice: the second time some keys are cached and
+            // the others were evicted by the first.
+            for _ in 0..2 {
+                let body = submissions.encode();
+                let app = app.clone();
+                let request = tokio::spawn(async move { post(app, "/submissions", body).await });
+                let Some(Message::Submit {
+                    transactions,
+                    result,
+                    ..
+                }) = receiver.recv().await
+                else {
+                    panic!("expected submission");
+                };
+                assert_eq!(transactions.len(), submissions.len());
+                for (candidate, submission) in transactions.iter().zip(&submissions) {
+                    assert_eq!(candidate.transaction, submission.transaction);
                 }
                 result
                     .expect("blocking submission should have a waiter")
