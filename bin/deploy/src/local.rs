@@ -151,6 +151,7 @@ fn build_validators(
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            shared_key_cache_size: args.shared_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -228,6 +229,7 @@ fn build_secondaries(
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            shared_key_cache_size: args.shared_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -489,7 +491,8 @@ mod tests {
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig,
         default_history_page_cache_bytes, default_max_pool_bytes, default_max_propose_bytes,
         default_public_key_cache_size, default_publisher_rayon_threads,
-        default_state_page_cache_bytes, generate_local_cluster_material, total_secondaries,
+        default_shared_key_cache_size, default_state_page_cache_bytes,
+        generate_local_cluster_material, total_secondaries,
     };
     use std::{
         fs,
@@ -517,6 +520,7 @@ mod tests {
             indexer_rayon_threads: None,
             indexer_publisher_rayon_threads: default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
+            shared_key_cache_size: default_shared_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             state_page_cache_bytes: default_state_page_cache_bytes(),
@@ -785,6 +789,37 @@ mod tests {
         assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
         assert!(!commands[3].contains("--mode"));
+    }
+
+    /// Every node of a local bundle, voting or not, gets the configured shared
+    /// key cache size.
+    #[test]
+    fn local_nodes_carry_the_shared_key_cache_size() {
+        let mut args = test_args(false);
+        args.relayer = true;
+        args.shared_key_cache_size = commonware_utils::NZUsize!(250_000);
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let nodes: Vec<_> = build_validators(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        )
+        .into_iter()
+        .chain(build_secondaries(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        ))
+        .collect();
+
+        assert_eq!(nodes.len(), args.validators as usize + 1);
+        for node in nodes {
+            let yaml = serde_yaml::to_value(&node.config).expect("config serializes");
+            assert_eq!(yaml["shared_key_cache_size"].as_u64(), Some(250_000));
+        }
     }
 
     #[test]

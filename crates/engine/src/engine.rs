@@ -85,10 +85,6 @@ use tracing::{error, info, warn};
 // Validators sign votes with ed25519 keys.
 type P = ed25519::PublicKey;
 
-/// Senders whose shared keys a validator keeps, each saving one Diffie-Hellman
-/// per transaction it compares a tag for.
-const SHARED_KEY_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 16);
-
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
 const MAX_BLOCK_SIZE: NonZero<usize> = NZUsize!(MAXIMUM_BLOCK_SIZE);
@@ -192,6 +188,13 @@ where
     pub partition_prefix: String,
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
+    /// Senders of tagged transactions whose shared keys this validator keeps.
+    ///
+    /// Comparing a tag for a sender that is not among them costs one
+    /// Diffie-Hellman, about one signature verification. Every validator
+    /// compares a tag for every tagged transaction of every block, so this
+    /// should hold all the senders active at once.
+    pub shared_key_cache_size: NonZero<usize>,
     pub startup: StartupMode,
     /// Whether requested or interrupted peer state sync may skip local execution.
     pub allow_state_sync: bool,
@@ -595,7 +598,7 @@ where
             config.transaction_namespace,
             config.secret,
             participants.len(),
-            SHARED_KEY_CACHE_SIZE,
+            config.shared_key_cache_size,
             VerdictsConfig {
                 partition: format!("{}_verdicts", config.partition_prefix),
                 items_per_blob: ITEMS_PER_BLOB,

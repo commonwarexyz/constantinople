@@ -398,6 +398,7 @@ impl EngineDefinition for TestEngineDefinition {
                         context.child("public_key_cache"),
                         NZUsize!(1024),
                     ),
+                    shared_key_cache_size: NZUsize!(1024),
                     startup,
                     allow_state_sync,
                     sync_config: SyncEngineConfig {

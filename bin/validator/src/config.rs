@@ -53,6 +53,10 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
     100_000
 }
 
+pub(crate) const fn default_shared_key_cache_size() -> NonZeroUsize {
+    NZUsize!(1 << 16)
+}
+
 /// Indexer wiring for a secondary validator.
 ///
 /// Primary (voting) validators ignore this section. Secondaries with
@@ -152,6 +156,12 @@ pub struct ValidatorConfig {
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
+    /// Senders of tagged transactions whose shared keys this node keeps, for
+    /// the tags it compares as a validator and again for the submissions it
+    /// admits as a proposer. A sender outside the cache costs one
+    /// Diffie-Hellman per transaction.
+    #[serde(default = "default_shared_key_cache_size")]
+    pub shared_key_cache_size: NonZeroUsize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
@@ -261,6 +271,9 @@ pub struct LoadedConfig {
     pub history_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     pub public_key_cache_size: usize,
+    /// Capacity, in senders, of each cache of keys shared with the senders of
+    /// tagged transactions.
+    pub shared_key_cache_size: NonZeroUsize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
     pub otel: Option<(String, f64)>,
     /// Whether logs are emitted as JSON.
@@ -420,6 +433,7 @@ fn decode_with_network(
         history_page_cache_bytes: config.history_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
         public_key_cache_size: config.public_key_cache_size,
+        shared_key_cache_size: config.shared_key_cache_size,
         otel,
         json_logs,
         deployer_managed: json_logs,
@@ -577,8 +591,9 @@ mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
         default_history_page_cache_bytes, default_max_pool_bytes, default_max_propose_bytes,
-        default_public_key_cache_size, default_state_page_cache_bytes, default_upload_budget_bytes,
-        default_upload_max_in_flight, load_deployer_config, load_local_config,
+        default_public_key_cache_size, default_shared_key_cache_size,
+        default_state_page_cache_bytes, default_upload_budget_bytes, default_upload_max_in_flight,
+        load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{Signer, ed25519};
@@ -724,6 +739,7 @@ mod tests {
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
+                shared_key_cache_size: default_shared_key_cache_size(),
                 traces: 0.0,
                 bootstrappers,
                 indexer: None,
@@ -759,6 +775,7 @@ mod tests {
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
+                shared_key_cache_size: default_shared_key_cache_size(),
                 traces: 0.0,
                 bootstrappers,
                 indexer: None,
@@ -863,6 +880,30 @@ mod tests {
         let config: ValidatorConfig = serde_yaml::from_value(value).unwrap();
         assert_eq!(config.state_page_cache_bytes, 6 * 1024 * 1024 * 1024);
         assert_eq!(config.history_page_cache_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    /// A config written before the shared key cache was configurable keeps the
+    /// size it had, a configured size reaches the node, and a cache of no
+    /// senders is refused.
+    #[test]
+    fn shared_key_cache_size_is_read_from_the_config() {
+        let cluster = Cluster::new(2, 0);
+        let config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        let mut value = serde_yaml::to_value(config).unwrap();
+
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove("shared_key_cache_size");
+        let omitted: ValidatorConfig = serde_yaml::from_value(value.clone()).unwrap();
+        assert_eq!(omitted.shared_key_cache_size.get(), 1 << 16);
+
+        value["shared_key_cache_size"] = 250_000.into();
+        let configured: ValidatorConfig = serde_yaml::from_value(value.clone()).unwrap();
+        assert_eq!(configured.shared_key_cache_size.get(), 250_000);
+
+        value["shared_key_cache_size"] = 0.into();
+        assert!(serde_yaml::from_value::<ValidatorConfig>(value).is_err());
     }
 
     #[test]

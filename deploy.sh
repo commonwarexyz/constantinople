@@ -14,6 +14,7 @@ usage() {
     echo "  --regions <comma-separated-regions>     default us-east-1,us-west-2" >&2
     echo "  --spammer-accounts <count>              default 4096" >&2
     echo "  --spammer-submitters <count>            default validator count" >&2
+    echo "  --spammer-mode <signatures|macs>        default signatures" >&2
     echo "  --max-pool-bytes <bytes>                default deploy CLI value" >&2
     echo "  --storage-size <gib>                    default 150" >&2
 }
@@ -28,6 +29,7 @@ reset_options() {
     REGIONS=us-east-1,us-west-2
     SPAMMER_ACCOUNTS=4096
     SPAMMER_SUBMITTERS=
+    SPAMMER_MODE=
     MAX_POOL_BYTES=
     STORAGE_SIZE=150
     GENERATE_ARGS=()
@@ -73,6 +75,9 @@ parse_options() {
                 ;;
             --spammer-submitters)
                 target=SPAMMER_SUBMITTERS
+                ;;
+            --spammer-mode)
+                target=SPAMMER_MODE
                 ;;
             --max-pool-bytes)
                 target=MAX_POOL_BYTES
@@ -120,11 +125,17 @@ prepare_deployment() {
         --indexer-rayon-threads 12
         --indexer-publisher-rayon-threads 4
         --public-key-cache-size 5000000
+        --shared-key-cache-size 5000000
         --max-propose-bytes 16777216
     )
 
     if [ -n "$SPAMMER_SUBMITTERS" ]; then
         GENERATE_ARGS+=(--spammer-submitters "$SPAMMER_SUBMITTERS")
+    fi
+
+    # The generator rejects an unknown mode before anything is built.
+    if [ -n "$SPAMMER_MODE" ]; then
+        GENERATE_ARGS+=(--spammer-mode "$SPAMMER_MODE")
     fi
 
     if [ -n "$MAX_POOL_BYTES" ]; then

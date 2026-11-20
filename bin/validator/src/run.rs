@@ -61,9 +61,6 @@ use std::{
 use tracing::info;
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
-/// Senders of tagged transactions whose shared key the mempool keeps.
-const SUBMISSION_KEY_CACHE_SIZE: NonZeroUsize = NZUsize!(1 << 16);
-
 const STATE_SYNC_APPLY_BATCH_SIZE: NonZeroU64 = NZU64!(1024);
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
     maintenance_interval: NZUsize!(1024),
@@ -182,6 +179,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         state_page_cache_bytes,
         history_page_cache_bytes,
         public_key_cache_size,
+        shared_key_cache_size,
         otel,
         json_logs,
         deployer_managed,
@@ -341,7 +339,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                         validator,
                         validators: participants.len() as u32,
                         secret: decoded.tag_secret.clone(),
-                        key_cache_size: SUBMISSION_KEY_CACHE_SIZE,
+                        key_cache_size: shared_key_cache_size,
                     }
                 }),
             },
@@ -419,6 +417,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     partition_prefix: decoded.partition_prefix,
                     strategy,
                     public_key_cache,
+                    shared_key_cache_size,
                     startup,
                     allow_state_sync: indexer_handle.is_none(),
                     sync_config: production_sync_config(),

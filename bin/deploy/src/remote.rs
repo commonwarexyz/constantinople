@@ -172,6 +172,7 @@ fn build_validators(
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            shared_key_cache_size: args.shared_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -229,6 +230,7 @@ fn build_secondaries(
             state_page_cache_bytes: args.state_page_cache_bytes,
             history_page_cache_bytes: args.history_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            shared_key_cache_size: args.shared_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -559,8 +561,8 @@ mod tests {
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
         default_history_page_cache_bytes, default_max_pool_bytes, default_max_propose_bytes,
         default_public_key_cache_size, default_publisher_rayon_threads,
-        default_state_page_cache_bytes, generate_local_cluster_material, total_secondaries,
-        validate_generate_args,
+        default_shared_key_cache_size, default_state_page_cache_bytes,
+        generate_local_cluster_material, total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -579,6 +581,7 @@ mod tests {
             indexer_rayon_threads: None,
             indexer_publisher_rayon_threads: default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
+            shared_key_cache_size: default_shared_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             state_page_cache_bytes: default_state_page_cache_bytes(),
@@ -751,6 +754,7 @@ mod tests {
                 state_page_cache_bytes: default_state_page_cache_bytes(),
                 history_page_cache_bytes: default_history_page_cache_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
+                shared_key_cache_size: default_shared_key_cache_size(),
                 traces: 0.0,
                 bootstrappers: Vec::new(),
                 indexer: None,
@@ -873,6 +877,43 @@ mod tests {
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
         );
+    }
+
+    /// In MAC mode the remote spammer is told the mode and gets one tag key
+    /// for each validator, in the order of the validators it targets.
+    #[test]
+    fn remote_spammer_config_carries_the_mode_and_tag_keys() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_mode = crate::SpammerMode::Macs;
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let config = remote_spammer_config(&args, &remote, &material);
+        let yaml = serde_yaml::to_value(&config).expect("spammer config should serialize");
+
+        assert_eq!(yaml["mode"].as_str(), Some("macs"));
+        assert_eq!(config.primary_validators, material.primary_hex());
+        assert_eq!(config.primary_tag_keys, material.primary_tag_keys_hex());
+        assert_eq!(config.primary_tag_keys.len(), args.validators as usize);
+        let listed: Vec<_> = yaml["primary_tag_keys"]
+            .as_sequence()
+            .expect("tag keys should be a list")
+            .iter()
+            .map(|key| {
+                key.as_str()
+                    .expect("tag key should be a string")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(listed, config.primary_tag_keys);
+
+        // Without the flag the spammer signs.
+        args.spammer_mode = crate::SpammerMode::Signatures;
+        let signed = remote_spammer_config(&args, &remote, &material);
+        let yaml = serde_yaml::to_value(&signed).expect("spammer config should serialize");
+        assert_eq!(yaml["mode"].as_str(), Some("signatures"));
     }
 
     #[test]
@@ -1185,6 +1226,41 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    /// Every node of a remote bundle, voting or not, gets the configured shared
+    /// key cache size, and the default is the size nodes had before it was
+    /// configurable.
+    #[test]
+    fn remote_nodes_carry_the_shared_key_cache_size() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.relayer = true;
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let sizes = |args: &GenerateArgs| -> Vec<usize> {
+            super::build_validators(args, &remote, Path::new("/tmp/configs"), &material)
+                .into_iter()
+                .chain(build_secondaries(
+                    args,
+                    &remote,
+                    Path::new("/tmp/configs"),
+                    &material,
+                ))
+                .map(|node| {
+                    let yaml = serde_yaml::to_value(&node.config).expect("config serializes");
+                    let size = yaml["shared_key_cache_size"]
+                        .as_u64()
+                        .expect("shared key cache size is written");
+                    usize::try_from(size).expect("size fits")
+                })
+                .collect()
+        };
+
+        assert_eq!(sizes(&args), vec![1 << 16; 5]);
+
+        args.shared_key_cache_size = commonware_utils::NZUsize!(250_000);
+        assert_eq!(sizes(&args), vec![250_000; 5]);
     }
 
     #[test]

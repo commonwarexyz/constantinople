@@ -65,6 +65,14 @@ assert_pair --rayon-threads 13 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-worker-threads 8 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-rayon-threads 12 "${GENERATE_ARGS[@]}"
 assert_pair --indexer-publisher-rayon-threads 4 "${GENERATE_ARGS[@]}"
+# Both key caches hold every account of the largest runs, in either mode.
+assert_pair --public-key-cache-size 5000000 "${GENERATE_ARGS[@]}"
+assert_pair --shared-key-cache-size 5000000 "${GENERATE_ARGS[@]}"
+# Without a mode the generator's default applies: signatures.
+assert_excludes --spammer-mode "${GENERATE_ARGS[@]}"
+
+prepare_case --spammer-mode macs
+assert_pair --spammer-mode macs "${GENERATE_ARGS[@]}"
 
 prepare_case --store-url https://store.example.com
 assert_pair --store-url https://store.example.com "${REMOTE_ARGS[@]}"
@@ -145,6 +153,7 @@ for option in \
     --regions \
     --spammer-accounts \
     --spammer-submitters \
+    --spammer-mode \
     --max-pool-bytes \
     --storage-size
 do
@@ -166,6 +175,7 @@ for mapping in \
     "--regions REGIONS" \
     "--spammer-accounts SPAMMER_ACCOUNTS" \
     "--spammer-submitters SPAMMER_SUBMITTERS" \
+    "--spammer-mode SPAMMER_MODE" \
     "--max-pool-bytes MAX_POOL_BYTES" \
     "--storage-size STORAGE_SIZE"
 do

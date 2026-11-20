@@ -59,6 +59,7 @@ const INDEXER_UPLOAD_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
+const DEFAULT_SHARED_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1 << 16).unwrap();
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +125,11 @@ pub(crate) struct GenerateArgs {
     /// Capacity of each node's decompressed public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
+    /// Senders of tagged transactions whose shared keys each node keeps. A
+    /// sender outside the cache costs a validator one Diffie-Hellman per
+    /// transaction, so this should cover the accounts active at once.
+    #[arg(long, default_value_t = DEFAULT_SHARED_KEY_CACHE_SIZE)]
+    shared_key_cache_size: NonZeroUsize,
     /// Maximum encoded block bytes, including framing. At most 16 MiB.
     /// Submission budgets reserve space for block encoding overhead.
     #[arg(long = "max-propose-bytes", default_value_t = default_max_propose_bytes())]
@@ -524,6 +530,9 @@ pub(crate) struct ValidatorConfig {
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,
+    /// Senders of tagged transactions whose shared keys the node keeps.
+    #[serde(default = "default_shared_key_cache_size")]
+    shared_key_cache_size: NonZeroUsize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
@@ -939,6 +948,10 @@ pub(crate) const fn default_history_page_cache_bytes() -> usize {
 
 pub(crate) const fn default_public_key_cache_size() -> usize {
     DEFAULT_PUBLIC_KEY_CACHE_SIZE
+}
+
+pub(crate) const fn default_shared_key_cache_size() -> NonZeroUsize {
+    DEFAULT_SHARED_KEY_CACHE_SIZE
 }
 
 pub(crate) fn generate_deployer_tag() -> String {

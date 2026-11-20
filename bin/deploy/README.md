@@ -16,8 +16,8 @@ the agreed validator count. A smaller local proposal budget does not restrict
 receiving valid peer blocks. Network messages remain capped at 32 MiB.
 
 `deploy.sh` accepts `--validators`, `--regions`, `--storage-size`,
-`--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
-Run `./deploy.sh --help` for defaults.
+`--spammer-accounts`, `--spammer-submitters`, `--spammer-mode`, and
+`--max-pool-bytes`. Run `./deploy.sh --help` for defaults.
 
 Each node runs two page caches. The state cache defaults to 6 GiB and holds the
 account-state journals. The history cache defaults to 2 GiB and is shared by the
@@ -187,6 +187,18 @@ By default the spammer's accounts sign their transactions. With `--spammer-mode 
 they share a key with every validator instead and send tags, and the generated command
 adds `--mode macs --tag-keys <primary-tag-keys>`. Everything else is the same in both
 modes, so the two can be compared.
+
+Each node keeps the keys it shares with the senders of tagged transactions:
+one cache for the tags it compares as a validator and one for the submissions
+it admits as a proposer. `--shared-key-cache-size N` sets how many senders each
+holds (default `65536`) and is written to node YAML as `shared_key_cache_size`.
+A sender outside the cache costs a validator one Diffie-Hellman per
+transaction, about one signature verification, so when measuring `macs` mode
+set it well above the number of accounts, `spammer_accounts *
+relayer_submitters`: a new key is on probation in a tenth of the cache before
+it is kept. `deploy.sh` sets it to 5,000,000, for which a validator reserves
+about 280 MiB at startup and a secondary about 140 MiB, before any sender is
+seen.
 
 When `--spammer` is set, the generated spammer command uses `--relayer-url`,
 `--relayer-submitters <validators>`, and `--relayer-targets <primary-keys>`.
