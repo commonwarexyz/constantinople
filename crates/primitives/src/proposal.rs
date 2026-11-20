@@ -4,6 +4,7 @@ use crate::{Outcomes, ParentNotarization, Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
 use commonware_consensus::types::coding::COMMITMENT_SIZE;
 use commonware_cryptography::{Digest, ed25519, sha256};
+use constantinople_auth::MAX_ENTRIES;
 
 /// Maximum encoded block size accepted by consensus, including its header and body framing.
 pub const MAXIMUM_BLOCK_SIZE: usize = 16 * 1024 * 1024;
@@ -11,21 +12,23 @@ pub const MAXIMUM_BLOCK_SIZE: usize = 16 * 1024 * 1024;
 /// Maximum encoded application message accepted by the validator network.
 pub const MAXIMUM_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 
-/// Transaction-byte budget after reserving space for block framing.
+/// Transaction-byte budget after reserving space for block framing and for
+/// what a block carries about its parent.
 ///
-/// The budget covers a block that carries no notarization of its parent and no
-/// outcome bits. A proposer knows both before it selects transactions, and
-/// counts their size ([`parent_bytes`]) against this budget.
+/// A block carries a notarization of its parent and one outcome bit for each of
+/// the parent's transactions. Their size depends on the parent, so the budget
+/// reserves the most they take ([`parent_bytes_bound`]) when the parent is as
+/// full as this budget allows and `validators` validators vote.
 ///
 /// Returns `None` if the block budget exceeds the consensus limit or cannot
-/// accommodate the largest header and an empty body.
-pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
+/// accommodate the largest header, the reservation and an empty body.
+pub fn max_transaction_bytes(block_bytes: usize, validators: u32) -> Option<usize> {
     if block_bytes > MAXIMUM_BLOCK_SIZE {
         return None;
     }
     let body_bytes = block_bytes
         .checked_sub(maximum_header_size())?
-        .checked_sub(parent_bytes::<sha256::Digest>(None, &Outcomes::new()))?;
+        .checked_sub(parent_bytes_bound(validators, 0))?;
 
     // A transaction's length prefix takes one byte below 128 bytes and two bytes
     // above. With the smallest transaction at 82 bytes, `a` short and `b` long
@@ -33,7 +36,15 @@ pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
     let minimum_transaction = Transaction::<sha256::Digest>::SIZE + TransactionSignature::MIN_SIZE;
     let max_transaction_count = body_bytes / minimum_transaction;
     let framing = max_transaction_count.encode_size() + body_bytes / 64;
-    body_bytes.checked_sub(framing)
+    let available = body_bytes.checked_sub(framing)?;
+
+    // Each transaction of the parent costs this block one bit in every vote's
+    // report and one outcome bit. `t` transactions take at least
+    // `t * minimum_transaction` bytes of the parent's budget, and at most
+    // `(t / 8 + 1) * share` bytes here.
+    let share = validators as usize + 1;
+    let bits = minimum_transaction * 8;
+    Some(available.saturating_sub(share) * bits / (bits + share))
 }
 
 /// Encoded size of what a block carries about its parent: the notarization and
@@ -45,6 +56,23 @@ pub fn parent_bytes<C: Digest>(
     notarization.map_or(false.encode_size(), |notarization| {
         true.encode_size() + notarization.encode_size()
     }) + outcomes.encode_size()
+}
+
+/// The most [`parent_bytes`] can be for a parent with `transactions`
+/// transactions, if every one of `validators` votes in the notarization
+/// carries a report no longer than one bit for each transaction.
+///
+/// A validator that follows the protocol sends such a report. A faulty one may
+/// send a longer report, which a proposer counts against its transactions.
+pub fn parent_bytes_bound(validators: u32, transactions: usize) -> usize {
+    let validators = validators as usize;
+    let bits = transactions.div_ceil(8);
+    let proposal = 3 * UInt(u64::MAX).encode_size() + COMMITMENT_SIZE;
+    let signers = u64::SIZE + validators.div_ceil(8);
+    let report = UInt(2 * MAX_ENTRIES as u64 + 1).encode_size() + bits;
+    let votes = validators.encode_size() + validators * (report + ed25519::Signature::SIZE);
+    let outcomes = u64::SIZE + bits;
+    true.encode_size() + proposal + signers + votes + outcomes
 }
 
 fn maximum_header_size() -> usize {
@@ -66,12 +94,14 @@ mod tests {
     use commonware_codec::Encode;
     use commonware_coding::ReedSolomon;
     use commonware_consensus::{
-        simplex::types::Context,
+        simplex::types::{Context, Notarization, Notarize, Proposal},
         types::{Epoch, Round, View, coding::Commitment as CodingCommitment},
     };
     use commonware_cryptography::{Digest, Signer, secp256r1::standard as secp256r1};
     use commonware_math::algebra::Random;
-    use commonware_utils::non_empty_range;
+    use commonware_parallel::Sequential;
+    use commonware_utils::{non_empty, non_empty_range};
+    use constantinople_auth::Report;
     use std::num::NonZeroU64;
 
     type Commitment = CodingCommitment<
@@ -138,17 +168,71 @@ mod tests {
         [unsigned, minimum, maximum]
     }
 
-    #[test]
-    fn empty_block_bound_matches_maximum_header_codec() {
-        let block = Block::<_, _, sha256::Sha256>::new(maximum_header(), Vec::new());
-        assert_eq!(
-            maximum_header_size()
-                + parent_bytes::<Commitment>(None, &Outcomes::new())
-                + 0usize.encode_size(),
-            block.encode().len()
+    const VALIDATORS: [u32; 2] = [6, 16];
+
+    /// A notarization by every one of `validators` validators, each reporting
+    /// on `entries` transactions with a report as long as an honest one gets.
+    fn notarization(validators: u32, entries: usize) -> ParentNotarization<Commitment> {
+        let fixture = constantinople_auth::fixture(
+            &mut commonware_utils::test_rng(),
+            b"proposal-test",
+            validators,
         );
-        assert_eq!(max_transaction_bytes(block.encode().len()), Some(0));
-        assert_eq!(max_transaction_bytes(block.encode().len() - 1), None);
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
+            View::new(u64::MAX - 1),
+            Commitment::default(),
+        );
+        let verdicts: Vec<bool> = (0..entries).map(|position| position % 2 == 0).collect();
+        let votes: Vec<_> = fixture
+            .schemes
+            .iter()
+            .map(|scheme| {
+                scheme.reports().insert(
+                    proposal.round,
+                    proposal.payload.as_ref(),
+                    Report::new(&verdicts),
+                );
+                Notarize::sign(scheme, proposal.clone()).expect("report was recorded")
+            })
+            .collect();
+        Notarization::from_notarizes(&fixture.schemes[0], non_empty![@votes.iter()], &Sequential)
+            .expect("every validator voted")
+    }
+
+    /// The smallest block budget that leaves a transaction budget.
+    fn minimum_block_budget(validators: u32) -> usize {
+        (0..MAXIMUM_BLOCK_SIZE)
+            .find(|&budget| max_transaction_bytes(budget, validators).is_some())
+            .expect("some budget is large enough")
+    }
+
+    #[test]
+    fn bound_covers_what_a_block_carries_about_its_parent() {
+        for validators in VALIDATORS {
+            for entries in [0, 1, 7, 8, 9, 64, 1_000, 10_001] {
+                let notarization = notarization(validators, entries);
+                let outcomes = Outcomes::zeroes(entries as u64);
+                let bound = parent_bytes_bound(validators, entries);
+                assert!(parent_bytes(Some(&notarization), &outcomes) <= bound);
+                assert!(parent_bytes::<Commitment>(None, &outcomes) <= bound);
+            }
+        }
+    }
+
+    #[test]
+    fn smallest_budget_holds_an_empty_block() {
+        for validators in VALIDATORS {
+            let budget = minimum_block_budget(validators);
+            assert_eq!(max_transaction_bytes(budget, validators), Some(0));
+            let block = Block::<_, _, sha256::Sha256>::with_parent(
+                maximum_header(),
+                Some(notarization(validators, 0)),
+                Outcomes::new(),
+                Vec::new(),
+            );
+            assert!(block.encode().len() <= budget);
+        }
     }
 
     #[test]
@@ -169,24 +253,46 @@ mod tests {
             &transactions[..2],
             &transactions[..],
         ];
-        for pattern in patterns {
-            for block_budget in [380, 512, 8192, 19232, 19381, MAXIMUM_BLOCK_SIZE] {
-                let budget = max_transaction_bytes(block_budget).unwrap();
-                let mut filled = 0;
-                let mut body = Vec::new();
-                for transaction in pattern.iter().cycle() {
-                    let size = transaction.encode_size();
-                    if filled + size > budget {
-                        break;
+        for validators in VALIDATORS {
+            let minimum = minimum_block_budget(validators);
+            for block_budget in [
+                minimum,
+                minimum + 83,
+                minimum + 1_000,
+                19_232,
+                19_381,
+                MAXIMUM_BLOCK_SIZE,
+            ] {
+                let budget = max_transaction_bytes(block_budget, validators).unwrap();
+
+                // The parent holds as many transactions as the budget allows, and
+                // every vote for it reports on all of them.
+                let parent = budget / transactions[0].encode_size();
+                let notarization = notarization(validators, parent);
+                let outcomes = Outcomes::zeroes(parent as u64);
+
+                for pattern in patterns {
+                    let mut filled = 0;
+                    let mut body = Vec::new();
+                    for transaction in pattern.iter().cycle() {
+                        let size = transaction.encode_size();
+                        if filled + size > budget {
+                            break;
+                        }
+                        filled += size;
+                        body.push(transaction.clone());
                     }
-                    filled += size;
-                    body.push(transaction.clone());
+                    let block = Block::with_parent(
+                        maximum_header(),
+                        Some(notarization.clone()),
+                        outcomes.clone(),
+                        body,
+                    );
+                    assert!(
+                        block.encode().len() <= block_budget,
+                        "transaction budget {budget} exceeded block budget {block_budget}",
+                    );
                 }
-                let block = Block::new(maximum_header(), body);
-                assert!(
-                    block.encode().len() <= block_budget,
-                    "transaction budget {budget} exceeded block budget {block_budget}",
-                );
             }
         }
     }
@@ -194,7 +300,7 @@ mod tests {
     #[test]
     fn rejects_invalid_block_budgets() {
         for budget in [0, MAXIMUM_BLOCK_SIZE + 1, usize::MAX] {
-            assert_eq!(max_transaction_bytes(budget), None);
+            assert_eq!(max_transaction_bytes(budget, 6), None);
         }
     }
 }

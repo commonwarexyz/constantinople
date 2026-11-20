@@ -185,8 +185,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         relayer,
     } = config;
 
-    let transaction_budget = max_transaction_bytes(max_propose_bytes)
-        .expect("configured encoded block budget must be valid");
+    let transaction_budget =
+        max_transaction_bytes(max_propose_bytes, decoded.primary_participants.len() as u32)
+            .expect("configured encoded block budget must be valid");
 
     let config_dir = config_path
         .parent()

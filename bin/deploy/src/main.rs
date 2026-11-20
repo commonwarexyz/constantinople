@@ -757,7 +757,7 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         args.max_propose_bytes,
     );
     assert!(
-        max_transaction_bytes(args.max_propose_bytes).is_some(),
+        max_transaction_bytes(args.max_propose_bytes, args.validators).is_some(),
         "--max-propose-bytes {} is too small for an encoded empty block",
         args.max_propose_bytes,
     );
@@ -1584,7 +1584,7 @@ mod tests {
     #[test]
     fn validates_minimum_encoded_block_budget() {
         let minimum = (0..=super::MAXIMUM_BLOCK_SIZE)
-            .find(|&budget| super::max_transaction_bytes(budget).is_some())
+            .find(|&budget| super::max_transaction_bytes(budget, 6).is_some())
             .expect("empty block fits within the consensus limit");
         for budget in [0, 1, minimum - 1] {
             let args = proposal_args(6, budget);

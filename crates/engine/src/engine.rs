@@ -1004,7 +1004,7 @@ mod unit_tests {
             constantinople_primitives::TRANSACTION_NAMESPACE,
             &mut sha256::Sha256::default(),
         );
-        let proposal_bytes = max_transaction_bytes(MAXIMUM_BLOCK_SIZE).unwrap();
+        let proposal_bytes = max_transaction_bytes(MAXIMUM_BLOCK_SIZE, 6).unwrap();
         let transaction_count = proposal_bytes / transaction.encode_size();
         let header = Header {
             context: Context {

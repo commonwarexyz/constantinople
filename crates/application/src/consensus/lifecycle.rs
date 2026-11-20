@@ -25,7 +25,7 @@ use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
     Block, Header, Outcomes, ParentNotarization, Sealable, SealedBlock, SignedTransaction,
     notarization_digest, outcomes_digest,
-    proposal::{MAXIMUM_BLOCK_SIZE, parent_bytes},
+    proposal::{MAXIMUM_BLOCK_SIZE, parent_bytes, parent_bytes_bound},
 };
 use rand::{CryptoRng, Rng};
 use std::{collections::HashSet, future::Future, sync::Arc};
@@ -157,10 +157,13 @@ where
         // nothing here depends on the state: a transaction is left out only if
         // it is listed twice or lacks what its kind requires.
         //
-        // The byte budget of the transaction source assumes a block that says
-        // nothing about its parent. What this block says takes from it.
-        let reserved = parent_bytes(notarization.as_ref(), &Outcomes::zeroes(entries.len()))
-            - parent_bytes::<C>(None, &Outcomes::new());
+        // The byte budget of the transaction source leaves room for what this
+        // block says about its parent, as long as every vote's report is no
+        // longer than an honest one. Anything beyond that takes from the budget.
+        let reserved =
+            parent_bytes(notarization.as_ref(), &Outcomes::zeroes(entries.len())).saturating_sub(
+                parent_bytes_bound(self.validators(), entries.len() as usize),
+            );
         let candidates = input
             .propose(&parent_header, context.round, reserved)
             .instrument(info_span!("application.propose.input"))

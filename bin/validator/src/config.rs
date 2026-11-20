@@ -373,7 +373,8 @@ fn decode_with_network(
         config.max_propose_bytes,
     );
     assert!(
-        max_transaction_bytes(config.max_propose_bytes).is_some(),
+        max_transaction_bytes(config.max_propose_bytes, primary_participants.len() as u32)
+            .is_some(),
         "max_propose_bytes {} is too small for an encoded empty block",
         config.max_propose_bytes,
     );
@@ -821,7 +822,7 @@ mod tests {
     fn validates_minimum_encoded_block_budget() {
         let cluster = Cluster::new(4, 0);
         let minimum = (0..=super::MAXIMUM_BLOCK_SIZE)
-            .find(|&budget| super::max_transaction_bytes(budget).is_some())
+            .find(|&budget| super::max_transaction_bytes(budget, 4).is_some())
             .expect("empty block fits within the consensus limit");
         for budget in [0, 1, minimum - 1] {
             let Err(error) = std::panic::catch_unwind(|| decode_proposal_config(&cluster, budget))
