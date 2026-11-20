@@ -950,7 +950,7 @@ where
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use commonware_codec::{Decode, Encode, EncodeSize};
+    use commonware_codec::{Decode, Encode, EncodeSize, FixedSize};
     use commonware_coding::{Config as CodingConfig, ReedSolomon};
     use commonware_consensus::{
         marshal::coding::types::Shard,
@@ -963,7 +963,9 @@ mod unit_tests {
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_primitives::{
         Block, Header, Sealable, Transaction, TransactionPublicKey,
-        proposal::{MAXIMUM_BLOCK_SIZE, MAXIMUM_MESSAGE_SIZE, max_transaction_bytes},
+        proposal::{
+            MAXIMUM_BLOCK_SIZE, MAXIMUM_MESSAGE_SIZE, max_transaction_bytes, parent_bytes_bound,
+        },
     };
     use futures::FutureExt;
     use rand::{SeedableRng, rngs::StdRng};
@@ -1057,8 +1059,14 @@ mod unit_tests {
                 .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
         // The budget reserves two prefix bytes per 128 body bytes, the worst
-        // case over transaction sizes. These transactions use fewer.
-        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < MAXIMUM_BLOCK_SIZE / 256);
+        // case over transaction sizes. These transactions use fewer. It also
+        // reserves room for a notarization of a full parent and its outcome
+        // bits, which this block does not carry.
+        let smallest = Transaction::<sha256::Digest>::SIZE
+            + constantinople_primitives::TransactionSignature::MIN_SIZE;
+        let reserved = parent_bytes_bound(6, proposal_bytes / smallest);
+        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < MAXIMUM_BLOCK_SIZE / 256 + reserved);
+        assert!(reserved < MAXIMUM_BLOCK_SIZE / 64);
         type TestShard = Shard<
             EngineBlock<sha256::Sha256, ed25519::PublicKey>,
             ReedSolomon<sha256::Sha256>,
